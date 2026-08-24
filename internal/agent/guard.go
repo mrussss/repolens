@@ -21,11 +21,11 @@ func DefaultGuardConfig() GuardConfig {
 }
 
 type AgentGuard struct {
-	cfg            GuardConfig
-	stepCount      int
-	toolCallCount  int
-	callHistory    map[string]int
-	lastCallHash   string
+	cfg             GuardConfig
+	stepCount       int
+	toolCallCount   int
+	callHistory     map[string]int
+	lastCallHash    string
 	consecutiveSame int
 }
 

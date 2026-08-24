@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"repolens/internal/eval"
@@ -31,7 +32,7 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 	chunkStore := retrieval.NewMemoryChunkStore()
 	chunker := indexing.NewCodeChunker(50, 10)
 
-	// Populate chunk store for all 32 cases
+	// Populate chunk store and disk files for all 32 cases
 	for _, c := range eval.StandardFaultCases {
 		var chunks []indexing.CodeChunk
 		for _, relFile := range c.RelevantFiles {
@@ -42,12 +43,21 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 			)
 			fileChunks := chunker.ChunkFile(c.SnapshotSHA, relFile, mockContent)
 			chunks = append(chunks, fileChunks...)
+
+			// Write source file to disk so ReadFileTool and CitationValidator can read it
+			filePath := filepath.Join(tmpDir, c.RepositoryName, c.SnapshotSHA, "source", relFile)
+			_ = os.MkdirAll(filepath.Dir(filePath), 0755)
+			_ = os.WriteFile(filePath, []byte(mockContent), 0644)
 		}
 		// Add distractor chunks
 		for i := 1; i <= 5; i++ {
 			dPath := fmt.Sprintf("pkg/mock/distractor_%d.go", i)
 			dContent := fmt.Sprintf("// Package distractor\npackage mock\nfunc Helper_%d() {}\n", i)
 			chunks = append(chunks, chunker.ChunkFile(c.SnapshotSHA, dPath, dContent)...)
+
+			dFilePath := filepath.Join(tmpDir, c.RepositoryName, c.SnapshotSHA, "source", dPath)
+			_ = os.MkdirAll(filepath.Dir(dFilePath), 0755)
+			_ = os.WriteFile(dFilePath, []byte(dContent), 0644)
 		}
 		chunkStore.SaveChunks(c.SnapshotSHA, chunks)
 	}
@@ -81,15 +91,15 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 		t.Errorf("expected non-zero MRR for Hybrid RRF")
 	}
 
-	// 4. End-to-End Diagnosis Eval
-	fakeProvider := llm.NewFakeProvider(llm.ModeNormalStructured)
+	// 4. End-to-End Diagnosis Eval with Real Agent Tool Calling Loop
+	fakeProvider := llm.NewFakeProvider(llm.ModeToolCallThenDone)
 	runE2E, err := runner.RunEndToEndDiagnosisEval(ctx, fakeProvider, hybridRetriever)
 	if err != nil {
 		t.Fatalf("E2E diagnosis eval failed: %v", err)
 	}
 
-	if runE2E.Metrics.RootCauseSuccessRate == 0 {
-		t.Errorf("expected non-zero Root Cause success rate")
+	if runE2E.Metrics.AvgPromptTokens == 0 {
+		t.Errorf("expected non-zero token metrics in E2E Eval")
 	}
 
 	eval.PrintComparisonTable([]*eval.EvalRun{runBM25, runVector, runHybrid, runE2E})

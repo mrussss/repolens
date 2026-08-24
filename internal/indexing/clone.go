@@ -50,9 +50,9 @@ func isPrivateOrLocalIP(ip net.IP) bool {
 }
 
 type SafeGitCloner struct {
-	allowHosts    []string
-	maxSizeMB     int64
-	cloneTimeout  time.Duration
+	allowHosts   []string
+	maxSizeMB    int64
+	cloneTimeout time.Duration
 }
 
 func NewSafeGitCloner(allowHosts []string, maxSizeMB int64, timeout time.Duration) *SafeGitCloner {

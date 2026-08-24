@@ -20,13 +20,13 @@ func TestSSRFAndGitURLValidation(t *testing.T) {
 	}{
 		{"https://github.com/repolens/sample-repo", true},
 		{"https://gitlab.com/repolens/sample-repo", true},
-		{"http://github.com/repolens/sample-repo", false},         // Non-HTTPS denied
-		{"file:///etc/passwd", false},                             // file:// protocol denied
-		{"ssh://git@github.com/repolens/repo", false},             // SSH denied
-		{"https://127.0.0.1/repolens/repo", false},                // Loopback IP denied
-		{"https://10.0.0.1/repolens/repo", false},                 // Private RFC1918 denied
-		{"https://169.254.169.254/latest/meta-data", false},       // Link-local metadata denied
-		{"https://malicious-host.com/repo", false},                // Unallowed host denied
+		{"http://github.com/repolens/sample-repo", false},   // Non-HTTPS denied
+		{"file:///etc/passwd", false},                       // file:// protocol denied
+		{"ssh://git@github.com/repolens/repo", false},       // SSH denied
+		{"https://127.0.0.1/repolens/repo", false},          // Loopback IP denied
+		{"https://10.0.0.1/repolens/repo", false},           // Private RFC1918 denied
+		{"https://169.254.169.254/latest/meta-data", false}, // Link-local metadata denied
+		{"https://malicious-host.com/repo", false},          // Unallowed host denied
 	}
 
 	for _, tt := range tests {

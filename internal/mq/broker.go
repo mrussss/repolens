@@ -23,14 +23,14 @@ const (
 )
 
 type Message struct {
-	ID          string            `json:"id"`
-	EventType   string            `json:"event_type"`
-	Payload     string            `json:"payload"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Redelivered bool              `json:"redelivered"`
-	AttemptCount int              `json:"attempt_count"`
-	AckFunc     func() error      `json:"-"`
-	NackFunc    func(requeue bool) error `json:"-"`
+	ID           string                   `json:"id"`
+	EventType    string                   `json:"event_type"`
+	Payload      string                   `json:"payload"`
+	Headers      map[string]string        `json:"headers,omitempty"`
+	Redelivered  bool                     `json:"redelivered"`
+	AttemptCount int                      `json:"attempt_count"`
+	AckFunc      func() error             `json:"-"`
+	NackFunc     func(requeue bool) error `json:"-"`
 }
 
 type Broker interface {

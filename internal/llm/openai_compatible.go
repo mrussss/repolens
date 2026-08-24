@@ -11,10 +11,10 @@ import (
 )
 
 type OpenAICompatibleProvider struct {
-	apiKey     string
-	baseURL    string
+	apiKey       string
+	baseURL      string
 	defaultModel string
-	httpClient *http.Client
+	httpClient   *http.Client
 }
 
 func NewOpenAICompatibleProvider(apiKey, baseURL, defaultModel string) *OpenAICompatibleProvider {

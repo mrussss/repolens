@@ -9,9 +9,9 @@ import (
 )
 
 type Relay struct {
-	store    Store
-	broker   mq.Broker
-	interval time.Duration
+	store     Store
+	broker    mq.Broker
+	interval  time.Duration
 	batchSize int
 }
 

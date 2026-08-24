@@ -13,16 +13,16 @@ import (
 
 var (
 	blockedFilenames = map[string]bool{
-		".env":                  true,
-		".env.local":            true,
-		".env.production":       true,
-		"id_rsa":                true,
-		"id_dsa":                true,
-		"id_ed25519":            true,
-		"credentials.json":      true,
-		"service-account.json":  true,
-		".git/config":           true,
-		".git/HEAD":             true,
+		".env":                 true,
+		".env.local":           true,
+		".env.production":      true,
+		"id_rsa":               true,
+		"id_dsa":               true,
+		"id_ed25519":           true,
+		"credentials.json":     true,
+		"service-account.json": true,
+		".git/config":          true,
+		".git/HEAD":            true,
 	}
 
 	blockedExtensions = map[string]bool{
