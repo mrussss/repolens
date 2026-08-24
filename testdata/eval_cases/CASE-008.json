@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-008",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/agent-core",
+  "snapshot_sha": "snap-agent-08",
+  "issue_title": "Agent enters infinite loop calling search_code with identical query",
+  "issue_description": "LLM generated 50 consecutive calls to search_code('test') exhausting token budget.",
+  "error_log": "agent loop error: max steps exceeded due to repeated identical tool invocation",
+  "expected_root_cause": "Missing repeat-call hash detection guard to abort consecutive identical tool executions",
+  "relevant_files": [
+    "internal/agent/guard.go",
+    "internal/agent/loop.go"
+  ],
+  "forbidden_claims": [
+    "database deadlock"
+  ]
+}

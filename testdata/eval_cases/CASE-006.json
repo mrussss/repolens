@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-006",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/git-ingest",
+  "snapshot_sha": "snap-git-06",
+  "issue_title": "SSRF vulnerability allows cloning internal cloud metadata endpoint",
+  "issue_description": "User passed http://169.254.169.254/latest/meta-data as git URL.",
+  "error_log": "security alert: outbound request attempted to cloud metadata link-local address 169.254.169.254",
+  "expected_root_cause": "Git cloner lacks host allowlist and IP resolution check for private and link-local CIDR blocks",
+  "relevant_files": [
+    "internal/indexing/clone.go"
+  ],
+  "forbidden_claims": [
+    "AWS IAM permission error"
+  ]
+}

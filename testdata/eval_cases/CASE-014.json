@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-014",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/chunker-service",
+  "snapshot_sha": "snap-chunk-14",
+  "issue_title": "Index out of range panic during code chunk slicing with overlap",
+  "issue_description": "Single-line files cause code chunker to panic on index out of range [0:60].",
+  "error_log": "panic: runtime error: slice bounds out of range [:60] with capacity 1",
+  "expected_root_cause": "Chunker does not clamp end line boundary to total file line count",
+  "relevant_files": [
+    "internal/indexing/chunk.go"
+  ],
+  "forbidden_claims": [
+    "text file encoding error"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-003",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/order-service",
+  "snapshot_sha": "snap-order-03",
+  "issue_title": "Duplicate orders created on rapid client double clicks",
+  "issue_description": "Clients submitting two identical checkout requests within 100ms receive two order IDs.",
+  "error_log": "order duplicate warning: duplicate checkout triggered without unique constraint check",
+  "expected_root_cause": "Missing unique idempotency key constraint and request hash verification in database transaction",
+  "relevant_files": [
+    "internal/diagnosis/store.go",
+    "internal/diagnosis/service.go"
+  ],
+  "forbidden_claims": [
+    "client browser bug"
+  ]
+}

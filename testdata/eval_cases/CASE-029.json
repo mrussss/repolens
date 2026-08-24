@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-029",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/idemp-conflict",
+  "snapshot_sha": "snap-idemp-29",
+  "issue_title": "Idempotency key reused with different issue payload returns 200 instead of 409",
+  "issue_description": "Client reused Idempotency-Key: abc for a completely different repository and issue.",
+  "error_log": "idempotency error: key abc submitted with mismatched request hash",
+  "expected_root_cause": "Service did not compute SHA256 request hash and return 409 Conflict when hash differs",
+  "relevant_files": [
+    "internal/diagnosis/service.go",
+    "internal/diagnosis/handler.go"
+  ],
+  "forbidden_claims": [
+    "HTTP proxy altered header"
+  ]
+}

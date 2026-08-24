@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-018",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/bm25-ranker",
+  "snapshot_sha": "snap-bm25-18",
+  "issue_title": "BM25 ranker gives zero score to camelCase identifiers in query",
+  "issue_description": "Searching for 'handleRequest' fails to match 'HandleRequest' function symbol.",
+  "error_log": "retrieval miss: zero candidates returned for camelCase method name",
+  "expected_root_cause": "Tokenizer did not split camelCase and normalize terms to lowercase during index and query parsing",
+  "relevant_files": [
+    "internal/retrieval/bm25.go"
+  ],
+  "forbidden_claims": [
+    "Elasticsearch cluster down"
+  ]
+}

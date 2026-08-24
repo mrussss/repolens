@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-011",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/database-pool",
+  "snapshot_sha": "snap-db-11",
+  "issue_title": "Database connection pool exhausted under concurrent diagnosis requests",
+  "issue_description": "HTTP requests block indefinitely and return 504 Gateway Timeout during load spike.",
+  "error_log": "mysql error: Error 1040: Too many connections / connection pool full",
+  "expected_root_cause": "Goroutines leaking sql.DB connections due to missing defer rows.Close()",
+  "relevant_files": [
+    "internal/platform/mysql/mysql.go",
+    "internal/outbox/store.go"
+  ],
+  "forbidden_claims": [
+    "DNS server unreachable"
+  ]
+}

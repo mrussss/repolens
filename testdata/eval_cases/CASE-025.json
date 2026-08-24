@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-025",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/eval-repro",
+  "snapshot_sha": "snap-eval-25",
+  "issue_title": "Eval metrics differ between runs without record of changed prompt version",
+  "issue_description": "Regression score dropped from 92% to 74% but unable to trace which component changed.",
+  "error_log": "eval audit missing: EvalRun record lacks model, prompt_version and retrieval_version metadata",
+  "expected_root_cause": "EvalRun struct did not record full reproducibility parameters (dataset_version, git_commit, prompt_version)",
+  "relevant_files": [
+    "internal/eval/run.go",
+    "internal/eval/runner.go"
+  ],
+  "forbidden_claims": [
+    "CPU instruction set changed"
+  ]
+}

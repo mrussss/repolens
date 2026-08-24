@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-013",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/http-client",
+  "snapshot_sha": "snap-http-13",
+  "issue_title": "HTTP client socket leak leads to too many open files error",
+  "issue_description": "After 10,000 requests, server errors with socket: too many open files.",
+  "error_log": "http error: dial tcp: socket: too many open files",
+  "expected_root_cause": "Missing resp.Body.Close() on HTTP client response causing socket descriptors to remain open",
+  "relevant_files": [
+    "internal/llm/openai_compatible.go"
+  ],
+  "forbidden_claims": [
+    "kernel ulimit hardcoded to 10"
+  ]
+}

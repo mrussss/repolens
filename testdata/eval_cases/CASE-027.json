@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-027",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/symlink-guard",
+  "snapshot_sha": "snap-sym-27",
+  "issue_title": "Symlink inside repository pointing to /var/log read by read_file",
+  "issue_description": "Attacker created symlink link.txt -\u003e /var/log/syslog in repository.",
+  "error_log": "security violation: symlink target /var/log/syslog escapes snapshot root directory",
+  "expected_root_cause": "Missing filepath.EvalSymlinks verification comparing resolved path against snapshot root",
+  "relevant_files": [
+    "internal/platform/snapshotstore/snapshotstore.go",
+    "internal/tools/read_file.go"
+  ],
+  "forbidden_claims": [
+    "filesystem driver bug"
+  ]
+}
