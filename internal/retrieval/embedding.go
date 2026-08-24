@@ -111,32 +111,39 @@ func (p *OpenAICompatibleEmbeddingProvider) Embed(ctx context.Context, texts []s
 	return result, nil
 }
 
-// LocalTFIDFEmbeddingProvider computes deterministic sub-word and token feature embedding vectors
-// with L2 normalization for local / offline experimentation
-type LocalTFIDFEmbeddingProvider struct {
+// LocalHashedFeatureProvider computes deterministic sub-word and token hashed feature vectors
+// with L2 normalization for local / offline baseline experimentation (not a neural semantic model).
+type LocalHashedFeatureProvider struct {
 	model     string
 	dimension int
 }
 
-func NewLocalTFIDFEmbeddingProvider(dimension int) *LocalTFIDFEmbeddingProvider {
+func NewLocalHashedFeatureProvider(dimension int) *LocalHashedFeatureProvider {
 	if dimension <= 0 {
 		dimension = 128
 	}
-	return &LocalTFIDFEmbeddingProvider{
-		model:     "local-tfidf-v1",
+	return &LocalHashedFeatureProvider{
+		model:     "local-hashed-baseline-v1",
 		dimension: dimension,
 	}
 }
 
-func (p *LocalTFIDFEmbeddingProvider) Model() string {
+// Backward compatibility alias
+type LocalTFIDFEmbeddingProvider = LocalHashedFeatureProvider
+
+func NewLocalTFIDFEmbeddingProvider(dimension int) *LocalHashedFeatureProvider {
+	return NewLocalHashedFeatureProvider(dimension)
+}
+
+func (p *LocalHashedFeatureProvider) Model() string {
 	return p.model
 }
 
-func (p *LocalTFIDFEmbeddingProvider) Dimension() int {
+func (p *LocalHashedFeatureProvider) Dimension() int {
 	return p.dimension
 }
 
-func (p *LocalTFIDFEmbeddingProvider) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+func (p *LocalHashedFeatureProvider) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	result := make([][]float32, len(texts))
 	for i, text := range texts {
 		vec := make([]float32, p.dimension)

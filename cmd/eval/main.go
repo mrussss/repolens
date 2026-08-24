@@ -33,35 +33,16 @@ func main() {
 
 	fmt.Printf("Loaded %d benchmark fault cases from %s\n", len(eval.StandardFaultCases), dataDir)
 
-	// Create and populate chunk store with simulated snapshot chunks for each case
+	// Create and populate chunk store with real static repository fixture chunks for each case
 	chunkStore := retrieval.NewMemoryChunkStore()
 	chunker := indexing.NewCodeChunker(50, 10)
 
 	for _, c := range eval.StandardFaultCases {
-		var chunks []indexing.CodeChunk
-		for _, relFile := range c.RelevantFiles {
-			mockContent := fmt.Sprintf("// Code file: %s\npackage main\n\nfunc %s() {\n    // %s\n    // %s\n}\n",
-				relFile,
-				"HandleFailure",
-				c.ExpectedRootCause,
-				c.IssueDescription,
-			)
-			fileChunks := chunker.ChunkFile(c.SnapshotSHA, relFile, mockContent)
-			chunks = append(chunks, fileChunks...)
-
-			filePath := filepath.Join("/tmp/repolens_eval_snapshots", c.RepositoryName, c.SnapshotSHA, "source", relFile)
-			_ = os.MkdirAll(filepath.Dir(filePath), 0755)
-			_ = os.WriteFile(filePath, []byte(mockContent), 0644)
-		}
-		// Add some distractor chunks
-		for i := 1; i <= 8; i++ {
-			distractorPath := fmt.Sprintf("pkg/service/helper_%d.go", i)
-			distractorContent := fmt.Sprintf("// Package helper %d\npackage helper\n\nfunc HelperFunc%d() string {\n    return \"ok\"\n}\n", i, i)
-			chunks = append(chunks, chunker.ChunkFile(c.SnapshotSHA, distractorPath, distractorContent)...)
-
-			dFilePath := filepath.Join("/tmp/repolens_eval_snapshots", c.RepositoryName, c.SnapshotSHA, "source", distractorPath)
-			_ = os.MkdirAll(filepath.Dir(dFilePath), 0755)
-			_ = os.WriteFile(dFilePath, []byte(distractorContent), 0644)
+		fixtureDir := eval.GetFixturePathForRepo(c.RepositoryName)
+		targetSnapshotDir := filepath.Join("/tmp/repolens_eval_snapshots", c.RepositoryName, c.SnapshotSHA, "source")
+		chunks, err := eval.LoadFixtureChunksAndSnapshot(fixtureDir, targetSnapshotDir, c.SnapshotSHA, chunker)
+		if err != nil || len(chunks) == 0 {
+			fmt.Printf("Warning: failed to load fixture chunks for %s: %v\n", c.CaseID, err)
 		}
 		chunkStore.SaveChunks(c.SnapshotSHA, chunks)
 	}
@@ -82,17 +63,17 @@ func main() {
 		fmt.Printf("BM25 eval error: %v\n", err)
 	}
 
-	// 3. Vector Dense Search
-	embedder := retrieval.NewLocalTFIDFEmbeddingProvider(128)
+	// 3. Local Hashed Vector Baseline
+	embedder := retrieval.NewLocalHashedFeatureProvider(128)
 	vectorRetriever := retrieval.NewVectorRetriever(chunkStore, embedder)
-	runVector, err := runner.RunRetrievalEval(ctx, "VECTOR", vectorRetriever, chunkStore)
+	runVector, err := runner.RunRetrievalEval(ctx, "LOCAL_HASHED_VEC", vectorRetriever, chunkStore)
 	if err != nil {
 		fmt.Printf("Vector eval error: %v\n", err)
 	}
 
-	// 4. Hybrid RRF Search
+	// 4. Hybrid Baseline Search (BM25 + Hashed Vector)
 	hybridRetriever := retrieval.NewHybridRRFRetriever(60, bm25Retriever, vectorRetriever)
-	runHybrid, err := runner.RunRetrievalEval(ctx, "HYBRID_RRF", hybridRetriever, chunkStore)
+	runHybrid, err := runner.RunRetrievalEval(ctx, "HYBRID_BASELINE", hybridRetriever, chunkStore)
 	if err != nil {
 		fmt.Printf("Hybrid eval error: %v\n", err)
 	}
@@ -112,5 +93,6 @@ func main() {
 		runE2E,
 	})
 
-	fmt.Println("Eval run completed successfully. Metrics verified against ground truth datasets.")
+	fmt.Println("\nNote: LOCAL_HASHED_VEC is a deterministic token-hash baseline; production neural embeddings require OPENAI / compatible API keys.")
+	fmt.Println("Eval run completed successfully. Metrics verified against static repository fixtures.")
 }

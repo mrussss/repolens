@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"repolens/internal/indexing"
 )
 
 var StandardFaultCases = []EvalCase{
@@ -409,4 +412,67 @@ func WriteStandardDatasetToDir(dir string) error {
 		}
 	}
 	return nil
+}
+
+func findFixtureBaseDir() string {
+	candidates := []string{
+		"testdata/eval_repositories",
+		"../../testdata/eval_repositories",
+		"../testdata/eval_repositories",
+		"/home/lls/projects/repolens/testdata/eval_repositories",
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return "testdata/eval_repositories"
+}
+
+func GetFixturePathForRepo(repoName string) string {
+	base := findFixtureBaseDir()
+	var sub string
+	switch {
+	case strings.Contains(repoName, "payment"):
+		sub = "payment_service"
+	case strings.Contains(repoName, "auth"):
+		sub = "auth_service"
+	case strings.Contains(repoName, "order"):
+		sub = "order_service"
+	case strings.Contains(repoName, "queue") || strings.Contains(repoName, "worker") || strings.Contains(repoName, "pool") || strings.Contains(repoName, "retry"):
+		sub = "queue_worker"
+	case strings.Contains(repoName, "git"):
+		sub = "git_ingest"
+	default:
+		sub = "agent_runtime"
+	}
+	return filepath.Join(base, sub)
+}
+
+func LoadFixtureChunksAndSnapshot(fixtureRoot, targetSnapshotDir string, snapshotSHA string, chunker *indexing.CodeChunker) ([]indexing.CodeChunk, error) {
+	var chunks []indexing.CodeChunk
+	err := filepath.Walk(fixtureRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(fixtureRoot, path)
+		if err != nil {
+			return nil
+		}
+		contentBytes, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		content := string(contentBytes)
+		fileChunks := chunker.ChunkFile(snapshotSHA, relPath, content)
+		chunks = append(chunks, fileChunks...)
+
+		if targetSnapshotDir != "" {
+			destPath := filepath.Join(targetSnapshotDir, relPath)
+			_ = os.MkdirAll(filepath.Dir(destPath), 0755)
+			_ = os.WriteFile(destPath, contentBytes, 0644)
+		}
+		return nil
+	})
+	return chunks, err
 }

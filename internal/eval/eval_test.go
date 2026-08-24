@@ -2,7 +2,6 @@ package eval_test
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -32,33 +31,11 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 	chunkStore := retrieval.NewMemoryChunkStore()
 	chunker := indexing.NewCodeChunker(50, 10)
 
-	// Populate chunk store and disk files for all 32 cases
+	// Populate chunk store and disk files for all 32 cases from static fixtures
 	for _, c := range eval.StandardFaultCases {
-		var chunks []indexing.CodeChunk
-		for _, relFile := range c.RelevantFiles {
-			mockContent := fmt.Sprintf("// Package code\npackage main\n\nfunc %s() {\n    // %s\n    // %s\n}\n",
-				"ResolveFailure",
-				c.ExpectedRootCause,
-				c.IssueDescription,
-			)
-			fileChunks := chunker.ChunkFile(c.SnapshotSHA, relFile, mockContent)
-			chunks = append(chunks, fileChunks...)
-
-			// Write source file to disk so ReadFileTool and CitationValidator can read it
-			filePath := filepath.Join(tmpDir, c.RepositoryName, c.SnapshotSHA, "source", relFile)
-			_ = os.MkdirAll(filepath.Dir(filePath), 0755)
-			_ = os.WriteFile(filePath, []byte(mockContent), 0644)
-		}
-		// Add distractor chunks
-		for i := 1; i <= 5; i++ {
-			dPath := fmt.Sprintf("pkg/mock/distractor_%d.go", i)
-			dContent := fmt.Sprintf("// Package distractor\npackage mock\nfunc Helper_%d() {}\n", i)
-			chunks = append(chunks, chunker.ChunkFile(c.SnapshotSHA, dPath, dContent)...)
-
-			dFilePath := filepath.Join(tmpDir, c.RepositoryName, c.SnapshotSHA, "source", dPath)
-			_ = os.MkdirAll(filepath.Dir(dFilePath), 0755)
-			_ = os.WriteFile(dFilePath, []byte(dContent), 0644)
-		}
+		fixtureDir := eval.GetFixturePathForRepo(c.RepositoryName)
+		targetSnapshotDir := filepath.Join(tmpDir, c.RepositoryName, c.SnapshotSHA, "source")
+		chunks, _ := eval.LoadFixtureChunksAndSnapshot(fixtureDir, targetSnapshotDir, c.SnapshotSHA, chunker)
 		chunkStore.SaveChunks(c.SnapshotSHA, chunks)
 	}
 
@@ -75,7 +52,8 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 	}
 
 	// 2. Vector Eval
-	vectorRetriever := retrieval.NewVectorRetriever(chunkStore)
+	embedder := retrieval.NewLocalHashedFeatureProvider(128)
+	vectorRetriever := retrieval.NewVectorRetriever(chunkStore, embedder)
 	runVector, err := runner.RunRetrievalEval(ctx, "VECTOR", vectorRetriever, chunkStore)
 	if err != nil {
 		t.Fatalf("Vector eval failed: %v", err)
