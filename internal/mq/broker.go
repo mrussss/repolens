@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,7 +88,16 @@ func (b *MemoryBroker) PublishDLQ(ctx context.Context, queue string, msg Message
 		msg.Headers = make(map[string]string)
 	}
 	msg.Headers["x-death-reason"] = reason
-	return b.Publish(ctx, queue+".dlq", msg)
+
+	dlqQueue := queue
+	if queue == QueueDiagnosisTask {
+		dlqQueue = QueueDiagnosisDLQ
+	} else if queue == QueueIndexTask {
+		dlqQueue = QueueIndexDLQ
+	} else if !strings.HasSuffix(dlqQueue, ".dlq") {
+		dlqQueue = queue + ".dlq"
+	}
+	return b.Publish(ctx, dlqQueue, msg)
 }
 
 func (b *MemoryBroker) Consume(ctx context.Context, queue string, prefetch int) (<-chan Message, error) {
