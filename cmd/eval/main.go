@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"repolens/internal/eval"
 	"repolens/internal/indexing"
@@ -47,12 +48,20 @@ func main() {
 			)
 			fileChunks := chunker.ChunkFile(c.SnapshotSHA, relFile, mockContent)
 			chunks = append(chunks, fileChunks...)
+
+			filePath := filepath.Join("/tmp/repolens_eval_snapshots", c.RepositoryName, c.SnapshotSHA, "source", relFile)
+			_ = os.MkdirAll(filepath.Dir(filePath), 0755)
+			_ = os.WriteFile(filePath, []byte(mockContent), 0644)
 		}
 		// Add some distractor chunks
 		for i := 1; i <= 8; i++ {
 			distractorPath := fmt.Sprintf("pkg/service/helper_%d.go", i)
 			distractorContent := fmt.Sprintf("// Package helper %d\npackage helper\n\nfunc HelperFunc%d() string {\n    return \"ok\"\n}\n", i, i)
 			chunks = append(chunks, chunker.ChunkFile(c.SnapshotSHA, distractorPath, distractorContent)...)
+
+			dFilePath := filepath.Join("/tmp/repolens_eval_snapshots", c.RepositoryName, c.SnapshotSHA, "source", distractorPath)
+			_ = os.MkdirAll(filepath.Dir(dFilePath), 0755)
+			_ = os.WriteFile(dFilePath, []byte(distractorContent), 0644)
 		}
 		chunkStore.SaveChunks(c.SnapshotSHA, chunks)
 	}
@@ -74,7 +83,8 @@ func main() {
 	}
 
 	// 3. Vector Dense Search
-	vectorRetriever := retrieval.NewVectorRetriever(chunkStore)
+	embedder := retrieval.NewLocalTFIDFEmbeddingProvider(128)
+	vectorRetriever := retrieval.NewVectorRetriever(chunkStore, embedder)
 	runVector, err := runner.RunRetrievalEval(ctx, "VECTOR", vectorRetriever, chunkStore)
 	if err != nil {
 		fmt.Printf("Vector eval error: %v\n", err)
@@ -87,8 +97,8 @@ func main() {
 		fmt.Printf("Hybrid eval error: %v\n", err)
 	}
 
-	// 5. End-to-End Agent Diagnosis
-	fakeProvider := llm.NewFakeProvider(llm.ModeNormalStructured)
+	// 5. End-to-End Agent Diagnosis with Tool Calling
+	fakeProvider := llm.NewFakeProvider(llm.ModeToolCallThenDone)
 	runE2E, err := runner.RunEndToEndDiagnosisEval(ctx, fakeProvider, hybridRetriever)
 	if err != nil {
 		fmt.Printf("E2E diagnosis eval error: %v\n", err)
