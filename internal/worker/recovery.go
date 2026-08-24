@@ -6,6 +6,7 @@ import (
 
 	"repolens/internal/diagnosis"
 	"repolens/internal/platform/logger"
+	"repolens/internal/platform/metrics"
 )
 
 type HeartbeatEmitter struct {
@@ -111,6 +112,7 @@ func (s *RecoverySweeper) SweepOnce(ctx context.Context) int {
 			logger.L(ctx).Error("failed to recover stale attempt", "attempt_id", att.ID, "error", err)
 		} else {
 			recovered++
+			metrics.StaleAttemptRecoveredTotal.Inc()
 		}
 	}
 	return recovered

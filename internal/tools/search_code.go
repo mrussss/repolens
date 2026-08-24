@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"repolens/internal/llm"
+	"repolens/internal/platform/metrics"
 	"repolens/internal/retrieval"
 )
 
@@ -83,12 +85,17 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 		args.TopK = 20
 	}
 
+	start := time.Now()
 	results, err := t.retriever.Search(ctx, retrieval.SearchRequest{
 		SnapshotID: t.snapshotID,
 		Query:      args.Query,
 		TopK:       args.TopK,
 		Scope:      args.Scope,
 	})
+	latency := time.Since(start).Seconds()
+	metrics.RetrievalRequestsTotal.WithLabelValues("search_code").Inc()
+	metrics.RetrievalLatencySeconds.WithLabelValues("search_code").Observe(latency)
+
 	if err != nil {
 		return "", fmt.Errorf("retrieval failed: %w", err)
 	}

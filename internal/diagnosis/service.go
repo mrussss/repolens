@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"repolens/internal/outbox"
+	"repolens/internal/platform/metrics"
 	"repolens/internal/repo"
 	"repolens/internal/snapshot"
 )
@@ -114,6 +115,7 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		return nil, false, fmt.Errorf("failed to create diagnosis run: %w", err)
 	}
 
+	metrics.DiagnosisTotal.Inc()
 	return run, true, nil
 }
 

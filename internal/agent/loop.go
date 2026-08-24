@@ -15,6 +15,7 @@ import (
 	"repolens/internal/evidence"
 	"repolens/internal/llm"
 	"repolens/internal/platform/logger"
+	"repolens/internal/platform/metrics"
 	"repolens/internal/sse"
 	"repolens/internal/trace"
 )
@@ -132,6 +133,8 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 		totalPromptTokens += resp.PromptTokens
 		totalCompletionTokens += resp.CompletionTokens
+		metrics.TokenUsageTotal.WithLabelValues("prompt").Add(float64(resp.PromptTokens))
+		metrics.TokenUsageTotal.WithLabelValues("completion").Add(float64(resp.CompletionTokens))
 
 		// Check if assistant called tools
 		if len(resp.Message.ToolCalls) > 0 {
@@ -155,12 +158,16 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 				var toolResult string
 				if err != nil {
 					toolResult = fmt.Sprintf("Error: %v", err)
+					metrics.ToolCallsTotal.WithLabelValues(tc.Function.Name, "error").Inc()
 				} else {
 					toolExecStart := time.Now()
 					toolResult, err = t.Execute(ctx, tc.Function.Arguments)
 					toolExecLatency := time.Since(toolExecStart).Milliseconds()
 					if err != nil {
 						toolResult = fmt.Sprintf("Tool Execution Error: %v", err)
+						metrics.ToolCallsTotal.WithLabelValues(tc.Function.Name, "error").Inc()
+					} else {
+						metrics.ToolCallsTotal.WithLabelValues(tc.Function.Name, "success").Inc()
 					}
 
 					seq++

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,7 @@ import (
 	"repolens/internal/outbox"
 	"repolens/internal/platform/config"
 	"repolens/internal/platform/logger"
+	"repolens/internal/platform/metrics"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/shutdown"
 	"repolens/internal/platform/snapshotstore"
@@ -80,7 +82,7 @@ func main() {
 	router := gin.New()
 	router.Use(gin.Recovery())
 
-	// Logging & RequestID Middleware
+	// Logging & RequestID Middleware with Metrics
 	router.Use(func(c *gin.Context) {
 		reqID := c.GetHeader("X-Request-ID")
 		if reqID == "" {
@@ -89,6 +91,13 @@ func main() {
 		c.Set(string(logger.RequestIDKey), reqID)
 		c.Header("X-Request-ID", reqID)
 		c.Next()
+
+		status := strconv.Itoa(c.Writer.Status())
+		path := c.FullPath()
+		if path == "" {
+			path = "unknown"
+		}
+		metrics.HttpRequestsTotal.WithLabelValues(c.Request.Method, path, status).Inc()
 	})
 
 	// Health & Metrics
