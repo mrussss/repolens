@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: repolens-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: repolens
+      MYSQL_USER: repolens
+      MYSQL_PASSWORD: repolenspassword
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ../migrations/001_init_schema.sql:/docker-entrypoint-initdb.d/001_init_schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: repolens-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    container_name: repolens-api
+    ports:
+      - "8080:8080"
+    environment:
+      ENV: production
+      HTTP_PORT: "8080"
+      DB_DRIVER: mysql
+      DB_DSN: "repolens:repolenspassword@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      SNAPSHOT_BASE_PATH: "/data/repositories"
+      JWT_SECRET: "repolens-secret-key-prod"
+    volumes:
+      - snapshot_data:/data/repositories
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.relay
+    container_name: repolens-relay
+    environment:
+      ENV: production
+      DB_DRIVER: mysql
+      DB_DSN: "repolens:repolenspassword@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+    container_name: repolens-worker
+    environment:
+      ENV: production
+      DB_DRIVER: mysql
+      DB_DSN: "repolens:repolenspassword@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      SNAPSHOT_BASE_PATH: "/data/repositories"
+      LLM_PROVIDER: fake
+    volumes:
+      - snapshot_data:/data/repositories
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+  rabbitmq_data:
+  snapshot_data:
