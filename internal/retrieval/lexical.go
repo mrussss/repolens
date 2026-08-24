@@ -37,6 +37,11 @@ func (s *MemoryChunkStore) SaveChunks(snapshotID string, chunks []indexing.CodeC
 	s.chunks[snapshotID] = chunks
 }
 
+func (s *MemoryChunkStore) IndexChunks(ctx context.Context, snapshotID string, chunks []indexing.CodeChunk) error {
+	s.SaveChunks(snapshotID, chunks)
+	return nil
+}
+
 type LexicalRetriever struct {
 	chunkStore ChunkIndexStore
 }

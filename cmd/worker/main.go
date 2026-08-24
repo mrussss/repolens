@@ -66,6 +66,7 @@ func main() {
 	}
 
 	chunkStore := retrieval.NewMemoryChunkStore()
+	var indexWriter indexing.ChunkIndexWriter = chunkStore
 	var bm25Retriever retrieval.Retriever = retrieval.NewBM25Retriever(chunkStore)
 	var vectorRetriever retrieval.Retriever = retrieval.NewVectorRetriever(chunkStore, embedder)
 
@@ -75,7 +76,9 @@ func main() {
 			_ = esClient.EnsureIndex(context.Background(), embedder.Dimension())
 			bm25Retriever = retrieval.NewESBM25Retriever(esClient)
 			vectorRetriever = retrieval.NewESVectorRetriever(esClient, embedder)
-			log.Info("connected to elasticsearch 8 cluster for retrieval", "url", cfg.ESURL, "index", cfg.ESIndexName)
+			esWriter := retrieval.NewElasticsearchChunkIndexWriter(esClient, embedder)
+			indexWriter = retrieval.NewCompositeChunkIndexWriter(chunkStore, esWriter)
+			log.Info("connected to elasticsearch 8 cluster for retrieval and indexing", "url", cfg.ESURL, "index", cfg.ESIndexName)
 		} else {
 			log.Warn("elasticsearch not available, falling back to in-memory retrieval", "error", err)
 		}
@@ -86,7 +89,7 @@ func main() {
 	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
 	filter := indexing.NewFileFilter(cfg.MaxFileSizeKB)
 	chunker := indexing.NewCodeChunker(60, 10)
-	indexWorker := indexing.NewIndexWorker(broker, snapshotStore, indexStore, storeFS, cloner, filter, chunker, chunkStore, 2)
+	indexWorker := indexing.NewIndexWorker(broker, snapshotStore, indexStore, storeFS, cloner, filter, chunker, indexWriter, 2)
 
 	// LLM Provider
 	var provider llm.Provider

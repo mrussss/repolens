@@ -27,8 +27,8 @@ type IndexPayload struct {
 	Strategy     repoindex.RetrievalStrategy `json:"strategy"`
 }
 
-type IndexSaver interface {
-	SaveChunks(snapshotID string, chunks []CodeChunk)
+type ChunkIndexWriter interface {
+	IndexChunks(ctx context.Context, snapshotID string, chunks []CodeChunk) error
 }
 
 type IndexWorker struct {
@@ -39,7 +39,7 @@ type IndexWorker struct {
 	cloner        *SafeGitCloner
 	filter        *FileFilter
 	chunker       *CodeChunker
-	indexSaver    IndexSaver
+	indexWriter   ChunkIndexWriter
 	prefetch      int
 	wg            sync.WaitGroup
 }
@@ -52,7 +52,7 @@ func NewIndexWorker(
 	cloner *SafeGitCloner,
 	filter *FileFilter,
 	chunker *CodeChunker,
-	indexSaver IndexSaver,
+	indexWriter ChunkIndexWriter,
 	prefetch int,
 ) *IndexWorker {
 	if prefetch <= 0 {
@@ -66,7 +66,7 @@ func NewIndexWorker(
 		cloner:        cloner,
 		filter:        filter,
 		chunker:       chunker,
-		indexSaver:    indexSaver,
+		indexWriter:   indexWriter,
 		prefetch:      prefetch,
 	}
 }
@@ -181,8 +181,15 @@ func (w *IndexWorker) handleMessage(parentCtx context.Context, msg mq.Message) {
 	_ = hex.EncodeToString(h.Sum(nil))
 
 	// Step 3: Save chunks in index store
-	if w.indexSaver != nil {
-		w.indexSaver.SaveChunks(payload.SnapshotID, allChunks)
+	if w.indexWriter != nil {
+		if err := w.indexWriter.IndexChunks(ctx, payload.SnapshotID, allChunks); err != nil {
+			logger.L(ctx).Error("failed to write chunks to index store", "error", err)
+			_ = w.indexStore.UpdateStatus(ctx, payload.IndexID, repoindex.StatusIndexing, repoindex.StatusIndexFailed, nil, 0, 0, "INDEX_WRITE_FAILED: "+err.Error())
+			if msg.AckFunc != nil {
+				_ = msg.AckFunc()
+			}
+			return
+		}
 	}
 
 	readyAt := time.Now()
