@@ -20,28 +20,29 @@ We conducted benchmarks on the curated 32-case repository fault dataset with 4 d
    - High speed, but vulnerable to vocabulary mismatch and synonym variance.
 2. **BM25 Search (`BM25`)**:
    - Probabilistic term frequency-inverse document frequency ranking with length normalization and symbol weight boosting (`content^1.0`, `symbol^3.0`, `path^2.0`).
-   - Strong retrieval across technical symbols, identifier camelCase splits, and error log fragments.
-3. **Dense Vector Search (`VECTOR`)**:
-   - Semantic representation via `EmbeddingProvider` (128-dim TF-IDF / 1536-dim OpenAI `text-embedding-3-small`) with cosine similarity.
-   - Captures high-level semantic intent but can miss exact line-level symbol references.
-4. **Hybrid Reciprocal Rank Fusion (`HYBRID_RRF`)**:
-   - Rank-based reciprocal rank score fusion combining BM25 ranking and Vector kNN ranking:
+   - Strong retrieval across technical symbols, identifier camelCase splits, and error log fragments (MRR: 0.562).
+3. **Deterministic Local Hashed Feature Vector Baseline (`LOCAL_HASHED_VEC`)**:
+   - Deterministic 128-dimensional hashed feature representation provider with cosine similarity fallback.
+   - Provides reproducible baseline without external LLM/API dependencies (MRR: 0.491).
+4. **Hybrid Reciprocal Rank Fusion Baseline (`HYBRID_BASELINE`)**:
+   - Rank-based reciprocal rank score fusion combining BM25 ranking and Vector ranking:
      $$RRF\_Score(d) = \sum_{m \in \{BM25, Vector\}} \frac{1}{k + rank_m(d)}, \quad k = 60$$
-   - Combines the lexical precision of BM25 with dense semantic generalization.
+   - Eliminates score scale incompatibility between BM25 scores and cosine similarity.
 
-## Benchmark Results (32 Standard Fault Cases)
+## Benchmark Results (32 Curated Fault Cases on Static Repositories)
 
 | Strategy | File Hit@5 | File Hit@10 | MRR | Latency P50 (ms) | Complexity / Resource Cost |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Lexical** | 87.5% | 93.8% | 0.812 | < 5ms | Low (In-Memory) |
-| **BM25** | 96.9% | 100.0% | 0.941 | < 10ms | Moderate (In-Memory / ES 8) |
-| **Dense Vector** | 84.4% | 90.6% | 0.785 | ~ 25ms | Moderate (Embedding + Vector Search) |
-| **Hybrid RRF** | **96.9%** | **100.0%** | **0.958** | ~ 28ms | Moderate (Two-phase merge) |
+| **Lexical Baseline** | 56.2% | 62.5% | 0.554 | < 1ms | Low (In-Memory substring / token match) |
+| **BM25 Search** | **59.4%** | **62.5%** | **0.562** | ~ 3ms | Moderate (BM25 term statistics + field boosts) |
+| **Local Hashed Vec** | 59.4% | 62.5% | 0.491 | ~ 2ms | Low (128-dim deterministic token hashing) |
+| **Hybrid Baseline** | 59.4% | 62.5% | 0.535 | ~ 3ms | Moderate (Two-phase RRF rank merge) |
+| **E2E Diagnostic Agent** | 59.4% | 62.5% | 0.535 | ~ 7ms | Higher (Agent loop + tool dispatch + validation) |
 
 ## Failure Analysis & Trade-offs
-- **Lexical failure cases**: Missed cases where the issue description used conceptual synonyms (e.g., "duplicate charge on rapid double clicks") without mentioning the exact function name (`IdempotencyKey`).
-- **Dense Vector failure cases**: Returned semantically related modules (e.g., general payment processing) but ranked the exact error site lower than BM25 when precise function signatures appeared in the error log.
-- **Hybrid RRF advantages**: Prevents score scale incompatibility between BM25 raw BM25 scores and cosine similarity, ranking ground-truth files at Top-1 for 95%+ of cases.
+- **Lexical failure cases**: Missed cases where the issue description used conceptual synonyms without mentioning the exact symbol name.
+- **Hashed Feature failure cases**: Local deterministic hash representation does not capture deep neural semantics (unlike trained dense neural embeddings like `text-embedding-3-small`), resulting in lower MRR (0.491 vs BM25 0.562).
+- **Hybrid RRF advantages**: Prevents score scale incompatibility between BM25 raw scores and dense vector cosine distances, providing rank stability.
 
 ## Decision
 1. **Production Primary**: Deploy **BM25 + Hybrid RRF** as the production retrieval pipeline.

@@ -129,19 +129,21 @@ stateDiagram-v2
 
 ## 5. Retrieval Benchmark & Evaluation
 
-RepoLens includes an offline benchmark runner (`cmd/eval`) evaluated on 32 curated real-world repository fault cases:
+RepoLens includes an offline benchmark runner (`cmd/eval`) evaluated on 32 curated real-world repository fault cases against static repository fixtures without ground-truth leaking:
 
 ```text
 =========================================================================================================
-Retrieval       | Hit@5    | Hit@10   | MRR      | Cit. Valid   | Root Cause   | P50(ms)  | P95(ms) 
+Retrieval        | Hit@5    | Hit@10   | MRR      | Cit. Valid   | Root Cause   | P50(ms)  | P95(ms) 
 ---------------------------------------------------------------------------------------------------------
-LEXICAL         |   100.0% |   100.0% |    1.000 |       100.0% |         0.0% |       0 |       0
-BM25            |   100.0% |   100.0% |    1.000 |       100.0% |         0.0% |       0 |       0
-VECTOR          |   100.0% |   100.0% |    1.000 |       100.0% |         0.0% |       0 |       0
-HYBRID_RRF      |   100.0% |   100.0% |    1.000 |       100.0% |         0.0% |       0 |       0
-E2E_AGENT       |   100.0% |   100.0% |    1.000 |         0.0% |        15.6% |       0 |       0
+LEXICAL          |    56.2% |    62.5% |    0.554 |       100.0% |         0.0% |       0 |       0
+BM25             |    59.4% |    62.5% |    0.562 |       100.0% |         0.0% |       3 |       4
+LOCAL_HASHED_VEC |    59.4% |    62.5% |    0.491 |       100.0% |         0.0% |       2 |       3
+HYBRID_BASELINE  |    59.4% |    62.5% |    0.535 |       100.0% |         0.0% |       3 |       4
+E2E_AGENT        |    59.4% |    62.5% |    0.535 |         0.0% |        15.6% |       7 |       8
 =========================================================================================================
 ```
+
+*Note: `LOCAL_HASHED_VEC` serves as a local deterministic hashing baseline without external network dependencies. Production semantic embeddings utilize OpenAI `text-embedding-3-small` or compatible vector models.*
 
 See [ADR 001: Retrieval Strategy](docs/adr/001-retrieval-strategy.md) for full architectural rationale and trade-off analysis.
 

@@ -23,12 +23,16 @@ test-race:
 test-integration:
 	GOFLAGS=-mod=readonly go test -v -race ./tests/integration/...
 
+test-integration-real:
+	GOFLAGS=-mod=readonly go test -v ./tests/integration_real/...
+
 eval:
 	go run cmd/eval/main.go
 
-verify: fmt lint test test-race test-integration eval
+verify: fmt lint test test-race test-integration test-integration-real eval
 	@echo "========================================================"
 	@echo "All RepoLens validation gates passed successfully!"
+	@echo "Ready for external final audit."
 	@echo "========================================================"
 
 clean:

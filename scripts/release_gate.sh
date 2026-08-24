@@ -22,14 +22,18 @@ echo "[3/5] Running unit and component tests with race detector..."
 GOFLAGS=-mod=readonly go test -race ./internal/...
 echo "✓ Unit tests passed"
 
-echo "[4/5] Running integration test suite with race detector..."
+echo "[4/6] Running unit and component integration tests with race detector..."
 GOFLAGS=-mod=readonly go test -v -race ./tests/integration/...
-echo "✓ Integration tests passed"
+echo "✓ Component integration tests passed"
 
-echo "[5/5] Running offline 32-case eval benchmark..."
+echo "[5/6] Running real testcontainers integration tests..."
+GOFLAGS=-mod=readonly go test -v ./tests/integration_real/...
+echo "✓ Real testcontainers integration tests passed"
+
+echo "[6/6] Running offline 32-case eval benchmark..."
 go run cmd/eval/main.go
 echo "✓ Eval benchmark passed"
 
 echo "================================================================="
-echo "ALL GATES PASSED: RepoLens is verified and ready for release!"
+echo "ALL GATES PASSED: RepoLens is verified and ready for external final audit!"
 echo "================================================================="
