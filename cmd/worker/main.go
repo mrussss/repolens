@@ -11,6 +11,7 @@ import (
 	"repolens/internal/llm"
 	"repolens/internal/mq"
 	"repolens/internal/platform/config"
+	"repolens/internal/platform/elasticsearch"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/shutdown"
@@ -57,9 +58,28 @@ func main() {
 	citationVal := evidence.NewCitationValidator(storeFS)
 
 	// Retrieval engines
+	var embedder retrieval.EmbeddingProvider
+	if cfg.EmbeddingProvider == "openai" && cfg.EmbeddingAPIKey != "" {
+		embedder = retrieval.NewOpenAICompatibleEmbeddingProvider(cfg.EmbeddingAPIKey, cfg.EmbeddingBaseURL, cfg.EmbeddingModel, cfg.EmbeddingDim)
+	} else {
+		embedder = retrieval.NewLocalTFIDFEmbeddingProvider(cfg.EmbeddingDim)
+	}
+
 	chunkStore := retrieval.NewMemoryChunkStore()
-	bm25Retriever := retrieval.NewBM25Retriever(chunkStore)
-	vectorRetriever := retrieval.NewVectorRetriever(chunkStore)
+	var bm25Retriever retrieval.Retriever = retrieval.NewBM25Retriever(chunkStore)
+	var vectorRetriever retrieval.Retriever = retrieval.NewVectorRetriever(chunkStore, embedder)
+
+	if cfg.ESURL != "" {
+		esClient := elasticsearch.NewClient(cfg.ESURL, cfg.ESIndexName)
+		if err := esClient.Ping(context.Background()); err == nil {
+			_ = esClient.EnsureIndex(context.Background(), embedder.Dimension())
+			bm25Retriever = retrieval.NewESBM25Retriever(esClient)
+			vectorRetriever = retrieval.NewESVectorRetriever(esClient, embedder)
+			log.Info("connected to elasticsearch 8 cluster for retrieval", "url", cfg.ESURL, "index", cfg.ESIndexName)
+		} else {
+			log.Warn("elasticsearch not available, falling back to in-memory retrieval", "error", err)
+		}
+	}
 	hybridRetriever := retrieval.NewHybridRRFRetriever(60, bm25Retriever, vectorRetriever)
 
 	// Index Worker

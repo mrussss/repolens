@@ -1,0 +1,137 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: repolens-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: repolens
+      MYSQL_USER: repolens
+      MYSQL_PASSWORD: repolens_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: repolens-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: repolens
+      RABBITMQ_DEFAULT_PASS: repolens_mq_pass
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  elasticsearch:
+    image: elasticsearch:8.13.0
+    container_name: repolens-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: repolens-api
+    command: ["/app/repolens-api"]
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - HTTP_PORT=8080
+      - DB_DRIVER=mysql
+      - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
+      - RABBITMQ_URL=amqp://repolens:repolens_mq_pass@rabbitmq:5672/
+      - SNAPSHOT_BASE_PATH=/data/repositories
+      - ES_URL=http://elasticsearch:9200
+      - ES_INDEX_NAME=repolens_chunks
+      - JWT_SECRET=repolens-super-secret-jwt-key
+      - LLM_PROVIDER=fake
+    ports:
+      - "8080:8080"
+    volumes:
+      - snapshot_data:/data/repositories
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: repolens-relay
+    command: ["/app/repolens-relay"]
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - DB_DRIVER=mysql
+      - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
+      - RABBITMQ_URL=amqp://repolens:repolens_mq_pass@rabbitmq:5672/
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: repolens-worker
+    command: ["/app/repolens-worker"]
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - DB_DRIVER=mysql
+      - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
+      - RABBITMQ_URL=amqp://repolens:repolens_mq_pass@rabbitmq:5672/
+      - SNAPSHOT_BASE_PATH=/data/repositories
+      - ES_URL=http://elasticsearch:9200
+      - ES_INDEX_NAME=repolens_chunks
+      - LLM_PROVIDER=fake
+    volumes:
+      - snapshot_data:/data/repositories
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+  rabbitmq_data:
+  es_data:
+  snapshot_data:
