@@ -1,0 +1,39 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binary, output & coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Database & local data
+*.db
+*.db-journal
+*.sqlite
+data/
+tmp/
+
+# Environment and sensitive secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Logs
+*.log
+
+# OS & Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
