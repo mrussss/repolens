@@ -325,6 +325,14 @@ func (b *RabbitMQBroker) Consume(ctx context.Context, queue string, prefetch int
 					_ = d.Nack(false, false) // reject to DLQ
 					continue
 				}
+				if len(d.Headers) > 0 {
+					if msg.Headers == nil {
+						msg.Headers = make(map[string]string)
+					}
+					for k, v := range d.Headers {
+						msg.Headers[k] = fmt.Sprintf("%v", v)
+					}
+				}
 				msg.Redelivered = d.Redelivered
 				tag := d.DeliveryTag
 				ch := b.channel
