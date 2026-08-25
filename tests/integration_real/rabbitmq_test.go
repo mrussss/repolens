@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,6 +32,9 @@ func setupRealRabbitMQ(t *testing.T) (mq.Broker, string, func()) {
 		tc.WithImage("rabbitmq:3.12-management"),
 	)
 	if err != nil {
+		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
+			t.Fatalf("FAILED: real RabbitMQ testcontainers required by release gate but failed to start: %v", err)
+		}
 		t.Skipf("Skipping real RabbitMQ testcontainers test (Docker not available: %v)", err)
 		return nil, "", nil
 	}

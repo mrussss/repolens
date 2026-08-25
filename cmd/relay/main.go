@@ -29,6 +29,10 @@ func main() {
 	var broker mq.Broker
 	rmqBroker, err := mq.NewRabbitMQBroker(cfg.RabbitMQURL)
 	if err != nil {
+		if cfg.Env == "production" {
+			log.Error("failed to connect to rabbitmq in production mode", "error", err)
+			return
+		}
 		log.Warn("failed to connect to rabbitmq, falling back to memory broker for dev/tests", "error", err)
 		broker = mq.NewMemoryBroker()
 	} else {

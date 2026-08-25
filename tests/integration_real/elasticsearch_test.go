@@ -3,12 +3,13 @@ package integration_real
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
 
 	tc "github.com/testcontainers/testcontainers-go"
-	tces "github.com/testcontainers/testcontainers-go/modules/elasticsearch"
+	"github.com/testcontainers/testcontainers-go/wait"
 
 	"repolens/internal/indexing"
 	"repolens/internal/platform/elasticsearch"
@@ -20,19 +21,34 @@ func setupRealElasticsearch(t *testing.T) (*elasticsearch.Client, func()) {
 
 	// Check if image exists locally to prevent slow network hangs during test runs
 	if err := exec.Command("docker", "image", "inspect", "elasticsearch:8.13.0").Run(); err != nil {
+		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
+			t.Fatalf("FAILED: real Elasticsearch image elasticsearch:8.13.0 required by release gate but not present in Docker: %v", err)
+		}
 		t.Skipf("Skipping real Elasticsearch test (image elasticsearch:8.13.0 not present locally in Docker: %v)", err)
 		return nil, nil
 	}
 
-	esContainer, err := tces.RunContainer(ctx,
-		tc.WithImage("elasticsearch:8.13.0"),
-		tc.WithEnv(map[string]string{
+	req := tc.ContainerRequest{
+		Image:        "elasticsearch:8.13.0",
+		ExposedPorts: []string{"9200/tcp"},
+		Env: map[string]string{
 			"discovery.type":         "single-node",
 			"xpack.security.enabled": "false",
 			"ES_JAVA_OPTS":           "-Xms512m -Xmx512m",
-		}),
-	)
+		},
+		WaitingFor: wait.ForHTTP("/").WithPort("9200/tcp").WithStatusCodeMatcher(func(status int) bool {
+			return status == 200
+		}).WithStartupTimeout(60 * time.Second),
+	}
+
+	esContainer, err := tc.GenericContainer(ctx, tc.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
 	if err != nil {
+		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
+			t.Fatalf("FAILED: real Elasticsearch testcontainers required by release gate but failed to start: %v", err)
+		}
 		t.Skipf("Skipping real Elasticsearch testcontainers test (Docker not available: %v)", err)
 		return nil, nil
 	}

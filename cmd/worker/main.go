@@ -41,6 +41,10 @@ func main() {
 	var broker mq.Broker
 	rmqBroker, err := mq.NewRabbitMQBroker(cfg.RabbitMQURL)
 	if err != nil {
+		if cfg.Env == "production" {
+			log.Error("failed to connect to rabbitmq in production mode", "error", err)
+			return
+		}
 		log.Warn("failed to connect to rabbitmq, using memory broker", "error", err)
 		broker = mq.NewMemoryBroker()
 	} else {
@@ -80,6 +84,10 @@ func main() {
 			indexWriter = retrieval.NewCompositeChunkIndexWriter(chunkStore, esWriter)
 			log.Info("connected to elasticsearch 8 cluster for retrieval and indexing", "url", cfg.ESURL, "index", cfg.ESIndexName)
 		} else {
+			if cfg.Env == "production" {
+				log.Error("failed to connect to elasticsearch in production mode", "error", err)
+				return
+			}
 			log.Warn("elasticsearch not available, falling back to in-memory retrieval", "error", err)
 		}
 	}

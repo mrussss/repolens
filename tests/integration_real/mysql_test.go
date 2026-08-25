@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,6 +33,9 @@ func setupRealMySQL(t *testing.T) (*gorm.DB, func()) {
 		tcmysql.WithPassword("testpass"),
 	)
 	if err != nil {
+		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
+			t.Fatalf("FAILED: real MySQL testcontainers required by release gate but failed to start: %v", err)
+		}
 		t.Skipf("Skipping real MySQL testcontainers test (Docker not available: %v)", err)
 		return nil, nil
 	}

@@ -24,12 +24,15 @@ test-integration:
 	GOFLAGS=-mod=readonly go test -v -race ./tests/integration/...
 
 test-integration-real:
-	GOFLAGS=-mod=readonly go test -v ./tests/integration_real/...
+	REPOLENS_REQUIRE_REAL_INTEGRATION=1 GOFLAGS=-mod=readonly go test -v -race ./tests/integration_real/...
 
 eval:
 	go run cmd/eval/main.go
 
-verify: fmt lint test test-race test-integration test-integration-real eval
+release-gate:
+	./scripts/release_gate.sh
+
+verify: release-gate
 	@echo "========================================================"
 	@echo "All RepoLens validation gates passed successfully!"
 	@echo "Ready for external final audit."
