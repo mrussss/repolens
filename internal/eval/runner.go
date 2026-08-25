@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"repolens/internal/agent"
+	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/llm"
 	"repolens/internal/platform/snapshotstore"
@@ -110,31 +112,82 @@ func (r *Runner) RunEndToEndDiagnosisEval(ctx context.Context, provider llm.Prov
 		GitCommit:         "local-freeze",
 		RetrievalStrategy: "E2E_AGENT",
 		RetrievalVersion:  "1.1",
+		IndexVersion:      "v1",
+		PromptVersion:     "v1.1",
+		AgentVersion:      "v1.1",
+		Model:             "agent-e2e-pipeline",
 		TotalCases:        len(r.cases),
 		StartedAt:         time.Now(),
 	}
 
 	var results []CaseEvalResult
 	validator := evidence.NewCitationValidator(r.storeFS)
+	executor := agent.NewAgentRuntimeExecutor(
+		provider,
+		retriever,
+		r.storeFS,
+		nil,
+		nil,
+		agent.DefaultGuardConfig(),
+	)
 
 	for _, c := range r.cases {
 		start := time.Now()
 
-		genResp, err := provider.Generate(ctx, llm.GenerateRequest{
-			Messages: []llm.Message{
-				{Role: llm.RoleUser, Content: c.IssueTitle + "\n" + c.ErrorLog},
-			},
+		// 1. Evaluate Retrieval on the case query against ground-truth relevant files
+		query := c.IssueTitle + " " + c.ErrorLog
+		searchRes, _ := retriever.Search(ctx, retrieval.SearchRequest{
+			SnapshotID: c.SnapshotSHA,
+			Query:      query,
+			TopK:       10,
 		})
+		hit5, hit10, rr := CalculateRetrievalMetrics(searchRes, c.RelevantFiles)
+
+		// 2. Execute full Agent Loop with Tool Calling
+		diagRun := &diagnosis.DiagnosisRun{
+			ID:               uuid.New().String(),
+			RepositoryID:     c.RepositoryName,
+			SnapshotID:       c.SnapshotSHA,
+			IssueTitle:       c.IssueTitle,
+			IssueDescription: c.IssueDescription,
+			ErrorLog:         c.ErrorLog,
+			Status:           diagnosis.StatusRunning,
+		}
+		attempt := &diagnosis.DiagnosisAttempt{
+			ID:             uuid.New().String(),
+			DiagnosisRunID: diagRun.ID,
+			AttemptNo:      1,
+			Status:         diagnosis.AttemptStatusRunning,
+		}
+
+		execRes, err := executor.Execute(ctx, diagRun, attempt)
 		latency := time.Since(start).Milliseconds()
 
-		if err != nil {
+		if err != nil || execRes == nil || execRes.Report == nil {
+			promptTokens := 0
+			compTokens := 0
+			if execRes != nil {
+				promptTokens = execRes.PromptTokens
+				compTokens = execRes.CompletionTokens
+			}
+			results = append(results, CaseEvalResult{
+				CaseID:           c.CaseID,
+				HitAt5:           hit5,
+				HitAt10:          hit10,
+				ReciprocalRank:   rr,
+				CitationsTotal:   0,
+				CitationsValid:   0,
+				RootCauseSuccess: false,
+				ForbiddenClaim:   false,
+				LatencyMs:        latency,
+				PromptTokens:     promptTokens,
+				CompletionTokens: compTokens,
+			})
 			continue
 		}
 
-		var report evidence.DiagnosisReportData
-		_ = json.Unmarshal([]byte(genResp.Message.Content), &report)
-
-		rcSuccess, forb := CalculateCaseDiagnosis(&report, c)
+		report := execRes.Report
+		rcSuccess, forb := CalculateCaseDiagnosis(report, c)
 
 		citTotal := 0
 		citValid := 0
@@ -151,16 +204,16 @@ func (r *Runner) RunEndToEndDiagnosisEval(ctx context.Context, provider llm.Prov
 
 		results = append(results, CaseEvalResult{
 			CaseID:           c.CaseID,
-			HitAt5:           true,
-			HitAt10:          true,
-			ReciprocalRank:   1.0,
+			HitAt5:           hit5,
+			HitAt10:          hit10,
+			ReciprocalRank:   rr,
 			CitationsTotal:   citTotal,
 			CitationsValid:   citValid,
 			RootCauseSuccess: rcSuccess,
 			ForbiddenClaim:   forb,
 			LatencyMs:        latency,
-			PromptTokens:     genResp.PromptTokens,
-			CompletionTokens: genResp.CompletionTokens,
+			PromptTokens:     execRes.PromptTokens,
+			CompletionTokens: execRes.CompletionTokens,
 		})
 	}
 

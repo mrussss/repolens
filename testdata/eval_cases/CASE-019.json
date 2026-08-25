@@ -1,7 +1,7 @@
 {
   "case_id": "CASE-019",
   "dataset_version": "v1.0",
-  "repository_name": "repolens/secret-filter",
+  "repository_name": "repolens/order-service",
   "snapshot_sha": "snap-secret-19",
   "issue_title": "AWS secret access key in error log leaked to external LLM provider",
   "issue_description": "CI log containing AKIA... was sent unredacted in LLM prompt payload.",

@@ -13,7 +13,7 @@ const (
 )
 
 const (
-	AggregateDiagnosisRun   = "DIAGNOSIS_RUN"
+	AggregateDiagnosisRun    = "DIAGNOSIS_RUN"
 	AggregateRepositoryIndex = "REPOSITORY_INDEX"
 
 	EventDiagnosisRequested       = "DIAGNOSIS_REQUESTED"

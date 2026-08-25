@@ -2,13 +2,20 @@ package indexing_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"repolens/internal/indexing"
+	"repolens/internal/mq"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/repoindex"
+	"repolens/internal/snapshot"
 )
 
 func TestSSRFAndGitURLValidation(t *testing.T) {
@@ -20,13 +27,13 @@ func TestSSRFAndGitURLValidation(t *testing.T) {
 	}{
 		{"https://github.com/repolens/sample-repo", true},
 		{"https://gitlab.com/repolens/sample-repo", true},
-		{"http://github.com/repolens/sample-repo", false},         // Non-HTTPS denied
-		{"file:///etc/passwd", false},                             // file:// protocol denied
-		{"ssh://git@github.com/repolens/repo", false},             // SSH denied
-		{"https://127.0.0.1/repolens/repo", false},                // Loopback IP denied
-		{"https://10.0.0.1/repolens/repo", false},                 // Private RFC1918 denied
-		{"https://169.254.169.254/latest/meta-data", false},       // Link-local metadata denied
-		{"https://malicious-host.com/repo", false},                // Unallowed host denied
+		{"http://github.com/repolens/sample-repo", false},   // Non-HTTPS denied
+		{"file:///etc/passwd", false},                       // file:// protocol denied
+		{"ssh://git@github.com/repolens/repo", false},       // SSH denied
+		{"https://127.0.0.1/repolens/repo", false},          // Loopback IP denied
+		{"https://10.0.0.1/repolens/repo", false},           // Private RFC1918 denied
+		{"https://169.254.169.254/latest/meta-data", false}, // Link-local metadata denied
+		{"https://malicious-host.com/repo", false},          // Unallowed host denied
 	}
 
 	for _, tt := range tests {
@@ -145,5 +152,117 @@ func TestSnapshotStoreSecurityGuards(t *testing.T) {
 	_, err = storeFS.ReadFile(ctx, repoID, snapID, "../../../etc/passwd", 1, 10)
 	if err == nil {
 		t.Fatalf("expected error on path traversal, got nil")
+	}
+}
+
+type mockIndexStore struct {
+	repoindex.Store
+	mu         sync.Mutex
+	lastStatus repoindex.IndexStatus
+	lastErr    string
+}
+
+func (m *mockIndexStore) UpdateStatus(ctx context.Context, id string, expectedOldStatus, newStatus repoindex.IndexStatus, readyAt *time.Time, chunkCount, docCount int, errCode string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastStatus = newStatus
+	m.lastErr = errCode
+	return nil
+}
+
+func (m *mockIndexStore) GetStatus() (repoindex.IndexStatus, string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastStatus, m.lastErr
+}
+
+type mockSnapshotStore struct {
+	snapshot.Store
+}
+
+func (m *mockSnapshotStore) UpdateStatus(ctx context.Context, id string, oldStatus, newStatus snapshot.SnapshotStatus, readyAt *time.Time) error {
+	return nil
+}
+
+type failingIndexWriter struct {
+	err error
+}
+
+func (f *failingIndexWriter) IndexChunks(ctx context.Context, snapshotID string, chunks []indexing.CodeChunk) error {
+	return f.err
+}
+
+func TestIndexWorker_PartialFailurePropagatesIndexFailed(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "repolens_index_worker_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	storeFS := snapshotstore.NewLocalSnapshotStore(tmpDir)
+	repoID := "repo-fail-test"
+	snapID := "snap-fail-test"
+
+	sourceDir, err := storeFS.EnsureDir(repoID, snapID)
+	if err != nil {
+		t.Fatalf("failed to ensure source dir: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(sourceDir, "main.go"), []byte("package main\nfunc Hello() {}\n"), 0644)
+
+	mockBroker := mq.NewMemoryBroker()
+	mockSnapStore := &mockSnapshotStore{}
+	mockIdxStore := &mockIndexStore{}
+	cloner := indexing.NewSafeGitCloner([]string{"github.com"}, 50, 1*time.Minute)
+	filter := indexing.NewFileFilter(512)
+	chunker := indexing.NewCodeChunker(5, 2)
+	partialErr := errors.New("elasticsearch bulk indexing partial failure (1 items failed): op=index id=chunk-1 status=400 type=mapper_parsing_exception reason=bad embedding")
+	failingWriter := &failingIndexWriter{err: partialErr}
+
+	worker := indexing.NewIndexWorker(
+		mockBroker,
+		mockSnapStore,
+		mockIdxStore,
+		storeFS,
+		cloner,
+		filter,
+		chunker,
+		failingWriter,
+		1,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = worker.Start(ctx)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	payloadJSON, _ := json.Marshal(indexing.IndexPayload{
+		RepositoryID: repoID,
+		SnapshotID:   snapID,
+		IndexID:      "index-fail-001",
+		GitURL:       "https://github.com/repolens/test-repo",
+		Ref:          "main",
+	})
+
+	err = mockBroker.Publish(ctx, mq.QueueIndexTask, mq.Message{
+		ID:        "msg-index-001",
+		EventType: "index.task",
+		Payload:   string(payloadJSON),
+	})
+	if err != nil {
+		t.Fatalf("failed to publish index task: %v", err)
+	}
+
+	// Give worker time to process
+	time.Sleep(100 * time.Millisecond)
+
+	status, errCode := mockIdxStore.GetStatus()
+	if status != repoindex.StatusIndexFailed {
+		t.Fatalf("expected index status to be INDEX_FAILED (%s), got: %s", repoindex.StatusIndexFailed, status)
+	}
+	if !strings.Contains(errCode, "INDEX_WRITE_FAILED") || !strings.Contains(errCode, "partial failure") {
+		t.Fatalf("expected error message to record INDEX_WRITE_FAILED and partial failure, got: %s", errCode)
 	}
 }

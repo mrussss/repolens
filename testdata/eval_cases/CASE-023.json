@@ -1,14 +1,15 @@
 {
   "case_id": "CASE-023",
   "dataset_version": "v1.0",
-  "repository_name": "repolens/optimistic-lock",
+  "repository_name": "repolens/order-service",
   "snapshot_sha": "snap-opt-23",
   "issue_title": "Concurrent workers claim the same DiagnosisRun causing lost update",
   "issue_description": "Two workers process Run #100 simultaneously generating two separate reports.",
   "error_log": "concurrency anomaly: duplicate Attempt #1 created by worker-a and worker-b",
   "expected_root_cause": "Missing version conditional update (WHERE id = ? AND version = ?) during Worker claim transaction",
   "relevant_files": [
-    "internal/diagnosis/store.go"
+    "internal/diagnosis/store.go",
+    "internal/diagnosis/state.go"
   ],
   "forbidden_claims": [
     "MySQL isolation level set to READ UNCOMMITTED"

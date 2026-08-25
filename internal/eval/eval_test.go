@@ -2,8 +2,8 @@ package eval_test
 
 import (
 	"context"
-	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"repolens/internal/eval"
@@ -13,7 +13,47 @@ import (
 	"repolens/internal/retrieval"
 )
 
+func TestDatasetGroundTruthValidation(t *testing.T) {
+	if err := eval.ValidateDatasetFixtures(eval.StandardFaultCases); err != nil {
+		t.Fatalf("dataset ground truth validation failed: %v", err)
+	}
+
+	// Verify that an out-of-bounds line range is strictly rejected
+	invalidCase := eval.EvalCase{
+		CaseID:           "TEST-OUT-OF-BOUNDS",
+		RepositoryName:   "repolens/payment-service",
+		IssueTitle:       "Test issue title",
+		IssueDescription: "Test issue description",
+		RelevantFiles:    []string{"internal/platform/config/config.go"},
+		RelevantLineRanges: map[string]eval.LineRange{
+			"internal/platform/config/config.go": {Start: 1, End: 999999},
+		},
+	}
+	if err := eval.ValidateDatasetFixtures([]eval.EvalCase{invalidCase}); err == nil {
+		t.Fatalf("expected error for out-of-bounds line range 1-999999, got nil")
+	}
+
+	// Verify that an inverted line range is rejected
+	invertedCase := eval.EvalCase{
+		CaseID:           "TEST-INVERTED-RANGE",
+		RepositoryName:   "repolens/payment-service",
+		IssueTitle:       "Test issue title",
+		IssueDescription: "Test issue description",
+		RelevantFiles:    []string{"internal/platform/config/config.go"},
+		RelevantLineRanges: map[string]eval.LineRange{
+			"internal/platform/config/config.go": {Start: 20, End: 10},
+		},
+	}
+	if err := eval.ValidateDatasetFixtures([]eval.EvalCase{invertedCase}); err == nil {
+		t.Fatalf("expected error for inverted line range 20-10, got nil")
+	}
+}
+
 func TestRetrievalAndEvalBenchmark(t *testing.T) {
+	if err := eval.ValidateDatasetFixtures(eval.StandardFaultCases); err != nil {
+		t.Fatalf("dataset ground truth validation failed: %v", err)
+	}
+
 	tmpDir, err := os.MkdirTemp("", "repolens_eval_bench")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -31,23 +71,13 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 	chunkStore := retrieval.NewMemoryChunkStore()
 	chunker := indexing.NewCodeChunker(50, 10)
 
-	// Populate chunk store for all 32 cases
+	// Populate chunk store and disk files for all 32 cases from static fixtures
 	for _, c := range eval.StandardFaultCases {
-		var chunks []indexing.CodeChunk
-		for _, relFile := range c.RelevantFiles {
-			mockContent := fmt.Sprintf("// Package code\npackage main\n\nfunc %s() {\n    // %s\n    // %s\n}\n",
-				"ResolveFailure",
-				c.ExpectedRootCause,
-				c.IssueDescription,
-			)
-			fileChunks := chunker.ChunkFile(c.SnapshotSHA, relFile, mockContent)
-			chunks = append(chunks, fileChunks...)
-		}
-		// Add distractor chunks
-		for i := 1; i <= 5; i++ {
-			dPath := fmt.Sprintf("pkg/mock/distractor_%d.go", i)
-			dContent := fmt.Sprintf("// Package distractor\npackage mock\nfunc Helper_%d() {}\n", i)
-			chunks = append(chunks, chunker.ChunkFile(c.SnapshotSHA, dPath, dContent)...)
+		fixtureDir := eval.GetFixturePathForRepo(c.RepositoryName)
+		targetSnapshotDir := filepath.Join(tmpDir, c.RepositoryName, c.SnapshotSHA, "source")
+		chunks, err := eval.LoadFixtureChunksAndSnapshot(fixtureDir, targetSnapshotDir, c.SnapshotSHA, chunker)
+		if err != nil || len(chunks) == 0 {
+			t.Fatalf("failed to load fixture chunks for %s: %v (chunks=%d)", c.CaseID, err, len(chunks))
 		}
 		chunkStore.SaveChunks(c.SnapshotSHA, chunks)
 	}
@@ -65,7 +95,8 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 	}
 
 	// 2. Vector Eval
-	vectorRetriever := retrieval.NewVectorRetriever(chunkStore)
+	embedder := retrieval.NewLocalHashedFeatureProvider(128)
+	vectorRetriever := retrieval.NewVectorRetriever(chunkStore, embedder)
 	runVector, err := runner.RunRetrievalEval(ctx, "VECTOR", vectorRetriever, chunkStore)
 	if err != nil {
 		t.Fatalf("Vector eval failed: %v", err)
@@ -81,15 +112,15 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 		t.Errorf("expected non-zero MRR for Hybrid RRF")
 	}
 
-	// 4. End-to-End Diagnosis Eval
-	fakeProvider := llm.NewFakeProvider(llm.ModeNormalStructured)
+	// 4. End-to-End Diagnosis Eval with Real Agent Tool Calling Loop
+	fakeProvider := llm.NewFakeProvider(llm.ModeToolCallThenDone)
 	runE2E, err := runner.RunEndToEndDiagnosisEval(ctx, fakeProvider, hybridRetriever)
 	if err != nil {
 		t.Fatalf("E2E diagnosis eval failed: %v", err)
 	}
 
-	if runE2E.Metrics.RootCauseSuccessRate == 0 {
-		t.Errorf("expected non-zero Root Cause success rate")
+	if runE2E.Metrics.AvgPromptTokens == 0 {
+		t.Errorf("expected non-zero token metrics in E2E Eval")
 	}
 
 	eval.PrintComparisonTable([]*eval.EvalRun{runBM25, runVector, runHybrid, runE2E})

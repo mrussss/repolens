@@ -1,7 +1,7 @@
 {
   "case_id": "CASE-032",
   "dataset_version": "v1.0",
-  "repository_name": "repolens/retry-limit",
+  "repository_name": "repolens/queue-worker",
   "snapshot_sha": "snap-retry-32",
   "issue_title": "Retryable errors retried endlessly beyond MaxAttempts limit",
   "issue_description": "Task with persistent 500 error reached Attempt #15 instead of failing at Attempt #3.",

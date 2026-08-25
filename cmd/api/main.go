@@ -2,7 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,8 +19,8 @@ import (
 	"repolens/internal/outbox"
 	"repolens/internal/platform/config"
 	"repolens/internal/platform/logger"
+	"repolens/internal/platform/metrics"
 	"repolens/internal/platform/mysql"
-	"repolens/internal/platform/shutdown"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
@@ -26,6 +31,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		logger.L(context.Background()).Error("api server fatal error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	cfg := config.Load()
 	logger.Init(cfg.Env)
 	log := logger.L(context.Background())
@@ -34,14 +46,12 @@ func main() {
 
 	db, err := mysql.Connect(cfg)
 	if err != nil {
-		log.Error("failed to connect to database", "error", err)
-		return
+		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
 
 	if err := mysql.AutoMigrate(db.GormDB); err != nil {
-		log.Error("failed to run database auto migrations", "error", err)
-		return
+		return fmt.Errorf("failed to run database auto migrations: %w", err)
 	}
 
 	jwtManager := auth.NewJWTManager(cfg.JWTSecret, cfg.TokenTTL)
@@ -80,7 +90,7 @@ func main() {
 	router := gin.New()
 	router.Use(gin.Recovery())
 
-	// Logging & RequestID Middleware
+	// Logging & RequestID Middleware with Metrics
 	router.Use(func(c *gin.Context) {
 		reqID := c.GetHeader("X-Request-ID")
 		if reqID == "" {
@@ -89,6 +99,13 @@ func main() {
 		c.Set(string(logger.RequestIDKey), reqID)
 		c.Header("X-Request-ID", reqID)
 		c.Next()
+
+		status := strconv.Itoa(c.Writer.Status())
+		path := c.FullPath()
+		if path == "" {
+			path = "unknown"
+		}
+		metrics.HttpRequestsTotal.WithLabelValues(c.Request.Method, path, status).Inc()
 	})
 
 	// Health & Metrics
@@ -131,16 +148,31 @@ func main() {
 		Handler: router,
 	}
 
-	coord := shutdown.NewCoordinator()
-	coord.Register(func(ctx context.Context) error {
-		return srv.Shutdown(ctx)
-	})
-
+	errCh := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error("http server failed", "error", err)
+			errCh <- err
 		}
 	}()
 
-	coord.WaitForSignal(10 * time.Second)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigChan:
+		log.Info("received shutdown signal", "signal", sig.String())
+	case err := <-errCh:
+		log.Error("fatal http server error, triggering immediate shutdown", "error", err)
+		return fmt.Errorf("http server failed to listen: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Error("shutdown error", "error", err)
+	}
+
+	return nil
 }

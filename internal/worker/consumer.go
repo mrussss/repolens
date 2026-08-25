@@ -14,6 +14,7 @@ import (
 	"repolens/internal/evidence"
 	"repolens/internal/mq"
 	"repolens/internal/platform/logger"
+	"repolens/internal/platform/metrics"
 	"repolens/internal/sse"
 )
 
@@ -99,18 +100,34 @@ func (c *DiagnosisConsumer) Start(ctx context.Context) error {
 		case msg, ok := <-msgCh:
 			if !ok {
 				c.wg.Wait()
+				if ctx.Err() == nil {
+					return errors.New("diagnosis message channel closed unexpectedly by broker")
+				}
 				return nil
 			}
 			c.wg.Add(1)
-			go func(m mq.Message) {
+
+			// Isolate the execution context from the consume context so graceful shutdown
+			// doesn't immediately abort in-flight tasks as "Canceled".
+			taskCtx := context.WithoutCancel(ctx)
+
+			go func(m mq.Message, tCtx context.Context) {
 				defer c.wg.Done()
-				c.handleMessage(ctx, m)
-			}(msg)
+				c.handleMessage(tCtx, m)
+			}(msg, taskCtx)
 		}
 	}
 }
 
 func (c *DiagnosisConsumer) handleMessage(parentCtx context.Context, msg mq.Message) {
+	metrics.WorkerInflight.Inc()
+	defer metrics.WorkerInflight.Dec()
+
+	if msg.Redelivered {
+		metrics.MQRedeliveryTotal.Inc()
+	}
+	startProcess := time.Now()
+
 	var payload DiagnosisPayload
 	if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil {
 		logger.L(parentCtx).Error("malformed diagnosis message, routing to DLQ", "msg_id", msg.ID, "error", err)
@@ -213,6 +230,7 @@ func (c *DiagnosisConsumer) handleMessage(parentCtx context.Context, msg mq.Mess
 
 		// Check if max attempts reached
 		if isRetryable && attempt.AttemptNo < c.cfg.MaxAttempts {
+			metrics.ApplicationRetryTotal.Inc()
 			backoff := c.cfg.RetryBackoff * time.Duration(attempt.AttemptNo)
 			logger.L(ctx).Warn("attempt failed with retryable error, scheduling retry",
 				"run_id", run.ID,
@@ -234,6 +252,7 @@ func (c *DiagnosisConsumer) handleMessage(parentCtx context.Context, msg mq.Mess
 				backoff,
 			)
 		} else {
+			metrics.DiagnosisFailedTotal.WithLabelValues("TERMINAL_ERROR").Inc()
 			logger.L(ctx).Error("attempt failed terminally or retries exhausted",
 				"run_id", run.ID,
 				"attempt_id", attempt.ID,
@@ -332,6 +351,8 @@ func (c *DiagnosisConsumer) handleMessage(parentCtx context.Context, msg mq.Mess
 	)
 	if err != nil {
 		logger.L(ctx).Error("failed to finalize run status to SUCCEEDED", "run_id", run.ID, "error", err)
+	} else {
+		metrics.DiagnosisLatencySeconds.Observe(time.Since(startProcess).Seconds())
 	}
 
 	if c.sseHub != nil {

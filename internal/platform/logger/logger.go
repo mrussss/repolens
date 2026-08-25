@@ -9,12 +9,12 @@ import (
 type ctxKey string
 
 const (
-	RequestIDKey   ctxKey = "request_id"
-	UserIDKey      ctxKey = "user_id"
+	RequestIDKey    ctxKey = "request_id"
+	UserIDKey       ctxKey = "user_id"
 	RepositoryIDKey ctxKey = "repository_id"
-	SnapshotIDKey  ctxKey = "snapshot_id"
-	DiagnosisIDKey ctxKey = "diagnosis_id"
-	AttemptIDKey   ctxKey = "attempt_id"
+	SnapshotIDKey   ctxKey = "snapshot_id"
+	DiagnosisIDKey  ctxKey = "diagnosis_id"
+	AttemptIDKey    ctxKey = "attempt_id"
 )
 
 var defaultLogger *slog.Logger

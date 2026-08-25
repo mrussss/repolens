@@ -19,7 +19,8 @@ import (
 )
 
 func setupTestEnvironment(t *testing.T) (*gorm.DB, mq.Broker) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	dbName := "file:memdb_" + time.Now().String() + "?mode=memory&cache=shared"
+	db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}

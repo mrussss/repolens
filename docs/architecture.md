@@ -1,58 +1,61 @@
-# RepoLens 系统架构文档
+# RepoLens Architecture Specification
 
-## 1. 核心定位与架构分层
+## 1. System Overview
 
-RepoLens (Reliable AI Repository Diagnosis Platform) 是一个以 Go 为主语言的高可靠 AI 代码仓库故障诊断后端系统。
-系统严格区分三个事实层：
+RepoLens is an automated software repository diagnostic platform built in Go. It accepts error reports and CI logs, indexes repository snapshots, executes a bounded agent loop with diagnostic tools, verifies file citations against the immutable filesystem, and delivers structured root-cause reports.
 
-```text
-业务真相 (Business Truth)      → MySQL 8 (InnoDB, 事务, 乐观并发控制)
-代码真相 (Code Truth)          → Immutable RepositorySnapshot (本地只读共享存储)
-派生数据 (Derived Truth)       → RepositoryIndex / AgentStep / EvalRun
+```mermaid
+graph TD
+    subgraph ClientLayer [Client Layer]
+        CLI[Web / API Client]
+    end
+
+    subgraph ServiceLayer [Service Layer]
+        API[API Server :8080]
+        Relay[Outbox Relay Daemon]
+        Worker[Diagnosis Worker Daemon]
+        Sweeper[Recovery Sweeper Routine]
+    end
+
+    subgraph StorageLayer [Storage Layer]
+        MySQL[(MySQL 8\nACID State & Outbox)]
+        RabbitMQ[[RabbitMQ 3.12\nPersistent Queues & DLQ]]
+        ES[(Elasticsearch 8\nCode & Dense Vector Index)]
+        DiskStore[Local Filesystem\nSnapshot Storage]
+    end
+
+    CLI -->|HTTP REST / SSE| API
+    API -->|Transactional Outbox| MySQL
+    Relay -->|Fetch PENDING| MySQL
+    Relay -->|Publish Persistent Msg| RabbitMQ
+    RabbitMQ -->|Consume Message| Worker
+    Worker -->|ClaimRun & Heartbeat| MySQL
+    Worker -->|BM25 / kNN Search| ES
+    Worker -->|Read Code & Validate Citation| DiskStore
+    Sweeper -->|Reclaim Expired Attempts| MySQL
 ```
 
 ---
 
-## 2. 端到端执行主链路
+## 2. Core Subsystems
 
-```text
-[Developer]
-    ↓ POST /diagnoses (Idempotency-Key + Body)
-[Go API (Gin)]
-    ↓ 校验 User / Snapshot / Index + 计算 SHA256 Request Hash
-[MySQL Transaction]
-    ├─ Insert DiagnosisRun (Status=QUEUED, Version=1)
-    └─ Insert OutboxEvent (Status=PENDING, Type=DIAGNOSIS_REQUESTED)
-    ↓ 202 Accepted 返回给客户端
-[Outbox Relay]
-    ↓ 定期轮询 available_at <= now() 的事件并投递
-[RabbitMQ Exchange (Direct + DLX)]
-    ↓ Queue: repolens.diagnosis.task
-[Diagnosis Worker]
-    ↓ 条件更新 Claim Run (QUEUED/RETRY_WAIT → RUNNING)
-    ↓ 插入 DiagnosisAttempt #N (RUNNING, Heartbeat Ticker 启动)
-[Agent Runtime]
-    ├─ search_code (Lexical / BM25 / Vector / Hybrid RRF)
-    ├─ read_file (带 Path Traversal & Symlink & Secret Guards)
-    ├─ read_docs (文档只读)
-    └─ read_ci_log (错误日志过滤)
-    ↓
-[Structured Diagnosis Report (JSON)]
-    ↓
-[Citation Verification Engine]
-    ↓ 针对不可变 Snapshot 验证 File Path、Line Range 与 Excerpt Content Hash
-    ↓
-[Persistence Transaction]
-    ├─ Save Report & Validated Citations
-    └─ Finish Attempt & Run (SUCCEEDED)
-    ↓
-[SSE Stream Replay & Broadcast] (Last-Event-ID 支持)
-```
+### 2.1 API Server (`cmd/api`)
+- Exposes REST endpoints for user authentication, repository registration, snapshot indexing, and diagnosis task creation.
+- Provides Server-Sent Events (`GET /diagnoses/:id/stream`) for streaming live agent steps.
+- Exposes Prometheus telemetry on `GET /metrics`.
 
----
+### 2.2 Transactional Outbox & Relay (`cmd/relay`)
+- Employs the Transactional Outbox pattern to solve dual-write inconsistencies between MySQL and RabbitMQ.
+- `Relay` polls records ordered by `available_at ASC` and publishes them to RabbitMQ exchange `repolens.direct`.
 
-## 3. 核心设计原则
+### 2.3 Async Diagnosis Worker (`cmd/worker`)
+- Consumes AMQP messages from `repolens.diagnosis.task`.
+- Claims execution rights using optimistic concurrency (`version = version + 1`).
+- Runs active heartbeat routines.
+- Executes the `AgentLoop` with tool calling (`search_code`, `read_file`, `read_docs`, `read_ci_log`).
+- Re-verifies all report citations against the disk snapshot before transitioning run status to `SUCCEEDED`.
 
-1. **AI 生命周期与 HTTP 生命周期彻底解耦**：所有长耗时分析均由 Worker 异步执行，API 返回 202 Accepted。
-2. **Attempt 仅在 Worker Claim 后创建**：API 创建 Run 时 Attempt 计数为 0，保证 Attempt 精确代表真实发生的执行次数。
-3. **只读代码智能平台**：不执行仓库内的任意代码、构建脚本或 Shell 命令，全面防范 SSRF 与路径穿越。
+### 2.4 Code Retrieval Engine (`internal/retrieval` & `internal/platform/elasticsearch`)
+- **BM25 Search**: Multi-match query across `content`, `symbol` (boost 3.0), and `path` (boost 2.0).
+- **Dense Vector Search**: Computes embeddings via `EmbeddingProvider` and queries Elasticsearch dense vector kNN.
+- **Reciprocal Rank Fusion**: Merges ranking positions deterministically in Go.

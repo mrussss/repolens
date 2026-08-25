@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,14 +24,14 @@ const (
 )
 
 type Message struct {
-	ID          string            `json:"id"`
-	EventType   string            `json:"event_type"`
-	Payload     string            `json:"payload"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Redelivered bool              `json:"redelivered"`
-	AttemptCount int              `json:"attempt_count"`
-	AckFunc     func() error      `json:"-"`
-	NackFunc    func(requeue bool) error `json:"-"`
+	ID           string                   `json:"id"`
+	EventType    string                   `json:"event_type"`
+	Payload      string                   `json:"payload"`
+	Headers      map[string]string        `json:"headers,omitempty"`
+	Redelivered  bool                     `json:"redelivered"`
+	AttemptCount int                      `json:"attempt_count"`
+	AckFunc      func() error             `json:"-"`
+	NackFunc     func(requeue bool) error `json:"-"`
 }
 
 type Broker interface {
@@ -87,7 +88,16 @@ func (b *MemoryBroker) PublishDLQ(ctx context.Context, queue string, msg Message
 		msg.Headers = make(map[string]string)
 	}
 	msg.Headers["x-death-reason"] = reason
-	return b.Publish(ctx, queue+".dlq", msg)
+
+	dlqQueue := queue
+	if queue == QueueDiagnosisTask {
+		dlqQueue = QueueDiagnosisDLQ
+	} else if queue == QueueIndexTask {
+		dlqQueue = QueueIndexDLQ
+	} else if !strings.HasSuffix(dlqQueue, ".dlq") {
+		dlqQueue = queue + ".dlq"
+	}
+	return b.Publish(ctx, dlqQueue, msg)
 }
 
 func (b *MemoryBroker) Consume(ctx context.Context, queue string, prefetch int) (<-chan Message, error) {
@@ -314,6 +324,14 @@ func (b *RabbitMQBroker) Consume(ctx context.Context, queue string, prefetch int
 					logger.L(ctx).Error("failed to unmarshal delivery body, nacking to DLQ", "error", err)
 					_ = d.Nack(false, false) // reject to DLQ
 					continue
+				}
+				if len(d.Headers) > 0 {
+					if msg.Headers == nil {
+						msg.Headers = make(map[string]string)
+					}
+					for k, v := range d.Headers {
+						msg.Headers[k] = fmt.Sprintf("%v", v)
+					}
 				}
 				msg.Redelivered = d.Redelivered
 				tag := d.DeliveryTag

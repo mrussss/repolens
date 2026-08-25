@@ -107,13 +107,13 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 	var req TriggerIndexRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		req.Ref = r.DefaultRef
-		req.Strategy = repoindex.StrategyLexical
+		req.Strategy = repoindex.StrategyBM25
 	}
 	if req.Ref == "" {
 		req.Ref = r.DefaultRef
 	}
 	if req.Strategy == "" {
-		req.Strategy = repoindex.StrategyLexical
+		req.Strategy = repoindex.StrategyBM25
 	}
 
 	snapID := uuid.New().String()

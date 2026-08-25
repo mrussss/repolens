@@ -1,7 +1,7 @@
 {
   "case_id": "CASE-017",
   "dataset_version": "v1.0",
-  "repository_name": "repolens/cancellation-mgr",
+  "repository_name": "repolens/agent-runtime",
   "snapshot_sha": "snap-cancel-17",
   "issue_title": "Cancelled diagnosis continues executing LLM calls and wasting tokens",
   "issue_description": "User called /cancel but worker continued processing 6 more agent steps.",
@@ -9,7 +9,7 @@
   "expected_root_cause": "Agent loop did not check ctx.Done() and DB CancelRequested flag between tool steps",
   "relevant_files": [
     "internal/agent/loop.go",
-    "internal/worker/consumer.go"
+    "internal/agent/guard.go"
   ],
   "forbidden_claims": [
     "Linux kill signal failure"
