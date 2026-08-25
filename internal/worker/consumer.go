@@ -106,11 +106,11 @@ func (c *DiagnosisConsumer) Start(ctx context.Context) error {
 				return nil
 			}
 			c.wg.Add(1)
-			
+
 			// Isolate the execution context from the consume context so graceful shutdown
 			// doesn't immediately abort in-flight tasks as "Canceled".
 			taskCtx := context.WithoutCancel(ctx)
-			
+
 			go func(m mq.Message, tCtx context.Context) {
 				defer c.wg.Done()
 				c.handleMessage(tCtx, m)

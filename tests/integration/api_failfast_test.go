@@ -28,13 +28,13 @@ func TestAPI_FailFastOnPortCollision(t *testing.T) {
 
 	cmdRun := exec.CommandContext(ctx, "../../bin/repolens-api")
 	cmdRun.Env = append(cmdRun.Env, "HTTP_PORT=8099", "ENV=testing")
-	
+
 	// Since port is occupied, ListenAndServe will fail immediately and the process should exit with code 1
 	err = cmdRun.Run()
 	if err == nil {
 		t.Fatal("expected API server to fail-fast with error, but it exited cleanly")
 	}
-	
+
 	if ctx.Err() == context.DeadlineExceeded {
 		t.Fatal("API server did not fail-fast; it hung until context timeout")
 	}

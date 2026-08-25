@@ -9,7 +9,7 @@ import (
 func TestWorker_TaskContextIsolationDuringDrain(t *testing.T) {
 	// Simulate the consume context (parent)
 	consumeCtx, cancelConsume := context.WithCancel(context.Background())
-	
+
 	// Start an in-flight task that uses WithoutCancel to isolate from the consume context
 	taskCtx := context.WithoutCancel(consumeCtx)
 
