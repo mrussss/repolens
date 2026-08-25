@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	"repolens/internal/mq"
@@ -13,6 +15,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		logger.L(context.Background()).Error("outbox relay fatal error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	cfg := config.Load()
 	logger.Init(cfg.Env)
 	log := logger.L(context.Background())
@@ -21,8 +30,7 @@ func main() {
 
 	db, err := mysql.Connect(cfg)
 	if err != nil {
-		log.Error("failed to connect to database", "error", err)
-		return
+		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
 
@@ -30,8 +38,7 @@ func main() {
 	rmqBroker, err := mq.NewRabbitMQBroker(cfg.RabbitMQURL)
 	if err != nil {
 		if cfg.Env == "production" {
-			log.Error("failed to connect to rabbitmq in production mode", "error", err)
-			return
+			return fmt.Errorf("failed to connect to rabbitmq in production mode: %w", err)
 		}
 		log.Warn("failed to connect to rabbitmq, falling back to memory broker for dev/tests", "error", err)
 		broker = mq.NewMemoryBroker()
@@ -53,4 +60,5 @@ func main() {
 	go relay.Start(ctx)
 
 	coord.WaitForSignal(5 * time.Second)
+	return nil
 }

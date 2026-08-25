@@ -64,7 +64,7 @@ services:
     command: ["/app/repolens-api"]
     restart: unless-stopped
     environment:
-      - ENV=production
+      - ENV=development
       - HTTP_PORT=8080
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
@@ -94,7 +94,7 @@ services:
     command: ["/app/repolens-relay"]
     restart: unless-stopped
     environment:
-      - ENV=production
+      - ENV=development
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - RABBITMQ_URL=amqp://repolens:repolens_mq_pass@rabbitmq:5672/
@@ -112,7 +112,7 @@ services:
     command: ["/app/repolens-worker"]
     restart: unless-stopped
     environment:
-      - ENV=production
+      - ENV=development
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - RABBITMQ_URL=amqp://repolens:repolens_mq_pass@rabbitmq:5672/

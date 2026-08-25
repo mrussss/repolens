@@ -12,7 +12,7 @@ Most LLM coding tools suffer from two critical flaws:
 2. **Hallucinated Citations**: LLMs generate plausible-looking file paths and nonexistent line numbers without grounding.
 
 RepoLens solves both problems through **rigorous backend distributed reliability** and **deterministic evidence validation**:
-- **Zero-Loss Async Engine**: Transactional Outbox + Relay + RabbitMQ + MySQL optimistic locking ensures guaranteed at-least-once task dispatch with exact-once business execution semantics.
+- **Reliable Asynchronous Engine**: Transactional Outbox + Relay + RabbitMQ + MySQL optimistic locking ensures guaranteed at-least-once task delivery with idempotent business execution.
 - **Self-Healing Workers**: Periodic heartbeats and background recovery sweeper automatically reclaim abandoned attempts when worker nodes crash.
 - **Evidence-Based Citation Validator**: Every citation in the AI diagnostic report is strictly validated against an immutable filesystem snapshot (path existence, line bounds, and SHA256 content hash matching) before persisting to the user.
 - **Hybrid Code Retrieval**: Elasticsearch 8 BM25 + Dense Vector kNN search with Go-level Reciprocal Rank Fusion (RRF).
@@ -140,11 +140,12 @@ LEXICAL          |    90.6% |    96.9% |    0.883 |       100.0% |         0.0% 
 BM25             |    96.9% |   100.0% |    0.895 |       100.0% |         0.0% |       1 |       3
 LOCAL_HASHED_VEC |   100.0% |   100.0% |    0.843 |       100.0% |         0.0% |       2 |       5
 HYBRID_BASELINE  |    96.9% |   100.0% |    0.882 |       100.0% |         0.0% |       1 |       4
-E2E_AGENT        |    96.9% |   100.0% |    0.866 |         0.0% |        15.6% |       3 |       6
+AGENT_PLUMBING   |    96.9% |   100.0% |    0.866 |         0.0% |        15.6% |       3 |       6
 =========================================================================================================
 ```
 
-*Note: `LOCAL_HASHED_VEC` serves as a local deterministic hashing baseline without external network dependencies. Production semantic embeddings utilize OpenAI `text-embedding-3-small` or compatible vector models.*
+*Note: `LOCAL_HASHED_VEC` serves as a local deterministic hashing baseline without external network dependencies. Production semantic embeddings utilize OpenAI `text-embedding-3-small` or compatible vector models.*  
+*Note: `AGENT_PLUMBING` evaluates the deterministic agent loop execution, tool invocation dispatch, and citation verification plumbing using a fake LLM provider (verifying engineering harness reliability rather than live LLM model accuracy).*
 
 See [ADR 001: Retrieval Strategy](docs/adr/001-retrieval-strategy.md) for full architectural rationale and trade-off analysis.
 

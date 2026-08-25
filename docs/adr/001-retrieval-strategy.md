@@ -37,7 +37,9 @@ We conducted benchmarks on the curated 32-case repository fault dataset with 4 d
 | **BM25 Search** | **96.9%** | **100.0%** | **0.895** | ~ 1ms | Moderate (BM25 term statistics + field boosts) |
 | **Local Hashed Vec** | 100.0% | 100.0% | 0.843 | ~ 1ms | Low (128-dim deterministic token hashing) |
 | **Hybrid Baseline** | 96.9% | 100.0% | 0.882 | ~ 1ms | Moderate (Two-phase RRF rank merge) |
-| **E2E Diagnostic Agent** | 96.9% | 100.0% | 0.866 | ~ 2ms | Higher (Agent loop + tool dispatch + validation) |
+| **Agent Plumbing Eval** | 96.9% | 100.0% | 0.866 | ~ 2ms | Higher (Agent loop + tool dispatch + validation harness) |
+
+*Note: The Agent Plumbing benchmark evaluates end-to-end tool execution and report validation mechanics using a deterministic fake LLM provider rather than measuring live neural LLM inference accuracy.*
 
 ## Failure Analysis & Trade-offs
 - **Lexical failure cases**: Lower ranking precision where the issue description used conceptual terms without exact function name matches.

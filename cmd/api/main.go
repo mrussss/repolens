@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -28,6 +30,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		logger.L(context.Background()).Error("api server fatal error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	cfg := config.Load()
 	logger.Init(cfg.Env)
 	log := logger.L(context.Background())
@@ -36,14 +45,12 @@ func main() {
 
 	db, err := mysql.Connect(cfg)
 	if err != nil {
-		log.Error("failed to connect to database", "error", err)
-		return
+		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
 
 	if err := mysql.AutoMigrate(db.GormDB); err != nil {
-		log.Error("failed to run database auto migrations", "error", err)
-		return
+		return fmt.Errorf("failed to run database auto migrations: %w", err)
 	}
 
 	jwtManager := auth.NewJWTManager(cfg.JWTSecret, cfg.TokenTTL)
@@ -152,4 +159,5 @@ func main() {
 	}()
 
 	coord.WaitForSignal(10 * time.Second)
+	return nil
 }

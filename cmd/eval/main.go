@@ -90,11 +90,14 @@ func main() {
 		fmt.Printf("Hybrid eval error: %v\n", err)
 	}
 
-	// 5. End-to-End Agent Diagnosis with Tool Calling
+	// 5. Agent Diagnosis Runtime Plumbing Eval (with deterministic FakeProvider)
 	fakeProvider := llm.NewFakeProvider(llm.ModeToolCallThenDone)
 	runE2E, err := runner.RunEndToEndDiagnosisEval(ctx, fakeProvider, hybridRetriever)
 	if err != nil {
 		fmt.Printf("E2E diagnosis eval error: %v\n", err)
+	}
+	if runE2E != nil {
+		runE2E.RetrievalStrategy = "AGENT_PLUMBING"
 	}
 
 	eval.PrintComparisonTable([]*eval.EvalRun{
@@ -106,5 +109,6 @@ func main() {
 	})
 
 	fmt.Println("\nNote: LOCAL_HASHED_VEC is a deterministic token-hash baseline; production neural embeddings require OPENAI / compatible API keys.")
+	fmt.Println("Note: AGENT_PLUMBING evaluates the multi-step agent runtime loop, tool calling, and report validation plumbing using a deterministic fake LLM provider.")
 	fmt.Println("Eval run completed successfully. Metrics verified against static repository fixtures.")
 }
