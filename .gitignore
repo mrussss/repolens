@@ -38,3 +38,6 @@ credentials.json
 *.swp
 *.swo
 *~
+repolens-api
+repolens-relay
+repolens-worker
