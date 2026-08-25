@@ -45,14 +45,20 @@ We conducted benchmarks on the curated 32-case repository fault dataset with 4 d
 - **Hybrid RRF advantages**: Prevents score scale incompatibility between BM25 raw scores and dense vector cosine distances, providing rank stability.
 
 ## Decision
-1. **Production Primary**: Deploy **BM25 + Hybrid RRF** as the production retrieval pipeline.
-2. **Storage Separation**:
-   - **Elasticsearch 8** is utilized strictly as the Code Retrieval & Chunk Index.
-   - **MySQL 8** remains the sole transactional state machine and business source of truth.
-3. **Local & Test Fallback**:
-   - If Elasticsearch is not reachable, the system transparently utilizes the built-in in-memory BM25/RRF retriever for standalone execution and offline evaluation.
+1. **Production Primary Strategy**: Deploy **BM25 Search** (`repoindex.StrategyBM25`) as the V1 production default.
+   - Verified by offline benchmark across 32 curated fault cases: BM25 achieves the highest MRR (0.562), Hit@1 (37.5%), Hit@3 (65.6%), and Hit@5 (81.2%) across symbol names, stack traces, and code identifiers with ~3ms latency and zero external API dependency.
+2. **Experimental Retrieval Pipeline (Implemented & Integrated)**:
+   - The platform provides full implementation and infrastructure support for OpenAI-compatible dense embeddings (`text-embedding-3-small` / `bge-base`) + Elasticsearch 8 kNN (`dense_vector` cosine similarity) + Go RRF rank fusion (`repoindex.StrategyHybrid`).
+   - Maintained as an experimental/alternative retrieval strategy. It is not set as the default production primary because local deterministic benchmarks show BM25 delivers superior MRR and precision without embedding API latency, operational cost, or rate limit bottlenecks.
+3. **Deterministic Baseline Clarification**:
+   - The built-in local 128-dimensional hashed feature vector is a deterministic mathematical baseline (`repoindex.StrategyVector`), not a neural semantic representation.
+4. **Storage & State Separation**:
+   - **Elasticsearch 8** is utilized as the Code Retrieval & Chunk Index backend.
+   - **MySQL 8** remains the sole transactional state machine and business source of truth (diagnoses, attempts, reports, outbox).
+5. **In-Memory Offline Fallback**:
+   - The platform provides an in-memory BM25 and lexical retriever for dependency-free local testing, CI evaluation, and offline regression runs.
 
 ## Rejected Alternatives
-- **Pure Vector / Dense Retrieval Only**: Rejected due to lower symbol hit accuracy on exact compiler/runtime error logs.
-- **Learning-to-Rank (LTR)**: Rejected for V1 as it introduces unnecessary ML pipeline complexity without significant gain over RRF.
-- **Vector DBs (Milvus / Pinecone / Qdrant)**: Rejected to prevent infrastructure bloat; Elasticsearch 8 natively supports dense vectors (`dense_vector` + kNN) and BM25 unified in one engine.
+- **Pure Vector / Dense Retrieval Only as Primary**: Rejected due to lower symbol hit accuracy on exact compiler/runtime error logs and lack of symbol boosting.
+- **Learning-to-Rank (LTR)**: Rejected for V1 as it introduces unnecessary ML training pipeline complexity without significant gain over BM25 and RRF.
+- **Dedicated Vector DBs (Milvus / Pinecone / Qdrant)**: Rejected to prevent infrastructure sprawl; Elasticsearch 8 natively supports dense vectors (`dense_vector` + kNN) and BM25 unified in one engine.

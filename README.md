@@ -94,9 +94,9 @@ LLM diagnostic findings must provide line-level citations. Before persisting the
 2. **Line Boundary Check**: Asserts $1 \le \text{start\_line} \le \text{end\_line} \le \text{total\_lines}$.
 3. **Exact Excerpt & SHA256 Match**: Reads the immutable snapshot on disk, computes the SHA256 content hash, and validates excerpt containment. Citations are tagged `VALID` or `INVALID`.
 
-### 6. Hybrid RRF Retrieval (Elasticsearch 8 + Dense Vector)
-- **Lexical BM25**: Uses Elasticsearch 8 multi-match with field boosts (`symbol^3.0`, `path^2.0`, `content^1.0`).
-- **Dense Vector Search**: Generates embedding representations via `EmbeddingProvider` (Local TF-IDF or OpenAI `text-embedding-3-small`) queried via ES kNN.
+### 6. Retrieval Pipeline (BM25 Primary & Experimental Hybrid RRF)
+- **Production BM25 Search**: Evaluated and selected as the V1 production primary strategy (MRR 0.562). Uses Elasticsearch 8 multi-match with field boosts (`symbol^3.0`, `path^2.0`, `content^1.0`).
+- **Experimental Dense Vector & Hybrid Search**: Generates embeddings via `EmbeddingProvider` (Local deterministic feature hashing baseline or OpenAI-compatible `text-embedding-3-small`) queried via ES kNN.
 - **Reciprocal Rank Fusion (RRF)**: Merges rank positions in Go using $RRF(d) = \sum \frac{1}{60 + r_i(d)}$ to eliminate score scale mismatches.
 
 ---
