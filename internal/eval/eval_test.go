@@ -17,6 +17,36 @@ func TestDatasetGroundTruthValidation(t *testing.T) {
 	if err := eval.ValidateDatasetFixtures(eval.StandardFaultCases); err != nil {
 		t.Fatalf("dataset ground truth validation failed: %v", err)
 	}
+
+	// Verify that an out-of-bounds line range is strictly rejected
+	invalidCase := eval.EvalCase{
+		CaseID:           "TEST-OUT-OF-BOUNDS",
+		RepositoryName:   "repolens/payment-service",
+		IssueTitle:       "Test issue title",
+		IssueDescription: "Test issue description",
+		RelevantFiles:    []string{"internal/platform/config/config.go"},
+		RelevantLineRanges: map[string]eval.LineRange{
+			"internal/platform/config/config.go": {Start: 1, End: 999999},
+		},
+	}
+	if err := eval.ValidateDatasetFixtures([]eval.EvalCase{invalidCase}); err == nil {
+		t.Fatalf("expected error for out-of-bounds line range 1-999999, got nil")
+	}
+
+	// Verify that an inverted line range is rejected
+	invertedCase := eval.EvalCase{
+		CaseID:           "TEST-INVERTED-RANGE",
+		RepositoryName:   "repolens/payment-service",
+		IssueTitle:       "Test issue title",
+		IssueDescription: "Test issue description",
+		RelevantFiles:    []string{"internal/platform/config/config.go"},
+		RelevantLineRanges: map[string]eval.LineRange{
+			"internal/platform/config/config.go": {Start: 20, End: 10},
+		},
+	}
+	if err := eval.ValidateDatasetFixtures([]eval.EvalCase{invertedCase}); err == nil {
+		t.Fatalf("expected error for inverted line range 20-10, got nil")
+	}
 }
 
 func TestRetrievalAndEvalBenchmark(t *testing.T) {

@@ -533,10 +533,20 @@ func ValidateDatasetFixtures(cases []EvalCase) error {
 			}
 		}
 
-		// Verify relevant line ranges if present
-		for filePath, lr := range c.RelevantLineRanges {
-			if filePath == "" || lr.Start <= 0 || lr.End < lr.Start {
-				validationErrors = append(validationErrors, fmt.Sprintf("case %s has invalid line range %s:%d-%d", c.CaseID, filePath, lr.Start, lr.End))
+		// Verify relevant line ranges if present against actual file total line counts
+		for relFile, lr := range c.RelevantLineRanges {
+			if relFile == "" || lr.Start <= 0 || lr.End < lr.Start {
+				validationErrors = append(validationErrors, fmt.Sprintf("case %s has invalid line range %s:%d-%d (must satisfy 1 <= start <= end)", c.CaseID, relFile, lr.Start, lr.End))
+				continue
+			}
+			filePath := filepath.Join(fixtureDir, relFile)
+			totalLines, err := countFileLines(filePath)
+			if err != nil {
+				validationErrors = append(validationErrors, fmt.Sprintf("case %s cannot read file %q to verify line count: %v", c.CaseID, relFile, err))
+			} else if totalLines == 0 {
+				validationErrors = append(validationErrors, fmt.Sprintf("case %s file %q has 0 lines", c.CaseID, relFile))
+			} else if lr.End > totalLines {
+				validationErrors = append(validationErrors, fmt.Sprintf("case %s line range %s:%d-%d exceeds actual file total lines (%d)", c.CaseID, relFile, lr.Start, lr.End, totalLines))
 			}
 		}
 
@@ -551,4 +561,19 @@ func ValidateDatasetFixtures(cases []EvalCase) error {
 			len(validationErrors), strings.Join(validationErrors, "\n- "))
 	}
 	return nil
+}
+
+func countFileLines(filePath string) (int, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return 0, err
+	}
+	if len(data) == 0 {
+		return 0, nil
+	}
+	lines := strings.Count(string(data), "\n")
+	if !strings.HasSuffix(string(data), "\n") {
+		lines++
+	}
+	return lines, nil
 }

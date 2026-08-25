@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -87,6 +88,9 @@ func (w *IndexWorker) Start(ctx context.Context) error {
 		case msg, ok := <-msgCh:
 			if !ok {
 				w.wg.Wait()
+				if ctx.Err() == nil {
+					return errors.New("index message channel closed unexpectedly by broker")
+				}
 				return nil
 			}
 			w.wg.Add(1)

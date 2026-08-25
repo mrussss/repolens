@@ -20,10 +20,10 @@ We conducted benchmarks on the curated 32-case repository fault dataset with 4 d
    - High speed, but vulnerable to vocabulary mismatch and synonym variance.
 2. **BM25 Search (`BM25`)**:
    - Probabilistic term frequency-inverse document frequency ranking with length normalization and symbol weight boosting (`content^1.0`, `symbol^3.0`, `path^2.0`).
-   - Strong retrieval across technical symbols, identifier camelCase splits, and error log fragments (MRR: 0.562).
+   - Strong retrieval across technical symbols, identifier camelCase splits, and error log fragments (MRR: 0.895).
 3. **Deterministic Local Hashed Feature Vector Baseline (`LOCAL_HASHED_VEC`)**:
    - Deterministic 128-dimensional hashed feature representation provider with cosine similarity fallback.
-   - Provides reproducible baseline without external LLM/API dependencies (MRR: 0.491).
+   - Provides reproducible baseline without external LLM/API dependencies (MRR: 0.843).
 4. **Hybrid Reciprocal Rank Fusion Baseline (`HYBRID_BASELINE`)**:
    - Rank-based reciprocal rank score fusion combining BM25 ranking and Vector ranking:
      $$RRF\_Score(d) = \sum_{m \in \{BM25, Vector\}} \frac{1}{k + rank_m(d)}, \quad k = 60$$
@@ -36,7 +36,7 @@ We conducted benchmarks on the curated 32-case repository fault dataset with 4 d
 | **Lexical Baseline** | 90.6% | 96.9% | 0.883 | < 1ms | Low (In-Memory substring / token match) |
 | **BM25 Search** | **96.9%** | **100.0%** | **0.895** | ~ 1ms | Moderate (BM25 term statistics + field boosts) |
 | **Local Hashed Vec** | 100.0% | 100.0% | 0.843 | ~ 1ms | Low (128-dim deterministic token hashing) |
-| **Hybrid Baseline** | 96.9% | 100.0% | 0.866 | ~ 1ms | Moderate (Two-phase RRF rank merge) |
+| **Hybrid Baseline** | 96.9% | 100.0% | 0.882 | ~ 1ms | Moderate (Two-phase RRF rank merge) |
 | **E2E Diagnostic Agent** | 96.9% | 100.0% | 0.866 | ~ 2ms | Higher (Agent loop + tool dispatch + validation) |
 
 ## Failure Analysis & Trade-offs

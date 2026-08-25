@@ -100,6 +100,9 @@ func (c *DiagnosisConsumer) Start(ctx context.Context) error {
 		case msg, ok := <-msgCh:
 			if !ok {
 				c.wg.Wait()
+				if ctx.Err() == nil {
+					return errors.New("diagnosis message channel closed unexpectedly by broker")
+				}
 				return nil
 			}
 			c.wg.Add(1)

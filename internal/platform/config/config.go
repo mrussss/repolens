@@ -23,6 +23,7 @@ type Config struct {
 	LLMAPIKey         string
 	LLMBaseURL        string
 	LLMModel          string
+	RetrievalStrategy string // "bm25" (default, verified production primary), "hybrid"
 	ESURL             string
 	ESIndexName       string
 	EmbeddingProvider string // "local", "openai"
@@ -50,6 +51,7 @@ func Load() *Config {
 		LLMAPIKey:         getEnv("LLM_API_KEY", ""),
 		LLMBaseURL:        getEnv("LLM_BASE_URL", "https://api.openai.com/v1"),
 		LLMModel:          getEnv("LLM_MODEL", "gpt-4o"),
+		RetrievalStrategy: getEnv("RETRIEVAL_STRATEGY", "bm25"),
 		ESURL:             getEnv("ES_URL", "http://localhost:9200"),
 		ESIndexName:       getEnv("ES_INDEX_NAME", "repolens_chunks"),
 		EmbeddingProvider: getEnv("EMBEDDING_PROVIDER", "local"),

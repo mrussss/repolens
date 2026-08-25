@@ -47,9 +47,10 @@ flowchart TD
 
     subgraph AgentPipeline [Diagnostic Agent Runtime]
         Loop[Bounded Agent Loop] -->|Tool Dispatch| Tools[Tool Registry]
-        Tools -->|search_code| RRF[Hybrid RRF Retriever]
-        RRF -->|BM25 Multi-Match| ES
-        RRF -->|Dense Vector kNN| ES
+        Tools -->|search_code (Default Primary)| BM25[Production BM25 Retriever]
+        BM25 -->|Multi-Match Boosted Query| ES
+        Tools -.->|Optional Experimental| Hybrid[Hybrid RRF Retriever]
+        Hybrid -.->|BM25 + Dense kNN| ES
         Tools -->|read_file / read_docs| FS
         Loop -->|LLM Prompting| LLM[LLM Provider / OpenAI]
     end
@@ -95,7 +96,7 @@ LLM diagnostic findings must provide line-level citations. Before persisting the
 3. **Exact Excerpt & SHA256 Match**: Reads the immutable snapshot on disk, computes the SHA256 content hash, and validates excerpt containment. Citations are tagged `VALID` or `INVALID`.
 
 ### 6. Retrieval Pipeline (BM25 Primary & Experimental Hybrid RRF)
-- **Production BM25 Search**: Evaluated and selected as the V1 production primary strategy (MRR 0.562). Uses Elasticsearch 8 multi-match with field boosts (`symbol^3.0`, `path^2.0`, `content^1.0`).
+- **Production BM25 Search**: Evaluated and selected as the V1 production primary strategy (MRR 0.895, Hit@5 96.9%, Hit@10 100.0%). Uses Elasticsearch 8 multi-match with field boosts (`symbol^3.0`, `path^2.0`, `content^1.0`).
 - **Experimental Dense Vector & Hybrid Search**: Generates embeddings via `EmbeddingProvider` (Local deterministic feature hashing baseline or OpenAI-compatible `text-embedding-3-small`) queried via ES kNN.
 - **Reciprocal Rank Fusion (RRF)**: Merges rank positions in Go using $RRF(d) = \sum \frac{1}{60 + r_i(d)}$ to eliminate score scale mismatches.
 
@@ -137,9 +138,9 @@ Retrieval        | Hit@5    | Hit@10   | MRR      | Cit. Valid   | Root Cause   
 ---------------------------------------------------------------------------------------------------------
 LEXICAL          |    90.6% |    96.9% |    0.883 |       100.0% |         0.0% |       0 |       0
 BM25             |    96.9% |   100.0% |    0.895 |       100.0% |         0.0% |       1 |       3
-LOCAL_HASHED_VEC |   100.0% |   100.0% |    0.843 |       100.0% |         0.0% |       1 |       3
-HYBRID_BASELINE  |    96.9% |   100.0% |    0.866 |       100.0% |         0.0% |       1 |       3
-E2E_AGENT        |    96.9% |   100.0% |    0.866 |         0.0% |        15.6% |       2 |       6
+LOCAL_HASHED_VEC |   100.0% |   100.0% |    0.843 |       100.0% |         0.0% |       2 |       5
+HYBRID_BASELINE  |    96.9% |   100.0% |    0.882 |       100.0% |         0.0% |       1 |       4
+E2E_AGENT        |    96.9% |   100.0% |    0.866 |         0.0% |        15.6% |       3 |       6
 =========================================================================================================
 ```
 

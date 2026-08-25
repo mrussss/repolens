@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"repolens/internal/agent"
@@ -14,7 +18,6 @@ import (
 	"repolens/internal/platform/elasticsearch"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
-	"repolens/internal/platform/shutdown"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repoindex"
 	"repolens/internal/retrieval"
@@ -63,7 +66,8 @@ func main() {
 
 	// Retrieval engines
 	var embedder retrieval.EmbeddingProvider
-	if cfg.EmbeddingProvider == "openai" && cfg.EmbeddingAPIKey != "" {
+	hasNeuralEmbedding := cfg.EmbeddingProvider == "openai" && cfg.EmbeddingAPIKey != ""
+	if hasNeuralEmbedding {
 		embedder = retrieval.NewOpenAICompatibleEmbeddingProvider(cfg.EmbeddingAPIKey, cfg.EmbeddingBaseURL, cfg.EmbeddingModel, cfg.EmbeddingDim)
 	} else {
 		embedder = retrieval.NewLocalTFIDFEmbeddingProvider(cfg.EmbeddingDim)
@@ -91,7 +95,26 @@ func main() {
 			log.Warn("elasticsearch not available, falling back to in-memory retrieval", "error", err)
 		}
 	}
-	hybridRetriever := retrieval.NewHybridRRFRetriever(60, bm25Retriever, vectorRetriever)
+
+	var activeRetriever retrieval.Retriever
+	switch cfg.RetrievalStrategy {
+	case "hybrid":
+		if !hasNeuralEmbedding {
+			if cfg.Env == "production" {
+				log.Error("hybrid retrieval strategy requested in production but no neural embedding API key configured")
+				return
+			}
+			log.Warn("hybrid retrieval strategy requested without neural embedding API key, using local hashed baseline")
+		}
+		activeRetriever = retrieval.NewHybridRRFRetriever(60, bm25Retriever, vectorRetriever)
+		log.Info("retrieval strategy configured", "strategy", "hybrid", "neural_embedding", hasNeuralEmbedding)
+	case "bm25", "":
+		activeRetriever = bm25Retriever
+		log.Info("retrieval strategy configured", "strategy", "bm25")
+	default:
+		log.Warn("unknown retrieval strategy, defaulting to bm25", "strategy", cfg.RetrievalStrategy)
+		activeRetriever = bm25Retriever
+	}
 
 	// Index Worker
 	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
@@ -110,7 +133,7 @@ func main() {
 	sseHub := sse.NewHub()
 	agentExecutor := agent.NewAgentRuntimeExecutor(
 		provider,
-		hybridRetriever,
+		activeRetriever,
 		storeFS,
 		traceStore,
 		sseHub,
@@ -139,25 +162,38 @@ func main() {
 	recoverySweeper := worker.NewRecoverySweeper(diagnosisStore, 30*time.Second, 10*time.Second, 2*time.Second)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	coord := shutdown.NewCoordinator()
-	coord.Register(func(c context.Context) error {
-		cancel()
-		return nil
-	})
+	defer cancel()
+
+	errCh := make(chan error, 2)
 
 	go func() {
-		if err := indexWorker.Start(ctx); err != nil {
-			log.Error("index worker error", "error", err)
+		if err := indexWorker.Start(ctx); err != nil && ctx.Err() == nil {
+			log.Error("index worker daemon encountered fatal error", "error", err)
+			errCh <- fmt.Errorf("index worker error: %w", err)
 		}
 	}()
 
 	go func() {
-		if err := diagnosisConsumer.Start(ctx); err != nil {
-			log.Error("diagnosis consumer error", "error", err)
+		if err := diagnosisConsumer.Start(ctx); err != nil && ctx.Err() == nil {
+			log.Error("diagnosis consumer daemon encountered fatal error", "error", err)
+			errCh <- fmt.Errorf("diagnosis consumer error: %w", err)
 		}
 	}()
 
 	go recoverySweeper.Start(ctx)
 
-	coord.WaitForSignal(15 * time.Second)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigChan:
+		log.Info("received shutdown signal", "signal", sig.String())
+	case daemonErr := <-errCh:
+		log.Error("critical worker daemon component crashed, triggering immediate shutdown", "error", daemonErr)
+	}
+
+	cancel()
+	log.Info("waiting for workers and in-flight tasks to exit cleanly...")
+	time.Sleep(1 * time.Second)
+	log.Info("RepoLens Worker daemon shutdown completed")
 }
