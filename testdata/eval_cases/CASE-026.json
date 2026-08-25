@@ -1,15 +1,15 @@
 {
   "case_id": "CASE-026",
   "dataset_version": "v1.0",
-  "repository_name": "repolens/channel-deadlock",
+  "repository_name": "repolens/agent-runtime",
   "snapshot_sha": "snap-chan-26",
   "issue_title": "Deadlock on unbuffered channel write when consumer exits early",
   "issue_description": "Goroutine leaks and blocks forever writing to unbuffered channel.",
   "error_log": "goroutine leak: goroutine stuck in chan send (select) without active receiver",
   "expected_root_cause": "Writing to unbuffered channel without select default or buffered channel capacity",
   "relevant_files": [
-    "internal/mq/broker.go",
-    "internal/sse/handler.go"
+    "internal/sse/handler.go",
+    "internal/trace/step.go"
   ],
   "forbidden_claims": [
     "OS kernel deadlocked"

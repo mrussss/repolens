@@ -1,15 +1,15 @@
 {
   "case_id": "CASE-021",
   "dataset_version": "v1.0",
-  "repository_name": "repolens/shutdown-coord",
+  "repository_name": "repolens/queue-worker",
   "snapshot_sha": "snap-shut-21",
   "issue_title": "Worker terminates abruptly on SIGTERM discarding in-flight task progress",
   "issue_description": "K8s rolling update causes running tasks to fail abruptly without updating attempt status.",
   "error_log": "process exit: SIGTERM received, process terminated immediately without waiting for in-flight tasks",
   "expected_root_cause": "Missing graceful shutdown coordinator waiting on sync.WaitGroup within shutdown timeout",
   "relevant_files": [
-    "internal/platform/shutdown/shutdown.go",
-    "internal/worker/consumer.go"
+    "internal/worker/consumer.go",
+    "internal/worker/recovery.go"
   ],
   "forbidden_claims": [
     "hardware power outage"

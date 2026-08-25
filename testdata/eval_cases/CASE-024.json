@@ -1,7 +1,7 @@
 {
   "case_id": "CASE-024",
   "dataset_version": "v1.0",
-  "repository_name": "repolens/filter-guard",
+  "repository_name": "repolens/git-ingest",
   "snapshot_sha": "snap-filter-24",
   "issue_title": "Indexer indexes binary .so files and node_modules filling storage",
   "issue_description": "Repository indexing consumes 2GB memory indexing node_modules and binary shared objects.",

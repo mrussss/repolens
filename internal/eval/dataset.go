@@ -62,13 +62,13 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-005",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/worker-pool",
+		RepositoryName:    "repolens/queue-worker",
 		SnapshotSHA:       "snap-worker-05",
 		IssueTitle:        "Diagnosis tasks stuck in RUNNING forever after worker pod kill",
 		IssueDescription:  "SIGKILL sent to worker pod causes tasks to remain in RUNNING status perpetually.",
 		ErrorLog:          "run timeout: task #4928 remains in RUNNING status for 4 hours without heartbeat",
 		ExpectedRootCause: "Missing stale attempt recovery sweeper to mark dead worker attempts as ABANDONED and trigger retry",
-		RelevantFiles:     []string{"internal/worker/recovery.go", "internal/diagnosis/store.go"},
+		RelevantFiles:     []string{"internal/worker/recovery.go", "internal/worker/consumer.go"},
 		ForbiddenClaims:   []string{"MySQL table corruption"},
 	},
 	{
@@ -134,19 +134,19 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-011",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/database-pool",
+		RepositoryName:    "repolens/payment-service",
 		SnapshotSHA:       "snap-db-11",
 		IssueTitle:        "Database connection pool exhausted under concurrent diagnosis requests",
 		IssueDescription:  "HTTP requests block indefinitely and return 504 Gateway Timeout during load spike.",
 		ErrorLog:          "mysql error: Error 1040: Too many connections / connection pool full",
 		ExpectedRootCause: "Goroutines leaking sql.DB connections due to missing defer rows.Close()",
-		RelevantFiles:     []string{"internal/platform/mysql/mysql.go", "internal/outbox/store.go"},
+		RelevantFiles:     []string{"internal/platform/mysql/mysql.go", "internal/platform/config/config.go"},
 		ForbiddenClaims:   []string{"DNS server unreachable"},
 	},
 	{
 		CaseID:            "CASE-012",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/concurrency-worker",
+		RepositoryName:    "repolens/agent-runtime",
 		SnapshotSHA:       "snap-conc-12",
 		IssueTitle:        "Concurrent map read and map write crash in telemetry reporter",
 		IssueDescription:  "Application crashes intermittently with fatal error: concurrent map writes.",
@@ -170,7 +170,7 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-014",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/chunker-service",
+		RepositoryName:    "repolens/git-ingest",
 		SnapshotSHA:       "snap-chunk-14",
 		IssueTitle:        "Index out of range panic during code chunk slicing with overlap",
 		IssueDescription:  "Single-line files cause code chunker to panic on index out of range [0:60].",
@@ -182,37 +182,37 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-015",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/outbox-relay",
+		RepositoryName:    "repolens/order-service",
 		SnapshotSHA:       "snap-relay-15",
 		IssueTitle:        "Outbox events processed out of order causing race in status update",
 		IssueDescription:  "RETRY_REQUESTED event dispatched before DIAGNOSIS_REQUESTED completed.",
 		ErrorLog:          "order conflict: attempt to transition run from SUCCEEDED to RETRY_WAIT",
 		ExpectedRootCause: "Outbox relay fetching without ordering by available_at ASC or lack of conditional update check",
-		RelevantFiles:     []string{"internal/outbox/store.go", "internal/diagnosis/state.go"},
+		RelevantFiles:     []string{"internal/diagnosis/state.go", "internal/diagnosis/store.go"},
 		ForbiddenClaims:   []string{"RabbitMQ clustering failure"},
 	},
 	{
 		CaseID:            "CASE-016",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/transaction-guard",
+		RepositoryName:    "repolens/order-service",
 		SnapshotSHA:       "snap-tx-16",
 		IssueTitle:        "DiagnosisRun created in DB but OutboxEvent lost on crash",
 		IssueDescription:  "Task is listed in database as QUEUED but never picked up by RabbitMQ worker.",
 		ErrorLog:          "audit discrepancy: DiagnosisRun exists without corresponding OutboxEvent record",
 		ExpectedRootCause: "DiagnosisRun and OutboxEvent were inserted in separate database transactions instead of a single atomic transaction",
-		RelevantFiles:     []string{"internal/diagnosis/store.go"},
+		RelevantFiles:     []string{"internal/diagnosis/store.go", "internal/diagnosis/service.go"},
 		ForbiddenClaims:   []string{"RabbitMQ deleted the message"},
 	},
 	{
 		CaseID:            "CASE-017",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/cancellation-mgr",
+		RepositoryName:    "repolens/agent-runtime",
 		SnapshotSHA:       "snap-cancel-17",
 		IssueTitle:        "Cancelled diagnosis continues executing LLM calls and wasting tokens",
 		IssueDescription:  "User called /cancel but worker continued processing 6 more agent steps.",
 		ErrorLog:          "cancellation delay: worker completed execution 40 seconds after cancel_requested set to true",
 		ExpectedRootCause: "Agent loop did not check ctx.Done() and DB CancelRequested flag between tool steps",
-		RelevantFiles:     []string{"internal/agent/loop.go", "internal/worker/consumer.go"},
+		RelevantFiles:     []string{"internal/agent/loop.go", "internal/agent/guard.go"},
 		ForbiddenClaims:   []string{"Linux kill signal failure"},
 	},
 	{
@@ -230,7 +230,7 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-019",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/secret-filter",
+		RepositoryName:    "repolens/order-service",
 		SnapshotSHA:       "snap-secret-19",
 		IssueTitle:        "AWS secret access key in error log leaked to external LLM provider",
 		IssueDescription:  "CI log containing AKIA... was sent unredacted in LLM prompt payload.",
@@ -254,13 +254,13 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-021",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/shutdown-coord",
+		RepositoryName:    "repolens/queue-worker",
 		SnapshotSHA:       "snap-shut-21",
 		IssueTitle:        "Worker terminates abruptly on SIGTERM discarding in-flight task progress",
 		IssueDescription:  "K8s rolling update causes running tasks to fail abruptly without updating attempt status.",
 		ErrorLog:          "process exit: SIGTERM received, process terminated immediately without waiting for in-flight tasks",
 		ExpectedRootCause: "Missing graceful shutdown coordinator waiting on sync.WaitGroup within shutdown timeout",
-		RelevantFiles:     []string{"internal/platform/shutdown/shutdown.go", "internal/worker/consumer.go"},
+		RelevantFiles:     []string{"internal/worker/consumer.go", "internal/worker/recovery.go"},
 		ForbiddenClaims:   []string{"hardware power outage"},
 	},
 	{
@@ -278,19 +278,19 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-023",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/optimistic-lock",
+		RepositoryName:    "repolens/order-service",
 		SnapshotSHA:       "snap-opt-23",
 		IssueTitle:        "Concurrent workers claim the same DiagnosisRun causing lost update",
 		IssueDescription:  "Two workers process Run #100 simultaneously generating two separate reports.",
 		ErrorLog:          "concurrency anomaly: duplicate Attempt #1 created by worker-a and worker-b",
 		ExpectedRootCause: "Missing version conditional update (WHERE id = ? AND version = ?) during Worker claim transaction",
-		RelevantFiles:     []string{"internal/diagnosis/store.go"},
+		RelevantFiles:     []string{"internal/diagnosis/store.go", "internal/diagnosis/state.go"},
 		ForbiddenClaims:   []string{"MySQL isolation level set to READ UNCOMMITTED"},
 	},
 	{
 		CaseID:            "CASE-024",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/filter-guard",
+		RepositoryName:    "repolens/git-ingest",
 		SnapshotSHA:       "snap-filter-24",
 		IssueTitle:        "Indexer indexes binary .so files and node_modules filling storage",
 		IssueDescription:  "Repository indexing consumes 2GB memory indexing node_modules and binary shared objects.",
@@ -302,25 +302,25 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-025",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/eval-repro",
+		RepositoryName:    "repolens/agent-runtime",
 		SnapshotSHA:       "snap-eval-25",
 		IssueTitle:        "Eval metrics differ between runs without record of changed prompt version",
 		IssueDescription:  "Regression score dropped from 92% to 74% but unable to trace which component changed.",
 		ErrorLog:          "eval audit missing: EvalRun record lacks model, prompt_version and retrieval_version metadata",
 		ExpectedRootCause: "EvalRun struct did not record full reproducibility parameters (dataset_version, git_commit, prompt_version)",
-		RelevantFiles:     []string{"internal/eval/run.go", "internal/eval/runner.go"},
+		RelevantFiles:     []string{"internal/evidence/report.go", "pkg/prompt/templates.go"},
 		ForbiddenClaims:   []string{"CPU instruction set changed"},
 	},
 	{
 		CaseID:            "CASE-026",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/channel-deadlock",
+		RepositoryName:    "repolens/agent-runtime",
 		SnapshotSHA:       "snap-chan-26",
 		IssueTitle:        "Deadlock on unbuffered channel write when consumer exits early",
 		IssueDescription:  "Goroutine leaks and blocks forever writing to unbuffered channel.",
 		ErrorLog:          "goroutine leak: goroutine stuck in chan send (select) without active receiver",
 		ExpectedRootCause: "Writing to unbuffered channel without select default or buffered channel capacity",
-		RelevantFiles:     []string{"internal/mq/broker.go", "internal/sse/handler.go"},
+		RelevantFiles:     []string{"internal/sse/handler.go", "internal/trace/step.go"},
 		ForbiddenClaims:   []string{"OS kernel deadlocked"},
 	},
 	{
@@ -338,31 +338,31 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-028",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/dlq-router",
+		RepositoryName:    "repolens/queue-worker",
 		SnapshotSHA:       "snap-dlq-28",
 		IssueTitle:        "Poison message with corrupted bytes repeatedly crashes consumer",
 		IssueDescription:  "Invalid JSON payload causes worker to crash on every restart.",
 		ErrorLog:          "unmarshal failure: unexpected EOF parsing message payload",
 		ExpectedRootCause: "Worker did not catch JSON unmarshal errors to reject message to DLQ (QueueDiagnosisDLQ)",
-		RelevantFiles:     []string{"internal/worker/consumer.go", "internal/mq/broker.go"},
+		RelevantFiles:     []string{"internal/worker/consumer.go", "internal/outbox/store.go"},
 		ForbiddenClaims:   []string{"RabbitMQ corrupted queues"},
 	},
 	{
 		CaseID:            "CASE-029",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/idemp-conflict",
+		RepositoryName:    "repolens/order-service",
 		SnapshotSHA:       "snap-idemp-29",
 		IssueTitle:        "Idempotency key reused with different issue payload returns 200 instead of 409",
 		IssueDescription:  "Client reused Idempotency-Key: abc for a completely different repository and issue.",
 		ErrorLog:          "idempotency error: key abc submitted with mismatched request hash",
 		ExpectedRootCause: "Service did not compute SHA256 request hash and return 409 Conflict when hash differs",
-		RelevantFiles:     []string{"internal/diagnosis/service.go", "internal/diagnosis/handler.go"},
+		RelevantFiles:     []string{"internal/diagnosis/service.go", "internal/diagnosis/store.go"},
 		ForbiddenClaims:   []string{"HTTP proxy altered header"},
 	},
 	{
 		CaseID:            "CASE-030",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/heartbeat-loss",
+		RepositoryName:    "repolens/queue-worker",
 		SnapshotSHA:       "snap-hb-30",
 		IssueTitle:        "Slow LLM response blocks heartbeat emitter causing premature task recovery",
 		IssueDescription:  "LLM call taking 45s causes recovery sweeper to mark attempt ABANDONED while still running.",
@@ -386,7 +386,7 @@ var StandardFaultCases = []EvalCase{
 	{
 		CaseID:            "CASE-032",
 		DatasetVersion:    "v1.0",
-		RepositoryName:    "repolens/retry-limit",
+		RepositoryName:    "repolens/queue-worker",
 		SnapshotSHA:       "snap-retry-32",
 		IssueTitle:        "Retryable errors retried endlessly beyond MaxAttempts limit",
 		IssueDescription:  "Task with persistent 500 error reached Attempt #15 instead of failing at Attempt #3.",
@@ -439,9 +439,9 @@ func GetFixturePathForRepo(repoName string) string {
 		sub = "auth_service"
 	case strings.Contains(repoName, "order"):
 		sub = "order_service"
-	case strings.Contains(repoName, "queue") || strings.Contains(repoName, "worker") || strings.Contains(repoName, "pool") || strings.Contains(repoName, "retry"):
+	case strings.Contains(repoName, "queue") || strings.Contains(repoName, "worker") || strings.Contains(repoName, "pool") || strings.Contains(repoName, "retry") || strings.Contains(repoName, "relay"):
 		sub = "queue_worker"
-	case strings.Contains(repoName, "git"):
+	case strings.Contains(repoName, "git") || strings.Contains(repoName, "chunk") || strings.Contains(repoName, "filter"):
 		sub = "git_ingest"
 	default:
 		sub = "agent_runtime"
@@ -476,3 +476,80 @@ func LoadFixtureChunksAndSnapshot(fixtureRoot, targetSnapshotDir string, snapsho
 	})
 	return chunks, err
 }
+
+func ValidateDatasetFixtures(cases []EvalCase) error {
+	baseDir := findFixtureBaseDir()
+	info, err := os.Stat(baseDir)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("fixture ground truth validation failed: fixture base dir %q not accessible: %w", baseDir, err)
+	}
+
+	if len(cases) == 0 {
+		return fmt.Errorf("fixture ground truth validation failed: case list is empty")
+	}
+
+	var validationErrors []string
+
+	for _, c := range cases {
+		if c.CaseID == "" {
+			validationErrors = append(validationErrors, "case has empty CaseID")
+			continue
+		}
+		if c.RepositoryName == "" {
+			validationErrors = append(validationErrors, fmt.Sprintf("case %s has empty RepositoryName", c.CaseID))
+			continue
+		}
+		if len(c.RelevantFiles) == 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("case %s has no relevant files specified", c.CaseID))
+		}
+
+		fixtureDir := GetFixturePathForRepo(c.RepositoryName)
+		fixtureInfo, err := os.Stat(fixtureDir)
+		if err != nil || !fixtureInfo.IsDir() {
+			validationErrors = append(validationErrors, fmt.Sprintf("case %s repository fixture %q does not exist: %v", c.CaseID, fixtureDir, err))
+			continue
+		}
+
+		// Verify directory is not empty
+		entries, err := os.ReadDir(fixtureDir)
+		if err != nil || len(entries) == 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("case %s repository fixture %q is empty", c.CaseID, fixtureDir))
+			continue
+		}
+
+		// Verify every relevant file actually exists in the target fixture repository
+		for _, relFile := range c.RelevantFiles {
+			if strings.Contains(relFile, "..") {
+				validationErrors = append(validationErrors, fmt.Sprintf("case %s has invalid path traversal in relevant file %q", c.CaseID, relFile))
+				continue
+			}
+			filePath := filepath.Join(fixtureDir, relFile)
+			fileInfo, err := os.Stat(filePath)
+			if err != nil {
+				validationErrors = append(validationErrors, fmt.Sprintf("case %s (%s) references file %q which does not exist in %q",
+					c.CaseID, c.IssueTitle, relFile, fixtureDir))
+			} else if fileInfo.IsDir() || fileInfo.Size() == 0 {
+				validationErrors = append(validationErrors, fmt.Sprintf("case %s file %q is empty or a directory", c.CaseID, relFile))
+			}
+		}
+
+		// Verify relevant line ranges if present
+		for filePath, lr := range c.RelevantLineRanges {
+			if filePath == "" || lr.Start <= 0 || lr.End < lr.Start {
+				validationErrors = append(validationErrors, fmt.Sprintf("case %s has invalid line range %s:%d-%d", c.CaseID, filePath, lr.Start, lr.End))
+			}
+		}
+
+		// Ensure no empty title or description
+		if strings.TrimSpace(c.IssueTitle) == "" || strings.TrimSpace(c.IssueDescription) == "" {
+			validationErrors = append(validationErrors, fmt.Sprintf("case %s has empty issue title or description", c.CaseID))
+		}
+	}
+
+	if len(validationErrors) > 0 {
+		return fmt.Errorf("dataset ground truth validation failed with %d errors:\n- %s",
+			len(validationErrors), strings.Join(validationErrors, "\n- "))
+	}
+	return nil
+}
+

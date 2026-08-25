@@ -1,7 +1,7 @@
 {
   "case_id": "CASE-012",
   "dataset_version": "v1.0",
-  "repository_name": "repolens/concurrency-worker",
+  "repository_name": "repolens/agent-runtime",
   "snapshot_sha": "snap-conc-12",
   "issue_title": "Concurrent map read and map write crash in telemetry reporter",
   "issue_description": "Application crashes intermittently with fatal error: concurrent map writes.",

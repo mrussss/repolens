@@ -13,7 +13,17 @@ import (
 	"repolens/internal/retrieval"
 )
 
+func TestDatasetGroundTruthValidation(t *testing.T) {
+	if err := eval.ValidateDatasetFixtures(eval.StandardFaultCases); err != nil {
+		t.Fatalf("dataset ground truth validation failed: %v", err)
+	}
+}
+
 func TestRetrievalAndEvalBenchmark(t *testing.T) {
+	if err := eval.ValidateDatasetFixtures(eval.StandardFaultCases); err != nil {
+		t.Fatalf("dataset ground truth validation failed: %v", err)
+	}
+
 	tmpDir, err := os.MkdirTemp("", "repolens_eval_bench")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -35,7 +45,10 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 	for _, c := range eval.StandardFaultCases {
 		fixtureDir := eval.GetFixturePathForRepo(c.RepositoryName)
 		targetSnapshotDir := filepath.Join(tmpDir, c.RepositoryName, c.SnapshotSHA, "source")
-		chunks, _ := eval.LoadFixtureChunksAndSnapshot(fixtureDir, targetSnapshotDir, c.SnapshotSHA, chunker)
+		chunks, err := eval.LoadFixtureChunksAndSnapshot(fixtureDir, targetSnapshotDir, c.SnapshotSHA, chunker)
+		if err != nil || len(chunks) == 0 {
+			t.Fatalf("failed to load fixture chunks for %s: %v (chunks=%d)", c.CaseID, err, len(chunks))
+		}
 		chunkStore.SaveChunks(c.SnapshotSHA, chunks)
 	}
 

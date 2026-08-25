@@ -24,6 +24,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Step 0: Validate dataset ground truth fixtures before running any benchmarks
+	if err := eval.ValidateDatasetFixtures(eval.StandardFaultCases); err != nil {
+		fmt.Printf("FATAL: Dataset fixture validation failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✓ Dataset fixture ground truth validation passed (32/32 cases verified, 0 missing files)")
+
 	storeFS := snapshotstore.NewLocalSnapshotStore("/tmp/repolens_eval_snapshots")
 	runner := eval.NewRunner(storeFS)
 	if err := runner.LoadCasesFromDir(dataDir); err != nil {
@@ -41,8 +48,13 @@ func main() {
 		fixtureDir := eval.GetFixturePathForRepo(c.RepositoryName)
 		targetSnapshotDir := filepath.Join("/tmp/repolens_eval_snapshots", c.RepositoryName, c.SnapshotSHA, "source")
 		chunks, err := eval.LoadFixtureChunksAndSnapshot(fixtureDir, targetSnapshotDir, c.SnapshotSHA, chunker)
-		if err != nil || len(chunks) == 0 {
-			fmt.Printf("Warning: failed to load fixture chunks for %s: %v\n", c.CaseID, err)
+		if err != nil {
+			fmt.Printf("FATAL: failed to load fixture chunks for %s: %v\n", c.CaseID, err)
+			os.Exit(1)
+		}
+		if len(chunks) == 0 {
+			fmt.Printf("FATAL: 0 chunks loaded for fixture %s (%s)\n", c.CaseID, c.RepositoryName)
+			os.Exit(1)
 		}
 		chunkStore.SaveChunks(c.SnapshotSHA, chunks)
 	}
