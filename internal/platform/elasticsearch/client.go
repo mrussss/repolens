@@ -176,11 +176,68 @@ func (c *Client) BulkIndexChunks(ctx context.Context, chunks []indexing.CodeChun
 	}
 	defer resp.Body.Close()
 
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read bulk response body: %w", err)
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("bulk index error (status %d): %s", resp.StatusCode, string(respBody))
 	}
+
+	var bulkResp ESBulkResponse
+	if err := json.Unmarshal(respBody, &bulkResp); err != nil {
+		return fmt.Errorf("failed to parse bulk response JSON: %w", err)
+	}
+
+	if bulkResp.Errors {
+		var failedSummaries []string
+		for _, itemMap := range bulkResp.Items {
+			for op, item := range itemMap {
+				if item.Error != nil || item.Status >= 300 {
+					errType := "unknown"
+					errReason := "unknown"
+					if item.Error != nil {
+						if item.Error.Type != "" {
+							errType = item.Error.Type
+						}
+						if item.Error.Reason != "" {
+							errReason = item.Error.Reason
+						}
+					}
+					failedSummaries = append(failedSummaries, fmt.Sprintf(
+						"operation=%s id=%s status=%d type=%s reason=%s",
+						op, item.ID, item.Status, errType, errReason,
+					))
+				}
+			}
+		}
+		if len(failedSummaries) == 0 {
+			return fmt.Errorf("elasticsearch bulk returned errors=true with status %d", resp.StatusCode)
+		}
+		return fmt.Errorf("elasticsearch bulk indexing partial failure (%d items failed): %s",
+			len(failedSummaries), strings.Join(failedSummaries, "; "))
+	}
 	return nil
+}
+
+type ESBulkItemError struct {
+	Type   string `json:"type"`
+	Reason string `json:"reason"`
+}
+
+type ESBulkItemResult struct {
+	Index  string           `json:"_index"`
+	ID     string           `json:"_id"`
+	Status int              `json:"status"`
+	Error  *ESBulkItemError `json:"error,omitempty"`
+	Result string           `json:"result,omitempty"`
+}
+
+type ESBulkResponse struct {
+	Took   int                           `json:"took"`
+	Errors bool                          `json:"errors"`
+	Items  []map[string]ESBulkItemResult `json:"items"`
 }
 
 type ESSearchHit struct {
