@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,7 +21,6 @@ import (
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/metrics"
 	"repolens/internal/platform/mysql"
-	"repolens/internal/platform/shutdown"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
@@ -147,17 +148,31 @@ func run() error {
 		Handler: router,
 	}
 
-	coord := shutdown.NewCoordinator()
-	coord.Register(func(ctx context.Context) error {
-		return srv.Shutdown(ctx)
-	})
-
+	errCh := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error("http server failed", "error", err)
+			errCh <- err
 		}
 	}()
 
-	coord.WaitForSignal(10 * time.Second)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigChan:
+		log.Info("received shutdown signal", "signal", sig.String())
+	case err := <-errCh:
+		log.Error("fatal http server error, triggering immediate shutdown", "error", err)
+		return fmt.Errorf("http server failed to listen: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Error("shutdown error", "error", err)
+	}
+	
 	return nil
 }

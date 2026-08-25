@@ -94,10 +94,14 @@ func (w *IndexWorker) Start(ctx context.Context) error {
 				return nil
 			}
 			w.wg.Add(1)
-			go func(m mq.Message) {
+			
+			// Isolate the execution context from the consume context
+			taskCtx := context.WithoutCancel(ctx)
+			
+			go func(m mq.Message, tCtx context.Context) {
 				defer w.wg.Done()
-				w.handleMessage(ctx, m)
-			}(msg)
+				w.handleMessage(tCtx, m)
+			}(msg, taskCtx)
 		}
 	}
 }
