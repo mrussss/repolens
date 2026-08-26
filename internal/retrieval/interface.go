@@ -5,10 +5,12 @@ import (
 )
 
 type SearchRequest struct {
-	SnapshotID string `json:"snapshot_id"`
-	Query      string `json:"query"`
-	TopK       int    `json:"top_k"`
-	Scope      string `json:"scope,omitempty"` // e.g. file path prefix or extension
+	SnapshotID       string `json:"snapshot_id"`
+	CodeIndexBuildID int64  `json:"code_index_build_id,omitempty"`
+	RetrievalBuildID int64  `json:"retrieval_build_id,omitempty"`
+	Query            string `json:"query"`
+	TopK             int    `json:"top_k"`
+	Scope            string `json:"scope,omitempty"` // e.g. file path prefix or extension
 }
 
 type SearchResult struct {

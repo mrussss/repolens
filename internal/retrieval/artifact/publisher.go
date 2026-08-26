@@ -1,6 +1,7 @@
 package artifact
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -109,12 +110,42 @@ func (p *Publisher) Publish(buildID int64, claimToken string, strategy string, i
 
 // LoadIndex loads a published BM25 index from its final artifact directory.
 func LoadIndex(artifactDir string) (*bm25.Index, error) {
+	return LoadIndexVerified(artifactDir, 0, "")
+}
+
+// LoadIndexVerified validates both the manifest identity and the checksum of
+// the index bytes before exposing an artifact to the retriever.
+func LoadIndexVerified(artifactDir string, expectedBuildID int64, expectedHash string) (*bm25.Index, error) {
 	indexPath := filepath.Join(artifactDir, "index.json")
+	manifestPath := filepath.Join(artifactDir, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed opening artifact manifest at %s: %w", manifestPath, err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return nil, fmt.Errorf("invalid artifact manifest: %w", err)
+	}
+	if expectedBuildID > 0 && manifest.RetrievalBuildID != expectedBuildID {
+		return nil, fmt.Errorf("artifact build id mismatch: manifest=%d expected=%d", manifest.RetrievalBuildID, expectedBuildID)
+	}
 	f, err := os.Open(indexPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed opening index artifact at %s: %w", indexPath, err)
 	}
 	defer f.Close()
 
-	return bm25.Load(f)
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading index artifact: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	h := sha256.Sum256(data)
+	actualHash := hex.EncodeToString(h[:])
+	if manifest.ArtifactHash == "" || actualHash != manifest.ArtifactHash || (expectedHash != "" && actualHash != expectedHash) {
+		return nil, fmt.Errorf("retrieval artifact hash mismatch")
+	}
+	return bm25.Load(bytes.NewReader(data))
 }

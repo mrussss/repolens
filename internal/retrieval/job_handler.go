@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
+	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
@@ -38,17 +39,28 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	if err != nil {
 		return fmt.Errorf("failed fetching retrieval build %d: %w", rbID, err)
 	}
+	if rb.Status == codeintelmodel.BuildStatusReady {
+		return nil
+	}
 
 	cib, err := h.ciStore.GetByID(ctx, rb.CodeIndexBuildID)
 	if err != nil {
 		return fmt.Errorf("failed fetching code index build %d for retrieval: %w", rb.CodeIndexBuildID, err)
+	}
+	if cib.Status != codeintelmodel.BuildStatusReady {
+		return jobs.NewRetryableError("CODE_INDEX_NOT_READY", "code index build is not READY", nil)
+	}
+	if err := h.ciStore.MarkRetrievalBuilding(ctx, rb.ID); err != nil {
+		return jobs.NewRetryableError("RETRIEVAL_STATE_UPDATE_FAILED", err.Error(), err)
 	}
 
 	log.Info("starting retrieval build indexing", "retrieval_build_id", rb.ID, "code_index_build_id", cib.ID)
 
 	symbols, err := h.ciStore.ListSymbols(ctx, cib.ID, "", 10000)
 	if err != nil {
-		_ = h.ciStore.FailRetrievalBuild(ctx, rb.ID, err.Error())
+		if job.AttemptCount >= job.MaxAttempts {
+			_ = h.ciStore.FailRetrievalBuild(ctx, rb.ID, err.Error())
+		}
 		return fmt.Errorf("failed listing symbols for retrieval build: %w", err)
 	}
 
@@ -75,7 +87,9 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	finalPath, artifactHash, err := h.publisher.Publish(rb.ID, claimToken, rb.Strategy, idx)
 	if err != nil {
 		log.Error("failed publishing retrieval artifact", "build_id", rb.ID, "error", err)
-		_ = h.ciStore.FailRetrievalBuild(ctx, rb.ID, err.Error())
+		if job.AttemptCount >= job.MaxAttempts {
+			_ = h.ciStore.FailRetrievalBuild(ctx, rb.ID, err.Error())
+		}
 		return err
 	}
 

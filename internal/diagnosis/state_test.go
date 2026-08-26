@@ -2,6 +2,7 @@ package diagnosis_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"repolens/internal/diagnosis"
+	"repolens/internal/evidence"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/repo"
@@ -37,9 +39,7 @@ func TestStateTransitions(t *testing.T) {
 		{diagnosis.StatusQueued, diagnosis.StatusRunning, true},
 		{diagnosis.StatusQueued, diagnosis.StatusCancelled, true},
 		{diagnosis.StatusRunning, diagnosis.StatusSucceeded, true},
-		{diagnosis.StatusRunning, diagnosis.StatusRetryWait, true},
 		{diagnosis.StatusRunning, diagnosis.StatusFailed, true},
-		{diagnosis.StatusRetryWait, diagnosis.StatusRunning, true},
 		{diagnosis.StatusSucceeded, diagnosis.StatusRunning, false},
 		{diagnosis.StatusFailed, diagnosis.StatusRunning, false},
 		{diagnosis.StatusCancelled, diagnosis.StatusRunning, false},
@@ -169,5 +169,64 @@ func TestTransactionalJobCreation(t *testing.T) {
 	}
 	if job.Status != jobs.StatusPending {
 		t.Errorf("expected job status PENDING, got %s", job.Status)
+	}
+}
+
+func TestFinalizeSuccessIsFencedAndAtomic(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	diagStore := diagnosis.NewStore(db)
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-finalize", UserID: "user-finalize", RepositoryID: "repo-finalize", SnapshotID: "snap-finalize",
+		IssueTitle: "test", IdempotencyKey: "idempotency-finalize", IdempotencyRequestHash: "hash-finalize",
+	}
+	if err := diagStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	job := &jobs.AnalysisJob{}
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).First(job).Error; err != nil {
+		t.Fatal(err)
+	}
+	workerID, claimToken := "worker-finalize", "claim-finalize"
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
+		"status": jobs.StatusRunning, "worker_id": workerID, "claim_token": claimToken,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempt := &diagnosis.DiagnosisAttempt{ID: "attempt-finalize", DiagnosisRunID: run.ID, AttemptNo: 1, WorkerID: workerID}
+	if err := diagStore.StartAttempt(ctx, run.ID, attempt); err != nil {
+		t.Fatal(err)
+	}
+
+	// A duplicate citation ID forces a failure after report insertion. The
+	// transaction must roll back the report and leave all states RUNNING.
+	duplicate := &evidence.Citation{ID: "duplicate-citation", SnapshotID: run.SnapshotID, FilePath: "main.go", StartLine: 1, EndLine: 1}
+	if err := db.Create(duplicate).Error; err != nil {
+		t.Fatal(err)
+	}
+	report := &evidence.Report{ID: "report-rollback", DiagnosisRunID: run.ID, AttemptID: attempt.ID, RootCause: "root", FindingsJSON: "[]"}
+	err := diagStore.FinalizeSuccess(ctx, job.ID, workerID, claimToken, run.ID, attempt.ID, report, []evidence.Citation{{ID: duplicate.ID, SnapshotID: run.SnapshotID, FilePath: "main.go", StartLine: 1, EndLine: 1}}, 1, 1, 1)
+	if err == nil {
+		t.Fatal("expected duplicate citation to fail atomic finalization")
+	}
+	var reportCount int64
+	if err := db.Model(&evidence.Report{}).Where("id = ?", report.ID).Count(&reportCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if reportCount != 0 {
+		t.Fatalf("report was committed despite citation failure")
+	}
+	var savedRun diagnosis.DiagnosisRun
+	if err := db.First(&savedRun, "id = ?", run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if savedRun.Status != diagnosis.StatusRunning {
+		t.Fatalf("run changed after failed finalization: %s", savedRun.Status)
+	}
+
+	// A stale claim is rejected before any new report/citation is written.
+	err = diagStore.FinalizeSuccess(ctx, job.ID, workerID, "stale-claim", run.ID, attempt.ID, report, nil, 0, 0, 0)
+	if !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("expected ownership fencing, got %v", err)
 	}
 }

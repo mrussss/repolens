@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"repolens/internal/diagnosis"
+	"repolens/internal/jobs"
+	"repolens/internal/llm"
 	"repolens/internal/provider"
 )
 
@@ -125,5 +128,55 @@ func TestTestConnection(t *testing.T) {
 	}
 	if latency <= 0 {
 		t.Errorf("expected positive latency")
+	}
+}
+
+func TestBuildForDiagnosisPinsMetadataButReloadsRotatedKey(t *testing.T) {
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	mgr := provider.NewManager(filepath.Join(t.TempDir(), "provider.json"), "", "", "", "")
+	if err := mgr.SaveConfig(server.URL, "model-a", "key-a", false); err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := provider.NormalizeBaseURL(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &diagnosis.DiagnosisRun{
+		ProviderEndpointFingerprint: provider.ComputeEndpointFingerprint(normalized),
+		ProviderConfigFingerprint:   provider.ComputeConfigFingerprint(normalized, "model-a"),
+		ModelName:                   "model-a",
+	}
+
+	if err := mgr.SaveConfig(server.URL, "model-a", "key-b", false); err != nil {
+		t.Fatal(err)
+	}
+	p, err := mgr.BuildForDiagnosis(context.Background(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Generate(context.Background(), llm.GenerateRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "ping"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "Bearer key-b" {
+		t.Fatalf("worker did not reload rotated key: %q", authorization)
+	}
+
+	if err := mgr.SaveConfig(server.URL, "model-b", "key-c", false); err != nil {
+		t.Fatal(err)
+	}
+	_, err = mgr.BuildForDiagnosis(context.Background(), run)
+	if err == nil {
+		t.Fatal("expected provider model drift to be rejected")
+	}
+	class, code := jobs.ClassifyError(err)
+	if class != jobs.ErrorClassPermanent || code != "PROVIDER_CONFIG_MISMATCH" {
+		t.Fatalf("expected permanent provider mismatch, got class=%s code=%s err=%v", class, code, err)
 	}
 }

@@ -7,13 +7,22 @@ import (
 	"strings"
 )
 
-func ComputeRequestHash(repoID, snapshotID, title, description, errorLog string) string {
-	raw := fmt.Sprintf("%s|%s|%s|%s|%s",
+func ComputeRequestHash(repoID, snapshotID, title, description, errorLog string, pinnedBuildIDs ...int64) string {
+	var codeIndexBuildID, retrievalBuildID int64
+	if len(pinnedBuildIDs) > 0 {
+		codeIndexBuildID = pinnedBuildIDs[0]
+	}
+	if len(pinnedBuildIDs) > 1 {
+		retrievalBuildID = pinnedBuildIDs[1]
+	}
+	raw := fmt.Sprintf("%s|%s|%s|%s|%s|%d|%d",
 		strings.TrimSpace(repoID),
 		strings.TrimSpace(snapshotID),
 		strings.TrimSpace(title),
 		strings.TrimSpace(description),
 		strings.TrimSpace(errorLog),
+		codeIndexBuildID,
+		retrievalBuildID,
 	)
 	h := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(h[:])
@@ -22,13 +31,9 @@ func ComputeRequestHash(repoID, snapshotID, title, description, errorLog string)
 func IsValidRunTransition(from, to RunStatus) bool {
 	switch from {
 	case StatusQueued:
-		return to == StatusRunning || to == StatusCancelRequested || to == StatusCancelled
+		return to == StatusRunning || to == StatusCancelled
 	case StatusRunning:
-		return to == StatusSucceeded || to == StatusRetryWait || to == StatusFailed || to == StatusCancelRequested || to == StatusCancelled
-	case StatusRetryWait:
-		return to == StatusRunning || to == StatusCancelRequested || to == StatusCancelled || to == StatusFailed
-	case StatusCancelRequested:
-		return to == StatusCancelled || to == StatusFailed
+		return to == StatusSucceeded || to == StatusFailed || to == StatusCancelled
 	default:
 		return false
 	}

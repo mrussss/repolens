@@ -105,6 +105,7 @@ func TestProductionRetriever_SearchAndStructuralExpansion(t *testing.T) {
 			SemanticRelationsCount: 1,
 		},
 	}
+	_ = ciStore.MarkBuildBuilding(ctx, cib.ID)
 	_ = ciStore.SaveAnalysisResult(ctx, cib.ID, analysisRes)
 
 	// Create & Build BM25 Index
@@ -127,14 +128,14 @@ func TestProductionRetriever_SearchAndStructuralExpansion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed publishing artifact: %v", err)
 	}
+	_ = ciStore.MarkRetrievalBuilding(ctx, rb.ID)
 	_ = ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, hash, idx.TotalDocs)
 
 	// Search using ProductionRetriever
 	retriever := retrieval.NewProductionRetriever(ciStore, tempBase)
 	results, err := retriever.Search(ctx, retrieval.SearchRequest{
-		SnapshotID: snapID,
-		Query:      "ValidateToken",
-		TopK:       5,
+		SnapshotID: snapID, CodeIndexBuildID: cib.ID, RetrievalBuildID: rb.ID,
+		Query: "ValidateToken", TopK: 5,
 	})
 	if err != nil {
 		t.Fatalf("production search failed: %v", err)

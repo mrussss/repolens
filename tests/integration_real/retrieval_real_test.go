@@ -128,9 +128,8 @@ func (s *CheckoutService) ProcessCheckout(cartID string) error {
 	// 6. Test ProductionRetriever query against real published artifact
 	retriever := retrieval.NewProductionRetriever(ciStore, indexStorageDir)
 	results, err := retriever.Search(ctx, retrieval.SearchRequest{
-		SnapshotID: snapID,
-		Query:      "ProcessCheckout",
-		TopK:       5,
+		SnapshotID: snapID, CodeIndexBuildID: build.ID, RetrievalBuildID: finalRB.ID,
+		Query: "ProcessCheckout", TopK: 5,
 	})
 	if err != nil {
 		t.Fatalf("production search query failed: %v", err)

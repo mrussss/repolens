@@ -30,12 +30,17 @@ type Executor interface {
 }
 
 type AgentRuntimeExecutor struct {
-	provider   llm.Provider
-	retriever  retrieval.Retriever
-	ciStore    codeintelstore.Store
-	storeFS    snapshotstore.SnapshotStore
-	traceStore trace.Store
-	guardCfg   GuardConfig
+	provider        llm.Provider
+	providerFactory ProviderFactory
+	retriever       retrieval.Retriever
+	ciStore         codeintelstore.Store
+	storeFS         snapshotstore.SnapshotStore
+	traceStore      trace.Store
+	guardCfg        GuardConfig
+}
+
+type ProviderFactory interface {
+	BuildForDiagnosis(ctx context.Context, run *diagnosis.DiagnosisRun) (llm.Provider, error)
 }
 
 func NewAgentRuntimeExecutor(
@@ -54,6 +59,10 @@ func NewAgentRuntimeExecutor(
 	}
 }
 
+func NewAgentRuntimeExecutorWithFactory(factory ProviderFactory, retriever retrieval.Retriever, storeFS snapshotstore.SnapshotStore, traceStore trace.Store, guardCfg GuardConfig) *AgentRuntimeExecutor {
+	return &AgentRuntimeExecutor{providerFactory: factory, retriever: retriever, storeFS: storeFS, traceStore: traceStore, guardCfg: guardCfg}
+}
+
 func (e *AgentRuntimeExecutor) WithCodeIntelStore(ciStore codeintelstore.Store) *AgentRuntimeExecutor {
 	e.ciStore = ciStore
 	return e
@@ -61,17 +70,28 @@ func (e *AgentRuntimeExecutor) WithCodeIntelStore(ciStore codeintelstore.Store) 
 
 func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
 	registry := NewToolRegistry()
-
-	var buildID int64
-	if e.ciStore != nil {
-		cib, err := e.ciStore.GetBySnapshot(ctx, run.SnapshotID)
-		if err == nil && cib != nil {
-			buildID = cib.ID
+	provider := e.provider
+	if e.providerFactory != nil {
+		var err error
+		provider, err = e.providerFactory.BuildForDiagnosis(ctx, run)
+		if err != nil {
+			return nil, err
 		}
+	}
+	if provider == nil {
+		return nil, fmt.Errorf("no provider configured")
+	}
+
+	buildID := run.CodeIndexBuildID
+	if e.ciStore != nil && ((run.CodeIndexBuildID == 0) != (run.RetrievalBuildID == 0)) {
+		return nil, fmt.Errorf("incomplete pinned build lineage")
 	}
 
 	// Register 5 Read-Only Tools (Section 32 of Master Spec)
-	searchTool := tools.NewSearchCodeTool(e.retriever, run.SnapshotID)
+	searchTool := tools.NewPinnedSearchCodeTool(e.retriever, run.SnapshotID, run.CodeIndexBuildID, run.RetrievalBuildID)
+	if run.CodeIndexBuildID == 0 && run.RetrievalBuildID == 0 {
+		searchTool = tools.NewSearchCodeTool(e.retriever, run.SnapshotID)
+	}
 	getSymbolTool := tools.NewGetSymbolTool(e.ciStore, buildID)
 	findRefTool := tools.NewFindReferencesTool(e.ciStore, buildID)
 	findTestTool := tools.NewFindRelatedTestsTool(e.ciStore, buildID)
@@ -83,7 +103,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	registry.Register(findTestTool)
 	registry.Register(readFileTool)
 
-	loop := NewAgentLoop(e.provider, registry, e.traceStore, e.guardCfg)
+	loop := NewAgentLoop(provider, registry, e.traceStore, e.guardCfg)
 	res, err := loop.Run(ctx, run, attempt)
 	if err != nil {
 		return nil, fmt.Errorf("agent loop execution failed: %w", err)

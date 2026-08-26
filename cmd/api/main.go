@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -51,8 +53,8 @@ func run() error {
 	}
 	defer db.Close()
 
-	if err := mysql.AutoMigrate(db.GormDB); err != nil {
-		return fmt.Errorf("failed to run database auto migrations: %w", err)
+	if err := mysql.ApplyMigrations(db, "migrations"); err != nil {
+		return fmt.Errorf("failed to run database migrations: %w", err)
 	}
 
 	storeFS := snapshotstore.NewLocalSnapshotStore(cfg.SnapshotBasePath)
@@ -69,14 +71,27 @@ func run() error {
 
 	// Services & Managers
 	repoSvc := repo.NewService(repoStore)
-	diagnosisSvc := diagnosis.NewService(diagnosisStore, repoStore, snapshotStore)
+	providerPath := cfg.ProviderSecretPath
+	if providerPath == "" {
+		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
+	}
 	providerMgr := provider.NewManager(
-		filepath.Join(cfg.SnapshotBasePath, "provider.json"),
-		cfg.LLMBaseURL,
-		cfg.LLMModel,
-		cfg.LLMAPIKey,
-		cfg.LLMProvider,
+		providerPath,
+		cfg.ProviderBaseURL,
+		cfg.ProviderModel,
+		cfg.ProviderAPIKey,
+		cfg.ProviderType,
 	)
+	diagnosisSvc := diagnosis.NewService(diagnosisStore, repoStore, snapshotStore).
+		WithCodeIntelStore(codeIntelStore)
+	diagnosisSvc.WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
+		status := providerMgr.GetPublicStatus()
+		return diagnosis.ProviderMetadata{
+			EndpointFingerprint: status.EndpointFingerprint, ConfigFingerprint: status.ConfigFingerprint,
+			NormalizedBaseURL: status.BaseURL, ModelName: status.Model,
+			PromptVersion: "v2.1", AgentVersion: "v2.1", AgentConfigHash: "v2.1-default", Temperature: 0.1,
+		}
+	})
 
 	// Handlers
 	repoHandler := repo.NewHandler(repoSvc, snapshotStore, indexStore, db.GormDB)
@@ -87,6 +102,7 @@ func run() error {
 		snapshotStore,
 		diagnosisStore,
 		reportStore,
+		citationStore,
 		traceStore,
 		storeFS,
 	)
@@ -98,6 +114,7 @@ func run() error {
 
 	router := gin.New()
 	router.Use(gin.Recovery())
+	router.Use(localSecurityMiddleware())
 
 	// Logging & RequestID Middleware with Metrics
 	router.Use(func(c *gin.Context) {
@@ -131,6 +148,10 @@ func run() error {
 		// System & Provider & Demo
 		v1.GET("/system/provider", providerHandler.GetStatus)
 		v1.POST("/system/provider", providerHandler.SaveConfig)
+		v1.GET("/settings/provider", providerHandler.GetStatus)
+		v1.PUT("/settings/provider", providerHandler.SaveConfig)
+		v1.DELETE("/settings/provider", providerHandler.ClearConfig)
+		v1.POST("/settings/provider/test", providerHandler.TestConnection)
 		v1.POST("/system/provider/test", providerHandler.TestConnection)
 		v1.POST("/demo/trigger", providerHandler.TriggerDemo)
 
@@ -226,4 +247,38 @@ func run() error {
 	}
 
 	return nil
+}
+
+func localSecurityMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		host := c.Request.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		host = strings.Trim(host, "[]")
+		allowedHost := host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "repolens-api"
+		if !allowedHost {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid host"})
+			return
+		}
+		if origin := c.GetHeader("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			originHost := ""
+			if err == nil {
+				originHost = u.Hostname()
+			}
+			if err != nil || (originHost != "localhost" && originHost != "127.0.0.1" && originHost != "::1") {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "origin is not allowed"})
+				return
+			}
+		}
+		if c.Request.Method == http.MethodPost || c.Request.Method == http.MethodPut || c.Request.Method == http.MethodPatch || c.Request.Method == http.MethodDelete {
+			contentType := strings.ToLower(strings.TrimSpace(strings.Split(c.GetHeader("Content-Type"), ";")[0]))
+			if contentType != "application/json" {
+				c.AbortWithStatusJSON(http.StatusUnsupportedMediaType, gin.H{"error": "state-changing requests require application/json"})
+				return
+			}
+		}
+		c.Next()
+	}
 }

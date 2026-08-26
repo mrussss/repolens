@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/retrieval/artifact"
 	"repolens/internal/retrieval/bm25"
@@ -35,15 +36,26 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 		return nil, fmt.Errorf("snapshot_id is required for retrieval")
 	}
 
-	// 1. Resolve CodeIndexBuild and RetrievalBuild for this snapshot
-	cib, err := r.ciStore.GetBySnapshot(ctx, req.SnapshotID)
-	if err != nil {
-		return nil, fmt.Errorf("code index build not found for snapshot %s: %w", req.SnapshotID, err)
+	// Production requests must carry the identities captured by Diagnosis.
+	var cib *codeintelmodel.CodeIndexBuild
+	var rb *codeintelmodel.RetrievalBuild
+	if req.CodeIndexBuildID <= 0 || req.RetrievalBuildID <= 0 {
+		return nil, fmt.Errorf("both code_index_build_id and retrieval_build_id are required")
 	}
-
-	rb, err := r.ciStore.GetRetrievalBuildByCodeIndexBuild(ctx, cib.ID)
+	var err error
+	cib, err = r.ciStore.GetByID(ctx, req.CodeIndexBuildID)
 	if err != nil {
-		return nil, fmt.Errorf("retrieval build not found for code index build %d: %w", cib.ID, err)
+		return nil, fmt.Errorf("pinned code index build not found: %w", err)
+	}
+	rb, err = r.ciStore.GetRetrievalBuildByID(ctx, req.RetrievalBuildID)
+	if err != nil {
+		return nil, fmt.Errorf("pinned retrieval build not found: %w", err)
+	}
+	if cib.Status != codeintelmodel.BuildStatusReady || rb.Status != codeintelmodel.BuildStatusReady || rb.CodeIndexBuildID != cib.ID {
+		return nil, fmt.Errorf("pinned retrieval lineage is not READY or does not match")
+	}
+	if cib.SnapshotID != req.SnapshotID {
+		return nil, fmt.Errorf("pinned code index build belongs to snapshot %s, not %s", cib.SnapshotID, req.SnapshotID)
 	}
 
 	// 2. Load BM25 Index (with in-memory caching)
@@ -56,7 +68,7 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 		if artifactPath == "" {
 			artifactPath = filepath.Join(r.baseStorageDir, fmt.Sprintf("%d", rb.ID))
 		}
-		loaded, loadErr := artifact.LoadIndex(artifactPath)
+		loaded, loadErr := artifact.LoadIndexVerified(artifactPath, rb.ID, rb.ArtifactHash)
 		if loadErr != nil {
 			return nil, fmt.Errorf("failed loading retrieval artifact from %s: %w", artifactPath, loadErr)
 		}

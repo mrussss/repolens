@@ -16,11 +16,11 @@ import (
 	"repolens/internal/evidence"
 	"repolens/internal/indexing"
 	"repolens/internal/jobs"
-	"repolens/internal/llm"
 	"repolens/internal/platform/config"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/provider"
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
 	"repolens/internal/retrieval"
@@ -49,8 +49,8 @@ func run() error {
 	}
 	defer db.Close()
 
-	if err := mysql.AutoMigrate(db.GormDB); err != nil {
-		return fmt.Errorf("failed to run database auto migrations: %w", err)
+	if err := mysql.ApplyMigrations(db, "migrations"); err != nil {
+		return fmt.Errorf("failed to run database migrations: %w", err)
 	}
 
 	storeFS := snapshotstore.NewLocalSnapshotStore(cfg.SnapshotBasePath)
@@ -64,28 +64,11 @@ func run() error {
 	traceStore := trace.NewStore(db.GormDB)
 	citationVal := evidence.NewCitationValidator(storeFS)
 
-	// LLM Provider Validation
-	var provider llm.Provider
-	switch cfg.LLMProvider {
-	case "openai":
-		if cfg.LLMAPIKey == "" {
-			if cfg.Env == "production" {
-				return fmt.Errorf("LLM_API_KEY is required for openai LLM provider in production mode")
-			}
-			log.Warn("LLM_API_KEY is empty for openai provider, falling back to fake provider in non-production mode")
-			provider = llm.NewFakeProvider(llm.ModeNormalStructured)
-		} else {
-			provider = llm.NewOpenAICompatibleProvider(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel)
-		}
-	case "fake":
-		if cfg.Env == "production" {
-			return fmt.Errorf("LLM_PROVIDER=fake is strictly forbidden in production mode")
-		}
-		log.Warn("using fake LLM provider for development / testing mode")
-		provider = llm.NewFakeProvider(llm.ModeNormalStructured)
-	default:
-		return fmt.Errorf("unsupported LLM_PROVIDER: %q (supported: 'openai', 'fake')", cfg.LLMProvider)
+	providerPath := cfg.ProviderSecretPath
+	if providerPath == "" {
+		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
 	}
+	providerMgr := provider.NewManager(providerPath, cfg.ProviderBaseURL, cfg.ProviderModel, cfg.ProviderAPIKey, cfg.ProviderType)
 
 	// Pure Go Production Retrieval (BM25 + Structural Code Intelligence)
 	indexStorageDir := filepath.Join(cfg.SnapshotBasePath, "indexes")
@@ -95,8 +78,8 @@ func run() error {
 	filter := indexing.NewFileFilter(cfg.MaxFileSizeKB)
 	chunker := indexing.NewCodeChunker(60, 10)
 
-	agentExecutor := agent.NewAgentRuntimeExecutor(
-		provider,
+	agentExecutor := agent.NewAgentRuntimeExecutorWithFactory(
+		providerMgr,
 		activeRetriever,
 		storeFS,
 		traceStore,

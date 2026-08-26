@@ -10,8 +10,14 @@ import (
 )
 
 type SearchCodeTool struct {
-	retriever  retrieval.Retriever
-	snapshotID string
+	retriever        retrieval.Retriever
+	snapshotID       string
+	codeIndexBuildID int64
+	retrievalBuildID int64
+}
+
+func NewPinnedSearchCodeTool(retriever retrieval.Retriever, snapshotID string, codeIndexBuildID, retrievalBuildID int64) *SearchCodeTool {
+	return &SearchCodeTool{retriever: retriever, snapshotID: snapshotID, codeIndexBuildID: codeIndexBuildID, retrievalBuildID: retrievalBuildID}
 }
 
 func NewSearchCodeTool(retriever retrieval.Retriever, snapshotID string) *SearchCodeTool {
@@ -70,9 +76,8 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 	}
 
 	results, err := t.retriever.Search(ctx, retrieval.SearchRequest{
-		SnapshotID: t.snapshotID,
-		Query:      args.Query,
-		TopK:       topK,
+		SnapshotID: t.snapshotID, CodeIndexBuildID: t.codeIndexBuildID,
+		RetrievalBuildID: t.retrievalBuildID, Query: args.Query, TopK: topK,
 	})
 	if err != nil {
 		return "", fmt.Errorf("retrieval failed: %w", err)

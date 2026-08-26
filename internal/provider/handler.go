@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -25,6 +27,7 @@ type Handler struct {
 	snapshotStore  snapshot.Store
 	diagnosisStore diagnosis.Store
 	reportStore    evidence.ReportStore
+	citationStore  evidence.CitationStore
 	traceStore     trace.Store
 	storeFS        snapshotstore.SnapshotStore
 }
@@ -36,6 +39,7 @@ func NewHandler(
 	snapshotStore snapshot.Store,
 	diagnosisStore diagnosis.Store,
 	reportStore evidence.ReportStore,
+	citationStore evidence.CitationStore,
 	traceStore trace.Store,
 	storeFS snapshotstore.SnapshotStore,
 ) *Handler {
@@ -45,6 +49,7 @@ func NewHandler(
 		snapshotStore:  snapshotStore,
 		diagnosisStore: diagnosisStore,
 		reportStore:    reportStore,
+		citationStore:  citationStore,
 		traceStore:     traceStore,
 		storeFS:        storeFS,
 	}
@@ -70,7 +75,24 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 		return
 	}
 
-	if err := h.mgr.SaveConfig(req.BaseURL, req.Model, req.APIKey, false); err != nil {
+	newBase, err := NormalizeBaseURL(req.BaseURL)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	current := h.mgr.GetPublicStatus()
+	if current.EndpointFingerprint != "" && ComputeEndpointFingerprint(newBase) != current.EndpointFingerprint {
+		userID := c.GetString("user_id")
+		if runs, _, listErr := h.diagnosisStore.ListByUser(c.Request.Context(), userID, 1, 100); listErr == nil {
+			for _, run := range runs {
+				if run.Status == diagnosis.StatusQueued || run.Status == diagnosis.StatusRunning {
+					c.JSON(http.StatusConflict, gin.H{"error": "PROVIDER_ENDPOINT_IN_USE"})
+					return
+				}
+			}
+		}
+	}
+	if err := h.mgr.SaveConfig(newBase, req.Model, req.APIKey, false); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -79,6 +101,14 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 		"message": "provider configuration saved successfully",
 		"status":  h.mgr.GetPublicStatus(),
 	})
+}
+
+func (h *Handler) ClearConfig(c *gin.Context) {
+	if err := h.mgr.ClearConfig(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "provider configuration cleared", "status": h.mgr.GetPublicStatus()})
 }
 
 type TestConnectionRequest struct {
@@ -115,6 +145,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 // TriggerDemo creates a deterministic bundled demo repository, snapshot, and diagnosis run.
 func (h *Handler) TriggerDemo(c *gin.Context) {
 	ctx := c.Request.Context()
+	userID := c.GetString("user_id")
+	if userID == "" {
+		userID = "local-user"
+	}
 
 	// 1. Ensure Demo Repository
 	demoRepoID := "repo-demo-order-svc"
@@ -122,13 +156,18 @@ func (h *Handler) TriggerDemo(c *gin.Context) {
 	if existingRepo == nil {
 		demoRepo := &repo.Repository{
 			ID:         demoRepoID,
-			UserID:     "demo-user",
+			UserID:     userID,
 			Name:       "order-service (Demo)",
 			GitURL:     "https://github.com/repolens/demo-order-service",
 			DefaultRef: "main",
 			Status:     "ACTIVE",
 		}
 		_ = h.repoStore.Create(ctx, demoRepo)
+	} else if existingRepo.UserID != userID {
+		// The demo repository is a local singleton; keep it visible to the
+		// current local user even when an older v1 database used demo-user.
+		existingRepo.UserID = userID
+		_ = h.repoStore.Update(ctx, existingRepo)
 	}
 
 	// 2. Ensure Demo Snapshot files
@@ -172,13 +211,18 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 	now := time.Now().UTC()
 	existingSnap, _ := h.snapshotStore.GetByID(ctx, demoSnapID)
 	if existingSnap == nil {
+		mainBytes, _ := os.ReadFile(mainFile)
+		contentSum := sha256.Sum256(mainBytes)
 		demoSnap := &snapshot.RepositorySnapshot{
 			ID:               demoSnapID,
 			RepositoryID:     demoRepoID,
-			CommitSHA:        "e4d3c2b1a09876543210",
+			CommitSHA:        "e4d3c2b1a09876543210fedcba98765432100123",
 			Ref:              "main",
 			MaterializedPath: demoDir,
 			Status:           snapshot.StatusReady,
+			ContentHash:      hex.EncodeToString(contentSum[:]),
+			FileCount:        1,
+			TotalBytes:       int64(len(mainBytes)),
 			ReadyAt:          &now,
 		}
 		_ = h.snapshotStore.Create(ctx, demoSnap)
@@ -188,7 +232,7 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 	runID := "diag-demo-" + uuid.New().String()[:8]
 	demoRun := &diagnosis.DiagnosisRun{
 		ID:                     runID,
-		UserID:                 "demo-user",
+		UserID:                 userID,
 		RepositoryID:           demoRepoID,
 		SnapshotID:             demoSnapID,
 		IssueTitle:             "[Demo] Order submission worker deadlock under load",
@@ -237,6 +281,15 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 		CreatedAt:  now,
 	}
 	_ = h.reportStore.Create(ctx, demoReport)
+	if h.citationStore != nil {
+		demoCitation := evidence.Citation{
+			ID: uuid.New().String(), ReportID: demoReport.ID, SnapshotID: demoSnapID,
+			FilePath: "main.go", StartLine: 19, EndLine: 29, Reason: "Unbuffered channel initialization and blocking write",
+			CreatedAt: now,
+		}
+		evidence.NewCitationValidator(h.storeFS).Validate(ctx, demoRepoID, demoSnapID, &demoCitation)
+		_ = h.citationStore.CreateBatch(ctx, []evidence.Citation{demoCitation})
+	}
 
 	// Add Trace Steps
 	_ = h.traceStore.Create(ctx, &trace.AgentStep{

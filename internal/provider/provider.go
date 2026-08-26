@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"repolens/internal/diagnosis"
+	"repolens/internal/jobs"
 	"repolens/internal/llm"
 )
 
@@ -99,6 +101,37 @@ type Manager struct {
 	envAPIKey      string
 	envProvider    string
 	mu             sync.RWMutex
+}
+
+// BuildForDiagnosis loads the current secret for every execution while using
+// the identity pinned on the DiagnosisRun. This permits API-key rotation but
+// prevents a queued diagnosis from silently changing endpoint or model.
+func (m *Manager) BuildForDiagnosis(ctx context.Context, run *diagnosis.DiagnosisRun) (llm.Provider, error) {
+	cfg, err := m.GetSecretConfig()
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := NormalizeBaseURL(cfg.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid current provider endpoint: %w", err)
+	}
+	if run.ProviderEndpointFingerprint != "" && ComputeEndpointFingerprint(normalized) != run.ProviderEndpointFingerprint {
+		return nil, jobs.NewPermanentError("PROVIDER_ENDPOINT_MISMATCH", "current provider endpoint differs from diagnosis pin", nil)
+	}
+	modelName := strings.TrimSpace(cfg.Model)
+	if run.ModelName != "" && modelName != run.ModelName {
+		return nil, jobs.NewPermanentError("PROVIDER_CONFIG_MISMATCH", "current provider model differs from diagnosis pin", nil)
+	}
+	if run.ModelName != "" {
+		modelName = run.ModelName
+	}
+	if run.ProviderConfigFingerprint != "" && ComputeConfigFingerprint(normalized, modelName) != run.ProviderConfigFingerprint {
+		return nil, jobs.NewPermanentError("PROVIDER_CONFIG_MISMATCH", "current provider model differs from diagnosis pin", nil)
+	}
+	if cfg.IsDemo || m.envProvider == "fake" && normalized == "http://localhost/fake" {
+		return llm.NewFakeProvider(llm.ModeNormalStructured), nil
+	}
+	return llm.NewOpenAICompatibleProvider(cfg.APIKey, normalized, modelName), nil
 }
 
 // NewManager creates a new Manager instance.
@@ -242,6 +275,17 @@ func (m *Manager) SaveConfig(baseURL, model, apiKey string, isDemo bool) error {
 		return fmt.Errorf("failed committing secret file atomically: %w", err)
 	}
 
+	return nil
+}
+
+// ClearConfig removes the locally persisted credential without touching env
+// fallback values. The file is deliberately not read back into any response.
+func (m *Manager) ClearConfig() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := os.Remove(m.secretFilePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return nil
 }
 

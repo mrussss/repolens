@@ -269,6 +269,7 @@ func TestMilestone6_PureGoBM25AndStructuralProductionRetriever(t *testing.T) {
 	})
 
 	cib, _, _ := ciStore.GetOrCreateBuild(ctx, snapID, "example.com/m6", codeintelmodel.DefaultBuildContext())
+	_ = ciStore.MarkBuildBuilding(ctx, cib.ID)
 	_ = ciStore.SaveAnalysisResult(ctx, cib.ID, &codeintelmodel.AnalysisResult{
 		ModulePath:   "example.com/m6",
 		BuildContext: codeintelmodel.DefaultBuildContext(),
@@ -312,14 +313,14 @@ func TestMilestone6_PureGoBM25AndStructuralProductionRetriever(t *testing.T) {
 	pub := artifact.NewPublisher(tempBase)
 	rb, _, _ := ciStore.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
 	finalPath, hash, _ := pub.Publish(rb.ID, "tok", "BM25", idx)
+	_ = ciStore.MarkRetrievalBuilding(ctx, rb.ID)
 	_ = ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, hash, 1)
 
 	// Search via ProductionRetriever
 	prodRetriever := retrieval.NewProductionRetriever(ciStore, tempBase)
 	results, err := prodRetriever.Search(ctx, retrieval.SearchRequest{
-		SnapshotID: snapID,
-		Query:      "GenerateToken",
-		TopK:       5,
+		SnapshotID: snapID, CodeIndexBuildID: cib.ID, RetrievalBuildID: rb.ID,
+		Query: "GenerateToken", TopK: 5,
 	})
 	if err != nil {
 		t.Fatalf("retrieval failed: %v", err)

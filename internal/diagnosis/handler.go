@@ -35,6 +35,8 @@ type CreateDiagnosisRequest struct {
 	IssueDescription string `json:"issue_description"`
 	ErrorLog         string `json:"error_log"`
 	IdempotencyKey   string `json:"idempotency_key"`
+	CodeIndexBuildID int64  `json:"code_index_build_id"`
+	RetrievalBuildID int64  `json:"retrieval_build_id"`
 }
 
 func (h *Handler) Create(c *gin.Context) {
@@ -58,6 +60,8 @@ func (h *Handler) Create(c *gin.Context) {
 		IssueDescription: req.IssueDescription,
 		ErrorLog:         req.ErrorLog,
 		IdempotencyKey:   idempKey,
+		CodeIndexBuildID: req.CodeIndexBuildID,
+		RetrievalBuildID: req.RetrievalBuildID,
 	}
 
 	run, created, err := h.svc.Create(c.Request.Context(), input)

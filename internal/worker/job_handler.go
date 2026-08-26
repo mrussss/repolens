@@ -64,6 +64,10 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		DiagnosisRunID: run.ID,
 		AttemptNo:      job.AttemptCount,
 		WorkerID:       workerID,
+		Status:         diagnosis.AttemptStatusRunning,
+		StartedAt:      time.Now().UTC(),
+		HeartbeatAt:    time.Now().UTC(),
+		DeadlineAt:     time.Now().UTC().Add(30 * time.Minute),
 	}
 
 	if run.CancelRequested || job.CancelRequested {
@@ -72,8 +76,18 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
 	}
 
-	// Update status to RUNNING
-	_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusRunning, diagnosis.AttemptStatusRunning, 0, 0, 0, "", "", false, 0)
+	if starter, ok := h.diagnosisStore.(interface {
+		StartAttempt(context.Context, string, *diagnosis.DiagnosisAttempt) error
+	}); ok {
+		if err := starter.StartAttempt(ctx, run.ID, attempt); err != nil {
+			return jobs.NewRetryableError("START_ATTEMPT_FAILED", err.Error(), err)
+		}
+	} else {
+		// Compatibility path for lightweight unit stores.
+		if err := h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusRunning, diagnosis.AttemptStatusRunning, 0, 0, 0, "", "", false, 0); err != nil {
+			return jobs.NewRetryableError("START_ATTEMPT_FAILED", err.Error(), err)
+		}
+	}
 
 	result, execErr := h.executor.Execute(ctx, run, attempt)
 	if execErr != nil {
@@ -87,7 +101,9 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			newRunStatus = diagnosis.StatusFailed
 			newAttemptStatus = diagnosis.AttemptStatusFailedTerminal
 		} else {
-			newRunStatus = diagnosis.StatusRetryWait
+			// Retry belongs to AnalysisJob. Diagnosis remains RUNNING while
+			// the job is in RETRY_WAIT.
+			newRunStatus = diagnosis.StatusRunning
 			newAttemptStatus = diagnosis.AttemptStatusFailedRetryable
 		}
 
@@ -97,6 +113,11 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			!isTerminal, 5*time.Second,
 		)
 		return execErr
+	}
+	if result == nil || result.Report == nil {
+		err := jobs.NewRetryableError("EMPTY_AGENT_OUTPUT", "agent did not return a structured diagnosis report", nil)
+		h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
+		return err
 	}
 
 	// Process Report & Citations
@@ -114,15 +135,12 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			Confidence:            result.Report.Confidence,
 			CreatedAt:             time.Now().UTC(),
 		}
-		if err := h.reportStore.Create(ctx, rep); err != nil {
-			log.Error("failed saving report", "error", err)
-		}
-
 		var allCitations []evidence.Citation
 		for _, f := range result.Report.Findings {
 			for _, cit := range f.Citations {
 				cit.ReportID = rep.ID
 				cit.SnapshotID = run.SnapshotID
+				cit.CodeIndexBuildID = run.CodeIndexBuildID
 				cit.CreatedAt = time.Now().UTC()
 				if h.citationVal != nil {
 					h.citationVal.Validate(ctx, run.RepositoryID, run.SnapshotID, &cit)
@@ -130,10 +148,34 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				allCitations = append(allCitations, cit)
 			}
 		}
-		if len(allCitations) > 0 {
-			if err := h.citationStore.CreateBatch(ctx, allCitations); err != nil {
-				log.Error("failed saving citations", "error", err)
+
+		promptTokens := 0
+		completionTokens := 0
+		toolCalls := 0
+		if result != nil {
+			promptTokens, completionTokens, toolCalls = result.PromptTokens, result.CompletionTokens, result.ToolCalls
+		}
+		if finalizer, ok := h.diagnosisStore.(interface {
+			FinalizeSuccess(context.Context, int64, string, string, string, string, *evidence.Report, []evidence.Citation, int, int, int) error
+		}); ok {
+			if job.ClaimToken == nil || job.WorkerID == nil {
+				return jobs.ErrOwnershipLost
 			}
+			if err := finalizer.FinalizeSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID, rep, allCitations, promptTokens, completionTokens, toolCalls); err != nil {
+				h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
+				return jobs.NewRetryableError("ATOMIC_FINALIZE_FAILED", err.Error(), err)
+			}
+			log.Info("diagnosis job completed successfully")
+			return nil
+		}
+		// Compatibility fallback for non-SQL test stores.
+		if err := h.reportStore.Create(ctx, rep); err != nil {
+			h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
+			return jobs.NewRetryableError("REPORT_PERSIST_FAILED", err.Error(), err)
+		}
+		if err := h.citationStore.CreateBatch(ctx, allCitations); err != nil {
+			h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
+			return jobs.NewRetryableError("CITATION_PERSIST_FAILED", err.Error(), err)
 		}
 	}
 
@@ -158,4 +200,15 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	log.Info("diagnosis job completed successfully")
 	return nil
+}
+
+func (h *DiagnosisJobHandler) failDiagnosisIfTerminal(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, err error) {
+	if job == nil || job.AttemptCount < job.MaxAttempts {
+		return
+	}
+	class, code := jobs.ClassifyError(err)
+	if class == jobs.ErrorClassOwnershipLost {
+		return
+	}
+	_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, code, err.Error(), false, 0)
 }

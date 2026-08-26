@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"repolens/internal/evidence"
 	"repolens/internal/jobs"
 )
 
@@ -39,6 +40,111 @@ type Store interface {
 
 type GormStore struct {
 	db *gorm.DB
+}
+
+// StartAttempt records the business transition and attempt row before an
+// executor is called. It is deliberately separate from AnalysisJob claiming;
+// the job store owns execution leases while this store owns diagnosis state.
+func (s *GormStore) StartAttempt(ctx context.Context, runID string, attempt *DiagnosisAttempt) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var run DiagnosisRun
+		if err := tx.First(&run, "id = ?", runID).Error; err != nil {
+			return err
+		}
+		if run.Status == StatusQueued {
+			res := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ?", runID, StatusQueued).
+				Updates(map[string]interface{}{"status": StatusRunning, "version": gorm.Expr("version + 1")})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return ErrClaimConflict
+			}
+		} else if run.Status != StatusRunning {
+			return fmt.Errorf("diagnosis %s cannot start from %s", runID, run.Status)
+		}
+		if err := tx.Where("id = ?", attempt.ID).First(&DiagnosisAttempt{}).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+			if attempt.StartedAt.IsZero() {
+				attempt.StartedAt = time.Now().UTC()
+			}
+			if attempt.HeartbeatAt.IsZero() {
+				attempt.HeartbeatAt = attempt.StartedAt
+			}
+			if attempt.DeadlineAt.IsZero() {
+				attempt.DeadlineAt = attempt.StartedAt.Add(30 * time.Minute)
+			}
+			attempt.Status = AttemptStatusRunning
+			return tx.Create(attempt).Error
+		} else {
+			return err
+		}
+	})
+}
+
+// FinalizeSuccess atomically persists report/citations, closes the attempt and
+// diagnosis, and fences the AnalysisJob by worker and claim token.
+func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, citations []evidence.Citation, promptTokens, completionTokens, toolCalls int) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job jobs.AnalysisJob
+		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return jobs.ErrOwnershipLost
+			}
+			return err
+		}
+		if report == nil {
+			return errors.New("diagnosis report is required")
+		}
+		var run DiagnosisRun
+		if err := tx.First(&run, "id = ? AND status = ?", runID, StatusRunning).Error; err != nil {
+			return err
+		}
+		if report.DiagnosisRunID != runID || report.AttemptID != attemptID {
+			return errors.New("report lineage does not match diagnosis attempt")
+		}
+		for _, citation := range citations {
+			if citation.SnapshotID != run.SnapshotID || (run.CodeIndexBuildID > 0 && citation.CodeIndexBuildID != run.CodeIndexBuildID) {
+				return errors.New("citation lineage does not match diagnosis snapshot/build")
+			}
+		}
+		if err := tx.Create(report).Error; err != nil {
+			return fmt.Errorf("persist report: %w", err)
+		}
+		for i := range citations {
+			if citations[i].ID == "" {
+				citations[i].ID = uuid.New().String()
+			}
+			if err := tx.Create(&citations[i]).Error; err != nil {
+				return fmt.Errorf("persist citation: %w", err)
+			}
+		}
+		now := time.Now().UTC()
+		attRes := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).
+			Updates(map[string]interface{}{"status": AttemptStatusSucceeded, "finished_at": now, "prompt_tokens": promptTokens, "completion_tokens": completionTokens, "tool_calls": toolCalls})
+		if attRes.Error != nil {
+			return attRes.Error
+		}
+		if attRes.RowsAffected != 1 {
+			return fmt.Errorf("attempt %s finalize conflict", attemptID)
+		}
+		runRes := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ?", runID, StatusRunning).
+			Updates(map[string]interface{}{"status": StatusSucceeded, "final_attempt_id": attemptID, "version": gorm.Expr("version + 1")})
+		if runRes.Error != nil {
+			return runRes.Error
+		}
+		if runRes.RowsAffected != 1 {
+			return fmt.Errorf("diagnosis %s finalize conflict", runID)
+		}
+		jobRes := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).
+			Updates(map[string]interface{}{"status": jobs.StatusSucceeded, "finished_at": now, "updated_at": now})
+		if jobRes.Error != nil {
+			return jobRes.Error
+		}
+		if jobRes.RowsAffected != 1 {
+			return jobs.ErrOwnershipLost
+		}
+		return nil
+	})
 }
 
 func NewStore(db *gorm.DB) *GormStore {
@@ -287,7 +393,7 @@ func (s *GormStore) RequestCancellation(ctx context.Context, runID, userID strin
 			return fmt.Errorf("cannot cancel run in terminal status %s", run.Status)
 		}
 
-		nextStatus := StatusCancelRequested
+		nextStatus := run.Status
 		if run.Status == StatusQueued {
 			// If still queued, can transition directly to CANCELLED
 			nextStatus = StatusCancelled
@@ -359,11 +465,11 @@ func (s *GormStore) RecoverStaleAttempt(ctx context.Context, attemptID, runID st
 			return nil
 		}
 
-		// Transition Run to RETRY_WAIT
+		// Retry is represented only by AnalysisJob. The business diagnosis
+		// remains RUNNING and is resumed by the next job claim.
 		resRun := tx.Model(&DiagnosisRun{}).
 			Where("id = ? AND status = ?", runID, StatusRunning).
 			Updates(map[string]interface{}{
-				"status":  StatusRetryWait,
 				"version": gorm.Expr("version + 1"),
 			})
 		if resRun.Error != nil {
