@@ -16,7 +16,6 @@ import (
 	"repolens/internal/llm"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/metrics"
-	"repolens/internal/sse"
 	"repolens/internal/trace"
 )
 
@@ -65,7 +64,6 @@ type AgentLoop struct {
 	provider   llm.Provider
 	registry   *ToolRegistry
 	traceStore trace.Store
-	sseHub     *sse.Hub
 	guardCfg   GuardConfig
 }
 
@@ -73,14 +71,12 @@ func NewAgentLoop(
 	provider llm.Provider,
 	registry *ToolRegistry,
 	traceStore trace.Store,
-	sseHub *sse.Hub,
 	guardCfg GuardConfig,
 ) *AgentLoop {
 	return &AgentLoop{
 		provider:   provider,
 		registry:   registry,
 		traceStore: traceStore,
-		sseHub:     sseHub,
 		guardCfg:   guardCfg,
 	}
 }
@@ -148,10 +144,6 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 				// Record tool call step
 				_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolCall, tc.Function.Name, tc.Function.Arguments, "", "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "")
-				l.publishSSE(run.ID, "tool.called", map[string]interface{}{
-					"tool_name": tc.Function.Name,
-					"arguments": tc.Function.Arguments,
-				})
 
 				// Execute tool
 				t, err := l.registry.Get(tc.Function.Name)
@@ -172,10 +164,6 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 					seq++
 					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolResult, tc.Function.Name, "", toolResult, "COMPLETED", toolExecLatency, 0, 0, "")
-					l.publishSSE(run.ID, "tool.completed", map[string]interface{}{
-						"tool_name":  tc.Function.Name,
-						"result_len": len(toolResult),
-					})
 				}
 
 				messages = append(messages, llm.Message{
@@ -232,16 +220,6 @@ func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, s
 		CreatedAt:         time.Now(),
 	}
 	return l.traceStore.Create(ctx, step)
-}
-
-func (l *AgentLoop) publishSSE(runID, eventType string, data interface{}) {
-	if l.sseHub != nil {
-		l.sseHub.Publish(runID, sse.Event{
-			Type:      eventType,
-			Timestamp: time.Now(),
-			Data:      data,
-		})
-	}
 }
 
 var jsonExtractorRegex = regexp.MustCompile(`(?s)\{.*\}`)

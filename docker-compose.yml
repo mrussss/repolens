@@ -20,24 +20,6 @@ services:
       timeout: 5s
       retries: 10
 
-  rabbitmq:
-    image: rabbitmq:3.12-management
-    container_name: repolens-rabbitmq
-    restart: unless-stopped
-    environment:
-      RABBITMQ_DEFAULT_USER: repolens
-      RABBITMQ_DEFAULT_PASS: repolens_mq_pass
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   elasticsearch:
     image: elasticsearch:8.13.0
     container_name: repolens-elasticsearch
@@ -68,11 +50,9 @@ services:
       - HTTP_PORT=8080
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
-      - RABBITMQ_URL=amqp://repolens:repolens_mq_pass@rabbitmq:5672/
       - SNAPSHOT_BASE_PATH=/data/repositories
       - ES_URL=http://elasticsearch:9200
       - ES_INDEX_NAME=repolens_chunks
-      - JWT_SECRET=repolens-super-secret-jwt-key
       - LLM_PROVIDER=fake
     ports:
       - "8080:8080"
@@ -81,27 +61,7 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
       elasticsearch:
-        condition: service_healthy
-
-  relay:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: repolens-relay
-    command: ["/app/repolens-relay"]
-    restart: unless-stopped
-    environment:
-      - ENV=development
-      - DB_DRIVER=mysql
-      - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
-      - RABBITMQ_URL=amqp://repolens:repolens_mq_pass@rabbitmq:5672/
-    depends_on:
-      mysql:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
 
   worker:
@@ -115,7 +75,6 @@ services:
       - ENV=development
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
-      - RABBITMQ_URL=amqp://repolens:repolens_mq_pass@rabbitmq:5672/
       - SNAPSHOT_BASE_PATH=/data/repositories
       - ES_URL=http://elasticsearch:9200
       - ES_INDEX_NAME=repolens_chunks
@@ -125,13 +84,10 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
       elasticsearch:
         condition: service_healthy
 
 volumes:
   mysql_data:
-  rabbitmq_data:
   es_data:
   snapshot_data:

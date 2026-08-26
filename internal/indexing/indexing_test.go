@@ -2,19 +2,17 @@ package indexing_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"repolens/internal/indexing"
-	"repolens/internal/mq"
+	"repolens/internal/jobs"
 	"repolens/internal/platform/snapshotstore"
-	"repolens/internal/repoindex"
+	"repolens/internal/repo"
 	"repolens/internal/snapshot"
 )
 
@@ -155,32 +153,33 @@ func TestSnapshotStoreSecurityGuards(t *testing.T) {
 	}
 }
 
-type mockIndexStore struct {
-	repoindex.Store
-	mu         sync.Mutex
-	lastStatus repoindex.IndexStatus
-	lastErr    string
+type mockRepoStore struct {
+	repo.Store
 }
 
-func (m *mockIndexStore) UpdateStatus(ctx context.Context, id string, expectedOldStatus, newStatus repoindex.IndexStatus, readyAt *time.Time, chunkCount, docCount int, errCode string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.lastStatus = newStatus
-	m.lastErr = errCode
-	return nil
-}
-
-func (m *mockIndexStore) GetStatus() (repoindex.IndexStatus, string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.lastStatus, m.lastErr
+func (m *mockRepoStore) GetByID(ctx context.Context, id string) (*repo.Repository, error) {
+	return &repo.Repository{
+		ID:     id,
+		GitURL: "https://github.com/repolens/test-repo",
+	}, nil
 }
 
 type mockSnapshotStore struct {
 	snapshot.Store
+	lastStatus snapshot.SnapshotStatus
+}
+
+func (m *mockSnapshotStore) GetByID(ctx context.Context, id string) (*snapshot.RepositorySnapshot, error) {
+	return &snapshot.RepositorySnapshot{
+		ID:           id,
+		RepositoryID: "repo-fail-test",
+		Ref:          "main",
+		Status:       snapshot.StatusMaterializing,
+	}, nil
 }
 
 func (m *mockSnapshotStore) UpdateStatus(ctx context.Context, id string, oldStatus, newStatus snapshot.SnapshotStatus, readyAt *time.Time) error {
+	m.lastStatus = newStatus
 	return nil
 }
 
@@ -192,8 +191,8 @@ func (f *failingIndexWriter) IndexChunks(ctx context.Context, snapshotID string,
 	return f.err
 }
 
-func TestIndexWorker_PartialFailurePropagatesIndexFailed(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "repolens_index_worker_test")
+func TestSnapshotJobHandler_PartialFailurePropagatesError(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "repolens_snap_handler_test")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
@@ -209,60 +208,37 @@ func TestIndexWorker_PartialFailurePropagatesIndexFailed(t *testing.T) {
 	}
 	_ = os.WriteFile(filepath.Join(sourceDir, "main.go"), []byte("package main\nfunc Hello() {}\n"), 0644)
 
-	mockBroker := mq.NewMemoryBroker()
-	mockSnapStore := &mockSnapshotStore{}
-	mockIdxStore := &mockIndexStore{}
+	mockRepo := &mockRepoStore{}
+	mockSnap := &mockSnapshotStore{}
 	cloner := indexing.NewSafeGitCloner([]string{"github.com"}, 50, 1*time.Minute)
 	filter := indexing.NewFileFilter(512)
 	chunker := indexing.NewCodeChunker(5, 2)
-	partialErr := errors.New("elasticsearch bulk indexing partial failure (1 items failed): op=index id=chunk-1 status=400 type=mapper_parsing_exception reason=bad embedding")
+	partialErr := errors.New("elasticsearch bulk indexing partial failure: bad embedding")
 	failingWriter := &failingIndexWriter{err: partialErr}
 
-	worker := indexing.NewIndexWorker(
-		mockBroker,
-		mockSnapStore,
-		mockIdxStore,
+	handler := indexing.NewSnapshotJobHandler(
+		mockRepo,
+		mockSnap,
+		nil,
 		storeFS,
 		cloner,
 		filter,
 		chunker,
 		failingWriter,
-		1,
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		_ = worker.Start(ctx)
-	}()
-	time.Sleep(20 * time.Millisecond)
-
-	payloadJSON, _ := json.Marshal(indexing.IndexPayload{
-		RepositoryID: repoID,
-		SnapshotID:   snapID,
-		IndexID:      "index-fail-001",
-		GitURL:       "https://github.com/repolens/test-repo",
-		Ref:          "main",
-	})
-
-	err = mockBroker.Publish(ctx, mq.QueueIndexTask, mq.Message{
-		ID:        "msg-index-001",
-		EventType: "index.task",
-		Payload:   string(payloadJSON),
-	})
-	if err != nil {
-		t.Fatalf("failed to publish index task: %v", err)
+	ctx := context.Background()
+	job := &jobs.AnalysisJob{
+		ID:         1,
+		JobType:    jobs.JobTypeMaterializeSnapshot,
+		ResourceID: snapID,
 	}
 
-	// Give worker time to process
-	time.Sleep(100 * time.Millisecond)
-
-	status, errCode := mockIdxStore.GetStatus()
-	if status != repoindex.StatusIndexFailed {
-		t.Fatalf("expected index status to be INDEX_FAILED (%s), got: %s", repoindex.StatusIndexFailed, status)
+	execErr := handler.Execute(ctx, job)
+	if execErr == nil {
+		t.Fatalf("expected error from handler when indexWriter fails")
 	}
-	if !strings.Contains(errCode, "INDEX_WRITE_FAILED") || !strings.Contains(errCode, "partial failure") {
-		t.Fatalf("expected error message to record INDEX_WRITE_FAILED and partial failure, got: %s", errCode)
+	if !strings.Contains(execErr.Error(), "partial failure") {
+		t.Errorf("expected error message to contain partial failure, got: %v", execErr)
 	}
 }

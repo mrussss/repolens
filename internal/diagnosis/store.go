@@ -2,7 +2,6 @@ package diagnosis
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -11,7 +10,6 @@ import (
 	"gorm.io/gorm"
 
 	"repolens/internal/jobs"
-	"repolens/internal/outbox"
 )
 
 var (
@@ -23,7 +21,7 @@ var (
 )
 
 type Store interface {
-	CreateWithOutbox(ctx context.Context, run *DiagnosisRun, outboxEvent *outbox.OutboxEvent) error
+	Create(ctx context.Context, run *DiagnosisRun) error
 	GetByID(ctx context.Context, id string) (*DiagnosisRun, error)
 	GetByIDAndUser(ctx context.Context, id, userID string) (*DiagnosisRun, error)
 	GetByIdempotencyKey(ctx context.Context, userID, key string) (*DiagnosisRun, error)
@@ -47,7 +45,7 @@ func NewStore(db *gorm.DB) *GormStore {
 	return &GormStore{db: db}
 }
 
-func (s *GormStore) CreateWithOutbox(ctx context.Context, run *DiagnosisRun, outboxEvent *outbox.OutboxEvent) error {
+func (s *GormStore) Create(ctx context.Context, run *DiagnosisRun) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if run.ID == "" {
 			run.ID = uuid.New().String()
@@ -59,34 +57,7 @@ func (s *GormStore) CreateWithOutbox(ctx context.Context, run *DiagnosisRun, out
 			return err
 		}
 
-		if outboxEvent != nil {
-			if outboxEvent.ID == "" {
-				outboxEvent.ID = uuid.New().String()
-			}
-			outboxEvent.AggregateType = outbox.AggregateDiagnosisRun
-			outboxEvent.AggregateID = run.ID
-			outboxEvent.EventType = outbox.EventDiagnosisRequested
-			if outboxEvent.Payload == "" {
-				payload, _ := json.Marshal(map[string]interface{}{
-					"diagnosis_run_id": run.ID,
-					"repository_id":    run.RepositoryID,
-					"snapshot_id":      run.SnapshotID,
-					"user_id":          run.UserID,
-				})
-				outboxEvent.Payload = string(payload)
-			}
-			if outboxEvent.AvailableAt.IsZero() {
-				outboxEvent.AvailableAt = time.Now()
-			}
-			if outboxEvent.Status == "" {
-				outboxEvent.Status = outbox.StatusPending
-			}
-			if err := tx.Create(outboxEvent).Error; err != nil {
-				return err
-			}
-		}
-
-		// Also atomically insert analysis_job for DB-backed job execution
+		// Atomically insert analysis_job for DB-backed job execution
 		job := &jobs.AnalysisJob{
 			JobType:             jobs.JobTypeRunDiagnosis,
 			ResourceID:          run.ID,
@@ -298,27 +269,6 @@ func (s *GormStore) FinishAttemptAndRun(ctx context.Context, runID, attemptID st
 			return resRun.Error
 		}
 
-		// If retryable failure, create OutboxEvent for delayed retry
-		if newRunStatus == StatusRetryWait {
-			availableAt := now.Add(retryDelay)
-			payload, _ := json.Marshal(map[string]interface{}{
-				"diagnosis_run_id": runID,
-				"retry_count":      1,
-			})
-			evt := &outbox.OutboxEvent{
-				ID:            uuid.New().String(),
-				AggregateType: outbox.AggregateDiagnosisRun,
-				AggregateID:   runID,
-				EventType:     outbox.EventDiagnosisRetryRequested,
-				Payload:       string(payload),
-				Status:        outbox.StatusPending,
-				AvailableAt:   availableAt,
-			}
-			if err := tx.Create(evt).Error; err != nil {
-				return err
-			}
-		}
-
 		return nil
 	})
 }
@@ -420,21 +370,6 @@ func (s *GormStore) RecoverStaleAttempt(ctx context.Context, attemptID, runID st
 			return resRun.Error
 		}
 
-		// Create Outbox event for retry
-		availableAt := now.Add(backoff)
-		payload, _ := json.Marshal(map[string]interface{}{
-			"diagnosis_run_id": runID,
-			"recovery_reason":  "stale_attempt_recovered",
-		})
-		evt := &outbox.OutboxEvent{
-			ID:            uuid.New().String(),
-			AggregateType: outbox.AggregateDiagnosisRun,
-			AggregateID:   runID,
-			EventType:     outbox.EventDiagnosisRetryRequested,
-			Payload:       string(payload),
-			Status:        outbox.StatusPending,
-			AvailableAt:   availableAt,
-		}
-		return tx.Create(evt).Error
+		return nil
 	})
 }

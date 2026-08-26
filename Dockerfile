@@ -10,7 +10,6 @@ RUN GOPROXY=https://goproxy.cn,direct go mod download
 COPY . .
 
 RUN CGO_ENABLED=1 go build -o /bin/repolens-api ./cmd/api
-RUN CGO_ENABLED=1 go build -o /bin/repolens-relay ./cmd/relay
 RUN CGO_ENABLED=1 go build -o /bin/repolens-worker ./cmd/worker
 RUN CGO_ENABLED=1 go build -o /bin/repolens-eval ./cmd/eval
 
@@ -21,7 +20,6 @@ RUN apk add --no-cache ca-certificates git tzdata
 
 WORKDIR /app
 COPY --from=builder /bin/repolens-api /app/repolens-api
-COPY --from=builder /bin/repolens-relay /app/repolens-relay
 COPY --from=builder /bin/repolens-worker /app/repolens-worker
 COPY --from=builder /bin/repolens-eval /app/repolens-eval
 

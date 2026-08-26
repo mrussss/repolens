@@ -12,7 +12,6 @@ import (
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
-	"repolens/internal/sse"
 )
 
 // DiagnosisJobHandler implements jobs.Handler for RUN_DIAGNOSIS jobs.
@@ -22,7 +21,6 @@ type DiagnosisJobHandler struct {
 	citationStore  evidence.CitationStore
 	citationVal    *evidence.CitationValidator
 	executor       DiagnosisExecutor
-	sseHub         *sse.Hub
 }
 
 // NewDiagnosisJobHandler constructs a new DiagnosisJobHandler.
@@ -32,7 +30,6 @@ func NewDiagnosisJobHandler(
 	citationStore evidence.CitationStore,
 	citationVal *evidence.CitationValidator,
 	executor DiagnosisExecutor,
-	sseHub *sse.Hub,
 ) *DiagnosisJobHandler {
 	return &DiagnosisJobHandler{
 		diagnosisStore: diagnosisStore,
@@ -40,7 +37,6 @@ func NewDiagnosisJobHandler(
 		citationStore:  citationStore,
 		citationVal:    citationVal,
 		executor:       executor,
-		sseHub:         sseHub,
 	}
 }
 

@@ -4,7 +4,6 @@ all: build
 
 build:
 	go build -o bin/repolens-api ./cmd/api
-	go build -o bin/repolens-relay ./cmd/relay
 	go build -o bin/repolens-worker ./cmd/worker
 	go build -o bin/repolens-eval ./cmd/eval
 

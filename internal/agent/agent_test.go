@@ -72,7 +72,6 @@ func TestAgentLoopExecutionWithToolCalling(t *testing.T) {
 		fakeProvider,
 		registry,
 		traceStore,
-		nil,
 		agent.DefaultGuardConfig(),
 	)
 

@@ -7,7 +7,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"repolens/internal/outbox"
 	"repolens/internal/platform/metrics"
 	"repolens/internal/repo"
 	"repolens/internal/snapshot"
@@ -92,7 +91,6 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		return nil, false, fmt.Errorf("snapshot %s is not READY (current status: %s)", input.SnapshotID, snap.Status)
 	}
 
-	// Secret redaction
 	cleanDesc := RedactSecrets(input.IssueDescription)
 	cleanLog := RedactSecrets(input.ErrorLog)
 
@@ -110,8 +108,7 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		Version:                1,
 	}
 
-	outboxEvt := &outbox.OutboxEvent{}
-	if err := s.store.CreateWithOutbox(ctx, run, outboxEvt); err != nil {
+	if err := s.store.Create(ctx, run); err != nil {
 		return nil, false, fmt.Errorf("failed to create diagnosis run: %w", err)
 	}
 

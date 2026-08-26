@@ -13,10 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"repolens/internal/auth"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
-	"repolens/internal/outbox"
 	"repolens/internal/platform/config"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/metrics"
@@ -25,9 +23,7 @@ import (
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
 	"repolens/internal/snapshot"
-	"repolens/internal/sse"
 	"repolens/internal/trace"
-	"repolens/internal/user"
 )
 
 func main() {
@@ -54,33 +50,24 @@ func run() error {
 		return fmt.Errorf("failed to run database auto migrations: %w", err)
 	}
 
-	jwtManager := auth.NewJWTManager(cfg.JWTSecret, cfg.TokenTTL)
 	storeFS := snapshotstore.NewLocalSnapshotStore(cfg.SnapshotBasePath)
 	_ = storeFS
 
 	// Stores
-	userStore := user.NewStore(db.GormDB)
 	repoStore := repo.NewStore(db.GormDB)
 	snapshotStore := snapshot.NewStore(db.GormDB)
 	indexStore := repoindex.NewStore(db.GormDB)
-	outboxStore := outbox.NewStore(db.GormDB)
 	diagnosisStore := diagnosis.NewStore(db.GormDB)
 	reportStore := evidence.NewReportStore(db.GormDB)
 	citationStore := evidence.NewCitationStore(db.GormDB)
 	traceStore := trace.NewStore(db.GormDB)
 
 	// Services
-	userSvc := user.NewService(userStore)
 	repoSvc := repo.NewService(repoStore)
 	diagnosisSvc := diagnosis.NewService(diagnosisStore, repoStore, snapshotStore)
 
-	// SSE Hub & Handler
-	sseHub := sse.NewHub()
-	sseHandler := sse.NewHandler(sseHub, traceStore, diagnosisStore)
-
 	// Handlers
-	userHandler := user.NewHandler(userSvc, jwtManager)
-	repoHandler := repo.NewHandler(repoSvc, snapshotStore, indexStore, outboxStore, db.GormDB)
+	repoHandler := repo.NewHandler(repoSvc, snapshotStore, indexStore, db.GormDB)
 	diagnosisHandler := diagnosis.NewHandler(diagnosisSvc, reportStore, citationStore, traceStore)
 
 	if cfg.Env == "production" {
@@ -98,6 +85,8 @@ func run() error {
 		}
 		c.Set(string(logger.RequestIDKey), reqID)
 		c.Header("X-Request-ID", reqID)
+		// Default local user ID for single-tenant local runtime
+		c.Set(string(logger.UserIDKey), "local-user")
 		c.Next()
 
 		status := strconv.Itoa(c.Writer.Status())
@@ -114,33 +103,40 @@ func run() error {
 	})
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	// Public Auth routes
-	authGroup := router.Group("/auth")
+	// REST API (v1 / v2 compatible routes)
+	v1 := router.Group("/api/v1")
 	{
-		authGroup.POST("/register", userHandler.Register)
-		authGroup.POST("/login", userHandler.Login)
-	}
-
-	// Protected routes
-	api := router.Group("", auth.AuthMiddleware(jwtManager))
-	{
-		api.GET("/auth/me", userHandler.Me)
-
 		// Repositories & Indexing
-		api.POST("/repositories", repoHandler.Register)
-		api.GET("/repositories", repoHandler.List)
-		api.GET("/repositories/:id", repoHandler.Get)
-		api.POST("/repositories/:id/index", repoHandler.TriggerIndex)
+		v1.POST("/repositories", repoHandler.Register)
+		v1.GET("/repositories", repoHandler.List)
+		v1.GET("/repositories/:id", repoHandler.Get)
+		v1.POST("/repositories/:id/index", repoHandler.TriggerIndex)
 
 		// Diagnoses
-		api.POST("/diagnoses", diagnosisHandler.Create)
-		api.GET("/diagnoses", diagnosisHandler.List)
-		api.GET("/diagnoses/:id", diagnosisHandler.Get)
-		api.POST("/diagnoses/:id/cancel", diagnosisHandler.Cancel)
-		api.GET("/diagnoses/:id/attempts", diagnosisHandler.ListAttempts)
-		api.GET("/diagnoses/:id/report", diagnosisHandler.GetReport)
-		api.GET("/diagnoses/:id/steps", diagnosisHandler.GetSteps)
-		api.GET("/diagnoses/:id/stream", sseHandler.Stream)
+		v1.POST("/diagnoses", diagnosisHandler.Create)
+		v1.GET("/diagnoses", diagnosisHandler.List)
+		v1.GET("/diagnoses/:id", diagnosisHandler.Get)
+		v1.POST("/diagnoses/:id/cancel", diagnosisHandler.Cancel)
+		v1.GET("/diagnoses/:id/attempts", diagnosisHandler.ListAttempts)
+		v1.GET("/diagnoses/:id/report", diagnosisHandler.GetReport)
+		v1.GET("/diagnoses/:id/steps", diagnosisHandler.GetSteps)
+	}
+
+	// Legacy root routes alias for backward compatibility
+	root := router.Group("")
+	{
+		root.POST("/repositories", repoHandler.Register)
+		root.GET("/repositories", repoHandler.List)
+		root.GET("/repositories/:id", repoHandler.Get)
+		root.POST("/repositories/:id/index", repoHandler.TriggerIndex)
+
+		root.POST("/diagnoses", diagnosisHandler.Create)
+		root.GET("/diagnoses", diagnosisHandler.List)
+		root.GET("/diagnoses/:id", diagnosisHandler.Get)
+		root.POST("/diagnoses/:id/cancel", diagnosisHandler.Cancel)
+		root.GET("/diagnoses/:id/attempts", diagnosisHandler.ListAttempts)
+		root.GET("/diagnoses/:id/report", diagnosisHandler.GetReport)
+		root.GET("/diagnoses/:id/steps", diagnosisHandler.GetSteps)
 	}
 
 	srv := &http.Server{

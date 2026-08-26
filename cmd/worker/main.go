@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -15,16 +14,15 @@ import (
 	"repolens/internal/indexing"
 	"repolens/internal/jobs"
 	"repolens/internal/llm"
-	"repolens/internal/mq"
 	"repolens/internal/platform/config"
 	"repolens/internal/platform/elasticsearch"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/repo"
 	"repolens/internal/repoindex"
 	"repolens/internal/retrieval"
 	"repolens/internal/snapshot"
-	"repolens/internal/sse"
 	"repolens/internal/trace"
 	"repolens/internal/worker"
 )
@@ -41,7 +39,7 @@ func run() error {
 	logger.Init(cfg.Env)
 	log := logger.L(context.Background())
 
-	log.Info("starting RepoLens Worker daemon", "env", cfg.Env)
+	log.Info("starting RepoLens DB-backed Analysis Job Worker daemon", "env", cfg.Env)
 
 	db, err := mysql.Connect(cfg)
 	if err != nil {
@@ -49,20 +47,12 @@ func run() error {
 	}
 	defer db.Close()
 
-	var broker mq.Broker
-	rmqBroker, err := mq.NewRabbitMQBroker(cfg.RabbitMQURL)
-	if err != nil {
-		if cfg.Env == "production" {
-			return fmt.Errorf("failed to connect to rabbitmq in production mode: %w", err)
-		}
-		log.Warn("failed to connect to rabbitmq, using memory broker", "error", err)
-		broker = mq.NewMemoryBroker()
-	} else {
-		broker = rmqBroker
-		defer broker.Close()
+	if err := mysql.AutoMigrate(db.GormDB); err != nil {
+		return fmt.Errorf("failed to run database auto migrations: %w", err)
 	}
 
 	storeFS := snapshotstore.NewLocalSnapshotStore(cfg.SnapshotBasePath)
+	repoStore := repo.NewStore(db.GormDB)
 	snapshotStore := snapshot.NewStore(db.GormDB)
 	indexStore := repoindex.NewStore(db.GormDB)
 	diagnosisStore := diagnosis.NewStore(db.GormDB)
@@ -94,7 +84,7 @@ func run() error {
 		return fmt.Errorf("unsupported LLM_PROVIDER: %q (supported: 'openai', 'fake')", cfg.LLMProvider)
 	}
 
-	// Retrieval engines
+	// Retrieval engines (Temporarily kept for backward compatibility until M6)
 	var embedder retrieval.EmbeddingProvider
 	hasNeuralEmbedding := cfg.EmbeddingProvider == "openai" && cfg.EmbeddingAPIKey != ""
 	if hasNeuralEmbedding {
@@ -108,7 +98,6 @@ func run() error {
 	var bm25Retriever retrieval.Retriever = retrieval.NewBM25Retriever(chunkStore)
 	var vectorRetriever retrieval.Retriever = retrieval.NewVectorRetriever(chunkStore, embedder)
 
-	// In pure BM25 mode, we omit embedding vector generation to eliminate unnecessary API cost and compute
 	var esIndexWriter retrieval.EmbeddingProvider
 	if cfg.RetrievalStrategy == "hybrid" {
 		esIndexWriter = embedder
@@ -141,53 +130,25 @@ func run() error {
 			log.Warn("hybrid retrieval strategy requested without neural embedding API key, using local hashed baseline")
 		}
 		activeRetriever = retrieval.NewHybridRRFRetriever(60, bm25Retriever, vectorRetriever)
-		log.Info("retrieval strategy configured", "strategy", "hybrid", "neural_embedding", hasNeuralEmbedding)
 	case "bm25", "":
 		activeRetriever = bm25Retriever
-		log.Info("retrieval strategy configured", "strategy", "bm25 (pure text, zero embedding overhead)")
 	default:
-		log.Warn("unknown retrieval strategy, defaulting to bm25", "strategy", cfg.RetrievalStrategy)
 		activeRetriever = bm25Retriever
 	}
 
-	// Index Worker
 	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
 	filter := indexing.NewFileFilter(cfg.MaxFileSizeKB)
 	chunker := indexing.NewCodeChunker(60, 10)
-	indexWorker := indexing.NewIndexWorker(broker, snapshotStore, indexStore, storeFS, cloner, filter, chunker, indexWriter, 2)
 
-	sseHub := sse.NewHub()
 	agentExecutor := agent.NewAgentRuntimeExecutor(
 		provider,
 		activeRetriever,
 		storeFS,
 		traceStore,
-		sseHub,
 		agent.DefaultGuardConfig(),
 	)
 
-	// Diagnosis Consumer
-	consumerCfg := worker.ConsumerConfig{
-		Prefetch:        5,
-		MaxAttempts:     3,
-		AttemptDeadline: 5 * time.Minute,
-		RetryBackoff:    5 * time.Second,
-	}
-	diagnosisConsumer := worker.NewDiagnosisConsumer(
-		consumerCfg,
-		broker,
-		diagnosisStore,
-		reportStore,
-		citationStore,
-		citationVal,
-		agentExecutor,
-		sseHub,
-	)
-
-	// Stale Attempt Recovery Sweeper
-	recoverySweeper := worker.NewRecoverySweeper(diagnosisStore, 30*time.Second, 10*time.Second, 2*time.Second)
-
-	// DB-backed Analysis Job Worker Runtime (M2A / M2B)
+	// DB-backed Analysis Job Worker Runtime
 	jobsStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)
 	diagJobHandler := worker.NewDiagnosisJobHandler(
 		diagnosisStore,
@@ -195,71 +156,38 @@ func run() error {
 		citationStore,
 		citationVal,
 		agentExecutor,
-		sseHub,
 	)
+	snapshotJobHandler := indexing.NewSnapshotJobHandler(
+		repoStore,
+		snapshotStore,
+		indexStore,
+		storeFS,
+		cloner,
+		filter,
+		chunker,
+		indexWriter,
+	)
+
 	jobsWorker := jobs.NewWorker(jobsStore, jobs.DefaultWorkerConfig())
 	jobsWorker.RegisterHandler(jobs.JobTypeRunDiagnosis, diagJobHandler)
+	jobsWorker.RegisterHandler(jobs.JobTypeMaterializeSnapshot, snapshotJobHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	jobsWorker.Start(ctx)
-
-	errCh := make(chan error, 3)
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := indexWorker.Start(ctx); err != nil && ctx.Err() == nil {
-			log.Error("index worker daemon encountered fatal error", "error", err)
-			errCh <- fmt.Errorf("index worker error: %w", err)
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := diagnosisConsumer.Start(ctx); err != nil && ctx.Err() == nil {
-			log.Error("diagnosis consumer daemon encountered fatal error", "error", err)
-			errCh <- fmt.Errorf("diagnosis consumer error: %w", err)
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		recoverySweeper.Start(ctx)
-	}()
+	log.Info("analysis jobs worker started successfully")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	var fatalErr error
-	select {
-	case sig := <-sigChan:
-		log.Info("received shutdown signal", "signal", sig.String())
-	case daemonErr := <-errCh:
-		log.Error("critical worker daemon component crashed, triggering immediate shutdown", "error", daemonErr)
-		fatalErr = daemonErr
-	}
+	sig := <-sigChan
+	log.Info("received shutdown signal", "signal", sig.String())
 
 	cancel()
-	log.Info("shutting down worker daemon, draining in-flight tasks (timeout: 30s)...")
+	log.Info("shutting down worker daemon, draining in-flight jobs...")
+	jobsWorker.Stop()
+	log.Info("analysis jobs worker shut down cleanly")
 
-	drainDone := make(chan struct{})
-	go func() {
-		jobsWorker.Stop()
-		wg.Wait()
-		close(drainDone)
-	}()
-
-	select {
-	case <-drainDone:
-		log.Info("all worker components and in-flight tasks drained cleanly")
-	case <-time.After(30 * time.Second):
-		log.Warn("shutdown deadline exceeded (30s), terminating worker")
-	}
-
-	return fatalErr
+	return nil
 }

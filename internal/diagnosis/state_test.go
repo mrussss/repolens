@@ -2,6 +2,7 @@ package diagnosis_test
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -9,16 +10,17 @@ import (
 	"gorm.io/gorm"
 
 	"repolens/internal/diagnosis"
-	"repolens/internal/outbox"
+	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/repo"
 	"repolens/internal/snapshot"
 )
 
 func setupTestDB(t *testing.T) *gorm.DB {
-	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	dbPath := filepath.Join(t.TempDir(), "diagnosis_test.db")
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000&_journal_mode=WAL"), &gorm.Config{})
 	if err != nil {
-		t.Fatalf("failed to open sqlite memory db: %v", err)
+		t.Fatalf("failed to open sqlite db: %v", err)
 	}
 	if err := mysql.AutoMigrate(db); err != nil {
 		t.Fatalf("failed to auto migrate test db: %v", err)
@@ -133,12 +135,11 @@ func TestRequestHashAndIdempotencyConflict(t *testing.T) {
 	}
 }
 
-func TestTransactionalOutboxCreation(t *testing.T) {
+func TestTransactionalJobCreation(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
 	diagStore := diagnosis.NewStore(db)
-	outboxStore := outbox.NewStore(db)
 
 	run := &diagnosis.DiagnosisRun{
 		UserID:                 "user-1",
@@ -148,24 +149,25 @@ func TestTransactionalOutboxCreation(t *testing.T) {
 		IdempotencyKey:         "key-99",
 		IdempotencyRequestHash: "hash-99",
 	}
-	evt := &outbox.OutboxEvent{}
 
-	err := diagStore.CreateWithOutbox(ctx, run, evt)
+	err := diagStore.Create(ctx, run)
 	if err != nil {
-		t.Fatalf("failed to create run with outbox: %v", err)
+		t.Fatalf("failed to create run: %v", err)
 	}
 
-	// Verify both exist in DB
+	// Verify both run and analysis_job exist in DB
 	savedRun, err := diagStore.GetByID(ctx, run.ID)
 	if err != nil || savedRun == nil {
 		t.Fatalf("saved run not found: %v", err)
 	}
 
-	pendingEvents, err := outboxStore.FetchPending(ctx, 10)
-	if err != nil || len(pendingEvents) != 1 {
-		t.Fatalf("expected 1 pending outbox event, got %d (err: %v)", len(pendingEvents), err)
+	sqlDB, _ := db.DB()
+	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	job, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil || job == nil {
+		t.Fatalf("expected analysis_job created atomically, got %v", err)
 	}
-	if pendingEvents[0].AggregateID != run.ID {
-		t.Errorf("expected aggregate_id %s, got %s", run.ID, pendingEvents[0].AggregateID)
+	if job.Status != jobs.StatusPending {
+		t.Errorf("expected job status PENDING, got %s", job.Status)
 	}
 }

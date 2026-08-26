@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,13 +16,13 @@ import (
 	"gorm.io/gorm/logger"
 
 	"repolens/internal/diagnosis"
-	"repolens/internal/outbox"
+	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/repo"
 	"repolens/internal/snapshot"
 )
 
-func setupRealMySQL(t *testing.T) (*gorm.DB, func()) {
+func setupRealMySQL(t *testing.T) (*gorm.DB, *jobs.Store, func()) {
 	ctx := context.Background()
 
 	mysqlContainer, err := tcmysql.RunContainer(ctx,
@@ -37,7 +36,7 @@ func setupRealMySQL(t *testing.T) (*gorm.DB, func()) {
 			t.Fatalf("FAILED: real MySQL testcontainers required by release gate but failed to start: %v", err)
 		}
 		t.Skipf("Skipping real MySQL testcontainers test (Docker not available: %v)", err)
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	connStr, err := mysqlContainer.ConnectionString(ctx, "charset=utf8mb4&parseTime=True&loc=Local")
@@ -59,15 +58,23 @@ func setupRealMySQL(t *testing.T) (*gorm.DB, func()) {
 		t.Fatalf("failed to migrate real MySQL database: %v", err)
 	}
 
+	sqlDB, err := db.DB()
+	if err != nil {
+		_ = mysqlContainer.Terminate(ctx)
+		t.Fatalf("failed getting sql.DB: %v", err)
+	}
+
+	jobsStore := jobs.NewStore(sqlDB)
+
 	cleanup := func() {
 		_ = mysqlContainer.Terminate(context.Background())
 	}
 
-	return db, cleanup
+	return db, jobsStore, cleanup
 }
 
-func TestRealMySQL_DiagnosisIdempotencyAndOutbox(t *testing.T) {
-	db, cleanup := setupRealMySQL(t)
+func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
+	db, jobsStore, cleanup := setupRealMySQL(t)
 	if db == nil {
 		return
 	}
@@ -108,7 +115,7 @@ func TestRealMySQL_DiagnosisIdempotencyAndOutbox(t *testing.T) {
 		IdempotencyKey:   "idemp-real-001",
 	}
 
-	// 1. Create DiagnosisRun and OutboxEvent transactionally on real MySQL
+	// 1. Create DiagnosisRun and AnalysisJob transactionally on real MySQL
 	run1, created1, err := diagSvc.Create(ctx, input)
 	if err != nil || !created1 {
 		t.Fatalf("first creation failed on real MySQL: %v", err)
@@ -117,10 +124,13 @@ func TestRealMySQL_DiagnosisIdempotencyAndOutbox(t *testing.T) {
 		t.Errorf("expected QUEUED status, got %s", run1.Status)
 	}
 
-	// Verify 0 attempts before worker claim
-	attempts, err := diagStore.ListAttemptsByRun(ctx, run1.ID)
-	if err != nil || len(attempts) != 0 {
-		t.Fatalf("expected 0 attempts at API stage, got %d", len(attempts))
+	// Verify AnalysisJob exists on MySQL in PENDING status
+	job, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, run1.ID)
+	if err != nil || job == nil {
+		t.Fatalf("expected analysis_job on MySQL, got err: %v", err)
+	}
+	if job.Status != jobs.StatusPending {
+		t.Errorf("expected job status PENDING, got %s", job.Status)
 	}
 
 	// 2. Duplicate submission with SAME payload -> Return existing Run
@@ -141,8 +151,8 @@ func TestRealMySQL_DiagnosisIdempotencyAndOutbox(t *testing.T) {
 	}
 }
 
-func TestRealMySQL_ConcurrentWorkerClaimFencing(t *testing.T) {
-	db, cleanup := setupRealMySQL(t)
+func TestRealMySQL_ConcurrentSkipLockedClaim(t *testing.T) {
+	db, jobsStore, cleanup := setupRealMySQL(t)
 	if db == nil {
 		return
 	}
@@ -151,59 +161,59 @@ func TestRealMySQL_ConcurrentWorkerClaimFencing(t *testing.T) {
 	ctx := context.Background()
 	diagStore := diagnosis.NewStore(db)
 
-	run := &diagnosis.DiagnosisRun{
-		UserID:                 "user-conc-mysql",
-		RepositoryID:           "repo-conc-mysql",
-		SnapshotID:             "snap-conc-mysql",
-		IssueTitle:             "Concurrent Claim MySQL Test",
-		IdempotencyKey:         "k-conc-mysql",
-		IdempotencyRequestHash: "h-conc-mysql",
+	// Create 10 distinct diagnosis runs on MySQL
+	for i := 1; i <= 10; i++ {
+		run := &diagnosis.DiagnosisRun{
+			ID:                     fmt.Sprintf("diag-real-batch-%d", i),
+			UserID:                 "user-conc-mysql",
+			RepositoryID:           "repo-conc-mysql",
+			SnapshotID:             "snap-conc-mysql",
+			IssueTitle:             fmt.Sprintf("Batch Issue %d", i),
+			IdempotencyKey:         fmt.Sprintf("k-conc-mysql-%d", i),
+			IdempotencyRequestHash: fmt.Sprintf("h-conc-mysql-%d", i),
+		}
+		_ = diagStore.Create(ctx, run)
 	}
-	outboxEvt := &outbox.OutboxEvent{}
-	_ = diagStore.CreateWithOutbox(ctx, run, outboxEvt)
 
-	// Simulate 10 workers concurrently claiming the run on real MySQL
-	numWorkers := 10
-	var successfulClaims int64
-	var claimConflicts int64
-
+	// Simulate 5 workers concurrently claiming 2 jobs each with FOR UPDATE SKIP LOCKED
+	numWorkers := 5
+	claimedPerWorker := make([][]*jobs.AnalysisJob, numWorkers)
 	var wg sync.WaitGroup
-	expectedStatuses := []diagnosis.RunStatus{diagnosis.StatusQueued}
 
-	for i := 1; i <= numWorkers; i++ {
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		workerID := fmt.Sprintf("worker-node-%d", i)
-		go func(wID string) {
+		wIdx := i
+		workerID := fmt.Sprintf("worker-node-%d", wIdx)
+		go func() {
 			defer wg.Done()
-			_, attempt, err := diagStore.ClaimRun(ctx, run.ID, expectedStatuses, wID, 5*time.Minute)
-			if err == nil && attempt != nil {
-				atomic.AddInt64(&successfulClaims, 1)
-			} else if errors.Is(err, diagnosis.ErrClaimConflict) {
-				atomic.AddInt64(&claimConflicts, 1)
+			claimed, err := jobsStore.ClaimJobs(ctx, workerID, 2, 30*time.Second)
+			if err == nil {
+				claimedPerWorker[wIdx] = claimed
 			}
-		}(workerID)
+		}()
 	}
 	wg.Wait()
 
-	if successfulClaims != 1 {
-		t.Fatalf("expected EXACTLY 1 worker to claim run on real MySQL, got %d", successfulClaims)
-	}
-	if claimConflicts != int64(numWorkers-1) {
-		t.Fatalf("expected %d claim conflicts, got %d", numWorkers-1, claimConflicts)
+	// Verify all 10 jobs were claimed with ZERO duplicate claims across workers
+	seenJobIDs := make(map[int64]string)
+	totalClaimed := 0
+	for wIdx, claimed := range claimedPerWorker {
+		for _, cj := range claimed {
+			totalClaimed++
+			if prevWorker, duplicate := seenJobIDs[cj.ID]; duplicate {
+				t.Fatalf("DUPLICATE CLAIM DETECTED on MySQL: job %d claimed by both %s and %d", cj.ID, prevWorker, wIdx)
+			}
+			seenJobIDs[cj.ID] = fmt.Sprintf("worker-%d", wIdx)
+		}
 	}
 
-	// Verify only 1 Attempt exists on MySQL
-	attempts, err := diagStore.ListAttemptsByRun(ctx, run.ID)
-	if err != nil || len(attempts) != 1 {
-		t.Fatalf("expected exactly 1 attempt on real MySQL, got %d", len(attempts))
-	}
-	if attempts[0].AttemptNo != 1 || attempts[0].Status != diagnosis.AttemptStatusRunning {
-		t.Errorf("expected Attempt #1 RUNNING, got %+v", attempts[0])
+	if totalClaimed != 10 {
+		t.Fatalf("expected all 10 jobs claimed across workers, got %d", totalClaimed)
 	}
 }
 
-func TestRealMySQL_StaleAttemptRecovery(t *testing.T) {
-	db, cleanup := setupRealMySQL(t)
+func TestRealMySQL_LeaseRenewalAndReaping(t *testing.T) {
+	db, jobsStore, cleanup := setupRealMySQL(t)
 	if db == nil {
 		return
 	}
@@ -211,55 +221,41 @@ func TestRealMySQL_StaleAttemptRecovery(t *testing.T) {
 
 	ctx := context.Background()
 	diagStore := diagnosis.NewStore(db)
-	outboxStore := outbox.NewStore(db)
 
 	run := &diagnosis.DiagnosisRun{
-		UserID:                 "user-stale-mysql",
-		RepositoryID:           "repo-stale-mysql",
-		SnapshotID:             "snap-stale-mysql",
-		IssueTitle:             "Stale Recovery MySQL Test",
-		IdempotencyKey:         "k-stale-mysql",
-		IdempotencyRequestHash: "h-stale-mysql",
+		ID:                     "diag-reap-test",
+		UserID:                 "user-reap",
+		RepositoryID:           "repo-reap",
+		SnapshotID:             "snap-reap",
+		IssueTitle:             "Reap Test",
+		IdempotencyKey:         "k-reap",
+		IdempotencyRequestHash: "h-reap",
 	}
-	_ = diagStore.CreateWithOutbox(ctx, run, nil)
+	_ = diagStore.Create(ctx, run)
 
-	// Worker 1 claims
-	_, att1, err := diagStore.ClaimRun(ctx, run.ID, []diagnosis.RunStatus{diagnosis.StatusQueued}, "worker-crashed", 5*time.Minute)
-	if err != nil {
+	// Claim with a short lease (500ms)
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-crashing", 1, 500*time.Millisecond)
+	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim failed: %v", err)
 	}
 
-	// Force heartbeat in the past
-	staleHeartbeat := time.Now().Add(-2 * time.Minute)
-	_ = db.Model(&diagnosis.DiagnosisAttempt{}).Where("id = ?", att1.ID).Update("heartbeat_at", staleHeartbeat).Error
+	// Wait for lease expiration
+	time.Sleep(700 * time.Millisecond)
 
-	// Fetch stale attempts
-	staleAttempts, err := diagStore.FetchStaleAttempts(ctx, 30*time.Second, 10)
-	if err != nil || len(staleAttempts) != 1 {
-		t.Fatalf("expected 1 stale attempt on real MySQL, got %d (err: %v)", len(staleAttempts), err)
-	}
-
-	// Recover stale attempt (backoff -1s so available_at <= now)
-	err = diagStore.RecoverStaleAttempt(ctx, att1.ID, run.ID, -1*time.Second)
+	// Reaper runs on real MySQL
+	reaped, err := jobsStore.ReapExpiredJobs(ctx, 10)
 	if err != nil {
-		t.Fatalf("failed to recover stale attempt on MySQL: %v", err)
+		t.Fatalf("reap failed on real MySQL: %v", err)
+	}
+	if reaped != 1 {
+		t.Fatalf("expected 1 reaped job on MySQL, got %d", reaped)
 	}
 
-	// Verify Attempt #1 -> ABANDONED
-	att1Refreshed, _ := diagStore.GetAttempt(ctx, att1.ID)
-	if att1Refreshed.Status != diagnosis.AttemptStatusAbandoned {
-		t.Errorf("expected Attempt #1 ABANDONED, got %s", att1Refreshed.Status)
+	reapedJob, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatalf("failed fetching reaped job: %v", err)
 	}
-
-	// Verify Run -> RETRY_WAIT
-	runRefreshed, _ := diagStore.GetByID(ctx, run.ID)
-	if runRefreshed.Status != diagnosis.StatusRetryWait {
-		t.Errorf("expected Run status RETRY_WAIT, got %s", runRefreshed.Status)
-	}
-
-	// Verify retry OutboxEvent created in MySQL
-	pending, _ := outboxStore.FetchPending(ctx, 10)
-	if len(pending) == 0 || pending[0].EventType != outbox.EventDiagnosisRetryRequested {
-		t.Fatalf("expected retry outbox event in MySQL, got %+v", pending)
+	if reapedJob.Status != jobs.StatusRetryWait {
+		t.Errorf("expected job in RETRY_WAIT after reaping on MySQL, got %s", reapedJob.Status)
 	}
 }

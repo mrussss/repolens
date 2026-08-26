@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"strconv"
-	"time"
 )
 
 type Config struct {
@@ -11,10 +10,7 @@ type Config struct {
 	HTTPPort          string
 	DBDriver          string // "mysql" or "sqlite"
 	DSN               string
-	RabbitMQURL       string
 	SnapshotBasePath  string
-	JWTSecret         string
-	TokenTTL          time.Duration
 	AllowHosts        []string
 	MaxRepoSizeMB     int64
 	MaxFileCount      int
@@ -23,7 +19,7 @@ type Config struct {
 	LLMAPIKey         string
 	LLMBaseURL        string
 	LLMModel          string
-	RetrievalStrategy string // "bm25" (default, verified production primary), "hybrid"
+	RetrievalStrategy string // "bm25" (default), "hybrid"
 	ESURL             string
 	ESIndexName       string
 	EmbeddingProvider string // "local", "openai"
@@ -39,10 +35,7 @@ func Load() *Config {
 		HTTPPort:          getEnv("HTTP_PORT", "8080"),
 		DBDriver:          getEnv("DB_DRIVER", "sqlite"),
 		DSN:               getEnv("DB_DSN", "repolens.db"),
-		RabbitMQURL:       getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 		SnapshotBasePath:  getEnv("SNAPSHOT_BASE_PATH", "/data/repositories"),
-		JWTSecret:         getEnv("JWT_SECRET", "repolens-secret-key-change-in-prod"),
-		TokenTTL:          24 * time.Hour,
 		AllowHosts:        []string{"github.com", "gitlab.com"},
 		MaxRepoSizeMB:     getEnvInt64("MAX_REPO_SIZE_MB", 50),
 		MaxFileCount:      getEnvInt("MAX_FILE_COUNT", 2000),

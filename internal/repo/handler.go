@@ -1,7 +1,6 @@
 package repo
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
@@ -10,7 +9,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
-	"repolens/internal/outbox"
+	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
 	"repolens/internal/repoindex"
 	"repolens/internal/snapshot"
@@ -20,16 +19,14 @@ type Handler struct {
 	repoSvc       *Service
 	snapshotStore snapshot.Store
 	indexStore    repoindex.Store
-	outboxStore   outbox.Store
 	db            *gorm.DB
 }
 
-func NewHandler(repoSvc *Service, snapshotStore snapshot.Store, indexStore repoindex.Store, outboxStore outbox.Store, db *gorm.DB) *Handler {
+func NewHandler(repoSvc *Service, snapshotStore snapshot.Store, indexStore repoindex.Store, db *gorm.DB) *Handler {
 	return &Handler{
 		repoSvc:       repoSvc,
 		snapshotStore: snapshotStore,
 		indexStore:    indexStore,
-		outboxStore:   outboxStore,
 		db:            db,
 	}
 }
@@ -138,23 +135,14 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 		Status:       repoindex.StatusIndexQueued,
 	}
 
-	payload, _ := json.Marshal(map[string]interface{}{
-		"repository_id": repoID,
-		"snapshot_id":   snapID,
-		"index_id":      indexID,
-		"git_url":       r.GitURL,
-		"ref":           req.Ref,
-		"strategy":      req.Strategy,
-	})
-
-	outboxEvt := &outbox.OutboxEvent{
-		ID:            uuid.New().String(),
-		AggregateType: outbox.AggregateRepositoryIndex,
-		AggregateID:   idx.ID,
-		EventType:     outbox.EventRepositoryIndexRequested,
-		Payload:       string(payload),
-		Status:        outbox.StatusPending,
-		AvailableAt:   time.Now(),
+	job := &jobs.AnalysisJob{
+		JobType:             jobs.JobTypeMaterializeSnapshot,
+		ResourceID:          snapID,
+		Status:              jobs.StatusPending,
+		ExecutionGeneration: 1,
+		AttemptCount:        0,
+		MaxAttempts:         3,
+		NextRunAt:           time.Now().UTC(),
 	}
 
 	err = h.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
@@ -164,7 +152,7 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 		if err := tx.Create(idx).Error; err != nil {
 			return err
 		}
-		if err := tx.Create(outboxEvt).Error; err != nil {
+		if err := tx.Create(job).Error; err != nil {
 			return err
 		}
 		return nil

@@ -127,7 +127,6 @@ func (r *Runner) RunEndToEndDiagnosisEval(ctx context.Context, provider llm.Prov
 		retriever,
 		r.storeFS,
 		nil,
-		nil,
 		agent.DefaultGuardConfig(),
 	)
 

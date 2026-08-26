@@ -9,7 +9,6 @@ import (
 	"repolens/internal/llm"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/retrieval"
-	"repolens/internal/sse"
 	"repolens/internal/tools"
 	"repolens/internal/trace"
 )
@@ -34,7 +33,6 @@ type AgentRuntimeExecutor struct {
 	retriever  retrieval.Retriever
 	storeFS    snapshotstore.SnapshotStore
 	traceStore trace.Store
-	sseHub     *sse.Hub
 	guardCfg   GuardConfig
 }
 
@@ -43,7 +41,6 @@ func NewAgentRuntimeExecutor(
 	retriever retrieval.Retriever,
 	storeFS snapshotstore.SnapshotStore,
 	traceStore trace.Store,
-	sseHub *sse.Hub,
 	guardCfg GuardConfig,
 ) *AgentRuntimeExecutor {
 	return &AgentRuntimeExecutor{
@@ -51,7 +48,6 @@ func NewAgentRuntimeExecutor(
 		retriever:  retriever,
 		storeFS:    storeFS,
 		traceStore: traceStore,
-		sseHub:     sseHub,
 		guardCfg:   guardCfg,
 	}
 }
@@ -70,7 +66,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	registry.Register(readDocsTool)
 	registry.Register(readCILogTool)
 
-	loop := NewAgentLoop(e.provider, registry, e.traceStore, e.sseHub, e.guardCfg)
+	loop := NewAgentLoop(e.provider, registry, e.traceStore, e.guardCfg)
 	res, err := loop.Run(ctx, run, attempt)
 	if err != nil {
 		return nil, fmt.Errorf("agent loop execution failed: %w", err)
