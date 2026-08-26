@@ -7,7 +7,7 @@ CREATED
    ↓
 MATERIALIZING
    ↓
-READY / MATERIALIZE_FAILED
+READY / FAILED
 ```
 
 - **语义**：该状态机仅表达特定 Commit SHA 的源码是否已安全落盘并可只读访问。
@@ -15,19 +15,14 @@ READY / MATERIALIZE_FAILED
 
 ---
 
-## 2. RepositoryIndex 状态机
+## 2. CodeIndexBuild / RetrievalBuild 状态机
 
 ```text
-CREATED
-   ↓
-INDEX_QUEUED
-   ↓
-INDEXING
-   ↓
-READY / INDEX_FAILED
+CREATED → BUILDING → READY
+                    ↘ FAILED
 ```
 
-- **解耦优势**：同一 Snapshot 可派生多个不同 Retrieval Strategy（Lexical、BM25、Vector、Hybrid）的 Index 记录，便于在完全相同的代码事实上进行公平对比实验。
+- **解耦优势**：同一 Snapshot 可派生版本化 CodeIndexBuild 与 RetrievalBuild，Diagnosis 固定使用创建时的 build lineage。
 
 ---
 
@@ -38,16 +33,12 @@ READY / INDEX_FAILED
        │                 ↓                 │
        │              RUNNING              │
        │          ↙      ↓      ↘          │
-       │   RETRY_WAIT SUCCEEDED  FAILED    │
-       │       ↓                           │
-       │    QUEUED                         │
+       │   SUCCEEDED  FAILED  CANCELLED    │
        │                                   │
-       └──────→ CANCEL_REQUESTED ──────────┘
-                         ↓
-                     CANCELLED
+       └───────────────┘
 ```
 
-- **乐观并发控制**：所有状态迁移必须携带 `WHERE id = ? AND version = ? AND status = ?`，并递增 `version = version + 1`，彻底杜绝 Lost Update。
+- **状态分离**：`RETRY_WAIT` 只属于 `AnalysisJob`；取消请求由 `cancel_requested` flag 表达，Diagnosis 业务状态不增加中间状态。
 
 ---
 

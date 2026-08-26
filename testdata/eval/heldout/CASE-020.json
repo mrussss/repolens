@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-020",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/rrf-fusion",
+  "snapshot_sha": "snap-rrf-20",
+  "issue_title": "Hybrid search returns duplicate documents with varying score scales",
+  "issue_description": "Results list contains identical file chunk twice with raw BM25 score and raw cosine similarity.",
+  "error_log": "ranking anomaly: incompatible raw scores merged directly without rank reciprocal transformation",
+  "expected_root_cause": "Direct addition of raw BM25 and vector scores instead of Reciprocal Rank Fusion formula",
+  "relevant_files": [
+    "internal/retrieval/rrf.go"
+  ],
+  "forbidden_claims": [
+    "vector index corrupted"
+  ]
+}

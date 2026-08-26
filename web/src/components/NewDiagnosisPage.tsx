@@ -12,7 +12,7 @@ interface Props {
 export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapshotId, onDiagnosisCreated }) => {
   const [repos, setRepos] = useState<Repository[]>([]);
   const [selectedRepoId, setSelectedRepoId] = useState(initialRepoId || '');
-  const selectedSnapshotId = initialSnapshotId || '';
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState(initialSnapshotId || '');
   const [issueTitle, setIssueTitle] = useState('');
   const [issueDescription, setIssueDescription] = useState('');
   const [errorLog, setErrorLog] = useState('');
@@ -29,6 +29,10 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
       setRepos(list || []);
       if (!selectedRepoId && list?.length > 0) {
         setSelectedRepoId(list[0].id);
+        setSelectedSnapshotId(list[0].snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '');
+      } else if (!selectedSnapshotId && selectedRepoId) {
+        const selected = list.find((item) => item.id === selectedRepoId);
+        setSelectedSnapshotId(selected?.snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '');
       }
     } catch {
       // ignore
@@ -45,6 +49,10 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
       setError('Please provide an issue title');
       return;
     }
+    if (!selectedSnapshotId) {
+      setError('Select a READY snapshot before starting a diagnosis');
+      return;
+    }
 
     setLoading(true);
     setError(null);
@@ -52,7 +60,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
       const idempotencyKey = 'idemp-ui-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
       const res = await api.createDiagnosis({
         repository_id: selectedRepoId,
-        snapshot_id: selectedSnapshotId || 'latest',
+        snapshot_id: selectedSnapshotId,
         issue_title: issueTitle,
         issue_description: issueDescription,
         error_log: errorLog,
@@ -88,7 +96,12 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
             <select
               className="input-field"
               value={selectedRepoId}
-              onChange={(e) => setSelectedRepoId(e.target.value)}
+              onChange={(e) => {
+                const repoId = e.target.value;
+                setSelectedRepoId(repoId);
+                const repo = repos.find((item) => item.id === repoId);
+                setSelectedSnapshotId(repo?.snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '');
+              }}
               required
             >
               <option value="" disabled>Select a repository</option>
@@ -96,6 +109,16 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
                 <option key={r.id} value={r.id}>
                   {r.name} ({r.git_url})
                 </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">READY Snapshot</label>
+            <select className="input-field" value={selectedSnapshotId} onChange={(e) => setSelectedSnapshotId(e.target.value)} required>
+              <option value="" disabled>Select a READY snapshot</option>
+              {(repos.find((r) => r.id === selectedRepoId)?.snapshots || []).filter((snap) => snap.status === 'READY').map((snap) => (
+                <option key={snap.id} value={snap.id}>{snap.id} ({snap.commit_sha.slice(0, 12)})</option>
               ))}
             </select>
           </div>
@@ -137,7 +160,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1.5rem' }}>
-            <button type="submit" className="btn btn-primary" disabled={loading || !selectedRepoId || !issueTitle}>
+            <button type="submit" className="btn btn-primary" disabled={loading || !selectedRepoId || !selectedSnapshotId || !issueTitle}>
               <Play size={16} /> {loading ? 'Submitting...' : 'Run Grounded Diagnosis'}
             </button>
           </div>

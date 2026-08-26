@@ -112,6 +112,11 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
                     </span>
                     <span>{r.git_url}</span>
                   </div>
+                  {r.snapshots && r.snapshots.length > 0 && (
+                    <div style={{ marginTop: '0.5rem', color: 'var(--text-muted)', fontSize: '0.75rem' }}>
+                      Latest snapshot: <code>{r.snapshots[0].id}</code> · {r.snapshots[0].status}
+                    </div>
+                  )}
                 </div>
 
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
@@ -125,7 +130,8 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
                   </button>
                   <button
                     className="btn btn-primary"
-                    onClick={() => onSelectRepoForDiagnosis(r.id, r.snapshots?.[0]?.id || '')}
+                    onClick={() => onSelectRepoForDiagnosis(r.id, r.snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '')}
+                    disabled={!r.snapshots?.some((snapshot) => snapshot.status === 'READY')}
                   >
                     <Play size={14} /> New Diagnosis
                   </button>

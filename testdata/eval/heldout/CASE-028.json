@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-028",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/queue-worker",
+  "snapshot_sha": "snap-dlq-28",
+  "issue_title": "Poison message with corrupted bytes repeatedly crashes consumer",
+  "issue_description": "Invalid JSON payload causes worker to crash on every restart.",
+  "error_log": "unmarshal failure: unexpected EOF parsing message payload",
+  "expected_root_cause": "Worker did not catch JSON unmarshal errors to reject message to DLQ (QueueDiagnosisDLQ)",
+  "relevant_files": [
+    "internal/worker/consumer.go",
+    "internal/outbox/store.go"
+  ],
+  "forbidden_claims": [
+    "RabbitMQ corrupted queues"
+  ]
+}

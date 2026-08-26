@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-004",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/queue-service",
+  "snapshot_sha": "snap-queue-04",
+  "issue_title": "RabbitMQ consumer enters hot loop on LLM 429 rate limit error",
+  "issue_description": "When LLM API responds with 429, CPU spikes to 100% and millions of messages are redelivered instantly.",
+  "error_log": "worker error: rate limit 429 exceeded, immediate nack with requeue=true executed",
+  "expected_root_cause": "Immediate nack with requeue instead of transitioning run to RETRY_WAIT with delayed outbox event",
+  "relevant_files": [
+    "internal/worker/consumer.go",
+    "internal/outbox/store.go"
+  ],
+  "forbidden_claims": [
+    "RabbitMQ server crashed"
+  ]
+}

@@ -4,20 +4,17 @@
 
 ```mermaid
 stateDiagram-v2
-    [*] --> QUEUED: API POST /diagnoses (Atomic Transaction with OutboxEvent)
-    QUEUED --> RUNNING: Worker ClaimRun (Optimistic version bump)
+    [*] --> QUEUED: API POST /diagnoses (run + job transaction)
+    QUEUED --> RUNNING: Worker starts an attempt
     RUNNING --> SUCCEEDED: Agent finishes, citations verified & report saved
-    RUNNING --> RETRY_WAIT: Stale heartbeat recovery or retryable application error (429)
     RUNNING --> FAILED: Retries exhausted or terminal non-retryable error
-    RETRY_WAIT --> RUNNING: Outbox Relay dispatches retry event & Worker claims
     RUNNING --> CANCELLED: User requested cancellation via /diagnoses/:id/cancel
     QUEUED --> CANCELLED: User requested cancellation before worker claim
 ```
 
 ### Transition Invariants
-- `QUEUED`: `DiagnosisAttempt` count must be `0`. No worker holds execution rights.
-- `RUNNING`: Exactly one active `DiagnosisAttempt` with status `RUNNING`.
-- `RETRY_WAIT`: Associated with a pending `DIAGNOSIS_RETRY_REQUESTED` OutboxEvent where `available_at = NOW() + backoff`.
+- `QUEUED`: No worker holds execution rights; retry scheduling belongs to `AnalysisJob`.
+- `RUNNING`: The current `DiagnosisAttempt` owns execution progress.
 - `SUCCEEDED` / `FAILED` / `CANCELLED`: Terminal states. No subsequent transitions allowed.
 
 ---

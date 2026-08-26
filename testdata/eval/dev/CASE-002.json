@@ -1,0 +1,18 @@
+{
+  "case_id": "CASE-002",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/auth-service",
+  "snapshot_sha": "snap-auth-02",
+  "issue_title": "JWT validation returns 401 for valid tokens after midnight",
+  "issue_description": "Users are logged out unexpectedly every night at 00:00 UTC.",
+  "error_log": "auth error: token expired or clock skew exceeded: issued_at in future",
+  "expected_root_cause": "Time zone discrepancy in token issued_at calculation comparing UTC with local timestamp",
+  "relevant_files": [
+    "internal/auth/jwt.go",
+    "internal/auth/middleware.go"
+  ],
+  "forbidden_claims": [
+    "secret key leakage",
+    "database down"
+  ]
+}

@@ -1,12 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api';
-import { Repository, CodeSymbol, QualityReport, SymbolRelation } from '../types';
+import { Repository, Snapshot, CodeIndexBuild, CodeSymbol, QualityReport, SymbolRelation, RetrievalBuild } from '../types';
 import { Search, CheckCircle2, RefreshCw, BarChart2, Layers } from 'lucide-react';
 
 export const CodeIntelPage: React.FC = () => {
   const [repos, setRepos] = useState<Repository[]>([]);
   const [selectedRepoId, setSelectedRepoId] = useState<string>('');
-  const [buildId, setBuildId] = useState<number>(1);
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState<string>('');
+  const [buildId, setBuildId] = useState<number>(0);
+  const [retrievalBuild, setRetrievalBuild] = useState<RetrievalBuild | null>(null);
   const [quality, setQuality] = useState<QualityReport | null>(null);
   const [symbols, setSymbols] = useState<CodeSymbol[]>([]);
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -15,6 +17,7 @@ export const CodeIntelPage: React.FC = () => {
   const [relatedTests, setRelatedTests] = useState<SymbolRelation[]>([]);
   const [loading, setLoading] = useState(false);
   const [symbolLoading, setSymbolLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     loadInitialData();
@@ -27,11 +30,60 @@ export const CodeIntelPage: React.FC = () => {
       setRepos(list || []);
       if (list && list.length > 0) {
         setSelectedRepoId(list[0].id);
-        // Load build 1 quality & symbols by default
-        loadBuildDetails(1);
+        const snapshot = readySnapshots(list[0])[0];
+        if (snapshot) prepareBuild(snapshot);
       }
     } catch {
       // ignore
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const readySnapshots = (repo: Repository): Snapshot[] =>
+    (repo.snapshots || []).filter((snapshot) => snapshot.status === 'READY');
+
+  const waitForCodeIndex = async (id: number): Promise<CodeIndexBuild> => {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const build = await api.getCodeIndexBuild(id);
+      if (build.status === 'READY' || build.status === 'FAILED') return build;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error('Code index build is still running; refresh to continue.');
+  };
+
+  const waitForRetrieval = async (id: number): Promise<RetrievalBuild> => {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const build = await api.getRetrievalBuild(id);
+      if (build.status === 'READY' || build.status === 'FAILED') return build;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error('Retrieval build is still running; refresh to continue.');
+  };
+
+  const prepareBuild = async (snapshot: Snapshot) => {
+    try {
+      setLoading(true);
+      setSelectedSnapshotId(snapshot.id);
+      setQuality(null);
+      setSymbols([]);
+      setSelectedSymbol(null);
+      const response = await api.triggerCodeIndexBuild(snapshot.id);
+      const build = response.code_index_build.status === 'READY'
+        ? response.code_index_build
+        : await waitForCodeIndex(response.code_index_build.id);
+      if (build.status !== 'READY') throw new Error(`Code index build ${build.status}`);
+      setBuildId(build.id);
+
+      const retrievalResponse = await api.triggerRetrievalBuild(build.id);
+      const retrieval = retrievalResponse.retrieval_build.status === 'READY'
+        ? retrievalResponse.retrieval_build
+        : await waitForRetrieval(retrievalResponse.retrieval_build.id);
+      if (retrieval.status !== 'READY') throw new Error(`Retrieval build ${retrieval.status}`);
+      setRetrievalBuild(retrieval);
+      await loadBuildDetails(build.id);
+    } catch (err: any) {
+      setError(err.message || 'Failed preparing code intelligence builds');
     } finally {
       setLoading(false);
     }
@@ -104,15 +156,34 @@ export const CodeIntelPage: React.FC = () => {
             value={selectedRepoId}
             onChange={(e) => {
               setSelectedRepoId(e.target.value);
-              loadBuildDetails(1);
+              const selectedRepo = repos.find((repo) => repo.id === e.target.value);
+              const snapshot = selectedRepo ? readySnapshots(selectedRepo)[0] : undefined;
+              if (snapshot) prepareBuild(snapshot);
             }}
           >
             {repos.map((r) => (
               <option key={r.id} value={r.id}>{r.name}</option>
             ))}
           </select>
+          <select
+            className="input-field"
+            style={{ width: 260 }}
+            value={selectedSnapshotId}
+            onChange={(e) => {
+              const snapshot = (repos.find((repo) => repo.id === selectedRepoId)?.snapshots || []).find((item) => item.id === e.target.value);
+              if (snapshot) prepareBuild(snapshot);
+            }}
+            disabled={!selectedRepoId}
+          >
+            <option value="">Select READY snapshot</option>
+            {(repos.find((repo) => repo.id === selectedRepoId) ? readySnapshots(repos.find((repo) => repo.id === selectedRepoId)!) : []).map((snapshot) => (
+              <option key={snapshot.id} value={snapshot.id}>{snapshot.id} ({snapshot.commit_sha.slice(0, 12)})</option>
+            ))}
+          </select>
         </div>
       </div>
+
+      {error && <div className="card" style={{ marginBottom: '1rem', color: 'var(--accent-danger)' }}>{error}</div>}
 
       {/* Quality Breakdown Metrics Banner */}
       {quality && (
@@ -123,7 +194,7 @@ export const CodeIntelPage: React.FC = () => {
               Analysis Completeness & Certainty Distribution
             </h2>
             <span className="badge badge-success" style={{ marginLeft: 'auto' }}>
-              Build #{quality.code_index_build_id} {quality.status}
+              Build #{quality.code_index_build_id} {quality.status}{retrievalBuild ? ` · Retrieval #${retrievalBuild.id} READY` : ''}
             </span>
           </div>
 

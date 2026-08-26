@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-016",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/order-service",
+  "snapshot_sha": "snap-tx-16",
+  "issue_title": "DiagnosisRun created in DB but OutboxEvent lost on crash",
+  "issue_description": "Task is listed in database as QUEUED but never picked up by RabbitMQ worker.",
+  "error_log": "audit discrepancy: DiagnosisRun exists without corresponding OutboxEvent record",
+  "expected_root_cause": "DiagnosisRun and OutboxEvent were inserted in separate database transactions instead of a single atomic transaction",
+  "relevant_files": [
+    "internal/diagnosis/store.go",
+    "internal/diagnosis/service.go"
+  ],
+  "forbidden_claims": [
+    "RabbitMQ deleted the message"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-019",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/order-service",
+  "snapshot_sha": "snap-secret-19",
+  "issue_title": "AWS secret access key in error log leaked to external LLM provider",
+  "issue_description": "CI log containing AKIA... was sent unredacted in LLM prompt payload.",
+  "error_log": "security violation: unredacted credential pattern detected in outbound LLM payload",
+  "expected_root_cause": "Missing regex secret redaction filter on IssueDescription and ErrorLog before saving and prompt construction",
+  "relevant_files": [
+    "internal/diagnosis/service.go"
+  ],
+  "forbidden_claims": [
+    "AWS compromised"
+  ]
+}

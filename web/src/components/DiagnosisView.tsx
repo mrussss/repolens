@@ -36,7 +36,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
             const st = await api.getDiagnosisSteps(diagnosisId);
             setSteps(st || []);
           } catch {}
-        } else if (r.status === 'RUNNING' || r.status === 'QUEUED' || r.status === 'RETRY_WAIT') {
+        } else if (r.status === 'RUNNING' || r.status === 'QUEUED') {
           try {
             const st = await api.getDiagnosisSteps(diagnosisId);
             setSteps(st || []);
@@ -53,7 +53,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
 
     // Poll every 1.5s while active
     interval = setInterval(() => {
-      if (!run || run.status === 'QUEUED' || run.status === 'RUNNING' || run.status === 'RETRY_WAIT') {
+      if (!run || run.status === 'QUEUED' || run.status === 'RUNNING') {
         fetchAll();
       }
     }, 1500);
@@ -79,7 +79,6 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
       case 'SUCCEEDED': return <span className="badge badge-success">SUCCEEDED</span>;
       case 'RUNNING': return <span className="badge badge-info"><RefreshCw size={12} className="spin" style={{ marginRight: 4 }} /> RUNNING</span>;
       case 'QUEUED': return <span className="badge badge-warning">QUEUED</span>;
-      case 'RETRY_WAIT': return <span className="badge badge-warning">RETRY WAIT</span>;
       case 'FAILED': return <span className="badge badge-danger">FAILED</span>;
       case 'CANCELLED': return <span className="badge badge-danger">CANCELLED</span>;
       default: return <span className="badge">{status}</span>;
@@ -115,7 +114,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
           </div>
         </div>
 
-        {(run?.status === 'QUEUED' || run?.status === 'RUNNING' || run?.status === 'RETRY_WAIT') && (
+        {(run?.status === 'QUEUED' || run?.status === 'RUNNING') && (
           <button className="btn btn-danger" onClick={handleCancel} disabled={cancelling}>
             <StopCircle size={16} /> {cancelling ? 'Cancelling...' : 'Cancel Run'}
           </button>
@@ -129,7 +128,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
       )}
 
       {/* In-Flight Status Progress Banner */}
-      {(run?.status === 'QUEUED' || run?.status === 'RUNNING' || run?.status === 'RETRY_WAIT') && (
+      {(run?.status === 'QUEUED' || run?.status === 'RUNNING') && (
         <div className="card" style={{ background: '#1c2128', border: '1px solid var(--accent-primary)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
             <RefreshCw size={24} className="spin" color="var(--accent-primary)" />
@@ -137,7 +136,6 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
               <h3 style={{ color: 'var(--text-bright)', fontSize: '1rem', fontWeight: 600 }}>
                 {run.status === 'QUEUED' && 'Diagnosis Job Queued...'}
                 {run.status === 'RUNNING' && 'Autonomous AI Agent Investigating Codebase...'}
-                {run.status === 'RETRY_WAIT' && 'Retrying after transient backoff...'}
               </h3>
               <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
                 Executing code search, reading AST symbols, and inspecting stack traces in real time.

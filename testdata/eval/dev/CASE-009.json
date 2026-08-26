@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-009",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/citation-engine",
+  "snapshot_sha": "snap-cit-09",
+  "issue_title": "Hallucinated citations pass through to client report without verification",
+  "issue_description": "Report contains citation for non-existent file utils/helper.go line 999.",
+  "error_log": "citation mismatch: file utils/helper.go does not exist in target snapshot",
+  "expected_root_cause": "Backend failed to validate citations against immutable snapshot filesystem before persisting report",
+  "relevant_files": [
+    "internal/evidence/citation.go"
+  ],
+  "forbidden_claims": [
+    "git checkout failed"
+  ]
+}

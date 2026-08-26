@@ -46,8 +46,8 @@ func main() {
 	fmt.Println("              RepoLens v2.1 — AI Code Intelligence & Diagnosis Platform (Benchmark Runner)              ")
 	fmt.Println("=========================================================================================================")
 
-	dataDir := "testdata/eval_cases"
-	if err := eval.WriteStandardDatasetToDir(dataDir); err != nil {
+	dataDir := "testdata/eval"
+	if err := eval.WriteDatasetSets(dataDir); err != nil {
 		fmt.Printf("Error writing eval dataset: %v\n", err)
 		os.Exit(1)
 	}
@@ -61,17 +61,18 @@ func main() {
 
 	storeFS := snapshotstore.NewLocalSnapshotStore("/tmp/repolens_eval_snapshots")
 	runner := eval.NewRunner(storeFS)
-	if err := runner.LoadCasesFromDir(dataDir); err != nil {
+	if err := runner.LoadCasesFromDir(filepath.Join(dataDir, "heldout")); err != nil {
 		fmt.Printf("Error loading eval dataset: %v\n", err)
 		os.Exit(1)
 	}
+	heldoutCases := runner.Cases()
 
-	fmt.Printf("Loaded %d benchmark fault cases from %s\n", len(eval.StandardFaultCases), dataDir)
+	fmt.Printf("Loaded %d held-out benchmark fault cases from %s\n", len(heldoutCases), filepath.Join(dataDir, "heldout"))
 
 	chunker := indexing.NewCodeChunker(50, 10)
 	indexes := make(map[string]*bm25.Index)
 
-	for _, c := range eval.StandardFaultCases {
+	for _, c := range heldoutCases {
 		fixtureDir := eval.GetFixturePathForRepo(c.RepositoryName)
 		targetSnapshotDir := filepath.Join("/tmp/repolens_eval_snapshots", c.RepositoryName, c.SnapshotSHA, "source")
 		chunks, err := eval.LoadFixtureChunksAndSnapshot(fixtureDir, targetSnapshotDir, c.SnapshotSHA, chunker)
@@ -115,7 +116,7 @@ func main() {
 
 	// 3. Four-Track Promotion Rule Benchmark Evaluation (ADR 008)
 	var testCases []retrievaleval.TestCase
-	for _, c := range eval.StandardFaultCases {
+	for _, c := range heldoutCases {
 		testCases = append(testCases, retrievaleval.TestCase{
 			ID:            c.CaseID,
 			Query:         c.IssueTitle,
@@ -138,5 +139,8 @@ func main() {
 	promoRes := retrievaleval.CheckPromotionRule(cMetrics, dMetrics)
 
 	eval.PrintComparisonTable([]*eval.EvalRun{runBM25, runE2E})
-	fmt.Printf("\n✓ %s\n", promoRes.Summary)
+	fmt.Printf("\n%s\n", promoRes.Summary)
+	if !promoRes.PromotedToProduction {
+		fmt.Println("Structural Retrieval remains experimental; BM25 stays the production strategy.")
+	}
 }

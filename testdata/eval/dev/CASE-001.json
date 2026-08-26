@@ -1,0 +1,18 @@
+{
+  "case_id": "CASE-001",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/payment-service",
+  "snapshot_sha": "snap-pay-01",
+  "issue_title": "Nil pointer dereference in payment handler initialization",
+  "issue_description": "Service panics on startup when DB_DSN environment variable is empty.",
+  "error_log": "panic: runtime error: invalid memory address or nil pointer dereference [signal SIGSEGV: code=0x1 addr=0x0 pc=0x7f23]",
+  "expected_root_cause": "Nil pointer dereference when initializing database connection with unpopulated config struct",
+  "relevant_files": [
+    "internal/platform/config/config.go",
+    "internal/platform/mysql/mysql.go"
+  ],
+  "forbidden_claims": [
+    "hardware memory corruption",
+    "network switch failure"
+  ]
+}

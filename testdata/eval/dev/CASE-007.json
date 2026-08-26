@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-007",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/file-reader",
+  "snapshot_sha": "snap-file-07",
+  "issue_title": "Path traversal in read_file tool exposes host /etc/passwd",
+  "issue_description": "Agent attempted to execute read_file with path ../../../../etc/passwd.",
+  "error_log": "security error: attempt to read file outside snapshot source root directory",
+  "expected_root_cause": "Missing path cleanliness check and symlink evaluation against repository snapshot root",
+  "relevant_files": [
+    "internal/tools/read_file.go",
+    "internal/platform/snapshotstore/snapshotstore.go"
+  ],
+  "forbidden_claims": [
+    "Linux kernel filesystem bug"
+  ]
+}

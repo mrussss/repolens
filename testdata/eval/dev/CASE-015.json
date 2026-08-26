@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-015",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/order-service",
+  "snapshot_sha": "snap-relay-15",
+  "issue_title": "Outbox events processed out of order causing race in status update",
+  "issue_description": "RETRY_REQUESTED event dispatched before DIAGNOSIS_REQUESTED completed.",
+  "error_log": "order conflict: attempt to transition run from SUCCEEDED to RETRY_WAIT",
+  "expected_root_cause": "Outbox relay fetching without ordering by available_at ASC or lack of conditional update check",
+  "relevant_files": [
+    "internal/diagnosis/state.go",
+    "internal/diagnosis/store.go"
+  ],
+  "forbidden_claims": [
+    "RabbitMQ clustering failure"
+  ]
+}

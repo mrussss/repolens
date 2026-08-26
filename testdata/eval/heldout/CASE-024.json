@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-024",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/git-ingest",
+  "snapshot_sha": "snap-filter-24",
+  "issue_title": "Indexer indexes binary .so files and node_modules filling storage",
+  "issue_description": "Repository indexing consumes 2GB memory indexing node_modules and binary shared objects.",
+  "error_log": "indexer warning: binary content and third-party dependencies ingested into chunk store",
+  "expected_root_cause": "FileFilter missing ignored directory rules for node_modules and binary extensions",
+  "relevant_files": [
+    "internal/indexing/filter.go"
+  ],
+  "forbidden_claims": [
+    "SSD disk corrupted"
+  ]
+}

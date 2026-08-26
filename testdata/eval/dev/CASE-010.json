@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-010",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/sse-streamer",
+  "snapshot_sha": "snap-sse-10",
+  "issue_title": "Client reconnecting to SSE stream loses previous step history",
+  "issue_description": "When network blips, reconnecting client does not see steps 1 through 5.",
+  "error_log": "sse replay error: client sent Last-Event-ID: 3 but received only new events",
+  "expected_root_cause": "SSE handler does not query AgentStep records from database filtered by Last-Event-ID on connection",
+  "relevant_files": [
+    "internal/sse/handler.go",
+    "internal/trace/step.go"
+  ],
+  "forbidden_claims": [
+    "HTTP/2 stream multiplexing broken"
+  ]
+}

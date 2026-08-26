@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-031",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/citation-range",
+  "snapshot_sha": "snap-range-31",
+  "issue_title": "Invalid citation line range (start \u003e end) accepted without error",
+  "issue_description": "Report citations with start_line=50 and end_line=20 were marked as VALID.",
+  "error_log": "citation validation error: invalid line range 50 to 20",
+  "expected_root_cause": "Citation validator did not verify startLine \u003e= 1 and endLine \u003e= startLine",
+  "relevant_files": [
+    "internal/evidence/citation.go"
+  ],
+  "forbidden_claims": [
+    "IDE line numbering bug"
+  ]
+}

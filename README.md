@@ -1,261 +1,104 @@
-# RepoLens — Reliable AI Repository Diagnosis Platform
+# RepoLens v2.1
 
-> **Reliable Go Backend + Evidence-based AI Codebase Diagnosis Platform.**  
-> Given a software repository and an issue / CI error log, RepoLens reliably executes automated root-cause diagnosis and delivers structured, evidence-backed diagnostic reports with verified line-level source code citations.
+RepoLens 是一个本地单用户 Go 代码诊断工具：它把固定版本的 Go 仓库物化为不可变 Snapshot，用 AST 与离线 best-effort `go/types` 建立版本化 CodeIndex，再用纯 Go BM25 + Structural Retrieval 为受控 Agent 提供证据，最后校验源码 Citation。
 
----
-
-## 1. Why RepoLens?
-
-Most LLM coding tools suffer from two critical flaws:
-1. **Unreliable Agent Execution**: Direct synchronous LLM invocations fail under token rate limits, network timeouts, worker crashes, or repeated tool invocation loops, causing lost updates and duplicate charges.
-2. **Hallucinated Citations**: LLMs generate plausible-looking file paths and nonexistent line numbers without grounding.
-
-RepoLens solves both problems through **rigorous backend distributed reliability** and **deterministic evidence validation**:
-- **Reliable Asynchronous Engine**: Transactional Outbox + Relay + RabbitMQ + MySQL optimistic locking ensures guaranteed at-least-once task delivery with idempotent business execution.
-- **Self-Healing Workers**: Periodic heartbeats and background recovery sweeper automatically reclaim abandoned attempts when worker nodes crash.
-- **Evidence-Based Citation Validator**: Every citation in the AI diagnostic report is strictly validated against an immutable filesystem snapshot (path existence, line bounds, and SHA256 content hash matching) before persisting to the user.
-- **Hybrid Code Retrieval**: Elasticsearch 8 BM25 + Dense Vector kNN search with Go-level Reciprocal Rank Fusion (RRF).
-- **32-Case Regression Eval**: Built-in offline evaluation harness measuring File Hit@K, MRR, citation validity rate, and root-cause accuracy across versioned benchmark datasets.
-
----
-
-## 2. System Architecture
-
-```mermaid
-flowchart TD
-    Client[Client / Web UI / CI Webhook] -->|1. POST /diagnoses| API[RepoLens API Server]
-    
-    subgraph Storage [Persistence & Storage]
-        DB[(MySQL 8\nSource of Truth)]
-        FS[Local Snapshot Store\n/data/repositories]
-        ES[(Elasticsearch 8\nCode Retrieval Index)]
-    end
-
-    API -->|2. Atomic Transaction| DB
-    DB -.->|DiagnosisRun: QUEUED\nOutboxEvent: PENDING| DB
-
-    subgraph AsyncEngine [Reliable Asynchronous Engine]
-        Relay[Outbox Relay Daemon] -->|3. FetchPending & Publish| MQ[[RabbitMQ 3.12\nDirect Exchange + DLQ]]
-        MQ -->|4. Consume Task| Worker[RepoLens Diagnosis Worker]
-        Sweeper[Recovery Sweeper] -.->|Check Stale Heartbeats| DB
-    end
-
-    Relay -.->|Mark PUBLISHED| DB
-    Worker -->|5. ClaimRun with Version Check| DB
-    Worker -->|Heartbeat Emitter| DB
-
-    subgraph AgentPipeline [Diagnostic Agent Runtime]
-        Loop[Bounded Agent Loop] -->|Tool Dispatch| Tools[Tool Registry]
-        Tools -->|search_code (Default Primary)| BM25[Production BM25 Retriever]
-        BM25 -->|Multi-Match Boosted Query| ES
-        Tools -.->|Optional Experimental| Hybrid[Hybrid RRF Retriever]
-        Hybrid -.->|BM25 + Dense kNN| ES
-        Tools -->|read_file / read_docs| FS
-        Loop -->|LLM Prompting| LLM[LLM Provider / OpenAI]
-    end
-
-    Worker -->|6. Execute| Loop
-    Worker -->|7. Re-verify Citations| Validator[Citation Validator]
-    Validator -->|File & Content Hash Check| FS
-    Worker -->|8. Finalize SUCCEEDED| DB
-    Worker -->|9. Live Step Trace| SSE[SSE Stream Hub] --> Client
-```
-
----
-
-## 3. Engineering Highlights
-
-### 1. Transactional Outbox & Message Relay
-- **Dual-write Consistency**: `DiagnosisRun` and `OutboxEvent` are written within a single ACID transaction in MySQL.
-- **Decoupled Publishing**: A dedicated `Relay` polls pending outbox records ordered by `available_at ASC`, delivers persistent AMQP messages to RabbitMQ, and marks events as `PUBLISHED`.
-- **Elimination of Ghost State**: Prevents the classic distributed bug where a task is written to DB but lost when the process terminates before messaging.
-
-### 2. Concurrency Fencing & Worker Claim
-- **Optimistic Locking Fencing**: Workers claim queued jobs using conditional updates:
-  ```sql
-  UPDATE diagnosis_runs 
-  SET status = 'RUNNING', version = version + 1, updated_at = NOW() 
-  WHERE id = ? AND version = ? AND status IN ('QUEUED', 'RETRY_WAIT');
-  ```
-- **Mutual Exclusion**: Guarantees that only one worker obtains execution rights, returning `ErrClaimConflict` to concurrent workers.
-
-### 3. Worker Crash Recovery & Stale Sweeper
-- **Active Heartbeats**: Active workers run background heartbeat emitters updating `heartbeat_at` on their `DiagnosisAttempt`.
-- **Automated Reclaim**: The `RecoverySweeper` queries for running attempts whose heartbeats have expired (> 30s threshold). It marks dead attempts as `ABANDONED`, transitions the run to `RETRY_WAIT`, and transactionally schedules a retry outbox event.
-
-### 4. Transport Redelivery vs. Application Retry
-- **Transport Duplicate Delivery**: Handled idempotently at the consumer layer. If a message is redelivered for a completed task (`SUCCEEDED` or `FAILED`), the consumer safely ACKs without re-executing.
-- **Application 429 / 5xx Retries**: Handled via state machine transitions to `RETRY_WAIT` with exponential backoff delayed outbox events, ACKing the current AMQP message to prevent RabbitMQ consumer starvation hot-loops.
-- **Poison Message Dead-Letter Queue (DLQ)**: Malformed or unprocessable payloads are caught and forwarded to `repolens.diagnosis.dlq`.
-
-### 5. Deterministic Citation Validation
-LLM diagnostic findings must provide line-level citations. Before persisting the diagnostic report, the `CitationValidator` performs:
-1. **Path Traversal & Symlink Check**: Verifies that the path remains strictly inside the target repository snapshot.
-2. **Line Boundary Check**: Asserts $1 \le \text{start\_line} \le \text{end\_line} \le \text{total\_lines}$.
-3. **Exact Excerpt & SHA256 Match**: Reads the immutable snapshot on disk, computes the SHA256 content hash, and validates excerpt containment. Citations are tagged `VALID` or `INVALID`.
-
-### 6. Retrieval Pipeline (BM25 Primary & Experimental Hybrid RRF)
-- **Production BM25 Search**: Evaluated and selected as the V1 production primary strategy (MRR 0.895, Hit@5 96.9%, Hit@10 100.0%). Uses Elasticsearch 8 multi-match with field boosts (`symbol^3.0`, `path^2.0`, `content^1.0`).
-- **Experimental Dense Vector & Hybrid Search**: Generates embeddings via `EmbeddingProvider` (Local deterministic feature hashing baseline or OpenAI-compatible `text-embedding-3-small`) queried via ES kNN.
-- **Reciprocal Rank Fusion (RRF)**: Merges rank positions in Go using $RRF(d) = \sum \frac{1}{60 + r_i(d)}$ to eliminate score scale mismatches.
-
----
-
-## 4. State Machines
-
-### DiagnosisRun State Machine
-```mermaid
-stateDiagram-v2
-    [*] --> QUEUED: API POST /diagnoses
-    QUEUED --> RUNNING: Worker ClaimRun
-    RUNNING --> SUCCEEDED: Diagnosis Complete & Report Persisted
-    RUNNING --> RETRY_WAIT: Stale Heartbeat Reclaim or Retryable Error (429)
-    RUNNING --> FAILED: Retries Exhausted or Terminal Error
-    RETRY_WAIT --> RUNNING: Retry Outbox Relay & Worker Claim
-    RUNNING --> CANCELLED: User Cancel Requested
-```
-
-### DiagnosisAttempt State Machine
-```mermaid
-stateDiagram-v2
-    [*] --> RUNNING: ClaimRun (Attempt #N)
-    RUNNING --> SUCCEEDED: Diagnosis Complete
-    RUNNING --> FAILED_RETRYABLE: LLM 429 / Transient Error
-    RUNNING --> FAILED_TERMINAL: Fatal Error / Retries Exceeded
-    RUNNING --> ABANDONED: Worker Crash (Stale Sweeper Reclaim)
-```
-
----
-
-## 5. Retrieval Benchmark & Evaluation
-
-RepoLens includes an offline benchmark runner (`cmd/eval`) evaluated on 32 curated real-world repository fault cases against static repository fixtures without ground-truth leaking:
+核心链路：
 
 ```text
-=========================================================================================================
-Retrieval        | Hit@5    | Hit@10   | MRR      | Cit. Valid   | Root Cause   | P50(ms)  | P95(ms) 
----------------------------------------------------------------------------------------------------------
-LEXICAL          |    90.6% |    96.9% |    0.883 |       100.0% |         0.0% |       0 |       0
-BM25             |    96.9% |   100.0% |    0.895 |       100.0% |         0.0% |       1 |       3
-LOCAL_HASHED_VEC |   100.0% |   100.0% |    0.843 |       100.0% |         0.0% |       2 |       5
-HYBRID_BASELINE  |    96.9% |   100.0% |    0.882 |       100.0% |         0.0% |       1 |       4
-AGENT_PLUMBING   |    96.9% |   100.0% |    0.866 |         0.0% |        15.6% |       3 |       6
-=========================================================================================================
+Web → Go API → MySQL → DB-backed Analysis Jobs → Worker
+
+Repository → immutable Snapshot → CodeIndexBuild → RetrievalBuild
+           → 5 read-only tools → bounded Agent → validated citations
 ```
 
-*Note: `LOCAL_HASHED_VEC` serves as a local deterministic hashing baseline without external network dependencies. Production semantic embeddings utilize OpenAI `text-embedding-3-small` or compatible vector models.*  
-*Note: `AGENT_PLUMBING` evaluates the deterministic agent loop execution, tool invocation dispatch, and citation verification plumbing using a fake LLM provider (verifying engineering harness reliability rather than live LLM model accuracy).*
+## 快速开始
 
-See [ADR 001: Retrieval Strategy](docs/adr/001-retrieval-strategy.md) for full architectural rationale and trade-off analysis.
+需要 Docker、Docker Compose、Go 1.22+（仅本地开发）和 Node.js 20+（仅本地 Web 开发）。
 
----
-
-## 6. Quick Start
-
-### Prerequisites
-- Docker & Docker Compose
-- Go 1.22+ (for local builds)
-
-### 1. Launch with Docker Compose
 ```bash
-# Clone repository
-git clone https://github.com/mrussss/repolens.git
-cd repolens
-
-# Configure environment
 cp .env.example .env
-
-# Launch all infrastructure services & daemons
-docker compose up -d
+docker compose up --build
 ```
 
-Services initialized:
-- **API Server**: `http://localhost:8080`
-- **RabbitMQ Management**: `http://localhost:15672` (repolens / repolens_mq_pass)
-- **Elasticsearch 8**: `http://localhost:9200`
-- **MySQL 8**: `localhost:3306`
+打开 <http://127.0.0.1:8080>。Setup 页面可以保存 OpenAI-compatible Provider；API Key 只写入 API/Worker 共享的 0600 本地 secret 文件，不会返回浏览器、trace 或日志。没有 API Key 时可使用 Try Demo 的确定性 FakeProvider。
 
-### 2. Trigger Diagnosis via API
-```bash
-# 1. Register a repository
-curl -X POST http://localhost:8080/repositories \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "payment-service",
-    "git_url": "https://github.com/example/payment-service.git"
-  }'
+Compose 最终只运行 `mysql`、`api`、`worker`，默认仅绑定 loopback。仓库内容是不可信数据；系统不会执行用户仓库的 build、test、generate 或 package install。
 
-# 2. Trigger a diagnosis task
-curl -X POST http://localhost:8080/diagnoses \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: task-req-001" \
-  -d '{
-    "repository_id": "repo-id",
-    "snapshot_id": "snap-id",
-    "issue_title": "Nil pointer dereference in payment handler initialization",
-    "error_log": "panic: runtime error: invalid memory address or nil pointer dereference"
-  }'
+## 产品流程
 
-# 3. Stream real-time agent execution steps (SSE)
-curl -N http://localhost:8080/diagnoses/<id>/stream
+1. 注册公开 Git 仓库并选择 ref。
+2. 创建 Snapshot；Worker 解析 exact commit，完成文件 materialization 和 manifest hash 后才置为 READY。
+3. 创建 CodeIndexBuild，查看 Symbols、References、Related Tests 和 AnalysisQuality。
+4. 创建 RetrievalBuild。
+5. 选择固定 Snapshot / CodeIndexBuild / RetrievalBuild，提交 CI/Test failure。
+6. 轮询 Diagnosis、Report、Evidence 和 Agent Trace。
+
+Diagnosis 会冻结 Snapshot、两个 build、Provider endpoint/model、prompt/agent 版本和配置 hash。之后重新构建索引不会改变既有 Diagnosis；相同 endpoint 的 API Key rotation 可以继续使用，endpoint 或 model drift 会被拒绝。
+
+## API（节选）
+
+主 API 前缀是 `/api/v1`：
+
+```text
+GET/PUT/DELETE /settings/provider
+POST      /settings/provider/test
+POST      /demo/trigger
+POST      /repositories
+POST      /repositories/:id/index
+POST      /snapshots/:id/code-index-builds
+POST      /code-index-builds/:id/retrieval-builds
+POST      /diagnoses
+GET       /diagnoses/:id/report
+GET       /diagnoses/:id/steps
 ```
 
----
+Diagnosis 的业务状态只有 `QUEUED`、`RUNNING`、`SUCCEEDED`、`FAILED`、`CANCELLED`；执行层的 retry 只存在于 AnalysisJob 的 `RETRY_WAIT`。
 
-## 7. Testing & Verification
-
-RepoLens enforces strict release-gate checks covering unit tests, race detector verification, integration tests, and eval benchmark regression:
+## 验证
 
 ```bash
-# Run all unit tests
-make test
-
-# Run all tests with Go race detector
-make test-race
-
-# Run integration tests (Outbox, Concurrency, Recovery, DLQ, ES)
-make test-integration
-
-# Run offline 32-case eval benchmark
-make eval
-
-# Complete Release Gate validation
-make verify
+gofmt -l cmd internal tests
+go vet ./...
+go test ./...
+go test -race ./...
+cd web && npm ci && npm run build
+cd .. && go run ./cmd/eval
+docker compose config
 ```
 
----
+若本机有 Docker，可执行：
 
-## 8. Observability & Metrics
+```bash
+REPOLENS_REQUIRE_REAL_INTEGRATION=1 go test ./tests/integration_real/...
+docker compose build
+```
 
-Prometheus metrics are exposed on `GET /metrics` (`cmd/api`):
-- `http_requests_total{method, path, status}`: API request counters
-- `diagnosis_total`: Total diagnosis runs initiated
-- `diagnosis_failed_total{error_type}`: Failed runs count
-- `diagnosis_latency_seconds`: E2E diagnosis execution histogram
-- `worker_inflight`: Inflight tasks gauge
-- `mq_redelivery_total`: Redelivered transport messages
-- `application_retry_total`: Application retry count
-- `stale_attempt_recovered_total`: Crashed worker attempt recoveries
-- `retrieval_requests_total{strategy}`: Retrieval queries counter
-- `retrieval_latency_seconds{strategy}`: Retrieval latency histogram
-- `tool_calls_total{tool_name, status}`: Agent tool execution counter
-- `token_usage_total{type}`: Prompt & completion token counter
+完整 release gate：`./scripts/release_gate.sh`。
 
----
+## 范围与限制
 
-## 9. Security & Ingestion Boundaries
+- RepoLens v2.1 是 local single-user developer tool，不适合直接暴露到公网。
+- 主要支持一个公开 GitHub 仓库和一个 root Go module；外部依赖可能保持 unresolved。
+- 类型分析是离线、best-effort；Reference/Call 不是完整 runtime call graph。
+- Related Test 是证据排序，不是完整 test impact analysis。
+- BM25 是 portfolio-scale 的纯 Go 检索，不是分布式代码搜索。
+- Agent 只读、受步数/调用次数/输出大小限制；仓库文本与 CI log 视为不可信输入。
+- Citation validation 证明源码一致性，不证明模型结论的逻辑正确性；secret redaction 是 best-effort。
+- Eval 数据集小且经过整理，Dev 与 frozen held-out 分离；Structural Retrieval 只有通过 promotion rule 才能成为生产策略。
+- v1.1 的 RabbitMQ、Outbox、Elasticsearch、Vector/RRF、SSE 和旧 Auth 仅存在于历史版本，不属于 v2.1 core。
+- v2.1 不实现自动 Snapshot/Index retention 或 GC；`make clean-data` 是破坏性的全量本地重置，请谨慎使用。
 
-- **Safe Git Cloner**: Strictly validates remote Git URLs against private IPv4/IPv6 CIDRs (RFC 1918, RFC 3927, loopback, AWS metadata `169.254.169.254`), preventing SSRF.
-- **Snapshot Isolation**: Source snapshots are evaluated with `filepath.EvalSymlinks` to prevent symlink directory escapes into the host filesystem.
-- **Secret Redaction**: Regex filter automatically sanitizes API keys (`sk-`, `ghp_`, `AKIA...`, Authorization headers) from issue titles, descriptions, and error logs before persistence and prompt dispatch.
-- **Bounded Resource Limits**: Enforces repository size bounds (`MAX_REPO_SIZE_MB`), maximum file count (`MAX_FILE_COUNT`), and per-file size caps (`MAX_FILE_SIZE_KB`).
+## 项目结构
 
----
-
-## 10. Non-Goals & Architecture Scope
-
-To maintain engineering depth and architectural clarity, the following are explicitly out-of-scope for V1:
-- **Redis**: MySQL + RabbitMQ provide complete persistence and transactional guarantees.
-- **Kubernetes / Service Mesh**: Single-binary daemons with Docker Compose orchestration.
-- **Multi-Agent Swarm / LangGraph**: RepoLens relies on a single, deterministic, bounded Go agent runtime loop with strict error fences.
+```text
+cmd/{api,worker,eval}       可执行程序
+internal/jobs               DB-backed claim/lease/retry worker
+internal/indexing           Snapshot materialization
+internal/codeintel          AST、symbols、relations、quality
+internal/retrieval          BM25、artifact、structural retrieval
+internal/agent + tools      bounded Agent 与 5 个只读工具
+internal/evidence           report、citation validation
+migrations                  MySQL authoritative schema
+web                         React + TypeScript + Vite
+testdata                    parser fixtures、demo、eval cases
+```

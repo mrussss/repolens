@@ -57,6 +57,18 @@ export interface CodeIndexBuild {
   ready_at?: string;
 }
 
+export interface RetrievalBuild {
+  id: number;
+  code_index_build_id: number;
+  strategy: string;
+  artifact_path?: string;
+  artifact_hash?: string;
+  doc_count: number;
+  status: 'CREATED' | 'BUILDING' | 'READY' | 'FAILED';
+  created_at: string;
+  ready_at?: string;
+}
+
 export interface CodeSymbol {
   id: number;
   code_index_build_id: number;
@@ -123,10 +135,12 @@ export interface DiagnosisRun {
   user_id: string;
   repository_id: string;
   snapshot_id: string;
+  code_index_build_id?: number;
+  retrieval_build_id?: number;
   issue_title: string;
   issue_description?: string;
   error_log?: string;
-  status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'RETRY_WAIT' | 'CANCELLED';
+  status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED';
   execution_status?: string;
   attempt_count?: number;
   idempotency_key?: string;

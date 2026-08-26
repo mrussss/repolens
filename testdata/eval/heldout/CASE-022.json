@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE-022",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/json-parser",
+  "snapshot_sha": "snap-json-22",
+  "issue_title": "Markdown code fence in LLM response causes JSON unmarshal failure",
+  "issue_description": "LLM output starting with ```json is rejected as invalid report format.",
+  "error_log": "parse error: invalid character '`' looking for beginning of value",
+  "expected_root_cause": "Missing markdown code fence stripping and regex fallback in report parser",
+  "relevant_files": [
+    "internal/agent/loop.go"
+  ],
+  "forbidden_claims": [
+    "LLM model deleted"
+  ]
+}

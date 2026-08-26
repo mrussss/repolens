@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE-030",
+  "dataset_version": "v1.0",
+  "repository_name": "repolens/queue-worker",
+  "snapshot_sha": "snap-hb-30",
+  "issue_title": "Slow LLM response blocks heartbeat emitter causing premature task recovery",
+  "issue_description": "LLM call taking 45s causes recovery sweeper to mark attempt ABANDONED while still running.",
+  "error_log": "stale attempt warning: worker heartbeat expired after 30s threshold during long LLM call",
+  "expected_root_cause": "Heartbeat ticker ran in the same goroutine as synchronous LLM request instead of dedicated background goroutine",
+  "relevant_files": [
+    "internal/worker/recovery.go",
+    "internal/worker/consumer.go"
+  ],
+  "forbidden_claims": [
+    "system clock jumped forward"
+  ]
+}
