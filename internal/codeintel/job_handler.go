@@ -51,6 +51,12 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	if err != nil {
 		return fmt.Errorf("failed fetching code index build %d: %w", buildID, err)
 	}
+	if cib.Status == model.BuildStatusReady {
+		return nil
+	}
+	if err := h.store.MarkBuildBuilding(ctx, cib.ID); err != nil {
+		return jobs.NewRetryableError("BUILD_STATE_UPDATE_FAILED", err.Error(), err)
+	}
 
 	snap, err := h.snapStore.GetByID(ctx, cib.SnapshotID)
 	if err != nil {
@@ -68,13 +74,18 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	analysisRes, err := h.analyzer.Analyze(ctx, snapshotDir, bc)
 	if err != nil {
 		log.Error("code index build analysis failed", "build_id", cib.ID, "error", err)
-		_ = h.store.FailBuild(ctx, cib.ID, err.Error())
+		class, _ := jobs.ClassifyError(err)
+		if class == jobs.ErrorClassPermanent || job.AttemptCount >= job.MaxAttempts {
+			_ = h.store.FailBuild(ctx, cib.ID, err.Error())
+		}
 		return err
 	}
 
 	if err := h.store.SaveAnalysisResult(ctx, cib.ID, analysisRes); err != nil {
 		log.Error("failed persisting code index analysis result", "build_id", cib.ID, "error", err)
-		_ = h.store.FailBuild(ctx, cib.ID, err.Error())
+		if job.AttemptCount >= job.MaxAttempts {
+			_ = h.store.FailBuild(ctx, cib.ID, err.Error())
+		}
 		return err
 	}
 

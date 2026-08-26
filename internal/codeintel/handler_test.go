@@ -150,6 +150,7 @@ func TestCodeIntelHTTP_EndToEndEndpoints(t *testing.T) {
 			SemanticRelationsCount: 2,
 		},
 	}
+	_ = ciStore.MarkBuildBuilding(ctx, buildID)
 	_ = ciStore.SaveAnalysisResult(ctx, buildID, analysisRes)
 
 	// 5. GET /api/v1/code-index-builds/:id/quality -> 200 OK

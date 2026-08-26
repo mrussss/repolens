@@ -10,6 +10,7 @@ import (
 
 	"repolens/internal/codeintel/model"
 	"repolens/internal/jobs"
+	"repolens/internal/snapshot"
 )
 
 var (
@@ -24,6 +25,7 @@ type Store interface {
 	GetBySnapshot(ctx context.Context, snapshotID string) (*model.CodeIndexBuild, error)
 	SaveAnalysisResult(ctx context.Context, buildID int64, result *model.AnalysisResult) error
 	FailBuild(ctx context.Context, buildID int64, errorCode string) error
+	MarkBuildBuilding(ctx context.Context, buildID int64) error
 	ListSymbols(ctx context.Context, buildID int64, query string, limit int) ([]*model.Symbol, error)
 	GetSymbolByHash(ctx context.Context, buildID int64, symbolKeyHash string) (*model.Symbol, error)
 	ListRelationsForSymbol(ctx context.Context, buildID int64, symbolID int64) ([]*model.SymbolRelation, error)
@@ -35,6 +37,7 @@ type Store interface {
 	GetRetrievalBuildByCodeIndexBuild(ctx context.Context, codeIndexBuildID int64) (*model.RetrievalBuild, error)
 	CompleteRetrievalBuild(ctx context.Context, id int64, artifactPath, artifactHash string, docCount int) error
 	FailRetrievalBuild(ctx context.Context, id int64, errorCode string) error
+	MarkRetrievalBuilding(ctx context.Context, id int64) error
 
 	// Lineage Validation
 	ValidateLineage(ctx context.Context, repoID, snapshotID string, codeIndexBuildID, retrievalBuildID int64) error
@@ -74,7 +77,7 @@ func (s *GormStore) GetOrCreateBuild(ctx context.Context, snapshotID, modulePath
 		ModulePath:          modulePath,
 		GOOS:                bc.GOOS,
 		GOARCH:              bc.GOARCH,
-		BuildTagsHash:       ctxHash,
+		BuildTagsHash:       bc.BuildTagsHash(),
 		Status:              model.BuildStatusCreated,
 		CreatedAt:           time.Now().UTC(),
 	}
@@ -179,7 +182,9 @@ func (s *GormStore) SaveAnalysisResult(ctx context.Context, buildID int64, res *
 
 		// 4. Update CodeIndexBuild with metrics and READY status
 		now := time.Now().UTC()
-		return tx.Model(&model.CodeIndexBuild{}).Where("id = ?", buildID).Updates(map[string]interface{}{
+		result := tx.Model(&model.CodeIndexBuild{}).Where("id = ? AND status = ?", buildID, model.BuildStatusBuilding).Updates(map[string]interface{}{
+			"module_path":               res.ModulePath,
+			"build_tags_hash":           res.BuildContext.BuildTagsHash(),
 			"status":                    model.BuildStatusReady,
 			"files_total":               res.Quality.FilesTotal,
 			"files_parsed":              res.Quality.FilesParsed,
@@ -193,15 +198,56 @@ func (s *GormStore) SaveAnalysisResult(ctx context.Context, buildID int64, res *
 			"heuristic_relation_count":  res.Quality.HeuristicRelationsCount,
 			"unresolved_relation_count": res.Quality.UnresolvedRelationsCount,
 			"ready_at":                  &now,
-		}).Error
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("code index build %d finalize conflict", buildID)
+		}
+		return nil
 	})
 }
 
+func (s *GormStore) MarkBuildBuilding(ctx context.Context, buildID int64) error {
+	result := s.db.WithContext(ctx).Model(&model.CodeIndexBuild{}).
+		Where("id = ? AND status IN (?, ?)", buildID, model.BuildStatusCreated, model.BuildStatusBuilding).
+		Update("status", model.BuildStatusBuilding)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		build, err := s.GetByID(ctx, buildID)
+		if err == nil && build.Status == model.BuildStatusBuilding {
+			return nil
+		}
+		return fmt.Errorf("code index build %d is not claimable", buildID)
+	}
+	return nil
+}
+
 func (s *GormStore) FailBuild(ctx context.Context, buildID int64, errorCode string) error {
-	return s.db.WithContext(ctx).Model(&model.CodeIndexBuild{}).Where("id = ?", buildID).Updates(map[string]interface{}{
+	return s.db.WithContext(ctx).Model(&model.CodeIndexBuild{}).Where("id = ? AND status != ?", buildID, model.BuildStatusReady).Updates(map[string]interface{}{
 		"status":     model.BuildStatusFailed,
 		"error_code": errorCode,
 	}).Error
+}
+
+func (s *GormStore) MarkRetrievalBuilding(ctx context.Context, id int64) error {
+	result := s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).
+		Where("id = ? AND status IN (?, ?)", id, model.BuildStatusCreated, model.BuildStatusBuilding).
+		Update("status", model.BuildStatusBuilding)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		build, err := s.GetRetrievalBuildByID(ctx, id)
+		if err == nil && build.Status == model.BuildStatusBuilding {
+			return nil
+		}
+		return fmt.Errorf("retrieval build %d is not claimable", id)
+	}
+	return nil
 }
 
 func (s *GormStore) ListSymbols(ctx context.Context, buildID int64, query string, limit int) ([]*model.Symbol, error) {
@@ -326,18 +372,28 @@ func (s *GormStore) GetRetrievalBuildByCodeIndexBuild(ctx context.Context, codeI
 }
 
 func (s *GormStore) CompleteRetrievalBuild(ctx context.Context, id int64, artifactPath, artifactHash string, docCount int) error {
+	if artifactPath == "" || artifactHash == "" {
+		return fmt.Errorf("retrieval build %d cannot become READY without an artifact and hash", id)
+	}
 	now := time.Now().UTC()
-	return s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).Where("id = ?", id).Updates(map[string]interface{}{
+	result := s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).Where("id = ? AND status = ?", id, model.BuildStatusBuilding).Updates(map[string]interface{}{
 		"status":         model.BuildStatusReady,
 		"artifact_path":  artifactPath,
 		"artifact_hash":  artifactHash,
 		"document_count": docCount,
 		"ready_at":       &now,
-	}).Error
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("retrieval build %d finalize conflict", id)
+	}
+	return nil
 }
 
 func (s *GormStore) FailRetrievalBuild(ctx context.Context, id int64, errorCode string) error {
-	return s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).Where("id = ?", id).Updates(map[string]interface{}{
+	return s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).Where("id = ? AND status != ?", id, model.BuildStatusReady).Updates(map[string]interface{}{
 		"status":     model.BuildStatusFailed,
 		"error_code": errorCode,
 	}).Error
@@ -348,6 +404,10 @@ func (s *GormStore) FailRetrievalBuild(ctx context.Context, id int64, errorCode 
 // code_index_build.snapshot_id == snapshotID
 // retrieval_build.code_index_build_id == codeIndexBuildID
 func (s *GormStore) ValidateLineage(ctx context.Context, repoID, snapshotID string, codeIndexBuildID, retrievalBuildID int64) error {
+	var snap snapshot.RepositorySnapshot
+	if err := s.db.WithContext(ctx).First(&snap, "id = ?", snapshotID).Error; err != nil || snap.RepositoryID != repoID || snap.Status != snapshot.StatusReady {
+		return fmt.Errorf("%w: snapshot is missing, not READY, or belongs to another repository", ErrBuildLineageMismatch)
+	}
 	if codeIndexBuildID > 0 {
 		var cib model.CodeIndexBuild
 		if err := s.db.WithContext(ctx).First(&cib, "id = ?", codeIndexBuildID).Error; err != nil {

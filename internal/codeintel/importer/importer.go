@@ -25,6 +25,7 @@ type OfflineImporter struct {
 	pkgFilesMap  map[string]*PkgFiles      // pkgPath -> PkgFiles
 	cache        map[string]*types.Package // pkgPath -> *types.Package
 	typeErrors   map[string][]string       // pkgPath -> errors
+	loading      map[string]bool           // package states; prevents recursive deadlock
 	stdlibImport types.Importer
 }
 
@@ -36,6 +37,7 @@ func NewOfflineImporter(fset *token.FileSet, modulePath string, pkgFilesMap map[
 		pkgFilesMap:  pkgFilesMap,
 		cache:        make(map[string]*types.Package),
 		typeErrors:   make(map[string][]string),
+		loading:      make(map[string]bool),
 		stdlibImport: importer.Default(),
 	}
 }
@@ -48,56 +50,69 @@ func (oi *OfflineImporter) Import(path string) (*types.Package, error) {
 // ImportFrom imports the package with the given import path from dir.
 func (oi *OfflineImporter) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.Package, error) {
 	oi.mu.Lock()
-	defer oi.mu.Unlock()
-
-	// 1. Check cache
 	if pkg, ok := oi.cache[path]; ok {
+		oi.mu.Unlock()
 		return pkg, nil
 	}
+	if oi.loading[path] {
+		oi.mu.Unlock()
+		return nil, fmt.Errorf("root-module import cycle detected at %q", path)
+	}
 
-	// 2. Check if it's within the root module
-	if strings.HasPrefix(path, oi.modulePath) {
+	// Never hold the cache mutex while types.Check recursively imports another
+	// package. sync.Mutex is not re-entrant; the old implementation deadlocked
+	// on ordinary root-module cross-package imports.
+	if path == oi.modulePath || strings.HasPrefix(path, oi.modulePath+"/") {
 		pkgFiles, exists := oi.pkgFilesMap[path]
+		oi.mu.Unlock()
 		if !exists {
 			return nil, fmt.Errorf("root-module package %q not found in snapshot", path)
 		}
-
-		// Type-check this package in offline mode
-		pkg, err := oi.typeCheckPackageLocked(pkgFiles)
+		oi.mu.Lock()
+		oi.loading[path] = true
+		oi.mu.Unlock()
+		pkg, err := oi.typeCheckPackage(pkgFiles)
+		oi.mu.Lock()
+		delete(oi.loading, path)
 		if err != nil {
-			// Record error but return package if partially created
 			oi.typeErrors[path] = append(oi.typeErrors[path], err.Error())
 		}
 		if pkg != nil {
 			oi.cache[path] = pkg
+			oi.mu.Unlock()
 			return pkg, nil
 		}
+		oi.mu.Unlock()
 		return nil, fmt.Errorf("failed to type-check package %q: %w", path, err)
 	}
+	oi.mu.Unlock()
 
-	// 3. Check if it's a standard library package
+	// Standard library imports are also performed without the cache lock.
 	if oi.stdlibImport != nil {
 		if impFrom, ok := oi.stdlibImport.(types.ImporterFrom); ok {
 			pkg, err := impFrom.ImportFrom(path, srcDir, mode)
 			if err == nil {
+				oi.mu.Lock()
 				oi.cache[path] = pkg
+				oi.mu.Unlock()
 				return pkg, nil
 			}
 		} else {
 			pkg, err := oi.stdlibImport.Import(path)
 			if err == nil {
+				oi.mu.Lock()
 				oi.cache[path] = pkg
+				oi.mu.Unlock()
 				return pkg, nil
 			}
 		}
 	}
 
-	// 4. External dependency not present in snapshot -> unresolved (strictly offline)
+	// External dependency not present in snapshot -> unresolved (strictly offline).
 	return nil, fmt.Errorf("external dependency %q unresolved (offline mode: no network resolution)", path)
 }
 
-// typeCheckPackageLocked typechecks a root-module package while holding the mutex.
-func (oi *OfflineImporter) typeCheckPackageLocked(pf *PkgFiles) (*types.Package, error) {
+func (oi *OfflineImporter) typeCheckPackage(pf *PkgFiles) (*types.Package, error) {
 	var typeErrors []string
 	conf := types.Config{
 		Importer: oi,
@@ -110,7 +125,9 @@ func (oi *OfflineImporter) typeCheckPackageLocked(pf *PkgFiles) (*types.Package,
 	info := &types.Info{}
 	pkg, err := conf.Check(pf.PkgPath, oi.fset, pf.Files, info)
 	if err != nil && len(typeErrors) > 0 {
+		oi.mu.Lock()
 		oi.typeErrors[pf.PkgPath] = append(oi.typeErrors[pf.PkgPath], typeErrors...)
+		oi.mu.Unlock()
 	}
 	return pkg, err
 }

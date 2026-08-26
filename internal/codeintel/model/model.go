@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -65,9 +66,27 @@ func DefaultBuildContext() BuildContext {
 
 // BuildContextHash computes the SHA256 hash of the build context.
 func (bc BuildContext) BuildContextHash() string {
-	raw := fmt.Sprintf("%s|%s|%s", bc.GOOS, bc.GOARCH, strings.Join(bc.BuildTags, ","))
+	raw := fmt.Sprintf("%s|%s|%s", strings.TrimSpace(bc.GOOS), strings.TrimSpace(bc.GOARCH), strings.Join(normalizedBuildTags(bc.BuildTags), ","))
 	h := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(h[:])
+}
+
+// BuildTagsHash identifies the normalized build tag set independently from
+// GOOS/GOARCH, so the persisted build identity remains auditable.
+func (bc BuildContext) BuildTagsHash() string {
+	h := sha256.Sum256([]byte(strings.Join(normalizedBuildTags(bc.BuildTags), ",")))
+	return hex.EncodeToString(h[:])
+}
+
+func normalizedBuildTags(tags []string) []string {
+	result := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if tag = strings.TrimSpace(tag); tag != "" {
+			result = append(result, tag)
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 // CodeFile represents a parsed source file within the codebase.
