@@ -11,7 +11,33 @@ import (
 	"repolens/internal/llm"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/retrieval"
+	"repolens/internal/retrieval/bm25"
 )
+
+type MemoryBM25Retriever struct {
+	indexes map[string]*bm25.Index
+}
+
+func (m *MemoryBM25Retriever) Search(ctx context.Context, req retrieval.SearchRequest) ([]retrieval.SearchResult, error) {
+	idx, ok := m.indexes[req.SnapshotID]
+	if !ok {
+		return nil, nil
+	}
+	res := idx.Search(req.Query, req.TopK)
+	var out []retrieval.SearchResult
+	for _, r := range res {
+		out = append(out, retrieval.SearchResult{
+			ChunkID:         r.Document.FilePath,
+			Path:            r.Document.FilePath,
+			StartLine:       r.Document.StartLine,
+			EndLine:         r.Document.EndLine,
+			Snippet:         r.Document.Content,
+			Score:           r.Score,
+			RetrievalSource: "symbol_bm25_structural",
+		})
+	}
+	return out, nil
+}
 
 func TestDatasetGroundTruthValidation(t *testing.T) {
 	if err := eval.ValidateDatasetFixtures(eval.StandardFaultCases); err != nil {
@@ -68,10 +94,10 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 		runner.AddCase(c)
 	}
 
-	chunkStore := retrieval.NewMemoryChunkStore()
 	chunker := indexing.NewCodeChunker(50, 10)
+	indexes := make(map[string]*bm25.Index)
 
-	// Populate chunk store and disk files for all 32 cases from static fixtures
+	// Populate BM25 indexes and disk files for all 32 cases from static fixtures
 	for _, c := range eval.StandardFaultCases {
 		fixtureDir := eval.GetFixturePathForRepo(c.RepositoryName)
 		targetSnapshotDir := filepath.Join(tmpDir, c.RepositoryName, c.SnapshotSHA, "source")
@@ -79,14 +105,26 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 		if err != nil || len(chunks) == 0 {
 			t.Fatalf("failed to load fixture chunks for %s: %v (chunks=%d)", c.CaseID, err, len(chunks))
 		}
-		chunkStore.SaveChunks(c.SnapshotSHA, chunks)
+
+		idx := bm25.NewIndex(1.2, 0.75)
+		for _, ch := range chunks {
+			idx.AddDocument(bm25.Document{
+				FilePath:   ch.Path,
+				StartLine:  ch.StartLine,
+				EndLine:    ch.EndLine,
+				Content:    ch.Content,
+				SymbolName: ch.Symbol,
+			})
+		}
+		idx.Build()
+		indexes[c.SnapshotSHA] = idx
 	}
 
 	ctx := context.Background()
+	memRetriever := &MemoryBM25Retriever{indexes: indexes}
 
-	// 1. BM25 Eval
-	bm25Retriever := retrieval.NewBM25Retriever(chunkStore)
-	runBM25, err := runner.RunRetrievalEval(ctx, "BM25", bm25Retriever, chunkStore)
+	// 1. Pure Go BM25 Eval
+	runBM25, err := runner.RunRetrievalEval(ctx, "BM25", memRetriever)
 	if err != nil {
 		t.Fatalf("BM25 eval failed: %v", err)
 	}
@@ -94,27 +132,9 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 		t.Errorf("expected non-zero Hit@5 for BM25")
 	}
 
-	// 2. Vector Eval
-	embedder := retrieval.NewLocalHashedFeatureProvider(128)
-	vectorRetriever := retrieval.NewVectorRetriever(chunkStore, embedder)
-	runVector, err := runner.RunRetrievalEval(ctx, "VECTOR", vectorRetriever, chunkStore)
-	if err != nil {
-		t.Fatalf("Vector eval failed: %v", err)
-	}
-
-	// 3. Hybrid RRF Eval
-	hybridRetriever := retrieval.NewHybridRRFRetriever(60, bm25Retriever, vectorRetriever)
-	runHybrid, err := runner.RunRetrievalEval(ctx, "HYBRID_RRF", hybridRetriever, chunkStore)
-	if err != nil {
-		t.Fatalf("Hybrid RRF eval failed: %v", err)
-	}
-	if runHybrid.Metrics.MRR == 0 {
-		t.Errorf("expected non-zero MRR for Hybrid RRF")
-	}
-
-	// 4. End-to-End Diagnosis Eval with Real Agent Tool Calling Loop
+	// 2. End-to-End Diagnosis Eval with Real Agent Tool Calling Loop
 	fakeProvider := llm.NewFakeProvider(llm.ModeToolCallThenDone)
-	runE2E, err := runner.RunEndToEndDiagnosisEval(ctx, fakeProvider, hybridRetriever)
+	runE2E, err := runner.RunEndToEndDiagnosisEval(ctx, fakeProvider, memRetriever)
 	if err != nil {
 		t.Fatalf("E2E diagnosis eval failed: %v", err)
 	}
@@ -123,5 +143,5 @@ func TestRetrievalAndEvalBenchmark(t *testing.T) {
 		t.Errorf("expected non-zero token metrics in E2E Eval")
 	}
 
-	eval.PrintComparisonTable([]*eval.EvalRun{runBM25, runVector, runHybrid, runE2E})
+	eval.PrintComparisonTable([]*eval.EvalRun{runBM25, runE2E})
 }

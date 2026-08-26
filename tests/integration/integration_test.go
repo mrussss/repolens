@@ -3,8 +3,6 @@ package integration_test
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,11 +16,12 @@ import (
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
-	"repolens/internal/platform/elasticsearch"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
 	"repolens/internal/retrieval"
+	"repolens/internal/retrieval/artifact"
+	"repolens/internal/retrieval/bm25"
 	"repolens/internal/snapshot"
 	"repolens/internal/worker"
 )
@@ -249,82 +248,92 @@ func TestDBJobWorkerPipeline(t *testing.T) {
 	}
 }
 
-// 4. Test Elasticsearch & RRF Integration
-func TestElasticsearchAndRRFIntegration(t *testing.T) {
-	// Mock Elasticsearch Server
-	mockES := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"version":{"number":"8.13.0"}}`))
-			return
-		}
-
-		if r.URL.Path == "/test_index/_search" {
-			mockResp := `{
-				"hits": {
-					"total": {"value": 2, "relation": "eq"},
-					"hits": [
-						{
-							"_id": "chunk-1",
-							"_score": 4.5,
-							"_source": {
-								"snapshot_id": "snap-mock",
-								"path": "internal/auth/jwt.go",
-								"start_line": 10,
-								"end_line": 35,
-								"content": "func GenerateToken(userID string) (string, error) {",
-								"content_hash": "hash1"
-							}
-						},
-						{
-							"_id": "chunk-2",
-							"_score": 3.2,
-							"_source": {
-								"snapshot_id": "snap-mock",
-								"path": "internal/user/service.go",
-								"start_line": 50,
-								"end_line": 70,
-								"content": "func Login(username, password string) (*User, error) {",
-								"content_hash": "hash2"
-							}
-						}
-					]
-				}
-			}`
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(mockResp))
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"acknowledged": true}`))
-	}))
-	defer mockES.Close()
-
-	esClient := elasticsearch.NewClient(mockES.URL, "test_index")
-	bm25Retriever := retrieval.NewESBM25Retriever(esClient)
-	embedder := retrieval.NewLocalTFIDFEmbeddingProvider(128)
-	vectorRetriever := retrieval.NewESVectorRetriever(esClient, embedder)
-
-	rrfRetriever := retrieval.NewHybridRRFRetriever(60, bm25Retriever, vectorRetriever)
-
+// 4. Test Milestone 6: Pure Go BM25 & Structural Production Retriever
+func TestMilestone6_PureGoBM25AndStructuralProductionRetriever(t *testing.T) {
+	db, _ := setupTestDB(t)
 	ctx := context.Background()
-	results, err := rrfRetriever.Search(ctx, retrieval.SearchRequest{
-		SnapshotID: "snap-mock",
-		Query:      "login authentication",
+	tempBase := t.TempDir()
+
+	ciStore := codeintelstore.NewStore(db)
+	snapStore := snapshot.NewStore(db)
+
+	snapID := "snap-m6-test"
+	now := time.Now().UTC()
+	_ = snapStore.Create(ctx, &snapshot.RepositorySnapshot{
+		ID:           snapID,
+		RepositoryID: "repo-m6",
+		CommitSHA:    "sha-m6",
+		Ref:          "main",
+		Status:       snapshot.StatusReady,
+		ReadyAt:      &now,
+	})
+
+	cib, _, _ := ciStore.GetOrCreateBuild(ctx, snapID, "example.com/m6", codeintelmodel.DefaultBuildContext())
+	_ = ciStore.SaveAnalysisResult(ctx, cib.ID, &codeintelmodel.AnalysisResult{
+		ModulePath:   "example.com/m6",
+		BuildContext: codeintelmodel.DefaultBuildContext(),
+		Files: []*codeintelmodel.CodeFile{
+			{Path: "internal/auth/jwt.go", PackagePath: "example.com/m6/auth", PackageName: "auth", ContentHash: "h1", LineCount: 30, ParseStatus: "OK"},
+		},
+		Symbols: []*codeintelmodel.Symbol{
+			{
+				FilePath:          "internal/auth/jwt.go",
+				SymbolKeyRaw:      "example.com/m6|example.com/m6/auth||FUNCTION|GenerateToken",
+				SymbolKeyHash:     "key-gentok",
+				ModulePath:        "example.com/m6",
+				PackagePath:       "example.com/m6/auth",
+				PackageName:       "auth",
+				Kind:              codeintelmodel.SymbolKindFunction,
+				Name:              "GenerateToken",
+				QualifiedName:     "GenerateToken",
+				Signature:         "func GenerateToken(userID string) (string, error)",
+				StartLine:         10,
+				EndLine:           35,
+				ContentHash:       "ch1",
+			},
+		},
+		Relations: []*codeintelmodel.SymbolRelation{},
+		Quality:   codeintelmodel.AnalysisQuality{FilesTotal: 1, FilesParsed: 1, SymbolsTotal: 1},
+	})
+
+	// Build & publish BM25 index
+	idx := bm25.NewIndex(1.2, 0.75)
+	idx.AddDocument(bm25.Document{
+		FilePath:      "internal/auth/jwt.go",
+		StartLine:     10,
+		EndLine:       35,
+		Content:       "func GenerateToken(userID string) (string, error) { generate auth token }",
+		SymbolName:    "GenerateToken",
+		SymbolKeyHash: "key-gentok",
+		Kind:          "FUNCTION",
+	})
+	idx.Build()
+
+	pub := artifact.NewPublisher(tempBase)
+	rb, _, _ := ciStore.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
+	finalPath, hash, _ := pub.Publish(rb.ID, "tok", "BM25", idx)
+	_ = ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, hash, 1)
+
+	// Search via ProductionRetriever
+	prodRetriever := retrieval.NewProductionRetriever(ciStore, tempBase)
+	results, err := prodRetriever.Search(ctx, retrieval.SearchRequest{
+		SnapshotID: snapID,
+		Query:      "GenerateToken",
 		TopK:       5,
 	})
 	if err != nil {
-		t.Fatalf("RRF retrieval failed: %v", err)
+		t.Fatalf("retrieval failed: %v", err)
 	}
 
 	if len(results) == 0 {
-		t.Fatalf("expected non-empty search results from mock ES")
+		t.Fatalf("expected non-empty search results from pure Go BM25 retriever")
 	}
 
 	if results[0].Path != "internal/auth/jwt.go" {
 		t.Errorf("expected top result internal/auth/jwt.go, got %s", results[0].Path)
+	}
+	if results[0].RetrievalSource != "symbol_bm25_structural" {
+		t.Errorf("expected source symbol_bm25_structural, got %s", results[0].RetrievalSource)
 	}
 }
 

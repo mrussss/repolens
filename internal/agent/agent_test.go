@@ -53,10 +53,17 @@ func TestAgentGuardRepeatCallDetection(t *testing.T) {
 	}
 }
 
+type fakeRetriever struct{}
+
+func (f *fakeRetriever) Search(ctx context.Context, req retrieval.SearchRequest) ([]retrieval.SearchResult, error) {
+	return []retrieval.SearchResult{
+		{ChunkID: "c1", Path: "main.go", StartLine: 1, EndLine: 10, Snippet: "package main", Score: 1.0, RetrievalSource: "symbol_bm25_structural"},
+	}, nil
+}
+
 func TestAgentLoopExecutionWithToolCalling(t *testing.T) {
 	traceStore := setupTraceDB(t)
-	chunkStore := retrieval.NewMemoryChunkStore()
-	retriever := retrieval.NewLexicalRetriever(chunkStore)
+	retriever := &fakeRetriever{}
 	storeFS := snapshotstore.NewLocalSnapshotStore("/tmp/repolens_agent_test")
 
 	registry := agent.NewToolRegistry()

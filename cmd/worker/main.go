@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -17,7 +18,6 @@ import (
 	"repolens/internal/jobs"
 	"repolens/internal/llm"
 	"repolens/internal/platform/config"
-	"repolens/internal/platform/elasticsearch"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
@@ -87,57 +87,9 @@ func run() error {
 		return fmt.Errorf("unsupported LLM_PROVIDER: %q (supported: 'openai', 'fake')", cfg.LLMProvider)
 	}
 
-	// Retrieval engines (Temporarily kept for backward compatibility until M6)
-	var embedder retrieval.EmbeddingProvider
-	hasNeuralEmbedding := cfg.EmbeddingProvider == "openai" && cfg.EmbeddingAPIKey != ""
-	if hasNeuralEmbedding {
-		embedder = retrieval.NewOpenAICompatibleEmbeddingProvider(cfg.EmbeddingAPIKey, cfg.EmbeddingBaseURL, cfg.EmbeddingModel, cfg.EmbeddingDim)
-	} else {
-		embedder = retrieval.NewLocalTFIDFEmbeddingProvider(cfg.EmbeddingDim)
-	}
-
-	chunkStore := retrieval.NewMemoryChunkStore()
-	var indexWriter indexing.ChunkIndexWriter = chunkStore
-	var bm25Retriever retrieval.Retriever = retrieval.NewBM25Retriever(chunkStore)
-	var vectorRetriever retrieval.Retriever = retrieval.NewVectorRetriever(chunkStore, embedder)
-
-	var esIndexWriter retrieval.EmbeddingProvider
-	if cfg.RetrievalStrategy == "hybrid" {
-		esIndexWriter = embedder
-	}
-
-	if cfg.ESURL != "" {
-		esClient := elasticsearch.NewClient(cfg.ESURL, cfg.ESIndexName)
-		if err := esClient.Ping(context.Background()); err == nil {
-			_ = esClient.EnsureIndex(context.Background(), embedder.Dimension())
-			bm25Retriever = retrieval.NewESBM25Retriever(esClient)
-			vectorRetriever = retrieval.NewESVectorRetriever(esClient, embedder)
-			esWriter := retrieval.NewElasticsearchChunkIndexWriter(esClient, esIndexWriter)
-			indexWriter = retrieval.NewCompositeChunkIndexWriter(chunkStore, esWriter)
-			log.Info("connected to elasticsearch 8 cluster for retrieval and indexing", "url", cfg.ESURL, "index", cfg.ESIndexName)
-		} else {
-			if cfg.Env == "production" {
-				return fmt.Errorf("failed to connect to elasticsearch in production mode: %w", err)
-			}
-			log.Warn("elasticsearch not available, falling back to in-memory retrieval", "error", err)
-		}
-	}
-
-	var activeRetriever retrieval.Retriever
-	switch cfg.RetrievalStrategy {
-	case "hybrid":
-		if !hasNeuralEmbedding {
-			if cfg.Env == "production" {
-				return fmt.Errorf("hybrid retrieval strategy requested in production but no neural embedding API key configured")
-			}
-			log.Warn("hybrid retrieval strategy requested without neural embedding API key, using local hashed baseline")
-		}
-		activeRetriever = retrieval.NewHybridRRFRetriever(60, bm25Retriever, vectorRetriever)
-	case "bm25", "":
-		activeRetriever = bm25Retriever
-	default:
-		activeRetriever = bm25Retriever
-	}
+	// Pure Go Production Retrieval (BM25 + Structural Code Intelligence)
+	indexStorageDir := filepath.Join(cfg.SnapshotBasePath, "indexes")
+	activeRetriever := retrieval.NewProductionRetriever(codeIntelStore, indexStorageDir)
 
 	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
 	filter := indexing.NewFileFilter(cfg.MaxFileSizeKB)
@@ -168,7 +120,7 @@ func run() error {
 		cloner,
 		filter,
 		chunker,
-		indexWriter,
+		nil,
 	).WithCodeIntelStore(codeIntelStore)
 
 	codeIndexJobHandler := codeintel.NewCodeIndexJobHandler(
@@ -178,16 +130,22 @@ func run() error {
 		codeintel.NewAnalyzer(),
 	)
 
+	retrievalJobHandler := retrieval.NewRetrievalJobHandler(
+		codeIntelStore,
+		indexStorageDir,
+	)
+
 	jobsWorker := jobs.NewWorker(jobsStore, jobs.DefaultWorkerConfig())
 	jobsWorker.RegisterHandler(jobs.JobTypeRunDiagnosis, diagJobHandler)
 	jobsWorker.RegisterHandler(jobs.JobTypeMaterializeSnapshot, snapshotJobHandler)
 	jobsWorker.RegisterHandler(jobs.JobTypeBuildCodeIndex, codeIndexJobHandler)
+	jobsWorker.RegisterHandler(jobs.JobTypeBuildRetrieval, retrievalJobHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	jobsWorker.Start(ctx)
-	log.Info("analysis jobs worker started successfully with handlers for RUN_DIAGNOSIS, MATERIALIZE_SNAPSHOT, and BUILD_CODE_INDEX")
+	log.Info("analysis jobs worker started successfully with all 4 job handlers: RUN_DIAGNOSIS, MATERIALIZE_SNAPSHOT, BUILD_CODE_INDEX, BUILD_RETRIEVAL")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)

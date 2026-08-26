@@ -19,14 +19,7 @@ type Config struct {
 	LLMAPIKey         string
 	LLMBaseURL        string
 	LLMModel          string
-	RetrievalStrategy string // "bm25" (default), "hybrid"
-	ESURL             string
-	ESIndexName       string
-	EmbeddingProvider string // "local", "openai"
-	EmbeddingAPIKey   string
-	EmbeddingBaseURL  string
-	EmbeddingModel    string
-	EmbeddingDim      int
+	RetrievalStrategy string // "bm25", "symbol_bm25_structural"
 }
 
 func Load() *Config {
@@ -44,14 +37,7 @@ func Load() *Config {
 		LLMAPIKey:         getEnv("LLM_API_KEY", ""),
 		LLMBaseURL:        getEnv("LLM_BASE_URL", "https://api.openai.com/v1"),
 		LLMModel:          getEnv("LLM_MODEL", "gpt-4o"),
-		RetrievalStrategy: getEnv("RETRIEVAL_STRATEGY", "bm25"),
-		ESURL:             getEnv("ES_URL", "http://localhost:9200"),
-		ESIndexName:       getEnv("ES_INDEX_NAME", "repolens_chunks"),
-		EmbeddingProvider: getEnv("EMBEDDING_PROVIDER", "local"),
-		EmbeddingAPIKey:   getEnv("EMBEDDING_API_KEY", ""),
-		EmbeddingBaseURL:  getEnv("EMBEDDING_BASE_URL", "https://api.openai.com/v1"),
-		EmbeddingModel:    getEnv("EMBEDDING_MODEL", "text-embedding-3-small"),
-		EmbeddingDim:      getEnvInt("EMBEDDING_DIM", 128),
+		RetrievalStrategy: getEnv("RETRIEVAL_STRATEGY", "symbol_bm25_structural"),
 	}
 }
 

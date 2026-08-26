@@ -55,7 +55,7 @@ func (r *Runner) AddCase(c EvalCase) {
 	r.cases = append(r.cases, c)
 }
 
-func (r *Runner) RunRetrievalEval(ctx context.Context, strategy string, retriever retrieval.Retriever, chunkStore retrieval.ChunkIndexStore) (*EvalRun, error) {
+func (r *Runner) RunRetrievalEval(ctx context.Context, strategy string, retriever retrieval.Retriever) (*EvalRun, error) {
 	run := &EvalRun{
 		ID:                uuid.New().String(),
 		DatasetVersion:    "v1.0",

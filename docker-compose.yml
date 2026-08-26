@@ -20,24 +20,6 @@ services:
       timeout: 5s
       retries: 10
 
-  elasticsearch:
-    image: elasticsearch:8.13.0
-    container_name: repolens-elasticsearch
-    restart: unless-stopped
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    ports:
-      - "9200:9200"
-    volumes:
-      - es_data:/usr/share/elasticsearch/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 15
-
   api:
     build:
       context: .
@@ -51,8 +33,6 @@ services:
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - SNAPSHOT_BASE_PATH=/data/repositories
-      - ES_URL=http://elasticsearch:9200
-      - ES_INDEX_NAME=repolens_chunks
       - LLM_PROVIDER=fake
     ports:
       - "8080:8080"
@@ -60,8 +40,6 @@ services:
       - snapshot_data:/data/repositories
     depends_on:
       mysql:
-        condition: service_healthy
-      elasticsearch:
         condition: service_healthy
 
   worker:
@@ -76,18 +54,13 @@ services:
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - SNAPSHOT_BASE_PATH=/data/repositories
-      - ES_URL=http://elasticsearch:9200
-      - ES_INDEX_NAME=repolens_chunks
       - LLM_PROVIDER=fake
     volumes:
       - snapshot_data:/data/repositories
     depends_on:
       mysql:
         condition: service_healthy
-      elasticsearch:
-        condition: service_healthy
 
 volumes:
   mysql_data:
-  es_data:
   snapshot_data:
