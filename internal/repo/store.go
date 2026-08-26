@@ -7,6 +7,8 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"repolens/internal/snapshot"
 )
 
 type Store interface {
@@ -65,7 +67,9 @@ func (s *GormStore) ListByUser(ctx context.Context, userID string, page, pageSiz
 		return nil, 0, err
 	}
 
-	if err := tx.Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&repos).Error; err != nil {
+	if err := tx.Preload("Snapshots", func(db *gorm.DB) *gorm.DB {
+		return db.Where("status != ?", snapshot.StatusFailed).Order("created_at DESC")
+	}).Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&repos).Error; err != nil {
 		return nil, 0, err
 	}
 

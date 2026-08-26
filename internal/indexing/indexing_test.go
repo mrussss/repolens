@@ -174,6 +174,7 @@ func (m *mockSnapshotStore) GetByID(ctx context.Context, id string) (*snapshot.R
 		ID:           id,
 		RepositoryID: "repo-fail-test",
 		Ref:          "main",
+		CommitSHA:    "local-fixture-commit",
 		Status:       snapshot.StatusMaterializing,
 	}, nil
 }
@@ -181,6 +182,147 @@ func (m *mockSnapshotStore) GetByID(ctx context.Context, id string) (*snapshot.R
 func (m *mockSnapshotStore) UpdateStatus(ctx context.Context, id string, oldStatus, newStatus snapshot.SnapshotStatus, readyAt *time.Time) error {
 	m.lastStatus = newStatus
 	return nil
+}
+
+type materializationRecorder struct {
+	snapshot.Store
+	snap        *snapshot.RepositorySnapshot
+	finalized   bool
+	failed      bool
+	commitSHA   string
+	contentHash string
+	fileCount   int
+	totalBytes  int64
+}
+
+func (m *materializationRecorder) GetByID(ctx context.Context, id string) (*snapshot.RepositorySnapshot, error) {
+	return m.snap, nil
+}
+
+func (m *materializationRecorder) UpdateStatus(ctx context.Context, id string, oldStatus, newStatus snapshot.SnapshotStatus, readyAt *time.Time) error {
+	if newStatus == snapshot.StatusReady {
+		m.snap.Status = snapshot.StatusReady
+	}
+	return nil
+}
+
+func (m *materializationRecorder) FinalizeMaterialization(ctx context.Context, id, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	m.finalized = true
+	m.commitSHA = commitSHA
+	m.contentHash = contentHash
+	m.fileCount = fileCount
+	m.totalBytes = totalBytes
+	m.snap.CommitSHA = commitSHA
+	m.snap.ContentHash = contentHash
+	m.snap.FileCount = fileCount
+	m.snap.TotalBytes = totalBytes
+	m.snap.Status = snapshot.StatusReady
+	m.snap.ReadyAt = &readyAt
+	return nil
+}
+
+func (m *materializationRecorder) FailMaterialization(ctx context.Context, id, errorCode string) error {
+	m.failed = true
+	m.snap.Status = snapshot.StatusFailed
+	m.snap.ErrorCode = errorCode
+	return nil
+}
+
+type fixtureCloner struct {
+	commitSHA string
+}
+
+func (c *fixtureCloner) ValidateGitURL(string) error { return nil }
+
+func (c *fixtureCloner) CloneTo(ctx context.Context, gitURL, ref, targetDir string) (string, error) {
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "main.go"), []byte("package main\nfunc Hello() {}\n"), 0644); err != nil {
+		return "", err
+	}
+	return c.commitSHA, nil
+}
+
+type failingWalkStore struct{ snapshotstore.SnapshotStore }
+
+func (f failingWalkStore) WalkFiles(string, string, func(string, os.FileInfo) error) error {
+	return errors.New("simulated walk failure")
+}
+
+func TestSnapshotJobHandler_FinalizesOnlyAfterMaterialization(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Cleanup(func() {
+		// The handler seals READY snapshots read-only. Restore permissions before
+		// testing.T removes its temporary directory.
+		_ = filepath.Walk(tmpDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return os.Chmod(path, 0755)
+			}
+			return os.Chmod(path, 0644)
+		})
+	})
+	storeFS := snapshotstore.NewLocalSnapshotStore(tmpDir)
+	commitSHA := "0123456789abcdef0123456789abcdef01234567"
+	recorder := &materializationRecorder{snap: &snapshot.RepositorySnapshot{
+		ID: "snap-exact", RepositoryID: "repo-exact", Ref: "main", CommitSHA: "pending", Status: snapshot.StatusMaterializing,
+	}}
+	handler := indexing.NewSnapshotJobHandler(
+		&mockRepoStore{}, recorder, nil, storeFS,
+		&fixtureCloner{commitSHA: commitSHA}, indexing.NewFileFilter(512), indexing.NewCodeChunker(5, 2), nil,
+	)
+
+	if err := handler.Execute(context.Background(), &jobs.AnalysisJob{ID: 11, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3}); err != nil {
+		t.Fatalf("materialization failed: %v", err)
+	}
+	if !recorder.finalized || recorder.snap.Status != snapshot.StatusReady {
+		t.Fatalf("expected finalizer to publish READY snapshot")
+	}
+	if recorder.commitSHA != commitSHA || recorder.commitSHA == "pending" {
+		t.Fatalf("exact commit was not persisted: got %q", recorder.commitSHA)
+	}
+	if recorder.contentHash == "" || recorder.fileCount != 1 || recorder.totalBytes == 0 {
+		t.Fatalf("materialization identity was incomplete: hash=%q files=%d bytes=%d", recorder.contentHash, recorder.fileCount, recorder.totalBytes)
+	}
+
+	firstHash := recorder.contentHash
+	recorder.finalized = false
+	recorder.snap.Status = snapshot.StatusMaterializing
+	if err := handler.Execute(context.Background(), &jobs.AnalysisJob{ID: 12, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3}); err != nil {
+		t.Fatalf("repeat materialization failed: %v", err)
+	}
+	if recorder.contentHash != firstHash {
+		t.Fatalf("manifest hash changed for identical source: %s != %s", recorder.contentHash, firstHash)
+	}
+}
+
+func TestSnapshotJobHandler_DoesNotMarkReadyOnWalkFailure(t *testing.T) {
+	recorder := &materializationRecorder{snap: &snapshot.RepositorySnapshot{
+		ID: "snap-walk-fail", RepositoryID: "repo-fail-test", Ref: "main", CommitSHA: "0123456789abcdef0123456789abcdef01234567", Status: snapshot.StatusMaterializing,
+	}}
+	baseFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	handler := indexing.NewSnapshotJobHandler(
+		&mockRepoStore{}, recorder, nil, failingWalkStore{SnapshotStore: baseFS},
+		&fixtureCloner{commitSHA: recorder.snap.CommitSHA}, indexing.NewFileFilter(512), indexing.NewCodeChunker(5, 2), nil,
+	)
+	job := &jobs.AnalysisJob{ID: 13, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3}
+	err := handler.Execute(context.Background(), job)
+	if err == nil || recorder.snap.Status == snapshot.StatusReady || recorder.finalized {
+		t.Fatalf("walk failure must leave snapshot non-READY: err=%v status=%s", err, recorder.snap.Status)
+	}
+	class, _ := jobs.ClassifyError(err)
+	if class != jobs.ErrorClassRetryable {
+		t.Fatalf("walk failure should be retryable, got %s", class)
+	}
+
+	job.AttemptCount = job.MaxAttempts
+	_ = handler.Execute(context.Background(), job)
+	if !recorder.failed || recorder.snap.Status != snapshot.StatusFailed {
+		t.Fatalf("retry exhaustion must fail snapshot: failed=%v status=%s", recorder.failed, recorder.snap.Status)
+	}
 }
 
 type failingIndexWriter struct {

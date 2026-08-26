@@ -148,9 +148,14 @@ func (c *SafeGitCloner) CloneTo(ctx context.Context, gitURL, ref, targetDir stri
 	shaCmd := exec.CommandContext(ctx, "git", "-C", targetDir, "rev-parse", "HEAD")
 	shaOut, err := shaCmd.Output()
 	if err != nil {
-		return "unknown", nil
+		_ = os.RemoveAll(targetDir)
+		return "", fmt.Errorf("failed to resolve exact cloned commit: %w", err)
 	}
 	commitSHA := strings.TrimSpace(string(shaOut))
+	if len(commitSHA) != 40 {
+		_ = os.RemoveAll(targetDir)
+		return "", fmt.Errorf("git returned invalid commit SHA %q", commitSHA)
+	}
 
 	// Remove .git directory to keep source clean and prevent git-hook execution
 	gitDir := filepath.Join(targetDir, ".git")

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	codeintelmodel "repolens/internal/codeintel/model"
@@ -25,10 +26,15 @@ type SnapshotJobHandler struct {
 	indexStore     repoindex.Store
 	codeIntelStore codeintelstore.Store
 	storeFS        snapshotstore.SnapshotStore
-	cloner         *SafeGitCloner
+	cloner         GitCloner
 	filter         *FileFilter
 	chunker        *CodeChunker
 	indexWriter    ChunkIndexWriter
+}
+
+type GitCloner interface {
+	CloneTo(ctx context.Context, gitURL, ref, targetDir string) (string, error)
+	ValidateGitURL(rawURL string) error
 }
 
 // NewSnapshotJobHandler creates a new SnapshotJobHandler.
@@ -37,7 +43,7 @@ func NewSnapshotJobHandler(
 	snapshotStore snapshot.Store,
 	indexStore repoindex.Store,
 	storeFS snapshotstore.SnapshotStore,
-	cloner *SafeGitCloner,
+	cloner GitCloner,
 	filter *FileFilter,
 	chunker *CodeChunker,
 	indexWriter ChunkIndexWriter,
@@ -74,6 +80,12 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		log.Info("snapshot already READY")
 		return nil
 	}
+	if snap.Status == snapshot.StatusCreated {
+		if err := h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusCreated, snapshot.StatusMaterializing, nil); err != nil {
+			return jobs.NewRetryableError("SNAPSHOT_STATE_UPDATE_FAILED", err.Error(), err)
+		}
+		snap.Status = snapshot.StatusMaterializing
+	}
 
 	r, err := h.repoStore.GetByID(ctx, snap.RepositoryID)
 	if err != nil {
@@ -81,21 +93,37 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 
 	targetDir := h.storeFS.GetSourcePath(snap.RepositoryID, snap.ID)
-	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
-		_, cloneErr := h.cloner.CloneTo(ctx, r.GitURL, snap.Ref, targetDir)
+	commitSHA := snap.CommitSHA
+	if commitSHA == "pending" || commitSHA == "" {
+		// Publish a fully cloned tree only after git has resolved HEAD.  A
+		// retry therefore cannot expose a half-written source directory.
+		stagingDir := targetDir + ".tmp-" + jobClaimSuffix(job)
+		_ = os.RemoveAll(stagingDir)
+		cloneSHA, cloneErr := h.cloner.CloneTo(ctx, r.GitURL, snap.Ref, stagingDir)
 		if cloneErr != nil {
 			log.Error("failed to clone repository for snapshot", "error", cloneErr)
-			_ = h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusFailed, nil)
-			return jobs.NewPermanentError("CLONE_FAILED", cloneErr.Error(), cloneErr)
+			if err := h.cloner.ValidateGitURL(r.GitURL); err != nil {
+				h.failIfTerminal(ctx, job, snap.ID, "INVALID_GIT_URL")
+				return jobs.NewPermanentError("INVALID_GIT_URL", err.Error(), err)
+			}
+			h.failIfTerminal(ctx, job, snap.ID, "CLONE_FAILED")
+			return jobs.NewRetryableError("CLONE_FAILED", cloneErr.Error(), cloneErr)
 		}
+		if err := os.RemoveAll(targetDir); err != nil {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
+		}
+		if err := os.Rename(stagingDir, targetDir); err != nil {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
+		}
+		commitSHA = cloneSHA
 	}
-
-	now := time.Now().UTC()
-	_ = h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusReady, &now)
 
 	// Build chunks & index if indexWriter is provided (migration compatibility)
 	var allChunks []CodeChunk
 	docCount := 0
+	fileCount := 0
+	var totalBytes int64
+	manifest := make([]string, 0)
 
 	walkErr := h.storeFS.WalkFiles(snap.RepositoryID, snap.ID, func(relPath string, info os.FileInfo) error {
 		if info.IsDir() {
@@ -110,30 +138,51 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 
 		content, err := h.storeFS.ReadFile(ctx, snap.RepositoryID, snap.ID, relPath, 1, -1)
 		if err != nil {
-			return nil
+			return err
 		}
 
 		chunks := h.chunker.ChunkFile(snap.ID, relPath, content)
 		allChunks = append(allChunks, chunks...)
 		docCount++
+		fileCount++
+		totalBytes += info.Size()
+		manifest = append(manifest, relPath+"\x00"+string(content))
 		return nil
 	})
 
 	if walkErr != nil {
 		log.Error("failed to walk snapshot files", "error", walkErr)
+		h.failIfTerminal(ctx, job, snap.ID, "WALK_FAILED")
 		return jobs.NewRetryableError("WALK_FAILED", walkErr.Error(), walkErr)
 	}
 
+	sort.Strings(manifest)
 	hasher := sha256.New()
-	for _, ch := range allChunks {
-		hasher.Write([]byte(ch.ContentHash))
+	for _, entry := range manifest {
+		_, _ = hasher.Write([]byte(entry))
 	}
+	contentHash := fmt.Sprintf("%x", hasher.Sum(nil))
 
 	if h.indexWriter != nil && len(allChunks) > 0 {
 		if err := h.indexWriter.IndexChunks(ctx, snap.ID, allChunks); err != nil {
 			log.Error("failed writing chunks to index store", "error", err)
+			h.failIfTerminal(ctx, job, snap.ID, "INDEX_WRITE_FAILED")
 			return jobs.NewRetryableError("INDEX_WRITE_FAILED", err.Error(), err)
 		}
+	}
+
+	now := time.Now().UTC()
+	if err := sealSnapshot(targetDir); err != nil {
+		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_SEAL_FAILED")
+		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
+	}
+	if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
+		if err := finalizer.FinalizeMaterialization(ctx, snap.ID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
+			return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
+		}
+	} else if err := h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusReady, &now); err != nil {
+		return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
 	}
 
 	// Auto-chain BUILD_CODE_INDEX job if codeIntelStore is wired
@@ -143,4 +192,40 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 
 	log.Info("snapshot materialization completed successfully", "chunks", len(allChunks), "docs", docCount)
 	return nil
+}
+
+func sealSnapshot(root string) error {
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return os.Chmod(path, 0555)
+		}
+		return os.Chmod(path, 0444)
+	})
+}
+
+func (h *SnapshotJobHandler) failIfTerminal(ctx context.Context, job *jobs.AnalysisJob, snapshotID, code string) {
+	if job != nil && (job.AttemptCount >= job.MaxAttempts) {
+		if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
+			_ = finalizer.FailMaterialization(ctx, snapshotID, code)
+		} else {
+			_ = h.snapshotStore.UpdateStatus(ctx, snapshotID, snapshot.StatusMaterializing, snapshot.StatusFailed, nil)
+		}
+	}
+}
+
+func jobClaimSuffix(job *jobs.AnalysisJob) string {
+	if job != nil && job.ClaimToken != nil && *job.ClaimToken != "" {
+		return (*job.ClaimToken)[:minInt(12, len(*job.ClaimToken))]
+	}
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

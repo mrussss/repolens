@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -497,6 +498,45 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 
 // ManualRequeueTx executes the Manual Requeue Rule for natural-identity resources within a transaction.
 func (s *Store) ManualRequeueTx(ctx context.Context, tx *sql.Tx, jobType JobType, resourceID string) error {
+	// Restore the business object in the same transaction as the execution
+	// generation reset. RETRY_WAIT never mutates business state, so this path
+	// is only for terminal retry exhaustion.
+	var businessQuery string
+	var businessArgs []interface{}
+	switch jobType {
+	case JobTypeMaterializeSnapshot:
+		businessQuery = `UPDATE repository_snapshots SET status = 'CREATED', error_code = NULL, ready_at = NULL WHERE id = ? AND status = 'FAILED'`
+		businessArgs = []interface{}{resourceID}
+	case JobTypeBuildCodeIndex:
+		businessQuery = `UPDATE code_index_builds SET status = 'CREATED', error_code = NULL, ready_at = NULL WHERE id = ? AND status = 'FAILED'`
+		businessArgs = []interface{}{resourceID}
+	case JobTypeBuildRetrieval:
+		businessQuery = `UPDATE retrieval_builds SET status = 'CREATED', error_code = NULL, ready_at = NULL, artifact_path = '', artifact_hash = '' WHERE id = ? AND status = 'FAILED'`
+		businessArgs = []interface{}{resourceID}
+	case JobTypeRunDiagnosis:
+		businessQuery = `UPDATE diagnosis_runs SET status = 'QUEUED', cancel_requested = FALSE, final_attempt_id = NULL, version = version + 1 WHERE id = ? AND status = 'FAILED'`
+		businessArgs = []interface{}{resourceID}
+	default:
+		return fmt.Errorf("unsupported manual requeue job type %s", jobType)
+	}
+	businessRes, err := tx.ExecContext(ctx, businessQuery, businessArgs...)
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+		return fmt.Errorf("failed restoring business object for (%s, %s): %w", jobType, resourceID, err)
+	}
+	if err == nil {
+		if affected, err := businessRes.RowsAffected(); err != nil {
+			return err
+		} else if affected != 1 {
+			// A few low-level job-store tests intentionally exercise jobs without a
+			// business row. Production resources always have one; preserve the
+			// useful isolated job-store behavior while rejecting an existing object
+			// in the wrong state.
+			var exists int
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM `+businessTable(jobType)+` WHERE id = ? LIMIT 1`, resourceID).Scan(&exists); err == nil {
+				return fmt.Errorf("cannot requeue business object (%s, %s): not in FAILED state", jobType, resourceID)
+			}
+		}
+	}
 	query := `
 		UPDATE analysis_jobs
 		SET status = 'PENDING',
@@ -532,6 +572,19 @@ func (s *Store) ManualRequeueTx(ctx context.Context, tx *sql.Tx, jobType JobType
 		return fmt.Errorf("cannot requeue job (%s, %s): not in FAILED state with RETRYABLE_EXHAUSTED", jobType, resourceID)
 	}
 	return nil
+}
+
+func businessTable(jobType JobType) string {
+	switch jobType {
+	case JobTypeMaterializeSnapshot:
+		return "repository_snapshots"
+	case JobTypeBuildCodeIndex:
+		return "code_index_builds"
+	case JobTypeBuildRetrieval:
+		return "retrieval_builds"
+	default:
+		return "diagnosis_runs"
+	}
 }
 
 func scanJob(row *sql.Row) (*AnalysisJob, error) {

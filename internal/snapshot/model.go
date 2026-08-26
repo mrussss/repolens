@@ -18,7 +18,7 @@ type RepositorySnapshot struct {
 	RepositoryID     string         `gorm:"size:64;not null;uniqueIndex:uq_repo_commit,priority:1;index:ix_repo_snap" json:"repository_id"`
 	CommitSHA        string         `gorm:"size:64;not null;uniqueIndex:uq_repo_commit,priority:2" json:"commit_sha"`
 	Ref              string         `gorm:"size:128;not null" json:"ref"`
-	RequestedRef     string         `gorm:"size:128" json:"requested_ref"`
+	RequestedRef     string         `gorm:"size:128" json:"requested_ref,omitempty"`
 	MaterializedPath string         `gorm:"size:512;not null" json:"materialized_path"`
 	ContentHash      string         `gorm:"size:64;not null" json:"content_hash"`
 	Status           SnapshotStatus `gorm:"size:32;not null;default:'CREATED'" json:"status"`

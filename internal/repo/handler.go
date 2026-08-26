@@ -114,7 +114,6 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 	}
 
 	snapID := uuid.New().String()
-	indexID := uuid.New().String()
 	matPath := "/data/repositories/" + repoID + "/" + snapID + "/source"
 
 	snap := &snapshot.RepositorySnapshot{
@@ -125,14 +124,6 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 		MaterializedPath: matPath,
 		ContentHash:      "",
 		Status:           snapshot.StatusMaterializing,
-	}
-
-	idx := &repoindex.RepositoryIndex{
-		ID:           indexID,
-		SnapshotID:   snapID,
-		Strategy:     req.Strategy,
-		IndexVersion: "v1",
-		Status:       repoindex.StatusIndexQueued,
 	}
 
 	job := &jobs.AnalysisJob{
@@ -149,9 +140,6 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 		if err := tx.Create(snap).Error; err != nil {
 			return err
 		}
-		if err := tx.Create(idx).Error; err != nil {
-			return err
-		}
 		if err := tx.Create(job).Error; err != nil {
 			return err
 		}
@@ -165,7 +153,6 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"snapshot": snap,
-		"index":    idx,
 		"message":  "snapshot creation and indexing queued",
 	})
 }

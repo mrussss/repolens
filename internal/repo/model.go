@@ -2,6 +2,8 @@ package repo
 
 import (
 	"time"
+
+	"repolens/internal/snapshot"
 )
 
 type RepositoryStatus string
@@ -13,12 +15,13 @@ const (
 )
 
 type Repository struct {
-	ID         string           `gorm:"primaryKey;size:36" json:"id"`
-	UserID     string           `gorm:"index;size:36;not null" json:"user_id"`
-	Name       string           `gorm:"size:128;not null" json:"name"`
-	GitURL     string           `gorm:"size:512;not null" json:"git_url"`
-	DefaultRef string           `gorm:"size:128;not null;default:'main'" json:"default_ref"`
-	Status     RepositoryStatus `gorm:"size:32;not null;default:'ACTIVE'" json:"status"`
-	CreatedAt  time.Time        `json:"created_at"`
-	UpdatedAt  time.Time        `json:"updated_at"`
+	ID         string                        `gorm:"primaryKey;size:36" json:"id"`
+	UserID     string                        `gorm:"index;size:36;not null" json:"user_id"`
+	Name       string                        `gorm:"size:128;not null" json:"name"`
+	GitURL     string                        `gorm:"size:512;not null" json:"git_url"`
+	DefaultRef string                        `gorm:"size:128;not null;default:'main'" json:"default_ref"`
+	Status     RepositoryStatus              `gorm:"size:32;not null;default:'ACTIVE'" json:"status"`
+	CreatedAt  time.Time                     `json:"created_at"`
+	UpdatedAt  time.Time                     `json:"updated_at"`
+	Snapshots  []snapshot.RepositorySnapshot `gorm:"foreignKey:RepositoryID;references:ID" json:"snapshots,omitempty"`
 }
