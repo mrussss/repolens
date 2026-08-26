@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/llm"
@@ -31,6 +32,7 @@ type Executor interface {
 type AgentRuntimeExecutor struct {
 	provider   llm.Provider
 	retriever  retrieval.Retriever
+	ciStore    codeintelstore.Store
 	storeFS    snapshotstore.SnapshotStore
 	traceStore trace.Store
 	guardCfg   GuardConfig
@@ -52,19 +54,34 @@ func NewAgentRuntimeExecutor(
 	}
 }
 
+func (e *AgentRuntimeExecutor) WithCodeIntelStore(ciStore codeintelstore.Store) *AgentRuntimeExecutor {
+	e.ciStore = ciStore
+	return e
+}
+
 func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
 	registry := NewToolRegistry()
 
-	// Register 4 Read-Only Tools for this diagnosis session
+	var buildID int64
+	if e.ciStore != nil {
+		cib, err := e.ciStore.GetBySnapshot(ctx, run.SnapshotID)
+		if err == nil && cib != nil {
+			buildID = cib.ID
+		}
+	}
+
+	// Register 5 Read-Only Tools (Section 32 of Master Spec)
 	searchTool := tools.NewSearchCodeTool(e.retriever, run.SnapshotID)
+	getSymbolTool := tools.NewGetSymbolTool(e.ciStore, buildID)
+	findRefTool := tools.NewFindReferencesTool(e.ciStore, buildID)
+	findTestTool := tools.NewFindRelatedTestsTool(e.ciStore, buildID)
 	readFileTool := tools.NewReadFileTool(e.storeFS, run.RepositoryID, run.SnapshotID)
-	readDocsTool := tools.NewReadDocsTool(e.storeFS, run.RepositoryID, run.SnapshotID)
-	readCILogTool := tools.NewReadCILogTool(run.ErrorLog)
 
 	registry.Register(searchTool)
+	registry.Register(getSymbolTool)
+	registry.Register(findRefTool)
+	registry.Register(findTestTool)
 	registry.Register(readFileTool)
-	registry.Register(readDocsTool)
-	registry.Register(readCILogTool)
 
 	loop := NewAgentLoop(e.provider, registry, e.traceStore, e.guardCfg)
 	res, err := loop.Run(ctx, run, attempt)

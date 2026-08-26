@@ -68,9 +68,10 @@ func TestAgentLoopExecutionWithToolCalling(t *testing.T) {
 
 	registry := agent.NewToolRegistry()
 	registry.Register(tools.NewSearchCodeTool(retriever, "snap-agent-1"))
+	registry.Register(tools.NewGetSymbolTool(nil, 0))
+	registry.Register(tools.NewFindReferencesTool(nil, 0))
+	registry.Register(tools.NewFindRelatedTestsTool(nil, 0))
 	registry.Register(tools.NewReadFileTool(storeFS, "repo-agent-1", "snap-agent-1"))
-	registry.Register(tools.NewReadDocsTool(storeFS, "repo-agent-1", "snap-agent-1"))
-	registry.Register(tools.NewReadCILogTool("Error: nil pointer in handler.go:25"))
 
 	// Tool calling then structured output
 	fakeProvider := llm.NewFakeProvider(llm.ModeToolCallThenDone)

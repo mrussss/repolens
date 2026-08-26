@@ -4,18 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"repolens/internal/llm"
-	"repolens/internal/platform/metrics"
 	"repolens/internal/retrieval"
 )
-
-type SearchCodeArgs struct {
-	Query string `json:"query"`
-	TopK  int    `json:"top_k,omitempty"`
-	Scope string `json:"scope,omitempty"`
-}
 
 type SearchCodeTool struct {
 	retriever  retrieval.Retriever
@@ -34,17 +26,13 @@ func (t *SearchCodeTool) Name() string {
 }
 
 func (t *SearchCodeTool) Description() string {
-	return "Search code snippets and symbols in the current repository snapshot using keywords or semantics."
+	return "Searches the codebase using code-aware BM25 and structural code intelligence. Returns ranked code symbols, files, scores, and structural reasoning."
 }
 
 func (t *SearchCodeTool) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{
 		Type: "function",
-		Function: struct {
-			Name        string                 `json:"name"`
-			Description string                 `json:"description"`
-			Parameters  map[string]interface{} `json:"parameters"`
-		}{
+		Function: llm.FunctionDef{
 			Name:        t.Name(),
 			Description: t.Description(),
 			Parameters: map[string]interface{}{
@@ -52,15 +40,11 @@ func (t *SearchCodeTool) Definition() llm.ToolDefinition {
 				"properties": map[string]interface{}{
 					"query": map[string]interface{}{
 						"type":        "string",
-						"description": "Keyword, symbol name, error message, or function name to search for",
+						"description": "Code search query, function name, struct, or error message",
 					},
 					"top_k": map[string]interface{}{
 						"type":        "integer",
-						"description": "Number of top results to return (default: 5, max: 20)",
-					},
-					"scope": map[string]interface{}{
-						"type":        "string",
-						"description": "Optional file path prefix or directory to scope the search",
+						"description": "Maximum number of results to return (default 5)",
 					},
 				},
 				"required": []string{"query"},
@@ -69,44 +53,38 @@ func (t *SearchCodeTool) Definition() llm.ToolDefinition {
 	}
 }
 
+type searchCodeArgs struct {
+	Query string `json:"query"`
+	TopK  int    `json:"top_k"`
+}
+
 func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, error) {
-	var args SearchCodeArgs
+	var args searchCodeArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "", fmt.Errorf("invalid arguments: %w", err)
+		return "", fmt.Errorf("invalid arguments for search_code: %w", err)
 	}
 
-	if args.Query == "" {
-		return "", fmt.Errorf("query parameter cannot be empty")
-	}
-	if args.TopK <= 0 {
-		args.TopK = 5
-	}
-	if args.TopK > 20 {
-		args.TopK = 20
+	topK := args.TopK
+	if topK <= 0 {
+		topK = 5
 	}
 
-	start := time.Now()
 	results, err := t.retriever.Search(ctx, retrieval.SearchRequest{
 		SnapshotID: t.snapshotID,
 		Query:      args.Query,
-		TopK:       args.TopK,
-		Scope:      args.Scope,
+		TopK:       topK,
 	})
-	latency := time.Since(start).Seconds()
-	metrics.RetrievalRequestsTotal.WithLabelValues("search_code").Inc()
-	metrics.RetrievalLatencySeconds.WithLabelValues("search_code").Observe(latency)
-
 	if err != nil {
 		return "", fmt.Errorf("retrieval failed: %w", err)
 	}
 
 	if len(results) == 0 {
-		return "No relevant code found matching query: " + args.Query, nil
+		return "No code matches found for the query.", nil
 	}
 
-	outBytes, err := json.Marshal(results)
+	outBytes, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("failed to format search results: %w", err)
+		return "", err
 	}
 
 	return string(outBytes), nil

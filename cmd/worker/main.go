@@ -101,7 +101,7 @@ func run() error {
 		storeFS,
 		traceStore,
 		agent.DefaultGuardConfig(),
-	)
+	).WithCodeIntelStore(codeIntelStore)
 
 	// DB-backed Analysis Job Worker Runtime
 	jobsStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)
