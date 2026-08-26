@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +22,7 @@ import (
 	"repolens/internal/platform/metrics"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/provider"
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
 	"repolens/internal/snapshot"
@@ -51,7 +54,6 @@ func run() error {
 	}
 
 	storeFS := snapshotstore.NewLocalSnapshotStore(cfg.SnapshotBasePath)
-	_ = storeFS
 
 	// Stores
 	repoStore := repo.NewStore(db.GormDB)
@@ -62,13 +64,29 @@ func run() error {
 	citationStore := evidence.NewCitationStore(db.GormDB)
 	traceStore := trace.NewStore(db.GormDB)
 
-	// Services
+	// Services & Managers
 	repoSvc := repo.NewService(repoStore)
 	diagnosisSvc := diagnosis.NewService(diagnosisStore, repoStore, snapshotStore)
+	providerMgr := provider.NewManager(
+		filepath.Join(cfg.SnapshotBasePath, "provider.json"),
+		cfg.LLMBaseURL,
+		cfg.LLMModel,
+		cfg.LLMAPIKey,
+		cfg.LLMProvider,
+	)
 
 	// Handlers
 	repoHandler := repo.NewHandler(repoSvc, snapshotStore, indexStore, db.GormDB)
 	diagnosisHandler := diagnosis.NewHandler(diagnosisSvc, reportStore, citationStore, traceStore)
+	providerHandler := provider.NewHandler(
+		providerMgr,
+		repoStore,
+		snapshotStore,
+		diagnosisStore,
+		reportStore,
+		traceStore,
+		storeFS,
+	)
 
 	if cfg.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -103,9 +121,15 @@ func run() error {
 	})
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	// REST API (v1 / v2 compatible routes)
+	// REST API (v1)
 	v1 := router.Group("/api/v1")
 	{
+		// System & Provider & Demo
+		v1.GET("/system/provider", providerHandler.GetStatus)
+		v1.POST("/system/provider", providerHandler.SaveConfig)
+		v1.POST("/system/provider/test", providerHandler.TestConnection)
+		v1.POST("/demo/trigger", providerHandler.TriggerDemo)
+
 		// Repositories & Indexing
 		v1.POST("/repositories", repoHandler.Register)
 		v1.GET("/repositories", repoHandler.List)
@@ -137,6 +161,22 @@ func run() error {
 		root.GET("/diagnoses/:id/attempts", diagnosisHandler.ListAttempts)
 		root.GET("/diagnoses/:id/report", diagnosisHandler.GetReport)
 		root.GET("/diagnoses/:id/steps", diagnosisHandler.GetSteps)
+	}
+
+	// Static assets & SPA fallback
+	staticDir := "./web/dist"
+	if _, err := os.Stat(staticDir); err == nil {
+		router.Static("/assets", filepath.Join(staticDir, "assets"))
+		router.StaticFile("/favicon.ico", filepath.Join(staticDir, "favicon.ico"))
+		router.NoRoute(func(c *gin.Context) {
+			if !strings.HasPrefix(c.Request.URL.Path, "/api/") &&
+				!strings.HasPrefix(c.Request.URL.Path, "/healthz") &&
+				!strings.HasPrefix(c.Request.URL.Path, "/metrics") {
+				c.File(filepath.Join(staticDir, "index.html"))
+				return
+			}
+			c.JSON(http.StatusNotFound, gin.H{"error": "route not found"})
+		})
 	}
 
 	srv := &http.Server{

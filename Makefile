@@ -1,8 +1,11 @@
-.PHONY: all build test test-race test-integration eval verify clean fmt lint
+.PHONY: all build web-build test test-race test-integration eval verify clean fmt lint
 
 all: build
 
-build:
+web-build:
+	cd web && npm run build
+
+build: web-build
 	go build -o bin/repolens-api ./cmd/api
 	go build -o bin/repolens-worker ./cmd/worker
 	go build -o bin/repolens-eval ./cmd/eval

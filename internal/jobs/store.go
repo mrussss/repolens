@@ -130,7 +130,7 @@ func (s *Store) ClaimJobs(ctx context.Context, workerID string, batchSize int, l
 		FROM analysis_jobs
 		WHERE status IN ('PENDING', 'RETRY_WAIT')
 		  AND next_run_at <= ?
-		ORDER BY created_at, id
+		ORDER BY id
 		LIMIT ?
 	`
 	if s.driver != "sqlite" && s.driver != "sqlite3" {

@@ -1,4 +1,13 @@
-# Stage 1: Build binary
+# Stage 0: Build Web UI
+FROM node:20-alpine AS web-builder
+
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm install
+COPY web/ ./
+RUN npm run build
+
+# Stage 1: Build Go binaries
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
@@ -22,6 +31,7 @@ WORKDIR /app
 COPY --from=builder /bin/repolens-api /app/repolens-api
 COPY --from=builder /bin/repolens-worker /app/repolens-worker
 COPY --from=builder /bin/repolens-eval /app/repolens-eval
+COPY --from=web-builder /web/dist /app/web/dist
 
 VOLUME /data/repositories
 
