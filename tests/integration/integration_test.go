@@ -13,6 +13,8 @@ import (
 	"gorm.io/gorm"
 
 	"repolens/internal/agent"
+	codeintelmodel "repolens/internal/codeintel/model"
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
@@ -424,5 +426,79 @@ func TestApplicationRetryOn429RateLimit(t *testing.T) {
 
 	if flakyExec.attemptCount != 2 {
 		t.Errorf("expected exactly 2 attempts (1 failure + 1 success), got %d", flakyExec.attemptCount)
+	}
+}
+
+// 6. Test Milestone 4: Snapshot Materialization & Code Index Chaining
+func TestMilestone4_SnapshotAndCodeIndexChaining(t *testing.T) {
+	db, jobsStore := setupTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	repoStore := repo.NewStore(db)
+	snapStore := snapshot.NewStore(db)
+	ciStore := codeintelstore.NewStore(db)
+
+	testRepo := &repo.Repository{ID: "repo-m4", UserID: "u-m4", Name: "payment-svc", GitURL: "https://github.com/a/b", Status: "ACTIVE"}
+	_ = repoStore.Create(ctx, testRepo)
+
+	now := time.Now().UTC()
+	testSnap := &snapshot.RepositorySnapshot{
+		ID:               "snap-m4",
+		RepositoryID:     testRepo.ID,
+		CommitSHA:        "sha-m4-12345",
+		Ref:              "main",
+		MaterializedPath: "/tmp/fake/path",
+		Status:           snapshot.StatusReady,
+		ReadyAt:          &now,
+	}
+	_ = snapStore.Create(ctx, testSnap)
+
+	// Create CodeIndexBuild + AnalysisJob
+	build, created, err := ciStore.GetOrCreateBuild(ctx, testSnap.ID, testRepo.Name, codeintelmodel.DefaultBuildContext())
+	if err != nil || !created {
+		t.Fatalf("failed creating CodeIndexBuild: %v", err)
+	}
+
+	job, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", build.ID))
+	if err != nil || job == nil {
+		t.Fatalf("expected BUILD_CODE_INDEX job created, got %v", err)
+	}
+	if job.Status != jobs.StatusPending {
+		t.Errorf("expected job status PENDING, got %s", job.Status)
+	}
+}
+
+// 7. Test Milestone 4: Lineage Invariant Prevention
+func TestMilestone4_LineageMismatchPrevention(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+
+	ciStore := codeintelstore.NewStore(db)
+	snapStore := snapshot.NewStore(db)
+
+	now := time.Now().UTC()
+	_ = snapStore.Create(ctx, &snapshot.RepositorySnapshot{
+		ID:           "snap-correct",
+		RepositoryID: "repo-correct",
+		CommitSHA:    "sha-1",
+		Ref:          "main",
+		Status:       snapshot.StatusReady,
+		ReadyAt:      &now,
+	})
+
+	build, _, _ := ciStore.GetOrCreateBuild(ctx, "snap-correct", "mod", codeintelmodel.DefaultBuildContext())
+	retBuild, _, _ := ciStore.GetOrCreateRetrievalBuild(ctx, build.ID, "BM25")
+
+	// Same lineage -> Pass
+	err := ciStore.ValidateLineage(ctx, "repo-correct", "snap-correct", build.ID, retBuild.ID)
+	if err != nil {
+		t.Errorf("expected valid lineage, got: %v", err)
+	}
+
+	// Mismatched snapshot -> Fail with BUILD_LINEAGE_MISMATCH
+	errMismatch := ciStore.ValidateLineage(ctx, "repo-correct", "snap-alien", build.ID, retBuild.ID)
+	if errMismatch == nil {
+		t.Errorf("expected lineage mismatch error for alien snapshot")
 	}
 }

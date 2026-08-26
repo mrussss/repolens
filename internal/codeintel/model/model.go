@@ -72,46 +72,54 @@ func (bc BuildContext) BuildContextHash() string {
 
 // CodeFile represents a parsed source file within the codebase.
 type CodeFile struct {
-	ID                     int64     `json:"id,omitempty"`
-	CodeIndexBuildID       int64     `json:"code_index_build_id,omitempty"`
-	Path                   string    `json:"path"`
-	PackagePath            string    `json:"package_path"`
-	PackageName            string    `json:"package_name"`
-	ContentHash            string    `json:"content_hash"`
-	LineCount              int       `json:"line_count"`
-	SizeBytes              int64     `json:"size_bytes"`
-	IsTest                 bool      `json:"is_test"`
-	IncludedByBuildContext bool      `json:"included_by_build_context"`
-	ParseStatus            string    `json:"parse_status"` // "OK", "ERROR", "SKIPPED"
-	ParseError             string    `json:"parse_error,omitempty"`
+	ID                     int64     `json:"id,omitempty" gorm:"primaryKey;autoIncrement"`
+	CodeIndexBuildID       int64     `json:"code_index_build_id,omitempty" gorm:"not null;index:ix_file_build"`
+	Path                   string    `json:"path" gorm:"size:512;not null;index:ix_file_path"`
+	PackagePath            string    `json:"package_path" gorm:"size:255;not null"`
+	PackageName            string    `json:"package_name" gorm:"size:128;not null"`
+	ContentHash            string    `json:"content_hash" gorm:"size:64;not null"`
+	LineCount              int       `json:"line_count" gorm:"not null;default:0"`
+	SizeBytes              int64     `json:"size_bytes" gorm:"not null;default:0"`
+	IsTest                 bool      `json:"is_test" gorm:"not null;default:false"`
+	IncludedByBuildContext bool      `json:"included_by_build_context" gorm:"not null;default:true"`
+	ParseStatus            string    `json:"parse_status" gorm:"size:32;not null;default:'OK'"` // "OK", "ERROR", "SKIPPED"
+	ParseError             string    `json:"parse_error,omitempty" gorm:"type:text"`
 	CreatedAt              time.Time `json:"created_at,omitempty"`
+}
+
+func (CodeFile) TableName() string {
+	return "code_files"
 }
 
 // Symbol represents an extracted code symbol (function, method, type, interface).
 type Symbol struct {
-	ID                int64      `json:"id,omitempty"`
-	CodeIndexBuildID  int64      `json:"code_index_build_id,omitempty"`
-	FileID            int64      `json:"file_id,omitempty"`
-	FilePath          string     `json:"file_path"`
-	SymbolKeyRaw      string     `json:"symbol_key_raw"`
-	SymbolKeyHash     string     `json:"symbol_key_hash"`
-	ModulePath        string     `json:"module_path"`
-	PackagePath       string     `json:"package_path"`
-	PackageName       string     `json:"package_name"`
-	Kind              SymbolKind `json:"kind"`
-	Name              string     `json:"name"`
-	QualifiedName     string     `json:"qualified_name"`
-	ReceiverRaw       string     `json:"receiver_raw,omitempty"`
-	ReceiverCanonical string     `json:"receiver_canonical,omitempty"`
-	Signature         string     `json:"signature"`
-	Doc               string     `json:"doc,omitempty"`
-	StartLine         int        `json:"start_line"`
-	StartCol          int        `json:"start_col"`
-	EndLine           int        `json:"end_line"`
-	EndCol            int        `json:"end_col"`
-	Exported          bool       `json:"exported"`
-	ContentHash       string     `json:"content_hash"`
-	SourceExcerpt     string     `json:"source_excerpt,omitempty"`
+	ID                int64      `json:"id,omitempty" gorm:"primaryKey;autoIncrement"`
+	CodeIndexBuildID  int64      `json:"code_index_build_id,omitempty" gorm:"not null;index:ix_sym_build;index:ix_sym_lookup,priority:1"`
+	FileID            int64      `json:"file_id,omitempty" gorm:"not null;index:ix_sym_file"`
+	FilePath          string     `json:"file_path" gorm:"size:512;not null"`
+	SymbolKeyRaw      string     `json:"symbol_key_raw" gorm:"size:512;not null"`
+	SymbolKeyHash     string     `json:"symbol_key_hash" gorm:"size:64;not null;index:ix_sym_lookup,priority:2"`
+	ModulePath        string     `json:"module_path" gorm:"size:255;not null"`
+	PackagePath       string     `json:"package_path" gorm:"size:255;not null"`
+	PackageName       string     `json:"package_name" gorm:"size:128;not null"`
+	Kind              SymbolKind `json:"kind" gorm:"size:32;not null"`
+	Name              string     `json:"name" gorm:"size:128;not null;index:ix_sym_name"`
+	QualifiedName     string     `json:"qualified_name" gorm:"size:255;not null"`
+	ReceiverRaw       string     `json:"receiver_raw,omitempty" gorm:"size:128"`
+	ReceiverCanonical string     `json:"receiver_canonical,omitempty" gorm:"size:128"`
+	Signature         string     `json:"signature" gorm:"type:text"`
+	Doc               string     `json:"doc,omitempty" gorm:"type:text"`
+	StartLine         int        `json:"start_line" gorm:"not null"`
+	StartCol          int        `json:"start_col" gorm:"not null"`
+	EndLine           int        `json:"end_line" gorm:"not null"`
+	EndCol            int        `json:"end_col" gorm:"not null"`
+	Exported          bool       `json:"exported" gorm:"not null;default:false"`
+	ContentHash       string     `json:"content_hash" gorm:"size:64;not null"`
+	SourceExcerpt     string     `json:"source_excerpt,omitempty" gorm:"-"`
+}
+
+func (Symbol) TableName() string {
+	return "symbols"
 }
 
 // BuildSymbolKey generates the raw symbol key and its SHA256 hash.
@@ -157,24 +165,28 @@ func CanonicalizeReceiver(recv string) string {
 
 // SymbolRelation represents a relationship between symbols or an unresolved reference.
 type SymbolRelation struct {
-	ID                  int64          `json:"id,omitempty"`
-	CodeIndexBuildID    int64          `json:"code_index_build_id,omitempty"`
-	FromSymbolID        *int64         `json:"from_symbol_id,omitempty"`
-	FromSymbolKeyHash   string         `json:"from_symbol_key_hash,omitempty"`
-	ToSymbolID          *int64         `json:"to_symbol_id,omitempty"`
-	ToSymbolKeyHash     string         `json:"to_symbol_key_hash,omitempty"`
-	RelationType        RelationType   `json:"relation_type"`
-	ResolutionKind      ResolutionKind `json:"resolution_kind"`
-	Confidence          float64        `json:"confidence"`
-	ReasonCode          string         `json:"reason_code"`
-	ReasonDetail        string         `json:"reason_detail,omitempty"`
-	TargetName          string         `json:"target_name,omitempty"`
-	TargetPackagePath   string         `json:"target_package_path,omitempty"`
-	TargetQualifiedName string         `json:"target_qualified_name,omitempty"`
-	FilePath            string         `json:"file_path"`
-	FileID              int64          `json:"file_id,omitempty"`
-	Line                int            `json:"line"`
-	Column              int            `json:"column"`
+	ID                  int64          `json:"id,omitempty" gorm:"primaryKey;autoIncrement"`
+	CodeIndexBuildID    int64          `json:"code_index_build_id,omitempty" gorm:"not null;index:ix_rel_build"`
+	FromSymbolID        *int64         `json:"from_symbol_id,omitempty" gorm:"index:ix_rel_from"`
+	FromSymbolKeyHash   string         `json:"from_symbol_key_hash,omitempty" gorm:"size:64"`
+	ToSymbolID          *int64         `json:"to_symbol_id,omitempty" gorm:"index:ix_rel_to"`
+	ToSymbolKeyHash     string         `json:"to_symbol_key_hash,omitempty" gorm:"size:64"`
+	RelationType        RelationType   `json:"relation_type" gorm:"size:32;not null"`
+	ResolutionKind      ResolutionKind `json:"resolution_kind" gorm:"size:32;not null"`
+	Confidence          float64        `json:"confidence" gorm:"not null;default:1.0"`
+	ReasonCode          string         `json:"reason_code" gorm:"size:64;not null"`
+	ReasonDetail        string         `json:"reason_detail,omitempty" gorm:"size:255"`
+	TargetName          string         `json:"target_name,omitempty" gorm:"size:128"`
+	TargetPackagePath   string         `json:"target_package_path,omitempty" gorm:"size:255"`
+	TargetQualifiedName string         `json:"target_qualified_name,omitempty" gorm:"size:255"`
+	FilePath            string         `json:"file_path" gorm:"size:512;not null"`
+	FileID              int64          `json:"file_id,omitempty" gorm:"not null"`
+	Line                int            `json:"line" gorm:"not null"`
+	Column              int            `json:"column" gorm:"not null"`
+}
+
+func (SymbolRelation) TableName() string {
+	return "symbol_relations"
 }
 
 // RelatedTestDiscovery represents a discovered test symbol linked to a target symbol.

@@ -3,6 +3,7 @@ package mysql
 import (
 	"gorm.io/gorm"
 
+	codeintelmodel "repolens/internal/codeintel/model"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
@@ -16,6 +17,11 @@ func AutoMigrate(db *gorm.DB) error {
 	return db.AutoMigrate(
 		&repo.Repository{},
 		&snapshot.RepositorySnapshot{},
+		&codeintelmodel.CodeIndexBuild{},
+		&codeintelmodel.RetrievalBuild{},
+		&codeintelmodel.CodeFile{},
+		&codeintelmodel.Symbol{},
+		&codeintelmodel.SymbolRelation{},
 		&repoindex.RepositoryIndex{},
 		&diagnosis.DiagnosisRun{},
 		&diagnosis.DiagnosisAttempt{},

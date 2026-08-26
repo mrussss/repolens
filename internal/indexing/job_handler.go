@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	codeintelmodel "repolens/internal/codeintel/model"
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/snapshotstore"
@@ -18,14 +20,15 @@ import (
 
 // SnapshotJobHandler handles MATERIALIZE_SNAPSHOT jobs.
 type SnapshotJobHandler struct {
-	repoStore     repo.Store
-	snapshotStore snapshot.Store
-	indexStore    repoindex.Store
-	storeFS       snapshotstore.SnapshotStore
-	cloner        *SafeGitCloner
-	filter        *FileFilter
-	chunker       *CodeChunker
-	indexWriter   ChunkIndexWriter
+	repoStore      repo.Store
+	snapshotStore  snapshot.Store
+	indexStore     repoindex.Store
+	codeIntelStore codeintelstore.Store
+	storeFS        snapshotstore.SnapshotStore
+	cloner         *SafeGitCloner
+	filter         *FileFilter
+	chunker        *CodeChunker
+	indexWriter    ChunkIndexWriter
 }
 
 // NewSnapshotJobHandler creates a new SnapshotJobHandler.
@@ -49,6 +52,12 @@ func NewSnapshotJobHandler(
 		chunker:       chunker,
 		indexWriter:   indexWriter,
 	}
+}
+
+// WithCodeIntelStore equips the handler with CodeIntelStore for automatic build chaining.
+func (h *SnapshotJobHandler) WithCodeIntelStore(cis codeintelstore.Store) *SnapshotJobHandler {
+	h.codeIntelStore = cis
+	return h
 }
 
 // Execute processes a MATERIALIZE_SNAPSHOT job.
@@ -76,7 +85,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		_, cloneErr := h.cloner.CloneTo(ctx, r.GitURL, snap.Ref, targetDir)
 		if cloneErr != nil {
 			log.Error("failed to clone repository for snapshot", "error", cloneErr)
-			_ = h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusMaterializeFailed, nil)
+			_ = h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusFailed, nil)
 			return jobs.NewPermanentError("CLONE_FAILED", cloneErr.Error(), cloneErr)
 		}
 	}
@@ -84,7 +93,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	now := time.Now().UTC()
 	_ = h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusReady, &now)
 
-	// Build chunks & index if indexWriter is provided
+	// Build chunks & index if indexWriter is provided (migration compatibility)
 	var allChunks []CodeChunk
 	docCount := 0
 
@@ -125,6 +134,11 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			log.Error("failed writing chunks to index store", "error", err)
 			return jobs.NewRetryableError("INDEX_WRITE_FAILED", err.Error(), err)
 		}
+	}
+
+	// Auto-chain BUILD_CODE_INDEX job if codeIntelStore is wired
+	if h.codeIntelStore != nil {
+		_, _, _ = h.codeIntelStore.GetOrCreateBuild(ctx, snap.ID, r.Name, codeintelmodel.DefaultBuildContext())
 	}
 
 	log.Info("snapshot materialization completed successfully", "chunks", len(allChunks), "docs", docCount)

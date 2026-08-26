@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"repolens/internal/agent"
+	"repolens/internal/codeintel"
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/indexing"
@@ -55,6 +57,7 @@ func run() error {
 	repoStore := repo.NewStore(db.GormDB)
 	snapshotStore := snapshot.NewStore(db.GormDB)
 	indexStore := repoindex.NewStore(db.GormDB)
+	codeIntelStore := codeintelstore.NewStore(db.GormDB)
 	diagnosisStore := diagnosis.NewStore(db.GormDB)
 	reportStore := evidence.NewReportStore(db.GormDB)
 	citationStore := evidence.NewCitationStore(db.GormDB)
@@ -166,17 +169,25 @@ func run() error {
 		filter,
 		chunker,
 		indexWriter,
+	).WithCodeIntelStore(codeIntelStore)
+
+	codeIndexJobHandler := codeintel.NewCodeIndexJobHandler(
+		codeIntelStore,
+		snapshotStore,
+		storeFS,
+		codeintel.NewAnalyzer(),
 	)
 
 	jobsWorker := jobs.NewWorker(jobsStore, jobs.DefaultWorkerConfig())
 	jobsWorker.RegisterHandler(jobs.JobTypeRunDiagnosis, diagJobHandler)
 	jobsWorker.RegisterHandler(jobs.JobTypeMaterializeSnapshot, snapshotJobHandler)
+	jobsWorker.RegisterHandler(jobs.JobTypeBuildCodeIndex, codeIndexJobHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	jobsWorker.Start(ctx)
-	log.Info("analysis jobs worker started successfully")
+	log.Info("analysis jobs worker started successfully with handlers for RUN_DIAGNOSIS, MATERIALIZE_SNAPSHOT, and BUILD_CODE_INDEX")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
