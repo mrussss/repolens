@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -53,15 +54,15 @@ func setupRealMySQL(t *testing.T) (*gorm.DB, *jobs.Store, func()) {
 		t.Fatalf("failed to open real MySQL connection: %v", err)
 	}
 
-	if err := mysql.AutoMigrate(db); err != nil {
-		_ = mysqlContainer.Terminate(ctx)
-		t.Fatalf("failed to migrate real MySQL database: %v", err)
-	}
-
 	sqlDB, err := db.DB()
 	if err != nil {
 		_ = mysqlContainer.Terminate(ctx)
 		t.Fatalf("failed getting sql.DB: %v", err)
+	}
+
+	if err := mysql.ApplyMigrations(&mysql.DB{GormDB: db, SqlDB: sqlDB}, filepath.Join("..", "..", "migrations")); err != nil {
+		_ = mysqlContainer.Terminate(ctx)
+		t.Fatalf("failed to apply authoritative MySQL migrations: %v", err)
 	}
 
 	jobsStore := jobs.NewStore(sqlDB)

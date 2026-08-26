@@ -55,21 +55,28 @@ func (r *Runner) AddCase(c EvalCase) {
 	r.cases = append(r.cases, c)
 }
 
+// Cases returns a snapshot of the loaded case split for benchmark setup.
+func (r *Runner) Cases() []EvalCase {
+	return append([]EvalCase(nil), r.cases...)
+}
+
 func (r *Runner) RunRetrievalEval(ctx context.Context, strategy string, retriever retrieval.Retriever) (*EvalRun, error) {
 	run := &EvalRun{
-		ID:                uuid.New().String(),
-		DatasetVersion:    "v1.0",
-		GitCommit:         "local-freeze",
-		SnapshotSHA:       "snapshot-base",
-		RetrievalStrategy: strategy,
-		RetrievalVersion:  "1.1",
-		IndexVersion:      "v1",
-		PromptVersion:     "v1.1",
-		AgentVersion:      "v1.1",
-		Model:             "fake-deterministic",
-		EmbeddingModel:    "pseudo-embed-128",
-		TotalCases:        len(r.cases),
-		StartedAt:         time.Now(),
+		ID:                  uuid.New().String(),
+		DatasetVersion:      "v2.1.0-heldout",
+		GitCommit:           "local-freeze",
+		SnapshotSHA:         "snapshot-base",
+		RetrievalStrategy:   strategy,
+		RetrievalVersion:    "v2.1.0",
+		IndexVersion:        "v2.1.0",
+		PromptVersion:       "v2.1",
+		AgentVersion:        "v2.1",
+		Model:               "fake-deterministic",
+		EmbeddingModel:      "pseudo-embed-128",
+		DatasetManifestHash: DatasetManifestHash(r.cases),
+		AgentConfigHash:     "v2.1-default",
+		TotalCases:          len(r.cases),
+		StartedAt:           time.Now(),
 	}
 
 	var results []CaseEvalResult
@@ -107,17 +114,19 @@ func (r *Runner) RunRetrievalEval(ctx context.Context, strategy string, retrieve
 
 func (r *Runner) RunEndToEndDiagnosisEval(ctx context.Context, provider llm.Provider, retriever retrieval.Retriever) (*EvalRun, error) {
 	run := &EvalRun{
-		ID:                uuid.New().String(),
-		DatasetVersion:    "v1.0",
-		GitCommit:         "local-freeze",
-		RetrievalStrategy: "E2E_AGENT",
-		RetrievalVersion:  "1.1",
-		IndexVersion:      "v1",
-		PromptVersion:     "v1.1",
-		AgentVersion:      "v1.1",
-		Model:             "agent-e2e-pipeline",
-		TotalCases:        len(r.cases),
-		StartedAt:         time.Now(),
+		ID:                  uuid.New().String(),
+		DatasetVersion:      "v2.1.0-heldout",
+		GitCommit:           "local-freeze",
+		RetrievalStrategy:   "E2E_AGENT",
+		RetrievalVersion:    "v2.1.0",
+		IndexVersion:        "v2.1.0",
+		PromptVersion:       "v2.1",
+		AgentVersion:        "v2.1",
+		Model:               "agent-e2e-pipeline",
+		DatasetManifestHash: DatasetManifestHash(r.cases),
+		AgentConfigHash:     "v2.1-default",
+		TotalCases:          len(r.cases),
+		StartedAt:           time.Now(),
 	}
 
 	var results []CaseEvalResult

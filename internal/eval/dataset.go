@@ -414,6 +414,48 @@ func WriteStandardDatasetToDir(dir string) error {
 	return nil
 }
 
+// WriteDatasetSets materializes the frozen split used by the v2.1 eval
+// protocol. Cases 001-016 are development cases; 017-032 are held-out.
+func WriteDatasetSets(baseDir string) error {
+	dev := filepath.Join(baseDir, "dev")
+	if err := os.MkdirAll(dev, 0755); err != nil {
+		return err
+	}
+	for _, c := range StandardFaultCases {
+		if c.CaseID >= "CASE-017" {
+			continue
+		}
+		if err := writeCaseFile(dev, c); err != nil {
+			return err
+		}
+	}
+	// Keep the held-out directory immutable after first materialization.
+	heldout := filepath.Join(baseDir, "heldout")
+	if err := os.MkdirAll(heldout, 0755); err != nil {
+		return err
+	}
+	for _, c := range StandardFaultCases {
+		if c.CaseID < "CASE-017" {
+			continue
+		}
+		path := filepath.Join(heldout, fmt.Sprintf("%s.json", c.CaseID))
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if err := writeCaseFile(heldout, c); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func writeCaseFile(dir string, c EvalCase) error {
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s.json", c.CaseID)), data, 0644)
+}
+
 func findFixtureBaseDir() string {
 	candidates := []string{
 		"testdata/eval_repositories",
