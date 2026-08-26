@@ -1,4 +1,4 @@
-import { ProviderStatus, Repository, DiagnosisRun, DiagnosisReport, AgentStep } from './types';
+import { ProviderStatus, Repository, DiagnosisRun, DiagnosisReport, AgentStep, CodeIndexBuild, CodeSymbol, SymbolRelation, QualityReport } from './types';
 
 const API_BASE = '/api/v1';
 
@@ -71,6 +71,41 @@ export const api = {
     return handleResponse(res);
   },
 
+  // Code Intelligence (M5)
+  async triggerCodeIndexBuild(snapshotId: string): Promise<{ code_index_build: CodeIndexBuild; status: string }> {
+    const res = await fetch(`${API_BASE}/snapshots/${snapshotId}/code-index-builds`, {
+      method: 'POST',
+    });
+    return handleResponse(res);
+  },
+
+  async getCodeIndexBuild(id: number): Promise<CodeIndexBuild> {
+    const res = await fetch(`${API_BASE}/code-index-builds/${id}`);
+    return handleResponse<CodeIndexBuild>(res);
+  },
+
+  async getBuildQuality(id: number): Promise<QualityReport> {
+    const res = await fetch(`${API_BASE}/code-index-builds/${id}/quality`);
+    return handleResponse<QualityReport>(res);
+  },
+
+  async listSymbols(buildId: number, query?: string): Promise<{ symbols: CodeSymbol[]; total: number }> {
+    const q = query ? `?q=${encodeURIComponent(query)}` : '';
+    const res = await fetch(`${API_BASE}/code-index-builds/${buildId}/symbols${q}`);
+    return handleResponse(res);
+  },
+
+  async getSymbolReferences(symbolId: number, buildId: number): Promise<{ relations: SymbolRelation[]; total: number }> {
+    const res = await fetch(`${API_BASE}/symbols/${symbolId}/references?code_index_build_id=${buildId}`);
+    return handleResponse(res);
+  },
+
+  async getSymbolRelatedTests(symbolId: number, buildId: number, symbolKeyHash: string): Promise<{ related_tests: SymbolRelation[]; total: number }> {
+    const res = await fetch(`${API_BASE}/symbols/${symbolId}/tests?code_index_build_id=${buildId}&symbol_key_hash=${symbolKeyHash}`);
+    return handleResponse(res);
+  },
+
+  // Diagnoses
   async listDiagnoses(): Promise<DiagnosisRun[]> {
     const res = await fetch(`${API_BASE}/diagnoses`);
     return handleResponse<DiagnosisRun[]>(res);

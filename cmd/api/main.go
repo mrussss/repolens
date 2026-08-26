@@ -15,6 +15,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"repolens/internal/codeintel"
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/platform/config"
@@ -59,6 +61,7 @@ func run() error {
 	repoStore := repo.NewStore(db.GormDB)
 	snapshotStore := snapshot.NewStore(db.GormDB)
 	indexStore := repoindex.NewStore(db.GormDB)
+	codeIntelStore := codeintelstore.NewStore(db.GormDB)
 	diagnosisStore := diagnosis.NewStore(db.GormDB)
 	reportStore := evidence.NewReportStore(db.GormDB)
 	citationStore := evidence.NewCitationStore(db.GormDB)
@@ -87,6 +90,7 @@ func run() error {
 		traceStore,
 		storeFS,
 	)
+	codeIntelHandler := codeintel.NewHandler(codeIntelStore, snapshotStore)
 
 	if cfg.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -135,6 +139,17 @@ func run() error {
 		v1.GET("/repositories", repoHandler.List)
 		v1.GET("/repositories/:id", repoHandler.Get)
 		v1.POST("/repositories/:id/index", repoHandler.TriggerIndex)
+
+		// Code Intelligence (M5)
+		v1.POST("/snapshots/:id/code-index-builds", codeIntelHandler.TriggerCodeIndexBuild)
+		v1.GET("/code-index-builds/:id", codeIntelHandler.GetCodeIndexBuild)
+		v1.GET("/code-index-builds/:id/quality", codeIntelHandler.GetQuality)
+		v1.GET("/code-index-builds/:id/symbols", codeIntelHandler.ListSymbols)
+		v1.GET("/symbols/:id", codeIntelHandler.GetSymbol)
+		v1.GET("/symbols/:id/references", codeIntelHandler.GetSymbolReferences)
+		v1.GET("/symbols/:id/tests", codeIntelHandler.GetSymbolTests)
+		v1.POST("/code-index-builds/:id/retrieval-builds", codeIntelHandler.TriggerRetrievalBuild)
+		v1.GET("/retrieval-builds/:id", codeIntelHandler.GetRetrievalBuild)
 
 		// Diagnoses
 		v1.POST("/diagnoses", diagnosisHandler.Create)

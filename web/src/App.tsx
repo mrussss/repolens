@@ -3,11 +3,12 @@ import { SetupPage } from './components/SetupPage';
 import { RepositoriesPage } from './components/RepositoriesPage';
 import { NewDiagnosisPage } from './components/NewDiagnosisPage';
 import { DiagnosisView } from './components/DiagnosisView';
+import { CodeIntelPage } from './components/CodeIntelPage';
 import { api } from './api';
 import { DiagnosisRun } from './types';
-import { FolderGit2, PlusCircle, Settings, Sparkles, Activity, Clock } from 'lucide-react';
+import { FolderGit2, PlusCircle, Settings, Sparkles, Activity, Clock, Code2 } from 'lucide-react';
 
-type ViewMode = 'setup' | 'repos' | 'new-diag' | 'diag-view' | 'history';
+type ViewMode = 'setup' | 'repos' | 'new-diag' | 'diag-view' | 'history' | 'codeintel';
 
 export const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<ViewMode>('setup');
@@ -24,13 +25,6 @@ export const App: React.FC = () => {
     try {
       const list = await api.listDiagnoses();
       setRecentDiagnoses(list || []);
-      // If user has existing diagnoses and currently on initial load, show history or repos
-      if (list && list.length > 0 && currentView === 'setup') {
-        const isConfigured = (await api.getProviderStatus()).is_configured;
-        if (isConfigured) {
-          // keep setup or allow user to navigate
-        }
-      }
     } catch {
       // ignore
     }
@@ -78,6 +72,13 @@ export const App: React.FC = () => {
                 onClick={() => setCurrentView('repos')}
               >
                 <FolderGit2 size={16} /> Repositories
+              </button>
+              <button
+                className="btn"
+                style={{ background: currentView === 'codeintel' ? 'var(--bg-subtle)' : 'transparent', border: 'none' }}
+                onClick={() => setCurrentView('codeintel')}
+              >
+                <Code2 size={16} /> Code Intel
               </button>
               <button
                 className="btn"
@@ -136,6 +137,10 @@ export const App: React.FC = () => {
           <RepositoriesPage
             onSelectRepoForDiagnosis={handleSelectRepoForDiagnosis}
           />
+        )}
+
+        {currentView === 'codeintel' && (
+          <CodeIntelPage />
         )}
 
         {currentView === 'new-diag' && (
@@ -198,10 +203,6 @@ export const App: React.FC = () => {
                         Repo ID: {d.repository_id} | Created: {new Date(d.created_at).toLocaleString()}
                       </div>
                     </div>
-
-                    <button className="btn" style={{ fontSize: '0.8rem' }}>
-                      View Report →
-                    </button>
                   </div>
                 ))}
               </div>
@@ -211,9 +212,9 @@ export const App: React.FC = () => {
       </main>
 
       {/* Footer */}
-      <footer style={{ borderTop: '1px solid var(--border-color)', background: 'var(--bg-card)', padding: '1rem 0', color: 'var(--text-muted)', fontSize: '0.8rem', textAlign: 'center' }}>
+      <footer style={{ borderTop: '1px solid var(--border-color)', padding: '1rem 0', color: 'var(--text-muted)', fontSize: '0.8rem', textAlign: 'center' }}>
         <div className="container">
-          RepoLens v2.1 — Grounded Code Intelligence & Automated Root Cause Analysis
+          RepoLens v2.1 Local Codebase Intelligence & RCA Engine &bull; Zero-leakage Local Storage
         </div>
       </footer>
     </div>
