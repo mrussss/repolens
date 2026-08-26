@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   mysql:
     image: mysql:8.0
@@ -11,7 +9,7 @@ services:
       MYSQL_USER: repolens
       MYSQL_PASSWORD: repolens_password
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -33,11 +31,12 @@ services:
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - SNAPSHOT_BASE_PATH=/data/repositories
-      - LLM_PROVIDER=fake
+      - PROVIDER_SECRET_PATH=/repolens-secrets/provider.json
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - snapshot_data:/data/repositories
+      - provider_secrets:/repolens-secrets
     depends_on:
       mysql:
         condition: service_healthy
@@ -54,9 +53,10 @@ services:
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - SNAPSHOT_BASE_PATH=/data/repositories
-      - LLM_PROVIDER=fake
+      - PROVIDER_SECRET_PATH=/repolens-secrets/provider.json
     volumes:
       - snapshot_data:/data/repositories
+      - provider_secrets:/repolens-secrets
     depends_on:
       mysql:
         condition: service_healthy
@@ -64,3 +64,4 @@ services:
 volumes:
   mysql_data:
   snapshot_data:
+  provider_secrets:
