@@ -98,8 +98,8 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	latency, err := h.mgr.TestConnection(c.Request.Context(), req.BaseURL, req.Model, req.APIKey)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{
-			"success": false,
-			"error":   err.Error(),
+			"success":    false,
+			"error":      err.Error(),
 			"latency_ms": latency.Milliseconds(),
 		})
 		return
@@ -275,10 +275,10 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 	)
 
 	c.JSON(http.StatusCreated, gin.H{
-		"message":      "Demo environment and diagnosis initialized successfully",
-		"diagnosis_id": demoRun.ID,
+		"message":       "Demo environment and diagnosis initialized successfully",
+		"diagnosis_id":  demoRun.ID,
 		"repository_id": demoRepoID,
-		"snapshot_id":  demoSnapID,
-		"report":       demoReport,
+		"snapshot_id":   demoSnapID,
+		"report":        demoReport,
 	})
 }

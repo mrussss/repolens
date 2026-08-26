@@ -7,10 +7,10 @@ import (
 
 // WindowResult represents a fixed-window text match from the V1 baseline.
 type WindowResult struct {
-	FilePath  string `json:"file_path"`
-	StartLine int    `json:"start_line"`
-	EndLine   int    `json:"end_line"`
-	Content   string `json:"content"`
+	FilePath  string  `json:"file_path"`
+	StartLine int     `json:"start_line"`
+	EndLine   int     `json:"end_line"`
+	Content   string  `json:"content"`
 	Score     float64 `json:"score"`
 }
 

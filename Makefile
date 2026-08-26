@@ -11,7 +11,7 @@ build: web-build
 	go build -o bin/repolens-eval ./cmd/eval
 
 fmt:
-	gofmt -s -w .
+	gofmt -s -w cmd/ internal/ tests/
 
 lint:
 	go vet ./...

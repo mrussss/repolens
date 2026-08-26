@@ -23,4 +23,3 @@ func BenchmarkAdd(b *testing.B) {
 func TestDivide(t *testing.T) {
 	t.Log("testing division edge cases")
 }
-

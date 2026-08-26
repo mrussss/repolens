@@ -19,10 +19,10 @@ import (
 
 // ProviderConfig represents stored provider credentials.
 type ProviderConfig struct {
-	BaseURL   string `json:"base_url"`
-	Model     string `json:"model"`
-	APIKey    string `json:"api_key"`
-	IsDemo    bool   `json:"is_demo,omitempty"`
+	BaseURL   string    `json:"base_url"`
+	Model     string    `json:"model"`
+	APIKey    string    `json:"api_key"`
+	IsDemo    bool      `json:"is_demo,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

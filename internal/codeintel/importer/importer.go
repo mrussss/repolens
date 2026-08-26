@@ -22,9 +22,9 @@ type OfflineImporter struct {
 	mu           sync.Mutex
 	fset         *token.FileSet
 	modulePath   string
-	pkgFilesMap  map[string]*PkgFiles     // pkgPath -> PkgFiles
+	pkgFilesMap  map[string]*PkgFiles      // pkgPath -> PkgFiles
 	cache        map[string]*types.Package // pkgPath -> *types.Package
-	typeErrors   map[string][]string      // pkgPath -> errors
+	typeErrors   map[string][]string       // pkgPath -> errors
 	stdlibImport types.Importer
 }
 

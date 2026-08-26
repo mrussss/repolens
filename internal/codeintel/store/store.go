@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	ErrBuildNotFound       = errors.New("code index build not found")
+	ErrBuildNotFound        = errors.New("code index build not found")
 	ErrBuildLineageMismatch = errors.New("build lineage mismatch: artifacts do not belong to the same snapshot chain")
 )
 

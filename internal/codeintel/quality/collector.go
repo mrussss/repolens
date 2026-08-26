@@ -38,4 +38,3 @@ func ComputeQuality(files []*model.CodeFile, symbols []*model.Symbol, relations 
 
 	return q
 }
-

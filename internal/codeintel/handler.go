@@ -89,22 +89,22 @@ func (h *Handler) GetQuality(c *gin.Context) {
 	}
 
 	quality := gin.H{
-		"code_index_build_id":        build.ID,
-		"snapshot_id":                build.SnapshotID,
-		"files_total":                build.FilesTotal,
-		"files_parsed":               build.FilesParsed,
-		"files_failed":               build.FilesFailed,
-		"parsed_pct":                 calcPct(build.FilesParsed, build.FilesTotal),
-		"packages_total":             build.PackagesTotal,
-		"packages_typechecked":       build.PackagesTypechecked,
-		"packages_failed":            build.PackagesFailed,
-		"typechecked_pct":            calcPct(build.PackagesTypechecked, build.PackagesTotal),
-		"symbol_count":               build.SymbolCount,
-		"semantic_relation_count":    build.SemanticRelationCount,
-		"syntactic_relation_count":   build.SyntacticRelationCount,
-		"heuristic_relation_count":   build.HeuristicRelationCount,
-		"unresolved_relation_count":  build.UnresolvedRelationCount,
-		"status":                     build.Status,
+		"code_index_build_id":       build.ID,
+		"snapshot_id":               build.SnapshotID,
+		"files_total":               build.FilesTotal,
+		"files_parsed":              build.FilesParsed,
+		"files_failed":              build.FilesFailed,
+		"parsed_pct":                calcPct(build.FilesParsed, build.FilesTotal),
+		"packages_total":            build.PackagesTotal,
+		"packages_typechecked":      build.PackagesTypechecked,
+		"packages_failed":           build.PackagesFailed,
+		"typechecked_pct":           calcPct(build.PackagesTypechecked, build.PackagesTotal),
+		"symbol_count":              build.SymbolCount,
+		"semantic_relation_count":   build.SemanticRelationCount,
+		"syntactic_relation_count":  build.SyntacticRelationCount,
+		"heuristic_relation_count":  build.HeuristicRelationCount,
+		"unresolved_relation_count": build.UnresolvedRelationCount,
+		"status":                    build.Status,
 	}
 
 	c.JSON(http.StatusOK, quality)
