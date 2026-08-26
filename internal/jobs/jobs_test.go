@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,12 +18,11 @@ import (
 
 func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	dsn := fmt.Sprintf("file:mem_%d?mode=memory&cache=shared&_busy_timeout=5000", time.Now().UnixNano())
-	db, err := sql.Open("sqlite3", dsn)
+	dbPath := filepath.Join(t.TempDir(), "jobs_test.db")
+	db, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	db.SetMaxOpenConns(1) // Single shared connection for sqlite in-memory ensures table persists across queries
 
 	createTableQuery := `
 	CREATE TABLE analysis_jobs (

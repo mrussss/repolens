@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"repolens/internal/jobs"
 	"repolens/internal/outbox"
 )
 
@@ -84,6 +85,21 @@ func (s *GormStore) CreateWithOutbox(ctx context.Context, run *DiagnosisRun, out
 				return err
 			}
 		}
+
+		// Also atomically insert analysis_job for DB-backed job execution
+		job := &jobs.AnalysisJob{
+			JobType:             jobs.JobTypeRunDiagnosis,
+			ResourceID:          run.ID,
+			Status:              jobs.StatusPending,
+			ExecutionGeneration: 1,
+			AttemptCount:        0,
+			MaxAttempts:         3,
+			NextRunAt:           time.Now().UTC(),
+		}
+		if err := tx.Create(job).Error; err != nil {
+			return err
+		}
+
 		return nil
 	})
 }

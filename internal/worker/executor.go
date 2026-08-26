@@ -3,24 +3,13 @@ package worker
 import (
 	"context"
 
+	"repolens/internal/agent"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 )
 
-type ExecutionResult struct {
-	Report           *evidence.DiagnosisReportData
-	RawOutput        string
-	PromptTokens     int
-	CompletionTokens int
-	ToolCalls        int
-	Retryable        bool
-	ErrorCode        string
-	ErrorMessage     string
-}
-
-type DiagnosisExecutor interface {
-	Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error)
-}
+type ExecutionResult = agent.ExecutionResult
+type DiagnosisExecutor = agent.Executor
 
 type FakeDiagnosisExecutor struct{}
 

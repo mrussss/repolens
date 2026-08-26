@@ -5,14 +5,29 @@ import (
 	"fmt"
 
 	"repolens/internal/diagnosis"
+	"repolens/internal/evidence"
 	"repolens/internal/llm"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/retrieval"
 	"repolens/internal/sse"
 	"repolens/internal/tools"
 	"repolens/internal/trace"
-	"repolens/internal/worker"
 )
+
+type ExecutionResult struct {
+	Report           *evidence.DiagnosisReportData
+	RawOutput        string
+	PromptTokens     int
+	CompletionTokens int
+	ToolCalls        int
+	Retryable        bool
+	ErrorCode        string
+	ErrorMessage     string
+}
+
+type Executor interface {
+	Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error)
+}
 
 type AgentRuntimeExecutor struct {
 	provider   llm.Provider
@@ -41,7 +56,7 @@ func NewAgentRuntimeExecutor(
 	}
 }
 
-func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
 	registry := NewToolRegistry()
 
 	// Register 4 Read-Only Tools for this diagnosis session
@@ -61,7 +76,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		return nil, fmt.Errorf("agent loop execution failed: %w", err)
 	}
 
-	return &worker.ExecutionResult{
+	return &ExecutionResult{
 		Report:           res.Report,
 		RawOutput:        res.RawOutput,
 		PromptTokens:     res.PromptTokens,

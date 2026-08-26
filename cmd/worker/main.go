@@ -13,6 +13,7 @@ import (
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/indexing"
+	"repolens/internal/jobs"
 	"repolens/internal/llm"
 	"repolens/internal/mq"
 	"repolens/internal/platform/config"
@@ -186,8 +187,23 @@ func run() error {
 	// Stale Attempt Recovery Sweeper
 	recoverySweeper := worker.NewRecoverySweeper(diagnosisStore, 30*time.Second, 10*time.Second, 2*time.Second)
 
+	// DB-backed Analysis Job Worker Runtime (M2A / M2B)
+	jobsStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)
+	diagJobHandler := worker.NewDiagnosisJobHandler(
+		diagnosisStore,
+		reportStore,
+		citationStore,
+		citationVal,
+		agentExecutor,
+		sseHub,
+	)
+	jobsWorker := jobs.NewWorker(jobsStore, jobs.DefaultWorkerConfig())
+	jobsWorker.RegisterHandler(jobs.JobTypeRunDiagnosis, diagJobHandler)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	jobsWorker.Start(ctx)
 
 	errCh := make(chan error, 3)
 	var wg sync.WaitGroup
@@ -233,6 +249,7 @@ func run() error {
 
 	drainDone := make(chan struct{})
 	go func() {
+		jobsWorker.Stop()
 		wg.Wait()
 		close(drainDone)
 	}()
