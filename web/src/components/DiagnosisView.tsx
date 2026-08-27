@@ -129,7 +129,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
 
       {/* In-Flight Status Progress Banner */}
       {(run?.status === 'QUEUED' || run?.status === 'RUNNING') && (
-        <div className="card" style={{ background: '#1c2128', border: '1px solid var(--accent-primary)' }}>
+        <div className="card" style={{ background: 'var(--bg-subtle)', border: '1px solid var(--accent-primary)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
             <RefreshCw size={24} className="spin" color="var(--accent-primary)" />
             <div>
