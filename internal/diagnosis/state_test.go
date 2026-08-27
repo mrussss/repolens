@@ -230,3 +230,81 @@ func TestFinalizeSuccessIsFencedAndAtomic(t *testing.T) {
 		t.Fatalf("expected ownership fencing, got %v", err)
 	}
 }
+
+func TestCancellationQueuedRunningAndFinalizeRace(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	store := diagnosis.NewStore(db)
+
+	queued := &diagnosis.DiagnosisRun{ID: "run-cancel-queued", UserID: "user-cancel", RepositoryID: "repo", SnapshotID: "snap", IssueTitle: "queued", IdempotencyKey: "cancel-queued", IdempotencyRequestHash: "hash"}
+	if err := store.Create(ctx, queued); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestCancellation(ctx, queued.ID, queued.UserID); err != nil {
+		t.Fatal(err)
+	}
+	var queuedJob jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, queued.ID).First(&queuedJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	if queuedJob.Status != jobs.StatusCancelled {
+		t.Fatalf("queued job status = %s", queuedJob.Status)
+	}
+	var queuedRun diagnosis.DiagnosisRun
+	if err := db.First(&queuedRun, "id = ?", queued.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if queuedRun.Status != diagnosis.StatusCancelled {
+		t.Fatalf("queued run status = %s", queuedRun.Status)
+	}
+
+	running := &diagnosis.DiagnosisRun{ID: "run-cancel-running", UserID: "user-cancel", RepositoryID: "repo", SnapshotID: "snap", IssueTitle: "running", IdempotencyKey: "cancel-running", IdempotencyRequestHash: "hash"}
+	if err := store.Create(ctx, running); err != nil {
+		t.Fatal(err)
+	}
+	var runningJob jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, running.ID).First(&runningJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	workerID, token := "worker-cancel", "claim-cancel"
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", runningJob.ID).Updates(map[string]interface{}{"status": jobs.StatusRunning, "worker_id": workerID, "claim_token": token}).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempt := &diagnosis.DiagnosisAttempt{ID: "attempt-cancel-running", DiagnosisRunID: running.ID, AttemptNo: 1, WorkerID: workerID}
+	if err := store.StartAttempt(ctx, running.ID, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestCancellation(ctx, running.ID, running.UserID); err != nil {
+		t.Fatal(err)
+	}
+	var flagJob jobs.AnalysisJob
+	if err := db.First(&flagJob, runningJob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !flagJob.CancelRequested {
+		t.Fatal("running job cancellation flag was not set")
+	}
+	if err := store.FinalizeCancellation(ctx, runningJob.ID, workerID, token, running.ID, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	var cancelledAttempt diagnosis.DiagnosisAttempt
+	if err := db.First(&cancelledAttempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if cancelledAttempt.Status != diagnosis.AttemptStatusCancelled {
+		t.Fatalf("attempt status = %s", cancelledAttempt.Status)
+	}
+	var runningRun diagnosis.DiagnosisRun
+	if err := db.First(&runningRun, "id = ?", running.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if runningRun.Status != diagnosis.StatusCancelled {
+		t.Fatalf("running run status = %s", runningRun.Status)
+	}
+	if err := db.First(&flagJob, runningJob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if flagJob.Status != jobs.StatusCancelled {
+		t.Fatalf("running job status = %s", flagJob.Status)
+	}
+}

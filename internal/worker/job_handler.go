@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -70,12 +71,6 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		DeadlineAt:     time.Now().UTC().Add(30 * time.Minute),
 	}
 
-	if run.CancelRequested || job.CancelRequested {
-		log.Info("diagnosis cancellation requested")
-		_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusCancelled, diagnosis.AttemptStatusCancelled, 0, 0, 0, "CANCELLED", "User requested cancellation", false, 0)
-		return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
-	}
-
 	if starter, ok := h.diagnosisStore.(interface {
 		StartAttempt(context.Context, string, *diagnosis.DiagnosisAttempt) error
 	}); ok {
@@ -88,30 +83,31 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			return jobs.NewRetryableError("START_ATTEMPT_FAILED", err.Error(), err)
 		}
 	}
+	if run.CancelRequested || job.CancelRequested {
+		log.Info("diagnosis cancellation requested")
+		return h.cancelAttempt(ctx, job, run, attempt)
+	}
 
 	result, execErr := h.executor.Execute(ctx, run, attempt)
 	if execErr != nil {
 		log.Error("agent execution failed", "error", execErr)
 		errClass, errCode := jobs.ClassifyError(execErr)
+		if errors.Is(execErr, context.Canceled) || errClass == jobs.ErrorClassCancelled {
+			return h.cancelAttempt(ctx, job, run, attempt)
+		}
 		isTerminal := (errClass == jobs.ErrorClassPermanent) || (job.AttemptCount >= job.MaxAttempts)
 
-		var newRunStatus diagnosis.RunStatus
 		var newAttemptStatus diagnosis.AttemptStatus
 		if isTerminal {
-			newRunStatus = diagnosis.StatusFailed
 			newAttemptStatus = diagnosis.AttemptStatusFailedTerminal
 		} else {
 			// Retry belongs to AnalysisJob. Diagnosis remains RUNNING while
 			// the job is in RETRY_WAIT.
-			newRunStatus = diagnosis.StatusRunning
 			newAttemptStatus = diagnosis.AttemptStatusFailedRetryable
 		}
 
-		_ = h.diagnosisStore.FinishAttemptAndRun(
-			ctx, run.ID, attempt.ID, newRunStatus, newAttemptStatus,
-			0, 0, 0, errCode, execErr.Error(),
-			!isTerminal, 5*time.Second,
-		)
+		// Diagnosis remains RUNNING until the Job Store terminalizes it.
+		_ = h.diagnosisStore.FinishAttempt(ctx, run.ID, attempt.ID, newAttemptStatus, 0, 0, 0, errCode, execErr.Error(), !isTerminal)
 		return execErr
 	}
 	if result == nil || result.Report == nil {
@@ -162,6 +158,9 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				return jobs.ErrOwnershipLost
 			}
 			if err := finalizer.FinalizeSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID, rep, allCitations, promptTokens, completionTokens, toolCalls); err != nil {
+				if errors.Is(err, jobs.ErrCancellationRequested) {
+					return h.cancelAttempt(ctx, job, run, attempt)
+				}
 				h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
 				return jobs.NewRetryableError("ATOMIC_FINALIZE_FAILED", err.Error(), err)
 			}
@@ -210,5 +209,18 @@ func (h *DiagnosisJobHandler) failDiagnosisIfTerminal(ctx context.Context, job *
 	if class == jobs.ErrorClassOwnershipLost {
 		return
 	}
-	_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, code, err.Error(), false, 0)
+	_ = h.diagnosisStore.FinishAttempt(ctx, run.ID, attempt.ID, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, code, err.Error(), false)
+}
+
+func (h *DiagnosisJobHandler) cancelAttempt(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) error {
+	if finalizer, ok := h.diagnosisStore.(interface {
+		FinalizeCancellation(context.Context, int64, string, string, string, string) error
+	}); ok && job.WorkerID != nil && job.ClaimToken != nil {
+		if err := finalizer.FinalizeCancellation(ctx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID); err != nil {
+			return err
+		}
+		return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
+	}
+	_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusCancelled, diagnosis.AttemptStatusCancelled, 0, 0, 0, "CANCELLED", "User requested cancellation", false, 0)
+	return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
 }

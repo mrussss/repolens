@@ -31,6 +31,7 @@ type Store interface {
 	GetAttempt(ctx context.Context, attemptID string) (*DiagnosisAttempt, error)
 	ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error)
 	UpdateAttemptHeartbeat(ctx context.Context, attemptID string, heartbeatAt time.Time) error
+	FinishAttempt(ctx context.Context, runID, attemptID string, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool) error
 	FinishAttemptAndRun(ctx context.Context, runID, attemptID string, newRunStatus RunStatus, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool, retryDelay time.Duration) error
 	RequestCancellation(ctx context.Context, runID, userID string) error
 	ConfirmCancellation(ctx context.Context, runID, attemptID string) error
@@ -92,12 +93,18 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 			}
 			return err
 		}
+		if job.CancelRequested {
+			return jobs.ErrCancellationRequested
+		}
 		if report == nil {
 			return errors.New("diagnosis report is required")
 		}
 		var run DiagnosisRun
 		if err := tx.First(&run, "id = ? AND status = ?", runID, StatusRunning).Error; err != nil {
 			return err
+		}
+		if run.CancelRequested {
+			return jobs.ErrCancellationRequested
 		}
 		if report.DiagnosisRunID != runID || report.AttemptID != attemptID {
 			return errors.New("report lineage does not match diagnosis attempt")
@@ -135,12 +142,52 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 		if runRes.RowsAffected != 1 {
 			return fmt.Errorf("diagnosis %s finalize conflict", runID)
 		}
-		jobRes := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).
+		jobRes := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).
 			Updates(map[string]interface{}{"status": jobs.StatusSucceeded, "finished_at": now, "updated_at": now})
 		if jobRes.Error != nil {
 			return jobRes.Error
 		}
 		if jobRes.RowsAffected != 1 {
+			return jobs.ErrOwnershipLost
+		}
+		return nil
+	})
+}
+
+func (s *GormStore) FinalizeCancellation(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job jobs.AnalysisJob
+		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return jobs.ErrOwnershipLost
+			}
+			return err
+		}
+		attemptResult := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).Updates(map[string]interface{}{
+			"status": AttemptStatusCancelled, "finished_at": time.Now().UTC(), "error_code": "CANCELLED",
+		})
+		if attemptResult.Error != nil {
+			return attemptResult.Error
+		}
+		if attemptResult.RowsAffected != 1 {
+			return jobs.ErrOwnershipLost
+		}
+		runResult := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ?", runID, StatusRunning).Updates(map[string]interface{}{
+			"status": StatusCancelled, "version": gorm.Expr("version + 1"),
+		})
+		if runResult.Error != nil {
+			return runResult.Error
+		}
+		if runResult.RowsAffected != 1 {
+			return fmt.Errorf("diagnosis %s cancellation conflict", runID)
+		}
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).Updates(map[string]interface{}{
+			"status": jobs.StatusCancelled, "terminal_reason": jobs.TerminalReasonCancelled, "finished_at": time.Now().UTC(),
+		})
+		if jobResult.Error != nil {
+			return jobResult.Error
+		}
+		if jobResult.RowsAffected != 1 {
 			return jobs.ErrOwnershipLost
 		}
 		return nil
@@ -340,6 +387,25 @@ func (s *GormStore) UpdateAttemptHeartbeat(ctx context.Context, attemptID string
 		Update("heartbeat_at", heartbeatAt).Error
 }
 
+func (s *GormStore) FinishAttempt(ctx context.Context, runID, attemptID string, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool) error {
+	now := time.Now().UTC()
+	result := s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).
+		Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).
+		Updates(map[string]interface{}{
+			"status": newAttemptStatus, "finished_at": &now,
+			"prompt_tokens": promptTokens, "completion_tokens": completionTokens,
+			"tool_calls": toolCalls, "error_code": errCode, "error_message": errMsg,
+			"retryable": retryable,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrAttemptNotFound
+	}
+	return nil
+}
+
 func (s *GormStore) FinishAttemptAndRun(ctx context.Context, runID, attemptID string, newRunStatus RunStatus, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool, retryDelay time.Duration) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		now := time.Now()
@@ -395,8 +461,30 @@ func (s *GormStore) RequestCancellation(ctx context.Context, runID, userID strin
 
 		nextStatus := run.Status
 		if run.Status == StatusQueued {
-			// If still queued, can transition directly to CANCELLED
+			// A queued diagnosis and its pending/retry job are cancelled together,
+			// before another claimant can observe them as runnable.
+			jobRes := tx.Model(&jobs.AnalysisJob{}).
+				Where("job_type = ? AND resource_id = ? AND status IN (?, ?)", jobs.JobTypeRunDiagnosis, runID, jobs.StatusPending, jobs.StatusRetryWait).
+				Updates(map[string]interface{}{"status": jobs.StatusCancelled, "terminal_reason": jobs.TerminalReasonCancelled, "cancel_requested": true, "finished_at": time.Now().UTC()})
+			if jobRes.Error != nil {
+				return jobRes.Error
+			}
+			if jobRes.RowsAffected != 1 {
+				return fmt.Errorf("diagnosis job %s is no longer queued", runID)
+			}
 			nextStatus = StatusCancelled
+		} else if run.Status != StatusRunning {
+			return fmt.Errorf("cannot cancel run in status %s", run.Status)
+		} else {
+			jobRes := tx.Model(&jobs.AnalysisJob{}).
+				Where("job_type = ? AND resource_id = ? AND status = ?", jobs.JobTypeRunDiagnosis, runID, jobs.StatusRunning).
+				Updates(map[string]interface{}{"cancel_requested": true})
+			if jobRes.Error != nil {
+				return jobRes.Error
+			}
+			if jobRes.RowsAffected != 1 {
+				return fmt.Errorf("diagnosis job %s is not running", runID)
+			}
 		}
 
 		return tx.Model(&DiagnosisRun{}).
