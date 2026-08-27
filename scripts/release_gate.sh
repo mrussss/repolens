@@ -49,11 +49,11 @@ cleanup() { docker compose down >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 docker compose up -d
 for attempt in $(seq 1 30); do
-    if curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null; then break; fi
+    if curl --noproxy '*' --max-time 5 --fail --silent http://127.0.0.1:8080/healthz >/dev/null; then break; fi
     if [ "$attempt" -eq 30 ]; then echo "ERROR: API health check timed out"; exit 1; fi
     sleep 2
 done
-demo_response=$(curl --fail --silent -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8080/api/v1/demo/trigger)
+demo_response=$(curl --noproxy '*' --max-time 30 --fail --silent -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8080/api/v1/demo/trigger)
 echo "$demo_response" | grep -q 'diagnosis_id'
 echo "✓ Product health and real Demo smoke passed"
 
