@@ -189,7 +189,7 @@ func (h *Handler) TriggerDemo(c *gin.Context) {
 	}
 
 	// 2. Ensure Demo Snapshot files
-	demoSnapID := "snap-demo-order-svc-001"
+	demoSnapID := "snap-demo-order-svc-002"
 	demoDir := h.storeFS.GetSourcePath(demoRepoID, demoSnapID)
 	_ = os.MkdirAll(demoDir, 0755)
 
