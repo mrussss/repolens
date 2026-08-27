@@ -166,6 +166,9 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	if s.providerMetadataSource != nil {
 		metadata = s.providerMetadataSource()
 	}
+	if metadata.AgentConfigHash == "" {
+		metadata.AgentConfigHash = ComputeAgentConfigHash(8, 12, 2, metadata.Temperature)
+	}
 	run := &DiagnosisRun{
 		ID:                          uuid.New().String(),
 		UserID:                      input.UserID,

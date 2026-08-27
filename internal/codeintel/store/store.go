@@ -24,6 +24,7 @@ type Store interface {
 	GetByID(ctx context.Context, id int64) (*model.CodeIndexBuild, error)
 	GetBySnapshot(ctx context.Context, snapshotID string) (*model.CodeIndexBuild, error)
 	SaveAnalysisResult(ctx context.Context, buildID int64, result *model.AnalysisResult) error
+	FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, result *model.AnalysisResult) error
 	FailBuild(ctx context.Context, buildID int64, errorCode string) error
 	MarkBuildBuilding(ctx context.Context, buildID int64) error
 	ListSymbols(ctx context.Context, buildID int64, query string, limit int) ([]*model.Symbol, error)
@@ -36,6 +37,7 @@ type Store interface {
 	GetRetrievalBuildByID(ctx context.Context, id int64) (*model.RetrievalBuild, error)
 	GetRetrievalBuildByCodeIndexBuild(ctx context.Context, codeIndexBuildID int64) (*model.RetrievalBuild, error)
 	CompleteRetrievalBuild(ctx context.Context, id int64, artifactPath, artifactHash string, docCount int) error
+	FinalizeRetrievalSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, artifactPath, artifactHash string, docCount int) error
 	FailRetrievalBuild(ctx context.Context, id int64, errorCode string) error
 	MarkRetrievalBuilding(ctx context.Context, id int64) error
 
@@ -135,77 +137,93 @@ func (s *GormStore) GetBySnapshot(ctx context.Context, snapshotID string) (*mode
 
 func (s *GormStore) SaveAnalysisResult(ctx context.Context, buildID int64, res *model.AnalysisResult) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 1. Batch insert CodeFiles
-		fileMap := make(map[string]int64)
-		for _, f := range res.Files {
-			f.CodeIndexBuildID = buildID
-			f.CreatedAt = time.Now().UTC()
-			if err := tx.Create(f).Error; err != nil {
-				return fmt.Errorf("failed saving code file %s: %w", f.Path, err)
-			}
-			fileMap[f.Path] = f.ID
-		}
+		return s.saveAnalysisResultTx(tx, buildID, res)
+	})
+}
 
-		// 2. Batch insert Symbols
-		symbolMap := make(map[string]int64)
-		for _, sym := range res.Symbols {
-			sym.CodeIndexBuildID = buildID
-			if fID, ok := fileMap[sym.FilePath]; ok {
-				sym.FileID = fID
-			}
-			if err := tx.Create(sym).Error; err != nil {
-				return fmt.Errorf("failed saving symbol %s: %w", sym.Name, err)
-			}
-			symbolMap[sym.SymbolKeyHash] = sym.ID
+func (s *GormStore) saveAnalysisResultTx(tx *gorm.DB, buildID int64, res *model.AnalysisResult) error {
+	// 1. Batch insert CodeFiles
+	fileMap := make(map[string]int64)
+	for _, f := range res.Files {
+		f.CodeIndexBuildID = buildID
+		f.CreatedAt = time.Now().UTC()
+		if err := tx.Create(f).Error; err != nil {
+			return fmt.Errorf("failed saving code file %s: %w", f.Path, err)
 		}
+		fileMap[f.Path] = f.ID
+	}
 
-		// 3. Batch insert SymbolRelations
-		for _, rel := range res.Relations {
-			rel.CodeIndexBuildID = buildID
-			if rel.FromSymbolKeyHash != "" {
-				if fromID, ok := symbolMap[rel.FromSymbolKeyHash]; ok {
-					rel.FromSymbolID = &fromID
-				}
-			}
-			if rel.ToSymbolKeyHash != "" {
-				if toID, ok := symbolMap[rel.ToSymbolKeyHash]; ok {
-					rel.ToSymbolID = &toID
-				}
-			}
-			if fID, ok := fileMap[rel.FilePath]; ok {
-				rel.FileID = fID
-			}
-			if err := tx.Create(rel).Error; err != nil {
-				return fmt.Errorf("failed saving symbol relation: %w", err)
-			}
+	// 2. Batch insert Symbols
+	symbolMap := make(map[string]int64)
+	for _, sym := range res.Symbols {
+		sym.CodeIndexBuildID = buildID
+		if fID, ok := fileMap[sym.FilePath]; ok {
+			sym.FileID = fID
 		}
+		if err := tx.Create(sym).Error; err != nil {
+			return fmt.Errorf("failed saving symbol %s: %w", sym.Name, err)
+		}
+		symbolMap[sym.SymbolKeyHash] = sym.ID
+	}
 
-		// 4. Update CodeIndexBuild with metrics and READY status
-		now := time.Now().UTC()
-		result := tx.Model(&model.CodeIndexBuild{}).Where("id = ? AND status = ?", buildID, model.BuildStatusBuilding).Updates(map[string]interface{}{
-			"module_path":               res.ModulePath,
-			"build_tags_hash":           res.BuildContext.BuildTagsHash(),
-			"status":                    model.BuildStatusReady,
-			"files_total":               res.Quality.FilesTotal,
-			"files_parsed":              res.Quality.FilesParsed,
-			"files_failed":              res.Quality.FilesFailed,
-			"packages_total":            res.Quality.PackagesTotal,
-			"packages_typechecked":      res.Quality.PackagesTypechecked,
-			"packages_failed":           res.Quality.PackagesFailed,
-			"symbol_count":              len(res.Symbols),
-			"semantic_relation_count":   res.Quality.SemanticRelationsCount,
-			"syntactic_relation_count":  res.Quality.SyntacticRelationsCount,
-			"heuristic_relation_count":  res.Quality.HeuristicRelationsCount,
-			"unresolved_relation_count": res.Quality.UnresolvedRelationsCount,
-			"ready_at":                  &now,
-		})
-		if result.Error != nil {
-			return result.Error
+	// 3. Batch insert SymbolRelations
+	for _, rel := range res.Relations {
+		rel.CodeIndexBuildID = buildID
+		if rel.FromSymbolKeyHash != "" {
+			if fromID, ok := symbolMap[rel.FromSymbolKeyHash]; ok {
+				rel.FromSymbolID = &fromID
+			}
 		}
-		if result.RowsAffected != 1 {
-			return fmt.Errorf("code index build %d finalize conflict", buildID)
+		if rel.ToSymbolKeyHash != "" {
+			if toID, ok := symbolMap[rel.ToSymbolKeyHash]; ok {
+				rel.ToSymbolID = &toID
+			}
 		}
-		return nil
+		if fID, ok := fileMap[rel.FilePath]; ok {
+			rel.FileID = fID
+		}
+		if err := tx.Create(rel).Error; err != nil {
+			return fmt.Errorf("failed saving symbol relation: %w", err)
+		}
+	}
+
+	// 4. Update CodeIndexBuild with metrics and READY status
+	now := time.Now().UTC()
+	result := tx.Model(&model.CodeIndexBuild{}).Where("id = ? AND status = ?", buildID, model.BuildStatusBuilding).Updates(map[string]interface{}{
+		"module_path":               res.ModulePath,
+		"build_tags_hash":           res.BuildContext.BuildTagsHash(),
+		"status":                    model.BuildStatusReady,
+		"files_total":               res.Quality.FilesTotal,
+		"files_parsed":              res.Quality.FilesParsed,
+		"files_failed":              res.Quality.FilesFailed,
+		"packages_total":            res.Quality.PackagesTotal,
+		"packages_typechecked":      res.Quality.PackagesTypechecked,
+		"packages_failed":           res.Quality.PackagesFailed,
+		"symbol_count":              len(res.Symbols),
+		"semantic_relation_count":   res.Quality.SemanticRelationsCount,
+		"syntactic_relation_count":  res.Quality.SyntacticRelationsCount,
+		"heuristic_relation_count":  res.Quality.HeuristicRelationsCount,
+		"unresolved_relation_count": res.Quality.UnresolvedRelationsCount,
+		"ready_at":                  &now,
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("code index build %d finalize conflict", buildID)
+	}
+	return nil
+}
+
+func (s *GormStore) FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, res *model.AnalysisResult) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := requireOwnedJob(tx, jobID, workerID, claimToken); err != nil {
+			return err
+		}
+		if err := s.saveAnalysisResultTx(tx, buildID, res); err != nil {
+			return err
+		}
+		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
 	})
 }
 
@@ -392,11 +410,59 @@ func (s *GormStore) CompleteRetrievalBuild(ctx context.Context, id int64, artifa
 	return nil
 }
 
+func (s *GormStore) FinalizeRetrievalSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, artifactPath, artifactHash string, docCount int) error {
+	if artifactPath == "" || artifactHash == "" {
+		return fmt.Errorf("retrieval build %d cannot become READY without an artifact and hash", buildID)
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := requireOwnedJob(tx, jobID, workerID, claimToken); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		result := tx.Model(&model.RetrievalBuild{}).Where("id = ? AND status = ?", buildID, model.BuildStatusBuilding).Updates(map[string]interface{}{
+			"status": model.BuildStatusReady, "artifact_path": artifactPath, "artifact_hash": artifactHash,
+			"document_count": docCount, "ready_at": &now,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("retrieval build %d finalize conflict", buildID)
+		}
+		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
+	})
+}
+
 func (s *GormStore) FailRetrievalBuild(ctx context.Context, id int64, errorCode string) error {
 	return s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).Where("id = ? AND status != ?", id, model.BuildStatusReady).Updates(map[string]interface{}{
 		"status":     model.BuildStatusFailed,
 		"error_code": errorCode,
 	}).Error
+}
+
+func requireOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) error {
+	var job jobs.AnalysisJob
+	if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return jobs.ErrOwnershipLost
+		}
+		return err
+	}
+	return nil
+}
+
+func finalizeOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) error {
+	now := time.Now().UTC()
+	result := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+		"status": jobs.StatusSucceeded, "finished_at": &now, "updated_at": &now,
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return jobs.ErrOwnershipLost
+	}
+	return nil
 }
 
 // ValidateLineage verifies the strict lineage invariant:

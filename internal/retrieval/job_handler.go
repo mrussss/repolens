@@ -58,9 +58,6 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	symbols, err := h.ciStore.ListSymbols(ctx, cib.ID, "", 10000)
 	if err != nil {
-		if job.AttemptCount >= job.MaxAttempts {
-			_ = h.ciStore.FailRetrievalBuild(ctx, rb.ID, err.Error())
-		}
 		return fmt.Errorf("failed listing symbols for retrieval build: %w", err)
 	}
 
@@ -87,15 +84,20 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	finalPath, artifactHash, err := h.publisher.Publish(rb.ID, claimToken, rb.Strategy, idx)
 	if err != nil {
 		log.Error("failed publishing retrieval artifact", "build_id", rb.ID, "error", err)
-		if job.AttemptCount >= job.MaxAttempts {
-			_ = h.ciStore.FailRetrievalBuild(ctx, rb.ID, err.Error())
-		}
 		return err
 	}
 
-	if err := h.ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, artifactHash, idx.TotalDocs); err != nil {
-		log.Error("failed updating retrieval build to READY", "build_id", rb.ID, "error", err)
-		return err
+	var finalizeErr error
+	if finalizer, ok := h.ciStore.(interface {
+		FinalizeRetrievalSuccess(context.Context, int64, string, string, int64, string, string, int) error
+	}); ok && job.WorkerID != nil && job.ClaimToken != nil {
+		finalizeErr = finalizer.FinalizeRetrievalSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, rb.ID, finalPath, artifactHash, idx.TotalDocs)
+	} else {
+		finalizeErr = h.ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, artifactHash, idx.TotalDocs)
+	}
+	if finalizeErr != nil {
+		log.Error("failed updating retrieval build to READY", "build_id", rb.ID, "error", finalizeErr)
+		return finalizeErr
 	}
 
 	log.Info("retrieval build completed and published successfully",

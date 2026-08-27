@@ -74,19 +74,21 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	analysisRes, err := h.analyzer.Analyze(ctx, snapshotDir, bc)
 	if err != nil {
 		log.Error("code index build analysis failed", "build_id", cib.ID, "error", err)
-		class, _ := jobs.ClassifyError(err)
-		if class == jobs.ErrorClassPermanent || job.AttemptCount >= job.MaxAttempts {
-			_ = h.store.FailBuild(ctx, cib.ID, err.Error())
-		}
+		// Terminal business transitions are claim-fenced by the Job Store.
 		return err
 	}
 
-	if err := h.store.SaveAnalysisResult(ctx, cib.ID, analysisRes); err != nil {
-		log.Error("failed persisting code index analysis result", "build_id", cib.ID, "error", err)
-		if job.AttemptCount >= job.MaxAttempts {
-			_ = h.store.FailBuild(ctx, cib.ID, err.Error())
-		}
-		return err
+	var saveErr error
+	if finalizer, ok := h.store.(interface {
+		FinalizeCodeIndexSuccess(context.Context, int64, string, string, int64, *model.AnalysisResult) error
+	}); ok && job.WorkerID != nil && job.ClaimToken != nil {
+		saveErr = finalizer.FinalizeCodeIndexSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, analysisRes)
+	} else {
+		saveErr = h.store.SaveAnalysisResult(ctx, cib.ID, analysisRes)
+	}
+	if saveErr != nil {
+		log.Error("failed persisting code index analysis result", "build_id", cib.ID, "error", saveErr)
+		return saveErr
 	}
 
 	// Auto-create/trigger BUILD_RETRIEVAL job for derived retrieval index

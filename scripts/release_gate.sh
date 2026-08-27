@@ -40,9 +40,22 @@ echo "[7/8] Building deterministic Web UI and running eval..."
 go run ./cmd/eval
 echo "✓ Eval benchmark passed"
 
-echo "[8/8] Validating Compose and image build..."
+echo "[8/9] Validating Compose and image build..."
 docker compose config >/dev/null
 docker compose build
+
+echo "[9/9] Running product smoke against the Compose stack..."
+cleanup() { docker compose down >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+docker compose up -d
+for attempt in $(seq 1 30); do
+    if curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null; then break; fi
+    if [ "$attempt" -eq 30 ]; then echo "ERROR: API health check timed out"; exit 1; fi
+    sleep 2
+done
+demo_response=$(curl --fail --silent -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8080/api/v1/demo/trigger)
+echo "$demo_response" | grep -q 'diagnosis_id'
+echo "✓ Product health and real Demo smoke passed"
 
 echo "================================================================="
 echo "ALL GATES PASSED: RepoLens is verified and ready for release!"

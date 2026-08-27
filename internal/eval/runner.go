@@ -74,7 +74,7 @@ func (r *Runner) RunRetrievalEval(ctx context.Context, strategy string, retrieve
 		Model:               "fake-deterministic",
 		EmbeddingModel:      "pseudo-embed-128",
 		DatasetManifestHash: DatasetManifestHash(r.cases),
-		AgentConfigHash:     "v2.1-default",
+		AgentConfigHash:     diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1),
 		TotalCases:          len(r.cases),
 		StartedAt:           time.Now(),
 	}
@@ -124,7 +124,7 @@ func (r *Runner) RunEndToEndDiagnosisEval(ctx context.Context, provider llm.Prov
 		AgentVersion:        "v2.1",
 		Model:               "agent-e2e-pipeline",
 		DatasetManifestHash: DatasetManifestHash(r.cases),
-		AgentConfigHash:     "v2.1-default",
+		AgentConfigHash:     diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1),
 		TotalCases:          len(r.cases),
 		StartedAt:           time.Now(),
 	}

@@ -122,7 +122,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
 			Messages:    messages,
 			Tools:       toolsDef,
-			Temperature: 0.1,
+			Temperature: run.Temperature,
 		})
 		latency := time.Since(startGen).Milliseconds()
 
