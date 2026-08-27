@@ -30,6 +30,14 @@ type SnapshotJobHandler struct {
 	filter         *FileFilter
 	chunker        *CodeChunker
 	indexWriter    ChunkIndexWriter
+	maxRepoBytes   int64
+	maxFileCount   int
+}
+
+func (h *SnapshotJobHandler) WithResourceLimits(maxRepoBytes int64, maxFileCount int) *SnapshotJobHandler {
+	h.maxRepoBytes = maxRepoBytes
+	h.maxFileCount = maxFileCount
+	return h
 }
 
 type GitCloner interface {
@@ -94,7 +102,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 
 	targetDir := h.storeFS.GetSourcePath(snap.RepositoryID, snap.ID)
 	commitSHA := snap.CommitSHA
-	if commitSHA == "pending" || commitSHA == "" {
+	if commitSHA == "pending" || commitSHA == "" || !sourceDirectoryExists(targetDir) {
 		// Publish a fully cloned tree only after git has resolved HEAD.  A
 		// retry therefore cannot expose a half-written source directory.
 		stagingDir := targetDir + ".tmp-" + jobClaimSuffix(job)
@@ -108,6 +116,10 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			}
 			h.failIfTerminal(ctx, job, snap.ID, "CLONE_FAILED")
 			return jobs.NewRetryableError("CLONE_FAILED", cloneErr.Error(), cloneErr)
+		}
+		if snap.CommitSHA != "pending" && snap.CommitSHA != "" && cloneSHA != snap.CommitSHA {
+			h.failIfTerminal(ctx, job, snap.ID, "COMMIT_CHANGED_DURING_RESOLVE")
+			return jobs.NewPermanentError("COMMIT_CHANGED_DURING_RESOLVE", fmt.Sprintf("resolved %s but clone returned %s", snap.CommitSHA, cloneSHA), nil)
 		}
 		if err := os.RemoveAll(targetDir); err != nil {
 			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
@@ -132,8 +144,17 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			}
 			return nil
 		}
+		if h.filter.IsOversized(info.Size()) {
+			return jobs.NewPermanentError("FILE_TOO_LARGE", fmt.Sprintf("file %s exceeds maximum size", relPath), nil)
+		}
 		if h.filter.ShouldIgnoreFile(relPath, info.Size()) {
 			return nil
+		}
+		if h.maxFileCount > 0 && fileCount >= h.maxFileCount {
+			return jobs.NewPermanentError("TOO_MANY_FILES", fmt.Sprintf("repository exceeds maximum file count %d", h.maxFileCount), nil)
+		}
+		if h.maxRepoBytes > 0 && totalBytes+info.Size() > h.maxRepoBytes {
+			return jobs.NewPermanentError("REPOSITORY_TOO_LARGE", fmt.Sprintf("repository exceeds maximum size %d bytes", h.maxRepoBytes), nil)
 		}
 
 		content, err := h.storeFS.ReadFile(ctx, snap.RepositoryID, snap.ID, relPath, 1, -1)
@@ -153,6 +174,9 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	if walkErr != nil {
 		log.Error("failed to walk snapshot files", "error", walkErr)
 		h.failIfTerminal(ctx, job, snap.ID, "WALK_FAILED")
+		if class, _ := jobs.ClassifyError(walkErr); class == jobs.ErrorClassPermanent {
+			return walkErr
+		}
 		return jobs.NewRetryableError("WALK_FAILED", walkErr.Error(), walkErr)
 	}
 
@@ -176,7 +200,12 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_SEAL_FAILED")
 		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
 	}
-	if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
+	if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil {
+		if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
+			return err
+		}
+	} else if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
 		if err := finalizer.FinalizeMaterialization(ctx, snap.ID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
@@ -206,7 +235,18 @@ func sealSnapshot(root string) error {
 	})
 }
 
+func sourceDirectoryExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
 func (h *SnapshotJobHandler) failIfTerminal(ctx context.Context, job *jobs.AnalysisJob, snapshotID, code string) {
+	if _, claimed := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); claimed {
+		// Production terminal transitions are performed by the claim-fenced
+		// AnalysisJob finalizer. This compatibility helper is for lightweight
+		// in-memory test stores only.
+		return
+	}
 	if job != nil && (job.AttemptCount >= job.MaxAttempts) {
 		if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
 			_ = finalizer.FailMaterialization(ctx, snapshotID, code)

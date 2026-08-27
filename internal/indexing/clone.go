@@ -57,7 +57,7 @@ type SafeGitCloner struct {
 
 func NewSafeGitCloner(allowHosts []string, maxSizeMB int64, timeout time.Duration) *SafeGitCloner {
 	if len(allowHosts) == 0 {
-		allowHosts = []string{"github.com", "gitlab.com"}
+		allowHosts = []string{"github.com"}
 	}
 	if maxSizeMB <= 0 {
 		maxSizeMB = 50
@@ -70,6 +70,35 @@ func NewSafeGitCloner(allowHosts []string, maxSizeMB int64, timeout time.Duratio
 		maxSizeMB:    maxSizeMB,
 		cloneTimeout: timeout,
 	}
+}
+
+// ResolveRef resolves a ref before a Snapshot row is created. This makes the
+// natural identity repository_id + exact commit_sha available to the API and
+// avoids concurrent requests colliding on the placeholder "pending" value.
+func (c *SafeGitCloner) ResolveRef(ctx context.Context, gitURL, ref string) (string, error) {
+	if err := c.ValidateGitURL(gitURL); err != nil {
+		return "", err
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, c.cloneTimeout)
+	defer cancel()
+	args := []string{"ls-remote", "--refs", gitURL}
+	if ref != "" {
+		args = append(args, ref)
+	}
+	cmd := exec.CommandContext(resolveCtx, "git", args...)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	out, err := cmd.Output()
+	if err != nil {
+		if errors.Is(resolveCtx.Err(), context.DeadlineExceeded) {
+			return "", fmt.Errorf("git ref resolution timed out after %v", c.cloneTimeout)
+		}
+		return "", fmt.Errorf("git ref resolution failed: %w", err)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 || len(fields[0]) != 40 {
+		return "", fmt.Errorf("git ref %q did not resolve to an exact commit SHA", ref)
+	}
+	return fields[0], nil
 }
 
 func (c *SafeGitCloner) ValidateGitURL(rawURL string) error {

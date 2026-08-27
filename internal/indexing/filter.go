@@ -108,6 +108,13 @@ func (f *FileFilter) ShouldIgnoreFile(relPath string, sizeBytes int64) bool {
 	return false
 }
 
+// IsOversized reports a file that violates the configured hard limit. It is
+// separate from ShouldIgnoreFile so production indexing can fail permanently
+// instead of silently hiding an oversized source file.
+func (f *FileFilter) IsOversized(sizeBytes int64) bool {
+	return sizeBytes > f.maxFileSizeKB*1024
+}
+
 func DetectLanguage(relPath string) string {
 	ext := strings.ToLower(filepath.Ext(relPath))
 	switch ext {

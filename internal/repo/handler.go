@@ -1,7 +1,9 @@
 package repo
 
 import (
+	"context"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -16,10 +18,17 @@ import (
 )
 
 type Handler struct {
-	repoSvc       *Service
-	snapshotStore snapshot.Store
-	indexStore    repoindex.Store
-	db            *gorm.DB
+	repoSvc          *Service
+	snapshotStore    snapshot.Store
+	indexStore       repoindex.Store
+	db               *gorm.DB
+	resolver         SnapshotResolver
+	jobStore         *jobs.Store
+	snapshotBasePath string
+}
+
+type SnapshotResolver interface {
+	ResolveRef(ctx context.Context, gitURL, ref string) (string, error)
 }
 
 func NewHandler(repoSvc *Service, snapshotStore snapshot.Store, indexStore repoindex.Store, db *gorm.DB) *Handler {
@@ -29,6 +38,17 @@ func NewHandler(repoSvc *Service, snapshotStore snapshot.Store, indexStore repoi
 		indexStore:    indexStore,
 		db:            db,
 	}
+}
+
+func (h *Handler) WithSnapshotResolver(resolver SnapshotResolver, jobStore *jobs.Store) *Handler {
+	h.resolver = resolver
+	h.jobStore = jobStore
+	return h
+}
+
+func (h *Handler) WithSnapshotBasePath(basePath string) *Handler {
+	h.snapshotBasePath = basePath
+	return h
 }
 
 type RegisterRepoRequest struct {
@@ -112,14 +132,38 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 	if req.Strategy == "" {
 		req.Strategy = repoindex.StrategyBM25
 	}
+	if h.resolver == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "snapshot resolver is not configured"})
+		return
+	}
+	commitSHA, err := h.resolver.ResolveRef(c.Request.Context(), r.GitURL, req.Ref)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed resolving repository ref: " + err.Error()})
+		return
+	}
+	if existing, lookupErr := h.snapshotStore.GetByCommit(c.Request.Context(), repoID, commitSHA); lookupErr == nil {
+		if existing.Status == snapshot.StatusFailed && h.jobStore != nil {
+			if requeueErr := h.jobStore.ManualRequeue(c.Request.Context(), jobs.JobTypeMaterializeSnapshot, existing.ID); requeueErr != nil {
+				c.JSON(http.StatusConflict, gin.H{"error": "snapshot already failed and cannot be requeued: " + requeueErr.Error()})
+				return
+			}
+			existing, _ = h.snapshotStore.GetByID(c.Request.Context(), existing.ID)
+		}
+		c.JSON(http.StatusAccepted, gin.H{"snapshot": existing, "message": "snapshot already exists for this commit"})
+		return
+	}
 
 	snapID := uuid.New().String()
-	matPath := "/data/repositories/" + repoID + "/" + snapID + "/source"
+	basePath := h.snapshotBasePath
+	if basePath == "" {
+		basePath = "/data/repositories"
+	}
+	matPath := filepath.Join(basePath, repoID, snapID, "source")
 
 	snap := &snapshot.RepositorySnapshot{
 		ID:               snapID,
 		RepositoryID:     repoID,
-		CommitSHA:        "pending", // will be updated upon git clone checkout
+		CommitSHA:        commitSHA,
 		Ref:              req.Ref,
 		MaterializedPath: matPath,
 		ContentHash:      "",
@@ -147,6 +191,10 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 	})
 
 	if err != nil {
+		if existing, lookupErr := h.snapshotStore.GetByCommit(c.Request.Context(), repoID, commitSHA); lookupErr == nil {
+			c.JSON(http.StatusAccepted, gin.H{"snapshot": existing, "message": "snapshot already exists for this commit"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to trigger indexing: " + err.Error()})
 		return
 	}

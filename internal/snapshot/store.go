@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"repolens/internal/jobs"
 )
 
 type Store interface {
@@ -24,6 +26,10 @@ type Store interface {
 type MaterializationFinalizer interface {
 	FinalizeMaterialization(ctx context.Context, id, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 	FailMaterialization(ctx context.Context, id, errorCode string) error
+}
+
+type ClaimedMaterializationFinalizer interface {
+	FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 }
 
 type GormStore struct {
@@ -113,6 +119,41 @@ func (s *GormStore) FinalizeMaterialization(ctx context.Context, id, commitSHA, 
 		return fmt.Errorf("snapshot %s materialization finalize conflict", id)
 	}
 	return nil
+}
+
+func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", snapshotID)
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job jobs.AnalysisJob
+		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return jobs.ErrOwnershipLost
+			}
+			return err
+		}
+		result := tx.Model(&RepositorySnapshot{}).Where("id = ? AND status = ?", snapshotID, StatusMaterializing).Updates(map[string]interface{}{
+			"commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
+			"total_bytes": totalBytes, "status": StatusReady, "ready_at": readyAt,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("snapshot %s materialization finalize conflict", snapshotID)
+		}
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+			"status": jobs.StatusSucceeded, "finished_at": readyAt, "updated_at": readyAt,
+		})
+		if jobResult.Error != nil {
+			return jobResult.Error
+		}
+		if jobResult.RowsAffected != 1 {
+			return jobs.ErrOwnershipLost
+		}
+		return nil
+	})
 }
 
 func (s *GormStore) FailMaterialization(ctx context.Context, id, errorCode string) error {
