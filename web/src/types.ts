@@ -5,6 +5,7 @@ export interface ProviderStatus {
   config_fingerprint?: string;
   is_configured: boolean;
   is_demo: boolean;
+  auth_mode?: 'bearer' | 'none';
   updated_at?: string;
 }
 

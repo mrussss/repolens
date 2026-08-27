@@ -68,7 +68,7 @@ func run() error {
 	if providerPath == "" {
 		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
 	}
-	providerMgr := provider.NewManager(providerPath, cfg.ProviderBaseURL, cfg.ProviderModel, cfg.ProviderAPIKey, cfg.ProviderType)
+	providerMgr := provider.NewManagerWithAuthMode(providerPath, cfg.ProviderBaseURL, cfg.ProviderModel, cfg.ProviderAPIKey, cfg.ProviderType, cfg.ProviderAuthMode)
 
 	// Pure Go Production Retrieval (BM25 + Structural Code Intelligence)
 	indexStorageDir := filepath.Join(cfg.SnapshotBasePath, "indexes")
@@ -104,7 +104,7 @@ func run() error {
 		filter,
 		chunker,
 		nil,
-	).WithCodeIntelStore(codeIntelStore)
+	).WithCodeIntelStore(codeIntelStore).WithResourceLimits(cfg.MaxRepoSizeMB*1024*1024, cfg.MaxFileCount)
 
 	codeIndexJobHandler := codeintel.NewCodeIndexJobHandler(
 		codeIntelStore,

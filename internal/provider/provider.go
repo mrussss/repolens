@@ -24,6 +24,7 @@ type ProviderConfig struct {
 	BaseURL   string    `json:"base_url"`
 	Model     string    `json:"model"`
 	APIKey    string    `json:"api_key"`
+	AuthMode  string    `json:"auth_mode"`
 	IsDemo    bool      `json:"is_demo,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -36,6 +37,7 @@ type PublicProviderStatus struct {
 	ConfigFingerprint   string `json:"config_fingerprint"`
 	IsConfigured        bool   `json:"is_configured"`
 	IsDemo              bool   `json:"is_demo"`
+	AuthMode            string `json:"auth_mode"`
 	UpdatedAt           string `json:"updated_at,omitempty"`
 }
 
@@ -86,9 +88,13 @@ func ComputeEndpointFingerprint(normalizedBaseURL string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// ComputeConfigFingerprint returns SHA256(normalize(base_url) + "|" + model).
-func ComputeConfigFingerprint(normalizedBaseURL, model string) string {
-	combined := fmt.Sprintf("%s|%s", normalizedBaseURL, strings.TrimSpace(model))
+// ComputeConfigFingerprint returns SHA256(normalize(base_url) + "|" + model + "|" + auth_mode).
+func ComputeConfigFingerprint(normalizedBaseURL, model string, authModes ...string) string {
+	authMode := "bearer"
+	if len(authModes) > 0 && authModes[0] == "none" {
+		authMode = "none"
+	}
+	combined := fmt.Sprintf("%s|%s|%s", normalizedBaseURL, strings.TrimSpace(model), authMode)
 	h := sha256.Sum256([]byte(combined))
 	return hex.EncodeToString(h[:])
 }
@@ -100,6 +106,7 @@ type Manager struct {
 	envModel       string
 	envAPIKey      string
 	envProvider    string
+	envAuthMode    string
 	mu             sync.RWMutex
 }
 
@@ -125,17 +132,22 @@ func (m *Manager) BuildForDiagnosis(ctx context.Context, run *diagnosis.Diagnosi
 	if run.ModelName != "" {
 		modelName = run.ModelName
 	}
-	if run.ProviderConfigFingerprint != "" && ComputeConfigFingerprint(normalized, modelName) != run.ProviderConfigFingerprint {
-		return nil, jobs.NewPermanentError("PROVIDER_CONFIG_MISMATCH", "current provider model differs from diagnosis pin", nil)
+	if run.ProviderConfigFingerprint != "" && ComputeConfigFingerprint(normalized, modelName, cfg.AuthMode) != run.ProviderConfigFingerprint {
+		return nil, jobs.NewPermanentError("PROVIDER_CONFIG_MISMATCH", "current provider model or authentication mode differs from diagnosis pin", nil)
 	}
 	if cfg.IsDemo || m.envProvider == "fake" && normalized == "http://localhost/fake" {
 		return llm.NewFakeProvider(llm.ModeNormalStructured), nil
 	}
-	return llm.NewOpenAICompatibleProvider(cfg.APIKey, normalized, modelName), nil
+	return llm.NewOpenAICompatibleProviderWithAuthMode(cfg.APIKey, normalized, modelName, cfg.AuthMode), nil
 }
 
 // NewManager creates a new Manager instance.
 func NewManager(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider string) *Manager {
+	return NewManagerWithAuthMode(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, "bearer")
+}
+
+// NewManagerWithAuthMode creates a manager with an explicit environment auth mode.
+func NewManagerWithAuthMode(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, authMode string) *Manager {
 	if secretFilePath == "" {
 		secretFilePath = "/data/provider.json"
 	}
@@ -145,6 +157,7 @@ func NewManager(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider str
 		envModel:       envModel,
 		envAPIKey:      envAPIKey,
 		envProvider:    envProvider,
+		envAuthMode:    normalizeAuthMode(authMode),
 	}
 }
 
@@ -159,9 +172,10 @@ func (m *Manager) GetPublicStatus() PublicProviderStatus {
 		return PublicProviderStatus{
 			BaseURL:             norm,
 			Model:               cfg.Model,
+			AuthMode:            normalizeAuthMode(cfg.AuthMode),
 			EndpointFingerprint: ComputeEndpointFingerprint(norm),
-			ConfigFingerprint:   ComputeConfigFingerprint(norm, cfg.Model),
-			IsConfigured:        cfg.APIKey != "" || cfg.IsDemo,
+			ConfigFingerprint:   ComputeConfigFingerprint(norm, cfg.Model, cfg.AuthMode),
+			IsConfigured:        cfg.APIKey != "" || cfg.IsDemo || normalizeAuthMode(cfg.AuthMode) == "none",
 			IsDemo:              cfg.IsDemo,
 			UpdatedAt:           cfg.UpdatedAt.Format(time.RFC3339),
 		}
@@ -173,19 +187,22 @@ func (m *Manager) GetPublicStatus() PublicProviderStatus {
 			BaseURL:             "http://localhost/fake",
 			Model:               "fake-gpt-4o",
 			EndpointFingerprint: ComputeEndpointFingerprint("http://localhost/fake"),
-			ConfigFingerprint:   ComputeConfigFingerprint("http://localhost/fake", "fake-gpt-4o"),
+			ConfigFingerprint:   ComputeConfigFingerprint("http://localhost/fake", "fake-gpt-4o", "none"),
+			AuthMode:            "none",
 			IsConfigured:        true,
 			IsDemo:              true,
 		}
 	}
 
-	if m.envBaseURL != "" && m.envAPIKey != "" {
+	if m.envBaseURL != "" && (m.envAPIKey != "" || m.envAuthMode == "none") {
 		norm, _ := NormalizeBaseURL(m.envBaseURL)
+		authMode := normalizeAuthMode(m.envAuthMode)
 		return PublicProviderStatus{
 			BaseURL:             norm,
 			Model:               m.envModel,
 			EndpointFingerprint: ComputeEndpointFingerprint(norm),
-			ConfigFingerprint:   ComputeConfigFingerprint(norm, m.envModel),
+			ConfigFingerprint:   ComputeConfigFingerprint(norm, m.envModel, authMode),
+			AuthMode:            authMode,
 			IsConfigured:        true,
 			IsDemo:              false,
 		}
@@ -210,19 +227,21 @@ func (m *Manager) GetSecretConfig() (*ProviderConfig, error) {
 	// Fallback to env
 	if m.envProvider == "fake" {
 		return &ProviderConfig{
-			BaseURL: "http://localhost/fake",
-			Model:   "fake-gpt-4o",
-			APIKey:  "fake-key",
-			IsDemo:  true,
+			BaseURL:  "http://localhost/fake",
+			Model:    "fake-gpt-4o",
+			APIKey:   "fake-key",
+			AuthMode: "none",
+			IsDemo:   true,
 		}, nil
 	}
 
-	if m.envBaseURL != "" && m.envAPIKey != "" {
+	if m.envBaseURL != "" && (m.envAPIKey != "" || m.envAuthMode == "none") {
 		return &ProviderConfig{
-			BaseURL: m.envBaseURL,
-			Model:   m.envModel,
-			APIKey:  m.envAPIKey,
-			IsDemo:  false,
+			BaseURL:  m.envBaseURL,
+			Model:    m.envModel,
+			APIKey:   m.envAPIKey,
+			AuthMode: normalizeAuthMode(m.envAuthMode),
+			IsDemo:   false,
 		}, nil
 	}
 
@@ -231,6 +250,10 @@ func (m *Manager) GetSecretConfig() (*ProviderConfig, error) {
 
 // SaveConfig atomically writes provider credentials to disk with 0600 permissions.
 func (m *Manager) SaveConfig(baseURL, model, apiKey string, isDemo bool) error {
+	return m.SaveConfigWithAuthMode(baseURL, model, apiKey, "bearer", isDemo)
+}
+
+func (m *Manager) SaveConfigWithAuthMode(baseURL, model, apiKey, authMode string, isDemo bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -243,11 +266,16 @@ func (m *Manager) SaveConfig(baseURL, model, apiKey string, isDemo bool) error {
 	if trimmedModel == "" {
 		return errors.New("model cannot be empty")
 	}
+	authMode = normalizeAuthMode(authMode)
+	if authMode == "bearer" && strings.TrimSpace(apiKey) == "" && !isDemo {
+		return errors.New("API key cannot be empty when bearer authentication is selected")
+	}
 
 	cfg := ProviderConfig{
 		BaseURL:   normalizedBase,
 		Model:     trimmedModel,
 		APIKey:    strings.TrimSpace(apiKey),
+		AuthMode:  authMode,
 		IsDemo:    isDemo,
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -291,13 +319,17 @@ func (m *Manager) ClearConfig() error {
 
 // TestConnection verifies that the provided BaseURL and APIKey can successfully communicate with OpenAI-compatible API.
 func (m *Manager) TestConnection(ctx context.Context, baseURL, model, apiKey string) (time.Duration, error) {
+	return m.TestConnectionWithAuthMode(ctx, baseURL, model, apiKey, "bearer")
+}
+
+func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model, apiKey, authMode string) (time.Duration, error) {
 	normBase, err := NormalizeBaseURL(baseURL)
 	if err != nil {
 		return 0, err
 	}
 
 	start := time.Now()
-	provider := llm.NewOpenAICompatibleProvider(apiKey, normBase, model)
+	provider := llm.NewOpenAICompatibleProviderWithAuthMode(apiKey, normBase, model, authMode)
 
 	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -316,6 +348,13 @@ func (m *Manager) TestConnection(ctx context.Context, baseURL, model, apiKey str
 	}
 
 	return latency, nil
+}
+
+func normalizeAuthMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "none") {
+		return "none"
+	}
+	return "bearer"
 }
 
 func (m *Manager) readSecretFile() (*ProviderConfig, error) {

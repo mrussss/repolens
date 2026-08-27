@@ -34,23 +34,23 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
         const selected = list.find((item) => item.id === selectedRepoId);
         setSelectedSnapshotId(selected?.snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '');
       }
-    } catch {
-      // ignore
+    } catch (err: any) {
+      setError(err.message || '加载仓库失败');
     }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedRepoId) {
-      setError('Please select a repository');
+      setError('请选择仓库');
       return;
     }
     if (!issueTitle) {
-      setError('Please provide an issue title');
+      setError('请填写问题标题');
       return;
     }
     if (!selectedSnapshotId) {
-      setError('Select a READY snapshot before starting a diagnosis');
+      setError('请先选择 READY 快照');
       return;
     }
 
@@ -68,7 +68,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
       });
       onDiagnosisCreated(res.diagnosis_run.id);
     } catch (err: any) {
-      setError(err.message || 'Failed initiating diagnosis');
+      setError(err.message || '启动诊断失败');
     } finally {
       setLoading(false);
     }
@@ -77,9 +77,9 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
   return (
     <div style={{ maxWidth: 800, margin: '0 auto' }}>
       <div style={{ marginBottom: '1.5rem' }}>
-        <h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-bright)' }}>Start New Diagnosis</h1>
+        <h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-bright)' }}>新建诊断</h1>
         <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-          Submit an issue title, description, and CI/runtime error stack trace to execute grounded code intelligence diagnosis.
+          提交问题标题、描述以及 CI/运行时错误堆栈，执行有代码依据的诊断。
         </p>
       </div>
 
@@ -92,7 +92,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
       <div className="card">
         <form onSubmit={handleSubmit}>
           <div className="form-group">
-            <label className="form-label">Target Repository</label>
+            <label className="form-label">目标仓库</label>
             <select
               className="input-field"
               value={selectedRepoId}
@@ -104,7 +104,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
               }}
               required
             >
-              <option value="" disabled>Select a repository</option>
+              <option value="" disabled>选择仓库</option>
               {repos.map((r) => (
                 <option key={r.id} value={r.id}>
                   {r.name} ({r.git_url})
@@ -114,9 +114,9 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
           </div>
 
           <div className="form-group">
-            <label className="form-label">READY Snapshot</label>
+            <label className="form-label">READY 快照</label>
             <select className="input-field" value={selectedSnapshotId} onChange={(e) => setSelectedSnapshotId(e.target.value)} required>
-              <option value="" disabled>Select a READY snapshot</option>
+              <option value="" disabled>选择 READY 快照</option>
               {(repos.find((r) => r.id === selectedRepoId)?.snapshots || []).filter((snap) => snap.status === 'READY').map((snap) => (
                 <option key={snap.id} value={snap.id}>{snap.id} ({snap.commit_sha.slice(0, 12)})</option>
               ))}
@@ -124,44 +124,44 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
           </div>
 
           <div className="form-group">
-            <label className="form-label">Issue Title / Bug Summary</label>
+            <label className="form-label">问题标题 / Bug 摘要</label>
             <input
               type="text"
               className="input-field"
               value={issueTitle}
               onChange={(e) => setIssueTitle(e.target.value)}
-              placeholder="e.g. Goroutine deadlock in worker channel dispatch"
+              placeholder="例如：Worker channel 分发时发生 Goroutine 死锁"
               required
             />
           </div>
 
           <div className="form-group">
-            <label className="form-label">Issue Description (Optional)</label>
+            <label className="form-label">问题描述（可选）</label>
             <textarea
               className="input-field"
               rows={3}
               value={issueDescription}
               onChange={(e) => setIssueDescription(e.target.value)}
-              placeholder="Describe user-reported behavior, steps to reproduce, or contextual symptoms..."
+              placeholder="描述用户看到的现象、复现步骤或上下文症状…"
             />
           </div>
 
           <div className="form-group">
-            <label className="form-label">CI Failure / Panic Log / Error Stacktrace</label>
+            <label className="form-label">CI 失败 / Panic 日志 / 错误堆栈</label>
             <textarea
               className="input-field"
               rows={6}
               style={{ fontFamily: 'var(--font-mono)', fontSize: '0.825rem' }}
               value={errorLog}
               onChange={(e) => setErrorLog(e.target.value)}
-              placeholder="Paste raw error log, panic trace, or CI output..."
+              placeholder="粘贴原始错误日志、panic 堆栈或 CI 输出…"
             />
-            <div className="form-hint">Secrets like Authorization headers and API keys are automatically redacted on ingestion.</div>
+            <div className="form-hint">Authorization 请求头和 API Key 等敏感信息会在写入时自动脱敏。</div>
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1.5rem' }}>
             <button type="submit" className="btn btn-primary" disabled={loading || !selectedRepoId || !selectedSnapshotId || !issueTitle}>
-              <Play size={16} /> {loading ? 'Submitting...' : 'Run Grounded Diagnosis'}
+              <Play size={16} /> {loading ? '提交中…' : '运行有依据的诊断'}
             </button>
           </div>
         </form>

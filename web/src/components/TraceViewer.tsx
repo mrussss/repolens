@@ -10,7 +10,7 @@ export const TraceViewer: React.FC<Props> = ({ steps }) => {
   if (!steps || steps.length === 0) {
     return (
       <div className="card" style={{ color: 'var(--text-muted)', fontSize: '0.875rem' }}>
-        No runtime agent trace steps recorded for this execution.
+        此次执行暂无 Agent 运行轨迹。
       </div>
     );
   }
@@ -21,9 +21,9 @@ export const TraceViewer: React.FC<Props> = ({ steps }) => {
         <div key={s.id} className="card" style={{ padding: '0.85rem 1rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.35rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <span className="badge badge-purple" style={{ fontSize: '0.7rem' }}>Step #{s.seq}</span>
+              <span className="badge badge-purple" style={{ fontSize: '0.7rem' }}>步骤 #{s.seq}</span>
               <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--accent-primary)', fontSize: '0.875rem' }}>
-                {s.tool_name ? `Tool: ${s.tool_name}` : s.step_type}
+                {s.tool_name ? `工具：${s.tool_name}` : s.step_type}
               </span>
             </div>
 
@@ -40,14 +40,14 @@ export const TraceViewer: React.FC<Props> = ({ steps }) => {
 
           {s.tool_args_summary && (
             <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.25rem', fontFamily: 'var(--font-mono)' }}>
-              <strong>Args: </strong>
+              <strong>参数：</strong>
               <span>{s.tool_args_summary}</span>
             </div>
           )}
 
           {s.tool_result_summary && (
             <div style={{ fontSize: '0.8rem', color: 'var(--text-bright)', marginTop: '0.25rem', fontFamily: 'var(--font-mono)' }}>
-              <strong>Result: </strong>
+              <strong>结果：</strong>
               <span>{s.tool_result_summary}</span>
             </div>
           )}

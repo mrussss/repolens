@@ -16,7 +16,7 @@ export const EvidenceViewer: React.FC<Props> = ({ findings }) => {
   if (!findings || findings.length === 0) {
     return (
       <div className="card" style={{ color: 'var(--text-muted)', fontSize: '0.875rem' }}>
-        No grounded code evidence findings recorded.
+        暂无有依据的代码证据。
       </div>
     );
   }
@@ -37,7 +37,7 @@ export const EvidenceViewer: React.FC<Props> = ({ findings }) => {
               </div>
               <button className="btn" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}>
                 {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                {f.citations?.length || 0} Citations
+                {f.citations?.length || 0} 条引用
               </button>
             </div>
 

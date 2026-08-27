@@ -21,6 +21,8 @@ import (
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
+	"repolens/internal/indexing"
+	"repolens/internal/jobs"
 	"repolens/internal/platform/config"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/metrics"
@@ -68,6 +70,8 @@ func run() error {
 	reportStore := evidence.NewReportStore(db.GormDB)
 	citationStore := evidence.NewCitationStore(db.GormDB)
 	traceStore := trace.NewStore(db.GormDB)
+	jobStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)
+	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
 
 	// Services & Managers
 	repoSvc := repo.NewService(repoStore)
@@ -75,12 +79,13 @@ func run() error {
 	if providerPath == "" {
 		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
 	}
-	providerMgr := provider.NewManager(
+	providerMgr := provider.NewManagerWithAuthMode(
 		providerPath,
 		cfg.ProviderBaseURL,
 		cfg.ProviderModel,
 		cfg.ProviderAPIKey,
 		cfg.ProviderType,
+		cfg.ProviderAuthMode,
 	)
 	diagnosisSvc := diagnosis.NewService(diagnosisStore, repoStore, snapshotStore).
 		WithCodeIntelStore(codeIntelStore)
@@ -89,12 +94,12 @@ func run() error {
 		return diagnosis.ProviderMetadata{
 			EndpointFingerprint: status.EndpointFingerprint, ConfigFingerprint: status.ConfigFingerprint,
 			NormalizedBaseURL: status.BaseURL, ModelName: status.Model,
-			PromptVersion: "v2.1", AgentVersion: "v2.1", AgentConfigHash: "v2.1-default", Temperature: 0.1,
+			PromptVersion: "v2.1", AgentVersion: "v2.1", AgentConfigHash: diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1), Temperature: 0.1,
 		}
 	})
 
 	// Handlers
-	repoHandler := repo.NewHandler(repoSvc, snapshotStore, indexStore, db.GormDB)
+	repoHandler := repo.NewHandler(repoSvc, snapshotStore, indexStore, db.GormDB).WithSnapshotResolver(cloner, jobStore).WithSnapshotBasePath(cfg.SnapshotBasePath)
 	diagnosisHandler := diagnosis.NewHandler(diagnosisSvc, reportStore, citationStore, traceStore)
 	providerHandler := provider.NewHandler(
 		providerMgr,
@@ -105,7 +110,7 @@ func run() error {
 		citationStore,
 		traceStore,
 		storeFS,
-	)
+	).WithDemoDependencies(db.GormDB, codeIntelStore, filepath.Join(cfg.SnapshotBasePath, "indexes"))
 	codeIntelHandler := codeintel.NewHandler(codeIntelStore, snapshotStore)
 
 	if cfg.Env == "production" {

@@ -6,7 +6,7 @@ import { DiagnosisView } from './components/DiagnosisView';
 import { CodeIntelPage } from './components/CodeIntelPage';
 import { api } from './api';
 import { DiagnosisRun } from './types';
-import { FolderGit2, PlusCircle, Settings, Sparkles, Activity, Clock, Code2 } from 'lucide-react';
+import { FolderGit2, PlusCircle, Settings, Sparkles, Activity, Clock, Code2, Sun, Moon } from 'lucide-react';
 
 type ViewMode = 'setup' | 'repos' | 'new-diag' | 'diag-view' | 'history' | 'codeintel';
 
@@ -16,6 +16,9 @@ export const App: React.FC = () => {
   const [preselectedRepoId, setPreselectedRepoId] = useState<string>('');
   const [preselectedSnapId, setPreselectedSnapId] = useState<string>('');
   const [recentDiagnoses, setRecentDiagnoses] = useState<DiagnosisRun[]>([]);
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('repolens-theme') as 'dark' | 'light') || 'dark');
+
+  useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('repolens-theme', theme); }, [theme]);
 
   useEffect(() => {
     loadRecentDiagnoses();
@@ -71,14 +74,14 @@ export const App: React.FC = () => {
                 style={{ background: currentView === 'repos' ? 'var(--bg-subtle)' : 'transparent', border: 'none' }}
                 onClick={() => setCurrentView('repos')}
               >
-                <FolderGit2 size={16} /> Repositories
+                <FolderGit2 size={16} /> 仓库
               </button>
               <button
                 className="btn"
                 style={{ background: currentView === 'codeintel' ? 'var(--bg-subtle)' : 'transparent', border: 'none' }}
                 onClick={() => setCurrentView('codeintel')}
               >
-                <Code2 size={16} /> Code Intel
+                <Code2 size={16} /> 代码智能
               </button>
               <button
                 className="btn"
@@ -89,21 +92,21 @@ export const App: React.FC = () => {
                   setCurrentView('new-diag');
                 }}
               >
-                <PlusCircle size={16} /> New Diagnosis
+                <PlusCircle size={16} /> 新建诊断
               </button>
               <button
                 className="btn"
                 style={{ background: currentView === 'history' ? 'var(--bg-subtle)' : 'transparent', border: 'none' }}
                 onClick={() => setCurrentView('history')}
               >
-                <Clock size={16} /> History ({recentDiagnoses.length})
+                <Clock size={16} /> 历史 ({recentDiagnoses.length})
               </button>
               <button
                 className="btn"
                 style={{ background: currentView === 'setup' ? 'var(--bg-subtle)' : 'transparent', border: 'none' }}
                 onClick={() => setCurrentView('setup')}
               >
-                <Settings size={16} /> Setup
+                <Settings size={16} /> 设置
               </button>
             </nav>
           </div>
@@ -115,12 +118,13 @@ export const App: React.FC = () => {
                 const res = await api.triggerDemo();
                 handleDemoStarted(res.diagnosis_id);
               } catch (e: any) {
-                alert('Demo error: ' + e.message);
+                alert('Demo 错误：' + e.message);
               }
             }}
           >
-            <Sparkles size={14} /> Try Demo
+            <Sparkles size={14} /> 试用 Demo
           </button>
+          <button className="btn" aria-label="切换主题" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button>
         </div>
       </header>
 
@@ -162,22 +166,22 @@ export const App: React.FC = () => {
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
               <div>
-                <h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-bright)' }}>Diagnosis History</h1>
+                <h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-bright)' }}>诊断历史</h1>
                 <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-                  Chronological record of code intelligence runs and grounded reports.
+                  按时间查看代码智能任务与有依据的诊断报告。
                 </p>
               </div>
               <button className="btn btn-primary" onClick={() => setCurrentView('new-diag')}>
-                <PlusCircle size={16} /> Start New Diagnosis
+                <PlusCircle size={16} /> 开始新诊断
               </button>
             </div>
 
             {recentDiagnoses.length === 0 ? (
               <div className="card" style={{ textAlign: 'center', padding: '3rem 1rem' }}>
                 <Activity size={36} color="var(--text-muted)" style={{ margin: '0 auto 1rem' }} />
-                <h3 style={{ fontSize: '1.1rem', color: 'var(--text-bright)', marginBottom: '0.5rem' }}>No Diagnoses Yet</h3>
+                <h3 style={{ fontSize: '1.1rem', color: 'var(--text-bright)', marginBottom: '0.5rem' }}>暂无诊断记录</h3>
                 <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginBottom: '1.5rem' }}>
-                  Run your first diagnosis on an indexed repository or click <strong>Try Demo</strong>.
+                  请先对已索引仓库发起诊断，或点击 <strong>试用 Demo</strong>。
                 </p>
               </div>
             ) : (
@@ -196,11 +200,11 @@ export const App: React.FC = () => {
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem' }}>
                         <h3 style={{ fontSize: '1.05rem', fontWeight: 600, color: 'var(--text-bright)' }}>{d.issue_title}</h3>
                         <span className={`badge ${d.status === 'SUCCEEDED' ? 'badge-success' : d.status === 'FAILED' ? 'badge-danger' : 'badge-warning'}`}>
-                          {d.status}
+                          {{ SUCCEEDED: '成功', FAILED: '失败', CANCELLED: '已取消', RUNNING: '运行中', QUEUED: '排队中' }[d.status] || d.status}
                         </span>
                       </div>
                       <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                        Repo ID: {d.repository_id} | Created: {new Date(d.created_at).toLocaleString()}
+                        仓库：{d.repository_id}｜创建于：{new Date(d.created_at).toLocaleString('zh-CN')}
                       </div>
                     </div>
                   </div>
@@ -214,7 +218,7 @@ export const App: React.FC = () => {
       {/* Footer */}
       <footer style={{ borderTop: '1px solid var(--border-color)', padding: '1rem 0', color: 'var(--text-muted)', fontSize: '0.8rem', textAlign: 'center' }}>
         <div className="container">
-          RepoLens v2.1 Local Codebase Intelligence & RCA Engine &bull; Zero-leakage Local Storage
+          RepoLens v2.1 本地代码智能与根因分析引擎 · 本地零泄漏存储
         </div>
       </footer>
     </div>

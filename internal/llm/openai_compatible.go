@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -14,10 +15,15 @@ type OpenAICompatibleProvider struct {
 	apiKey       string
 	baseURL      string
 	defaultModel string
+	authMode     string
 	httpClient   *http.Client
 }
 
 func NewOpenAICompatibleProvider(apiKey, baseURL, defaultModel string) *OpenAICompatibleProvider {
+	return NewOpenAICompatibleProviderWithAuthMode(apiKey, baseURL, defaultModel, "bearer")
+}
+
+func NewOpenAICompatibleProviderWithAuthMode(apiKey, baseURL, defaultModel, authMode string) *OpenAICompatibleProvider {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
@@ -28,6 +34,7 @@ func NewOpenAICompatibleProvider(apiKey, baseURL, defaultModel string) *OpenAICo
 		apiKey:       apiKey,
 		baseURL:      baseURL,
 		defaultModel: defaultModel,
+		authMode:     normalizeAuthMode(authMode),
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -77,13 +84,14 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 		return GenerateResponse{}, fmt.Errorf("failed to marshal openai request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+	endpoint := strings.TrimRight(p.baseURL, "/") + "/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return GenerateResponse{}, fmt.Errorf("failed to create http request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
+	if p.apiKey != "" && p.authMode == "bearer" {
 		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
 
@@ -127,4 +135,11 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 		PromptTokens:     openAIResp.Usage.PromptTokens,
 		CompletionTokens: openAIResp.Usage.CompletionTokens,
 	}, nil
+}
+
+func normalizeAuthMode(mode string) string {
+	if mode == "none" {
+		return "none"
+	}
+	return "bearer"
 }

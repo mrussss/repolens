@@ -23,7 +23,7 @@ export const api = {
     return handleResponse<ProviderStatus>(res);
   },
 
-  async saveProviderConfig(data: { base_url: string; model: string; api_key: string }): Promise<{ message: string; status: ProviderStatus }> {
+  async saveProviderConfig(data: { base_url: string; model: string; api_key?: string; auth_mode: 'bearer' | 'none' }): Promise<{ message: string; status: ProviderStatus }> {
     const res = await fetch(`${API_BASE}/settings/provider`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -32,7 +32,7 @@ export const api = {
     return handleResponse(res);
   },
 
-  async testProviderConnection(data: { base_url: string; model: string; api_key: string }): Promise<{ success: boolean; latency_ms: number; message: string }> {
+  async testProviderConnection(data: { base_url: string; model: string; api_key?: string; auth_mode: 'bearer' | 'none' }): Promise<{ success: boolean; latency_ms: number; message: string }> {
     const res = await fetch(`${API_BASE}/settings/provider/test`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

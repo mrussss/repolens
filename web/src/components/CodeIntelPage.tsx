@@ -28,13 +28,9 @@ export const CodeIntelPage: React.FC = () => {
       setLoading(true);
       const list = await api.listRepositories();
       setRepos(list || []);
-      if (list && list.length > 0) {
-        setSelectedRepoId(list[0].id);
-        const snapshot = readySnapshots(list[0])[0];
-        if (snapshot) prepareBuild(snapshot);
-      }
-    } catch {
-      // ignore
+      if (list && list.length > 0) setSelectedRepoId(list[0].id);
+    } catch (err: any) {
+      setError(err.message || '加载仓库失败');
     } finally {
       setLoading(false);
     }
@@ -49,7 +45,7 @@ export const CodeIntelPage: React.FC = () => {
       if (build.status === 'READY' || build.status === 'FAILED') return build;
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    throw new Error('Code index build is still running; refresh to continue.');
+    throw new Error('代码索引仍在运行，请稍后刷新。');
   };
 
   const waitForRetrieval = async (id: number): Promise<RetrievalBuild> => {
@@ -58,7 +54,7 @@ export const CodeIntelPage: React.FC = () => {
       if (build.status === 'READY' || build.status === 'FAILED') return build;
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    throw new Error('Retrieval build is still running; refresh to continue.');
+    throw new Error('检索索引仍在运行，请稍后刷新。');
   };
 
   const prepareBuild = async (snapshot: Snapshot) => {
@@ -72,18 +68,18 @@ export const CodeIntelPage: React.FC = () => {
       const build = response.code_index_build.status === 'READY'
         ? response.code_index_build
         : await waitForCodeIndex(response.code_index_build.id);
-      if (build.status !== 'READY') throw new Error(`Code index build ${build.status}`);
+      if (build.status !== 'READY') throw new Error(`代码索引状态为 ${build.status}`);
       setBuildId(build.id);
 
       const retrievalResponse = await api.triggerRetrievalBuild(build.id);
       const retrieval = retrievalResponse.retrieval_build.status === 'READY'
         ? retrievalResponse.retrieval_build
         : await waitForRetrieval(retrievalResponse.retrieval_build.id);
-      if (retrieval.status !== 'READY') throw new Error(`Retrieval build ${retrieval.status}`);
+      if (retrieval.status !== 'READY') throw new Error(`检索索引状态为 ${retrieval.status}`);
       setRetrievalBuild(retrieval);
       await loadBuildDetails(build.id);
     } catch (err: any) {
-      setError(err.message || 'Failed preparing code intelligence builds');
+      setError(err.message || '准备代码智能索引失败');
     } finally {
       setLoading(false);
     }
@@ -98,11 +94,9 @@ export const CodeIntelPage: React.FC = () => {
 
       const symRes = await api.listSymbols(id, searchQuery);
       setSymbols(symRes.symbols || []);
-      if (symRes.symbols && symRes.symbols.length > 0) {
-        handleSelectSymbol(symRes.symbols[0], id);
-      }
-    } catch {
-      // ignore
+      if (symRes.symbols && symRes.symbols.length > 0) await handleSelectSymbol(symRes.symbols[0], id);
+    } catch (err: any) {
+      setError(err.message || '加载代码索引详情失败');
     } finally {
       setLoading(false);
     }
@@ -114,11 +108,9 @@ export const CodeIntelPage: React.FC = () => {
       setLoading(true);
       const symRes = await api.listSymbols(buildId, searchQuery);
       setSymbols(symRes.symbols || []);
-      if (symRes.symbols && symRes.symbols.length > 0) {
-        handleSelectSymbol(symRes.symbols[0], buildId);
-      }
-    } catch {
-      // ignore
+      if (symRes.symbols && symRes.symbols.length > 0) await handleSelectSymbol(symRes.symbols[0], buildId);
+    } catch (err: any) {
+      setError(err.message || '搜索符号失败');
     } finally {
       setLoading(false);
     }
@@ -133,8 +125,8 @@ export const CodeIntelPage: React.FC = () => {
 
       const testRes = await api.getSymbolRelatedTests(sym.id, bId, sym.symbol_key_hash);
       setRelatedTests(testRes.related_tests || []);
-    } catch {
-      // ignore
+    } catch (err: any) {
+      setError(err.message || '加载符号关系失败');
     } finally {
       setSymbolLoading(false);
     }
@@ -144,9 +136,9 @@ export const CodeIntelPage: React.FC = () => {
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
         <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-bright)' }}>Code Intelligence Explorer</h1>
+          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-bright)' }}>代码智能浏览器</h1>
           <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-            Versioned AST Symbols, Canonical Receivers, Cross-package References, and Related Tests.
+            查看版本化 AST 符号、规范化接收者、跨包引用与关联测试。
           </p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
@@ -156,9 +148,9 @@ export const CodeIntelPage: React.FC = () => {
             value={selectedRepoId}
             onChange={(e) => {
               setSelectedRepoId(e.target.value);
-              const selectedRepo = repos.find((repo) => repo.id === e.target.value);
-              const snapshot = selectedRepo ? readySnapshots(selectedRepo)[0] : undefined;
-              if (snapshot) prepareBuild(snapshot);
+              setSelectedSnapshotId('');
+              setBuildId(0);
+              setRetrievalBuild(null);
             }}
           >
             {repos.map((r) => (
@@ -170,16 +162,21 @@ export const CodeIntelPage: React.FC = () => {
             style={{ width: 260 }}
             value={selectedSnapshotId}
             onChange={(e) => {
-              const snapshot = (repos.find((repo) => repo.id === selectedRepoId)?.snapshots || []).find((item) => item.id === e.target.value);
-              if (snapshot) prepareBuild(snapshot);
+              setSelectedSnapshotId(e.target.value);
             }}
             disabled={!selectedRepoId}
           >
-            <option value="">Select READY snapshot</option>
+            <option value="">选择 READY 快照</option>
             {(repos.find((repo) => repo.id === selectedRepoId) ? readySnapshots(repos.find((repo) => repo.id === selectedRepoId)!) : []).map((snapshot) => (
               <option key={snapshot.id} value={snapshot.id}>{snapshot.id} ({snapshot.commit_sha.slice(0, 12)})</option>
             ))}
           </select>
+          <button className="btn btn-primary" disabled={!selectedSnapshotId || loading} onClick={() => {
+            const snapshot = repos.find((repo) => repo.id === selectedRepoId)?.snapshots?.find((item) => item.id === selectedSnapshotId);
+            if (snapshot) prepareBuild(snapshot);
+          }}>
+            <RefreshCw size={14} /> 加载 / 刷新
+          </button>
         </div>
       </div>
 
@@ -191,32 +188,32 @@ export const CodeIntelPage: React.FC = () => {
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
             <BarChart2 size={18} color="var(--accent-primary)" />
             <h2 style={{ fontSize: '1.1rem', fontWeight: 600, color: 'var(--text-bright)' }}>
-              Analysis Completeness & Certainty Distribution
+              分析完整度与确定性分布
             </h2>
             <span className="badge badge-success" style={{ marginLeft: 'auto' }}>
-              Build #{quality.code_index_build_id} {quality.status}{retrievalBuild ? ` · Retrieval #${retrievalBuild.id} READY` : ''}
+              构建 #{quality.code_index_build_id} {quality.status === 'READY' ? '就绪' : quality.status}{retrievalBuild ? ` · 检索构建 #${retrievalBuild.id} 就绪` : ''}
             </span>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1rem', textAlign: 'center' }}>
             <div style={{ background: 'var(--bg-main)', padding: '0.75rem', borderRadius: 6, border: '1px solid var(--border-color)' }}>
               <div style={{ fontSize: '1.4rem', fontWeight: 700, color: 'var(--text-bright)' }}>{quality.parsed_pct}</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Files Parsed ({quality.files_parsed}/{quality.files_total})</div>
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>已解析文件（{quality.files_parsed}/{quality.files_total}）</div>
             </div>
             <div style={{ background: 'var(--bg-main)', padding: '0.75rem', borderRadius: 6, border: '1px solid var(--border-color)' }}>
               <div style={{ fontSize: '1.4rem', fontWeight: 700, color: 'var(--accent-primary)' }}>{quality.typechecked_pct}</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Typechecked ({quality.packages_typechecked}/{quality.packages_total})</div>
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>已类型检查包（{quality.packages_typechecked}/{quality.packages_total}）</div>
             </div>
             <div style={{ background: 'var(--bg-main)', padding: '0.75rem', borderRadius: 6, border: '1px solid var(--border-color)' }}>
               <div style={{ fontSize: '1.4rem', fontWeight: 700, color: 'var(--accent-success)' }}>{quality.symbol_count}</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Authoritative Symbols</div>
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>权威符号</div>
             </div>
             <div style={{ background: 'var(--bg-main)', padding: '0.75rem', borderRadius: 6, border: '1px solid var(--border-color)' }}>
               <div style={{ fontSize: '1.4rem', fontWeight: 700, color: 'var(--accent-purple)' }}>
                 {quality.semantic_relation_count + quality.syntactic_relation_count}
               </div>
               <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                Resolved Relations ({quality.semantic_relation_count} Semantic, {quality.syntactic_relation_count} Syntactic)
+                已解析关系（语义 {quality.semantic_relation_count}，语法 {quality.syntactic_relation_count}）
               </div>
             </div>
           </div>
@@ -233,7 +230,7 @@ export const CodeIntelPage: React.FC = () => {
               className="input-field"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search symbols (e.g. ProcessOrder, Service)..."
+              placeholder="搜索符号，例如 ProcessOrder、Service…"
             />
             <button type="submit" className="btn btn-primary">
               <Search size={14} />
@@ -246,7 +243,7 @@ export const CodeIntelPage: React.FC = () => {
             </div>
           ) : symbols.length === 0 ? (
             <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', textAlign: 'center', padding: '2rem 0' }}>
-              No symbols found in this build.
+              此构建中没有找到符号。
             </p>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', maxHeight: 550, overflowY: 'auto' }}>
@@ -298,14 +295,14 @@ export const CodeIntelPage: React.FC = () => {
                     <span className="badge badge-purple">{selectedSymbol.kind}</span>
                   </div>
                   <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
-                    Package: <code style={{ color: 'var(--accent-primary)' }}>{selectedSymbol.package_path}</code> | File: <code>{selectedSymbol.file_path}:L{selectedSymbol.start_line}-L{selectedSymbol.end_line}</code>
+                    包：<code style={{ color: 'var(--accent-primary)' }}>{selectedSymbol.package_path}</code>｜文件：<code>{selectedSymbol.file_path}:L{selectedSymbol.start_line}-L{selectedSymbol.end_line}</code>
                   </div>
                 </div>
               </div>
 
               {/* Signature & Raw Key */}
               <div style={{ marginBottom: '1.25rem' }}>
-                <h4 style={{ fontSize: '0.825rem', color: 'var(--text-muted)', marginBottom: '0.35rem' }}>Full Signature:</h4>
+                <h4 style={{ fontSize: '0.825rem', color: 'var(--text-muted)', marginBottom: '0.35rem' }}>完整签名：</h4>
                 <pre className="code-snippet">
                   <code>{selectedSymbol.signature || `${selectedSymbol.kind} ${selectedSymbol.name}()`}</code>
                 </pre>
@@ -314,11 +311,11 @@ export const CodeIntelPage: React.FC = () => {
               {/* Canonical Identity Key */}
               <div style={{ marginBottom: '1.25rem', background: 'var(--bg-main)', padding: '0.75rem', borderRadius: 6, border: '1px solid var(--border-color)' }}>
                 <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                  <strong>Symbol Key Raw: </strong>
+                  <strong>符号原始键：</strong>
                   <code>{selectedSymbol.symbol_key_raw}</code>
                 </div>
                 <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
-                  <strong>Key Hash: </strong>
+                  <strong>键哈希：</strong>
                   <code>{selectedSymbol.symbol_key_hash}</code>
                 </div>
               </div>
@@ -326,10 +323,10 @@ export const CodeIntelPage: React.FC = () => {
               {/* References & Callers */}
               <div style={{ marginBottom: '1.5rem' }}>
                 <h3 style={{ fontSize: '1rem', fontWeight: 600, color: 'var(--text-bright)', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <Layers size={16} /> References & Callers ({references.length})
+                  <Layers size={16} /> 引用与调用方（{references.length}）
                 </h3>
                 {references.length === 0 ? (
-                  <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>No incoming references or callers recorded.</p>
+                  <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>没有记录到入向引用或调用方。</p>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                     {references.map((r) => (
@@ -339,7 +336,7 @@ export const CodeIntelPage: React.FC = () => {
                           <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>{r.file_path}:L{r.line}</span>
                         </div>
                         <div style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-bright)' }}>
-                          Reason: {r.reason_code} {r.target_name ? `→ ${r.target_name}` : ''}
+                          原因：{r.reason_code} {r.target_name ? `→ ${r.target_name}` : ''}
                         </div>
                       </div>
                     ))}
@@ -350,10 +347,10 @@ export const CodeIntelPage: React.FC = () => {
               {/* Related Tests */}
               <div>
                 <h3 style={{ fontSize: '1rem', fontWeight: 600, color: 'var(--text-bright)', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <CheckCircle2 size={16} color="var(--accent-success)" /> Related Tests ({relatedTests.length})
+                  <CheckCircle2 size={16} color="var(--accent-success)" /> 关联测试（{relatedTests.length}）
                 </h3>
                 {relatedTests.length === 0 ? (
-                  <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>No related test discovered for this symbol.</p>
+                  <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>没有发现该符号的关联测试。</p>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                     {relatedTests.map((t) => (
@@ -373,7 +370,7 @@ export const CodeIntelPage: React.FC = () => {
             </div>
           ) : (
             <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', textAlign: 'center', padding: '4rem 0' }}>
-              Select a symbol on the left to inspect its signature, AST properties, references, and related tests.
+              请在左侧选择符号，查看签名、AST 属性、引用和关联测试。
             </p>
           )}
         </div>

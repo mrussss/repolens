@@ -12,24 +12,36 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
 	"repolens/internal/snapshot"
 	"repolens/internal/trace"
+
+	"gorm.io/gorm"
 )
 
 // Handler handles system provider configuration and demo mode endpoints.
 type Handler struct {
-	mgr            *Manager
-	repoStore      repo.Store
-	snapshotStore  snapshot.Store
-	diagnosisStore diagnosis.Store
-	reportStore    evidence.ReportStore
-	citationStore  evidence.CitationStore
-	traceStore     trace.Store
-	storeFS        snapshotstore.SnapshotStore
+	mgr             *Manager
+	repoStore       repo.Store
+	snapshotStore   snapshot.Store
+	diagnosisStore  diagnosis.Store
+	reportStore     evidence.ReportStore
+	citationStore   evidence.CitationStore
+	traceStore      trace.Store
+	storeFS         snapshotstore.SnapshotStore
+	db              *gorm.DB
+	codeIntelStore  codeintelstore.Store
+	indexStorageDir string
+}
+
+// WithDemoDependencies enables the real local code-intelligence demo path.
+func (h *Handler) WithDemoDependencies(db *gorm.DB, codeIntelStore codeintelstore.Store, indexStorageDir string) *Handler {
+	h.db, h.codeIntelStore, h.indexStorageDir = db, codeIntelStore, indexStorageDir
+	return h
 }
 
 // NewHandler constructs a new Handler.
@@ -62,9 +74,10 @@ func (h *Handler) GetStatus(c *gin.Context) {
 }
 
 type SaveProviderRequest struct {
-	BaseURL string `json:"base_url" binding:"required"`
-	Model   string `json:"model" binding:"required"`
-	APIKey  string `json:"api_key" binding:"required"`
+	BaseURL  string `json:"base_url" binding:"required"`
+	Model    string `json:"model" binding:"required"`
+	APIKey   string `json:"api_key"`
+	AuthMode string `json:"auth_mode"`
 }
 
 // SaveConfig saves new provider credentials.
@@ -92,7 +105,7 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 			}
 		}
 	}
-	if err := h.mgr.SaveConfig(newBase, req.Model, req.APIKey, false); err != nil {
+	if err := h.mgr.SaveConfigWithAuthMode(newBase, req.Model, req.APIKey, req.AuthMode, false); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -112,9 +125,10 @@ func (h *Handler) ClearConfig(c *gin.Context) {
 }
 
 type TestConnectionRequest struct {
-	BaseURL string `json:"base_url" binding:"required"`
-	Model   string `json:"model" binding:"required"`
-	APIKey  string `json:"api_key" binding:"required"`
+	BaseURL  string `json:"base_url" binding:"required"`
+	Model    string `json:"model" binding:"required"`
+	APIKey   string `json:"api_key"`
+	AuthMode string `json:"auth_mode"`
 }
 
 // TestConnection verifies connectivity with the target LLM provider.
@@ -125,7 +139,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		return
 	}
 
-	latency, err := h.mgr.TestConnection(c.Request.Context(), req.BaseURL, req.Model, req.APIKey)
+	latency, err := h.mgr.TestConnectionWithAuthMode(c.Request.Context(), req.BaseURL, req.Model, req.APIKey, req.AuthMode)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{
 			"success":    false,
@@ -144,6 +158,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 
 // TriggerDemo creates a deterministic bundled demo repository, snapshot, and diagnosis run.
 func (h *Handler) TriggerDemo(c *gin.Context) {
+	if h.db != nil && h.codeIntelStore != nil {
+		h.triggerRealDemo(c)
+		return
+	}
 	ctx := c.Request.Context()
 	userID := c.GetString("user_id")
 	if userID == "" {

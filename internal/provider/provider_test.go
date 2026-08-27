@@ -131,6 +131,35 @@ func TestTestConnection(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleAuthModesAndEndpointNormalization(t *testing.T) {
+	var gotPath, gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	withToken := llm.NewOpenAICompatibleProviderWithAuthMode("arbitrary-token", server.URL+"/v1/", "model", "bearer")
+	if _, err := withToken.Generate(context.Background(), llm.GenerateRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "ping"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/chat/completions" || gotAuth != "Bearer arbitrary-token" {
+		t.Fatalf("unexpected bearer request path=%q auth=%q", gotPath, gotAuth)
+	}
+
+	withoutAuth := llm.NewOpenAICompatibleProviderWithAuthMode("ignored", server.URL+"/v1/", "model", "none")
+	if _, err := withoutAuth.Generate(context.Background(), llm.GenerateRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "ping"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/chat/completions" || gotAuth != "" {
+		t.Fatalf("unexpected no-auth request path=%q auth=%q", gotPath, gotAuth)
+	}
+	if provider.ComputeConfigFingerprint(server.URL, "model", "none") == provider.ComputeConfigFingerprint(server.URL, "model", "bearer") {
+		t.Fatal("auth mode must be part of provider fingerprint")
+	}
+}
+
 func TestBuildForDiagnosisPinsMetadataButReloadsRotatedKey(t *testing.T) {
 	var authorization string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1,247 +1,35 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
+import { CheckCircle, Key, Play, RefreshCw, ShieldCheck, Sparkles } from 'lucide-react';
 import { api } from '../api';
 import { ProviderStatus } from '../types';
-import { CheckCircle, Play, Sparkles, RefreshCw, Key, ShieldCheck } from 'lucide-react';
 
-interface Props {
-  onDemoStarted: (diagnosisId: string) => void;
-  onConfigSaved: () => void;
-}
+interface Props { onDemoStarted: (diagnosisId: string) => void; onConfigSaved: () => void; }
+
+const presets = [
+  ['OpenAI', 'https://api.openai.com/v1', 'gpt-4o'], ['DeepSeek', 'https://api.deepseek.com/v1', 'deepseek-chat'],
+  ['OpenRouter', 'https://openrouter.ai/api/v1', 'openai/gpt-4o-mini'], ['硅基流动', 'https://api.siliconflow.cn/v1', 'Qwen/Qwen2.5-72B-Instruct'],
+  ['阿里云百炼', 'https://dashscope.aliyuncs.com/compatible-mode/v1', 'qwen-plus'], ['Moonshot / Kimi', 'https://api.moonshot.cn/v1', 'moonshot-v1-8k'],
+  ['Ollama', 'http://localhost:11434/v1', 'llama3.1'], ['vLLM', 'http://localhost:8000/v1', 'your-model'], ['自定义兼容服务', '', ''],
+];
 
 export const SetupPage: React.FC<Props> = ({ onDemoStarted, onConfigSaved }) => {
   const [status, setStatus] = useState<ProviderStatus | null>(null);
-  const [baseURL, setBaseURL] = useState('https://api.openai.com/v1');
-  const [model, setModel] = useState('gpt-4o');
-  const [apiKey, setApiKey] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [demoLoading, setDemoLoading] = useState(false);
-  const [testResult, setTestResult] = useState<{ success: boolean; latency_ms?: number; message?: string } | null>(null);
-  const [saveSuccess, setSaveSuccess] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [baseURL, setBaseURL] = useState('https://api.openai.com/v1'); const [model, setModel] = useState('gpt-4o'); const [apiKey, setApiKey] = useState('');
+  const [authMode, setAuthMode] = useState<'bearer' | 'none'>('bearer'); const [preset, setPreset] = useState('OpenAI'); const [loading, setLoading] = useState(false); const [testing, setTesting] = useState(false); const [demoLoading, setDemoLoading] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; latency_ms?: number; message?: string } | null>(null); const [saveSuccess, setSaveSuccess] = useState(false); const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadStatus();
-  }, []);
+  useEffect(() => { void loadStatus(); }, []);
+  const loadStatus = async () => { try { setLoading(true); const s = await api.getProviderStatus(); setStatus(s); if (s.base_url && !s.is_demo) setBaseURL(s.base_url); if (s.model && !s.is_demo) setModel(s.model); if (s.auth_mode) setAuthMode(s.auth_mode); } catch (err: any) { setError(err.message || '加载 Provider 状态失败'); } finally { setLoading(false); } };
+  const applyPreset = (name: string) => { setPreset(name); const item = presets.find((p) => p[0] === name); if (item?.[1]) { setBaseURL(item[1]); setModel(item[2]); } };
+  const handleTest = async () => { if (authMode === 'bearer' && !apiKey) { setError('Bearer 鉴权模式需要填写 API Key'); return; } setTesting(true); setError(null); setTestResult(null); try { setTestResult(await api.testProviderConnection({ base_url: baseURL, model, api_key: apiKey, auth_mode: authMode })); } catch (err: any) { setTestResult({ success: false, message: err.message }); } finally { setTesting(false); } };
+  const handleSave = async (e: React.FormEvent) => { e.preventDefault(); if (authMode === 'bearer' && !apiKey) { setError('Bearer 鉴权模式需要填写 API Key'); return; } setLoading(true); setError(null); setSaveSuccess(false); try { const res = await api.saveProviderConfig({ base_url: baseURL, model, api_key: apiKey, auth_mode: authMode }); setStatus(res.status); setSaveSuccess(true); setApiKey(''); onConfigSaved(); } catch (err: any) { setError(err.message || '保存 Provider 配置失败'); } finally { setLoading(false); } };
+  const handleDemo = async () => { setDemoLoading(true); setError(null); try { const res = await api.triggerDemo(); onDemoStarted(res.diagnosis_id); } catch (err: any) { setError(err.message || '启动 Demo 失败'); } finally { setDemoLoading(false); } };
 
-  const loadStatus = async () => {
-    try {
-      setLoading(true);
-      const s = await api.getProviderStatus();
-      setStatus(s);
-      if (s.base_url) setBaseURL(s.base_url);
-      if (s.model) setModel(s.model);
-    } catch (err: any) {
-      setError(err.message || 'Failed loading provider status');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleTest = async () => {
-    if (!apiKey) {
-      setError('Please provide an API Key for testing');
-      return;
-    }
-    setTesting(true);
-    setTestResult(null);
-    setError(null);
-    try {
-      const res = await api.testProviderConnection({ base_url: baseURL, model, api_key: apiKey });
-      setTestResult(res);
-    } catch (err: any) {
-      setTestResult({ success: false, message: err.message });
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!apiKey) {
-      setError('API Key cannot be empty');
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    setSaveSuccess(false);
-    try {
-      const res = await api.saveProviderConfig({ base_url: baseURL, model, api_key: apiKey });
-      setStatus(res.status);
-      setSaveSuccess(true);
-      setApiKey(''); // Clear secret from browser memory immediately
-      onConfigSaved();
-    } catch (err: any) {
-      setError(err.message || 'Failed saving provider configuration');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleTriggerDemo = async () => {
-    setDemoLoading(true);
-    setError(null);
-    try {
-      const res = await api.triggerDemo();
-      onDemoStarted(res.diagnosis_id);
-    } catch (err: any) {
-      setError(err.message || 'Failed initiating Demo environment');
-    } finally {
-      setDemoLoading(false);
-    }
-  };
-
-  return (
-    <div style={{ maxWidth: 800, margin: '0 auto' }}>
-      <div style={{ marginBottom: '2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-bright)' }}>System & LLM Setup</h1>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-            Configure your OpenAI-compatible inference provider or explore with 1-Click Demo Mode.
-          </p>
-        </div>
-        <button
-          className="btn btn-demo"
-          onClick={handleTriggerDemo}
-          disabled={demoLoading}
-          style={{ padding: '0.65rem 1.25rem', fontSize: '0.95rem' }}
-        >
-          {demoLoading ? <RefreshCw size={16} className="spin" /> : <Sparkles size={16} />}
-          Try Demo (No API Key Required)
-        </button>
-      </div>
-
-      {/* Current Status Card */}
-      <div className="card">
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <ShieldCheck size={20} color={status?.is_configured ? 'var(--accent-success)' : 'var(--text-muted)'} />
-            <h2 style={{ fontSize: '1.1rem', fontWeight: 600, color: 'var(--text-bright)' }}>Active Provider Status</h2>
-          </div>
-          {status?.is_configured ? (
-            <span className="badge badge-success">Configured</span>
-          ) : (
-            <span className="badge badge-warning">Unconfigured</span>
-          )}
-        </div>
-
-        {status?.is_configured ? (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '1rem', fontSize: '0.85rem' }}>
-            <div>
-              <span style={{ color: 'var(--text-muted)' }}>Base URL: </span>
-              <code style={{ color: 'var(--text-bright)' }}>{status.base_url}</code>
-            </div>
-            <div>
-              <span style={{ color: 'var(--text-muted)' }}>Model: </span>
-              <code style={{ color: 'var(--accent-primary)' }}>{status.model}</code>
-            </div>
-            <div>
-              <span style={{ color: 'var(--text-muted)' }}>Endpoint Fingerprint: </span>
-              <code style={{ fontSize: '0.75rem' }}>{status.endpoint_fingerprint?.slice(0, 16)}...</code>
-            </div>
-            <div>
-              <span style={{ color: 'var(--text-muted)' }}>Mode: </span>
-              <span>{status.is_demo ? 'Deterministic Local Demo' : 'Live Inference'}</span>
-            </div>
-          </div>
-        ) : (
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-            No LLM provider is currently configured. Provide your OpenAI-compatible Base URL & API Key below, or click <strong>Try Demo</strong>.
-          </p>
-        )}
-      </div>
-
-      {/* Provider Config Form */}
-      <div className="card">
-        <h2 style={{ fontSize: '1.1rem', fontWeight: 600, color: 'var(--text-bright)', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <Key size={18} /> Configure Provider Credentials
-        </h2>
-
-        {error && (
-          <div style={{ padding: '0.75rem', background: 'rgba(248,81,73,0.15)', border: '1px solid rgba(248,81,73,0.3)', borderRadius: 6, color: 'var(--accent-danger)', marginBottom: '1rem', fontSize: '0.85rem' }}>
-            {error}
-          </div>
-        )}
-
-        {saveSuccess && (
-          <div style={{ padding: '0.75rem', background: 'rgba(63,185,80,0.15)', border: '1px solid rgba(63,185,80,0.3)', borderRadius: 6, color: 'var(--accent-success)', marginBottom: '1rem', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <CheckCircle size={16} /> Configuration saved securely with 0600 file permissions!
-          </div>
-        )}
-
-        {testResult && (
-          <div style={{
-            padding: '0.75rem',
-            background: testResult.success ? 'rgba(63,185,80,0.15)' : 'rgba(248,81,73,0.15)',
-            border: `1px solid ${testResult.success ? 'rgba(63,185,80,0.3)' : 'rgba(248,81,73,0.3)'}`,
-            borderRadius: 6,
-            color: testResult.success ? 'var(--accent-success)' : 'var(--accent-danger)',
-            marginBottom: '1rem',
-            fontSize: '0.85rem'
-          }}>
-            {testResult.success ? `✓ ${testResult.message} (${testResult.latency_ms}ms)` : `✗ ${testResult.message}`}
-          </div>
-        )}
-
-        <form onSubmit={handleSave}>
-          <div className="form-group">
-            <label className="form-label">OpenAI-Compatible Base URL</label>
-            <input
-              type="text"
-              className="input-field"
-              value={baseURL}
-              onChange={(e) => setBaseURL(e.target.value)}
-              placeholder="https://api.openai.com/v1"
-              required
-            />
-            <div className="form-hint">Normalized automatically (e.g. OpenAI, DeepSeek, vLLM, Ollama, OpenRouter).</div>
-          </div>
-
-          <div className="form-group">
-            <label className="form-label">Model Name</label>
-            <input
-              type="text"
-              className="input-field"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="gpt-4o, deepseek-chat, claude-3-5-sonnet..."
-              required
-            />
-          </div>
-
-          <div className="form-group">
-            <label className="form-label">API Key</label>
-            <input
-              type="password"
-              className="input-field"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="sk-..."
-              required
-            />
-            <div className="form-hint">Never stored in browser or logs; written atomically with 0600 permissions.</div>
-          </div>
-
-          <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1.5rem' }}>
-            <button
-              type="button"
-              className="btn"
-              onClick={handleTest}
-              disabled={testing || !apiKey}
-            >
-              {testing ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}
-              Test Connection
-            </button>
-            <button
-              type="submit"
-              className="btn btn-primary"
-              disabled={loading || !apiKey}
-            >
-              {loading ? 'Saving...' : 'Save Configuration'}
-            </button>
-          </div>
-        </form>
-      </div>
+  return <div style={{ maxWidth: 800, margin: '0 auto' }}>
+    <div style={{ marginBottom: '2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}><div><h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-bright)' }}>系统与模型设置</h1><p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>配置 OpenAI 兼容推理服务，或使用一键 Demo 体验。</p></div><button className="btn btn-demo" onClick={handleDemo} disabled={demoLoading}>{demoLoading ? <RefreshCw size={16} className="spin" /> : <Sparkles size={16} />} 一键 Demo（无需 API Key）</button></div>
+    <div className="card"><div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}><div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><ShieldCheck size={20} color={status?.is_configured ? 'var(--accent-success)' : 'var(--text-muted)'} /><h2 style={{ fontSize: '1.1rem', color: 'var(--text-bright)' }}>当前 Provider 状态</h2></div><span className={`badge ${status?.is_configured ? 'badge-success' : 'badge-warning'}`}>{status?.is_configured ? '已配置' : '未配置'}</span></div>{status?.is_configured ? <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', fontSize: '0.85rem' }}><div>地址：<code>{status.base_url}</code></div><div>模型：<code>{status.model}</code></div><div>鉴权：{status.auth_mode === 'none' ? '无鉴权' : 'Bearer'}</div><div>模式：{status.is_demo ? '本地确定性 Demo' : '在线推理'}</div></div> : <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>尚未配置推理服务，请填写下方信息，或直接使用 Demo。</p>}</div>
+    <div className="card"><h2 style={{ fontSize: '1.1rem', color: 'var(--text-bright)', marginBottom: '1rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}><Key size={18} /> Provider 配置</h2>{error && <div className="alert alert-danger">{error}</div>}{saveSuccess && <div className="alert alert-success"><CheckCircle size={16} /> 配置已安全保存（文件权限 0600）。</div>}{testResult && <div className={`alert ${testResult.success ? 'alert-success' : 'alert-danger'}`}>{testResult.success ? `✓ 连接成功，延迟 ${testResult.latency_ms}ms` : `✗ ${testResult.message}`}</div>}
+      <form onSubmit={handleSave}><div className="form-group"><label className="form-label">服务预设</label><select className="input-field" value={preset} onChange={(e) => applyPreset(e.target.value)}>{presets.map((item) => <option key={item[0]}>{item[0]}</option>)}</select></div><div className="form-group"><label className="form-label">OpenAI 兼容 Base URL</label><input className="input-field" value={baseURL} onChange={(e) => setBaseURL(e.target.value)} placeholder="https://api.openai.com/v1" required /><div className="form-hint">支持 OpenAI、DeepSeek、OpenRouter、Ollama、vLLM 等服务。</div></div><div className="form-group"><label className="form-label">模型名称</label><input className="input-field" value={model} onChange={(e) => setModel(e.target.value)} placeholder="gpt-4o" required /></div><div className="form-group"><label className="form-label">鉴权模式</label><select className="input-field" value={authMode} onChange={(e) => setAuthMode(e.target.value as 'bearer' | 'none')}><option value="bearer">Bearer Token</option><option value="none">无鉴权</option></select></div><div className="form-group"><label className="form-label">API Key（可选）</label><input type="password" className="input-field" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={authMode === 'none' ? '无鉴权时可留空' : '可使用任意 Token，不要求 sk 前缀'} disabled={authMode === 'none'} /><div className="form-hint">密钥不会返回浏览器或日志，仅以 0600 权限原子写入本地文件。</div></div><div style={{ display: 'flex', gap: '0.75rem', marginTop: '1.5rem' }}><button type="button" className="btn" onClick={handleTest} disabled={testing || (authMode === 'bearer' && !apiKey)}>{testing ? <RefreshCw size={16} className="spin" /> : <Play size={16} />} 测试连接</button><button type="submit" className="btn btn-primary" disabled={loading || (authMode === 'bearer' && !apiKey)}>{loading ? '保存中…' : '保存配置'}</button></div></form>
     </div>
-  );
+  </div>;
 };
