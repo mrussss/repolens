@@ -234,7 +234,7 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 		demoSnap := &snapshot.RepositorySnapshot{
 			ID:               demoSnapID,
 			RepositoryID:     demoRepoID,
-			CommitSHA:        "e4d3c2b1a09876543210fedcba98765432100123",
+			CommitSHA:        demoCommit,
 			Ref:              "main",
 			MaterializedPath: demoDir,
 			Status:           snapshot.StatusReady,

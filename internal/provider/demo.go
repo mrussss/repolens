@@ -31,7 +31,7 @@ import (
 const (
 	demoRepoID = "repo-demo-order-svc"
 	demoSnapID = "snap-demo-order-svc-002"
-	demoCommit = "e4d3c2b1a09876543210fedcba98765432100123"
+	demoCommit = "f5e4d3c2b1a09876543210fedcba98765432100124"
 )
 
 const demoModule = `module github.com/repolens/demo-order-service
