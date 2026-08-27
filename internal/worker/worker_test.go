@@ -2,6 +2,7 @@ package worker_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -108,5 +109,77 @@ func TestWorkerJobHandler_ExecutionSuccess(t *testing.T) {
 	}
 	if job.Status != jobs.StatusSucceeded {
 		t.Errorf("expected job status SUCCEEDED, got %s", job.Status)
+	}
+}
+
+type cancellingDiagnosisExecutor struct {
+	cancel context.CancelFunc
+}
+
+func (e cancellingDiagnosisExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+	e.cancel()
+	return nil, context.Canceled
+}
+
+func TestWorkerJobHandler_CancellationFinalizesWithIndependentContext(t *testing.T) {
+	db, jobsStore := setupTestEnvironment(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	diagStore := diagnosis.NewStore(db)
+	repStore := evidence.NewReportStore(db)
+	citStore := evidence.NewCitationStore(db)
+	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	citVal := evidence.NewCitationValidator(storeFS)
+
+	run := &diagnosis.DiagnosisRun{
+		ID:                     "run-cancel-execution-context",
+		UserID:                 "user-cancel",
+		RepositoryID:           "repo-cancel",
+		SnapshotID:             "snap-cancel",
+		IssueTitle:             "Cancellation context test",
+		IdempotencyKey:         "cancel-execution-context",
+		IdempotencyRequestHash: "cancel-execution-context-hash",
+	}
+	if err := diagStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-cancel", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("failed to claim diagnosis job: err=%v jobs=%d", err, len(claimed))
+	}
+
+	handler := worker.NewDiagnosisJobHandler(
+		diagStore,
+		repStore,
+		citStore,
+		citVal,
+		cancellingDiagnosisExecutor{cancel: cancel},
+	)
+	err = handler.Execute(ctx, claimed[0])
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation error, got %v", err)
+	}
+
+	savedRun, err := diagStore.GetByID(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if savedRun.Status != diagnosis.StatusCancelled {
+		t.Fatalf("diagnosis status = %s, want CANCELLED", savedRun.Status)
+	}
+	attempts, err := diagStore.ListAttemptsByRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusCancelled {
+		t.Fatalf("attempts = %+v, want one CANCELLED attempt", attempts)
+	}
+	job, err := jobsStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != jobs.StatusCancelled {
+		t.Fatalf("job status = %s, want CANCELLED", job.Status)
 	}
 }

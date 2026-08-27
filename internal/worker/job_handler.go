@@ -213,14 +213,21 @@ func (h *DiagnosisJobHandler) failDiagnosisIfTerminal(ctx context.Context, job *
 }
 
 func (h *DiagnosisJobHandler) cancelAttempt(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) error {
+	// The execution context is expected to be cancelled when this path is
+	// reached after an agent stops. Terminal state persistence must therefore
+	// use an independent, bounded context so the atomic business/job finalize
+	// transaction can still complete.
+	finalizeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	if finalizer, ok := h.diagnosisStore.(interface {
 		FinalizeCancellation(context.Context, int64, string, string, string, string) error
 	}); ok && job.WorkerID != nil && job.ClaimToken != nil {
-		if err := finalizer.FinalizeCancellation(ctx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID); err != nil {
+		if err := finalizer.FinalizeCancellation(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID); err != nil {
 			return err
 		}
 		return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
 	}
-	_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusCancelled, diagnosis.AttemptStatusCancelled, 0, 0, 0, "CANCELLED", "User requested cancellation", false, 0)
+	_ = h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusCancelled, diagnosis.AttemptStatusCancelled, 0, 0, 0, "CANCELLED", "User requested cancellation", false, 0)
 	return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
 }
