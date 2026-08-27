@@ -188,6 +188,24 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	// Start background lease renewer
 	renewer := StartLeaseRenewer(jobCtx, w.store, job.ID, w.cfg.WorkerID, *job.ClaimToken, w.cfg.LeaseDuration, cancelJob)
 	defer renewer.Stop()
+	cancelPollDone := make(chan struct{})
+	go func() {
+		defer close(cancelPollDone)
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-jobCtx.Done():
+				return
+			case <-ticker.C:
+				requested, err := w.store.IsCancelRequested(jobCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
+				if err != nil || requested {
+					cancelJob()
+					return
+				}
+			}
+		}
+	}()
 
 	// Check if cancellation was requested before execution
 	if job.CancelRequested {
@@ -195,11 +213,15 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 		finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancelFinalize()
 		_ = w.store.ConditionalFinalizeCancel(finalizeCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
+		cancelJob()
+		<-cancelPollDone
 		return
 	}
 
 	start := time.Now()
 	err := handler.Execute(jobCtx, job)
+	cancelJob()
+	<-cancelPollDone
 	latency := time.Since(start)
 
 	finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
@@ -208,6 +230,9 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	if err == nil {
 		log.Info("job execution succeeded", "latency_ms", latency.Milliseconds())
 		finalErr := w.store.ConditionalFinalizeSuccess(finalizeCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
+		if errors.Is(finalErr, ErrAlreadyFinalized) {
+			return
+		}
 		if finalErr != nil && errors.Is(finalErr, ErrOwnershipLost) {
 			log.Warn("finalize success skipped due to ownership loss", "error", finalErr)
 		}

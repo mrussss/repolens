@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -265,6 +266,10 @@ func (s *Store) ConditionalFinalizeSuccessTx(ctx context.Context, tx *sql.Tx, jo
 		return err
 	}
 	if rowsAffected == 0 {
+		var status JobStatus
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM analysis_jobs WHERE id = ?`, jobID).Scan(&status); err == nil && status == StatusSucceeded {
+			return ErrAlreadyFinalized
+		}
 		return ErrOwnershipLost
 	}
 	return nil
@@ -327,13 +332,62 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 	if err != nil {
 		return fmt.Errorf("failed finalizing failure for job %d: %w", jobID, err)
 	}
-
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
 		return err
 	}
 	if rowsAffected == 0 {
 		return ErrOwnershipLost
+	}
+	if isTerminal {
+		if err := s.failBusinessTx(ctx, tx, jobID, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// failBusinessTx keeps terminal execution failure and business failure in one
+// claim-fenced transaction. The SQL is intentionally keyed by the fixed job
+// type enum, never by user input.
+func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, reaped bool) error {
+	var jobType JobType
+	var resourceID string
+	if err := tx.QueryRowContext(ctx, `SELECT job_type, resource_id FROM analysis_jobs WHERE id = ?`, jobID).Scan(&jobType, &resourceID); err != nil {
+		return err
+	}
+	code := "JOB_FAILED"
+	if reaped {
+		code = "LEASE_EXPIRED_EXHAUSTED"
+	}
+	var query string
+	switch jobType {
+	case JobTypeMaterializeSnapshot:
+		query = `UPDATE repository_snapshots SET status = 'FAILED', error_code = ? WHERE id = ? AND status IN ('CREATED', 'MATERIALIZING')`
+	case JobTypeBuildCodeIndex:
+		query = `UPDATE code_index_builds SET status = 'FAILED', error_code = ? WHERE id = ? AND status IN ('CREATED', 'BUILDING')`
+	case JobTypeBuildRetrieval:
+		query = `UPDATE retrieval_builds SET status = 'FAILED', error_code = ? WHERE id = ? AND status IN ('CREATED', 'BUILDING')`
+	case JobTypeRunDiagnosis:
+		query = `UPDATE diagnosis_runs SET status = 'FAILED', version = version + 1 WHERE id = ? AND status IN ('QUEUED', 'RUNNING')`
+	default:
+		return fmt.Errorf("unsupported job type %s during terminal failure", jobType)
+	}
+	args := []interface{}{code, resourceID}
+	if jobType == JobTypeRunDiagnosis {
+		args = []interface{}{resourceID}
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+		return fmt.Errorf("failed terminal business transition for %s/%s: %w", jobType, resourceID, err)
+	}
+	if jobType == JobTypeRunDiagnosis {
+		attemptStatus := "FAILED_TERMINAL"
+		if reaped {
+			attemptStatus = "ABANDONED"
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts SET status = ?, finished_at = ? WHERE diagnosis_run_id = ? AND status = 'RUNNING'`, attemptStatus, time.Now().UTC(), resourceID); err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("failed terminal diagnosis attempt transition for %s: %w", resourceID, err)
+		}
 	}
 	return nil
 }
@@ -409,6 +463,17 @@ func (s *Store) RequestCancel(ctx context.Context, jobType JobType, resourceID s
 	return err
 }
 
+// IsCancelRequested reads the authoritative cancellation flag for a claimed
+// job. Workers poll it so a running handler receives context cancellation.
+func (s *Store) IsCancelRequested(ctx context.Context, jobID int64, workerID, claimToken string) (bool, error) {
+	var requested bool
+	err := s.db.QueryRowContext(ctx, `SELECT cancel_requested FROM analysis_jobs WHERE id = ? AND status = 'RUNNING' AND worker_id = ? AND claim_token = ?`, jobID, workerID, claimToken).Scan(&requested)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrOwnershipLost
+	}
+	return requested, err
+}
+
 // ReapExpiredJobs scans for RUNNING jobs with expired leases and moves them to RETRY_WAIT or terminal FAILED.
 func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -470,6 +535,9 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 				return 0, fmt.Errorf("failed reaping job %d to retry_wait: %w", ej.id, err)
 			}
 		} else {
+			if err := s.failBusinessForReapedJob(ctx, tx, ej.id); err != nil {
+				return 0, err
+			}
 			// Mark terminal FAILED with RETRYABLE_EXHAUSTED
 			failQuery := `
 				UPDATE analysis_jobs
@@ -494,6 +562,10 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 		return 0, err
 	}
 	return reapedCount, nil
+}
+
+func (s *Store) failBusinessForReapedJob(ctx context.Context, tx *sql.Tx, jobID int64) error {
+	return s.failBusinessTx(ctx, tx, jobID, true)
 }
 
 // ManualRequeueTx executes the Manual Requeue Rule for natural-identity resources within a transaction.
@@ -572,6 +644,18 @@ func (s *Store) ManualRequeueTx(ctx context.Context, tx *sql.Tx, jobType JobType
 		return fmt.Errorf("cannot requeue job (%s, %s): not in FAILED state with RETRYABLE_EXHAUSTED", jobType, resourceID)
 	}
 	return nil
+}
+
+func (s *Store) ManualRequeue(ctx context.Context, jobType JobType, resourceID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.ManualRequeueTx(ctx, tx, jobType, resourceID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func businessTable(jobType JobType) string {

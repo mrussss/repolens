@@ -303,6 +303,82 @@ func TestStore_ReaperAndRetryExhaustion(t *testing.T) {
 	}
 }
 
+func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	for _, ddl := range []string{
+		`CREATE TABLE repository_snapshots (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
+		`CREATE TABLE code_index_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
+		`CREATE TABLE retrieval_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
+		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, version INTEGER NOT NULL)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, status TEXT NOT NULL, finished_at DATETIME)`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	cases := []struct {
+		typ       jobs.JobType
+		id, table string
+	}{
+		{jobs.JobTypeMaterializeSnapshot, "snap-reaped", "repository_snapshots"},
+		{jobs.JobTypeBuildCodeIndex, "build-reaped", "code_index_builds"},
+		{jobs.JobTypeBuildRetrieval, "retrieval-reaped", "retrieval_builds"},
+		{jobs.JobTypeRunDiagnosis, "diag-reaped", "diagnosis_runs"},
+	}
+	for _, tc := range cases {
+		if tc.typ == jobs.JobTypeRunDiagnosis {
+			_, _ = db.Exec(`INSERT INTO diagnosis_runs (id,status,version) VALUES (?, 'RUNNING', 1)`, tc.id)
+			_, _ = db.Exec(`INSERT INTO diagnosis_attempts (id,diagnosis_run_id,status) VALUES (?, ?, 'RUNNING')`, tc.id+"-attempt", tc.id)
+		} else {
+			_, _ = db.Exec(`INSERT INTO `+tc.table+` (id,status) VALUES (?, ?)`, tc.id, map[jobs.JobType]string{jobs.JobTypeMaterializeSnapshot: "MATERIALIZING", jobs.JobTypeBuildCodeIndex: "BUILDING", jobs.JobTypeBuildRetrieval: "BUILDING"}[tc.typ])
+		}
+		job := &jobs.AnalysisJob{JobType: tc.typ, ResourceID: tc.id, MaxAttempts: 1}
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE analysis_jobs SET status='RUNNING', attempt_count=1, worker_id='dead-worker', claim_token='dead-token', lease_until=datetime('now','-1 second') WHERE id=?`, job.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if count, err := store.ReapExpiredJobs(ctx, 20); err != nil || count != len(cases) {
+		t.Fatalf("reaped=%d err=%v", count, err)
+	}
+	for _, tc := range cases {
+		job, err := store.GetJobByResource(ctx, tc.typ, tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.Status != jobs.StatusFailed {
+			t.Fatalf("%s job status=%s", tc.typ, job.Status)
+		}
+		var status string
+		if tc.typ == jobs.JobTypeRunDiagnosis {
+			if err := db.QueryRow(`SELECT status FROM diagnosis_runs WHERE id=?`, tc.id).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status != "FAILED" {
+				t.Fatalf("diagnosis status=%s", status)
+			}
+			if err := db.QueryRow(`SELECT status FROM diagnosis_attempts WHERE diagnosis_run_id=?`, tc.id).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status != "ABANDONED" {
+				t.Fatalf("attempt status=%s", status)
+			}
+		} else {
+			if err := db.QueryRow(`SELECT status FROM `+tc.table+` WHERE id=?`, tc.id).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status != "FAILED" {
+				t.Fatalf("%s business status=%s", tc.typ, status)
+			}
+		}
+	}
+}
+
 func TestWorkerRuntime_ConcurrentExecution(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

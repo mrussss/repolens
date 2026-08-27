@@ -57,6 +57,9 @@ func ClassifyError(err error) (ErrorClass, string) {
 	if errors.Is(err, ErrOwnershipLost) {
 		return ErrorClassOwnershipLost, "OWNERSHIP_LOST"
 	}
+	if errors.Is(err, ErrCancellationRequested) {
+		return ErrorClassCancelled, "CANCELLATION_REQUESTED"
+	}
 
 	if errors.Is(err, context.Canceled) {
 		return ErrorClassCancelled, "CONTEXT_CANCELED"
