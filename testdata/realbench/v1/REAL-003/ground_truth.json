@@ -1,0 +1,15 @@
+{
+  "case_id": "REAL-003",
+  "fix_commit_sha": "0aa17a73624a122ce7ba46ff0b4bbf47d4df3bda",
+  "expected_root_cause": "NewRequestWithContext constructs the net/http request with a nil body and keeps the supplied raw body only in a custom reader field. Because the standard constructor never receives that body, it cannot populate Request.GetBody for replayable redirects.",
+  "primary_relevant_files": ["client.go"],
+  "supporting_files": ["client_test.go"],
+  "relevant_symbols": ["NewRequestWithContext"],
+  "relevant_line_ranges": {"client.go": {"start": 304, "end": 316}},
+  "provenance": {
+    "issue_url": "https://github.com/hashicorp/go-retryablehttp/issues/121",
+    "fix_pr_url": "https://github.com/hashicorp/go-retryablehttp/pull/122",
+    "fix_commit_url": "https://github.com/hashicorp/go-retryablehttp/commit/0aa17a73624a122ce7ba46ff0b4bbf47d4df3bda"
+  },
+  "curation_notes": "Issue report, merge parent, fix commit, changed production/test files, and redirect regression behavior were checked against GitHub."
+}

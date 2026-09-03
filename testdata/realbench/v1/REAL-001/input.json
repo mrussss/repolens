@@ -1,0 +1,9 @@
+{
+  "case_id": "REAL-001",
+  "dataset_version": "realbench-v1",
+  "repository": {"full_name": "go-chi/chi", "clone_url": "https://github.com/go-chi/chi.git"},
+  "buggy_commit_sha": "a54874f0e2f12647a19e82ee70dfa8185014100c",
+  "issue_title": "httpFancyWriter.ReadFrom double-counts BytesWritten when Tee is set",
+  "issue_description": "When an HTTP response is copied through a Tee writer, BytesWritten reports twice the actual bytes written.",
+  "error_log": "Observed reproduction: ReadFrom(strings.NewReader(\"hello world\")) returns n=11 but BytesWritten() reports 22."
+}

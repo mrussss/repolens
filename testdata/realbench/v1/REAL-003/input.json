@@ -1,0 +1,9 @@
+{
+  "case_id": "REAL-003",
+  "dataset_version": "realbench-v1",
+  "repository": {"full_name": "hashicorp/go-retryablehttp", "clone_url": "https://github.com/hashicorp/go-retryablehttp.git"},
+  "buggy_commit_sha": "571a88bc9c3b7c64575f0e9b0f646af1510f2c76",
+  "issue_title": "Request wrapper makes standard request GetBody property always nil",
+  "issue_description": "Wrapped requests with a body cannot be replayed for HTTP 307/308 redirects because the standard request GetBody callback is lost.",
+  "error_log": "Redirect with a body stops instead of resending the body: Request.GetBody is nil after NewRequestWithContext."
+}

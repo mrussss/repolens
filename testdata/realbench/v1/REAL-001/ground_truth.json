@@ -1,0 +1,15 @@
+{
+  "case_id": "REAL-001",
+  "fix_commit_sha": "2c567813d274099814f6912244ec670fea3b70a4",
+  "expected_root_cause": "The Tee branch of httpFancyWriter.ReadFrom increments basicWriter.bytes after io.Copy has already routed writes through basicWriter.Write, which performs the same accounting. The redundant increment doubles BytesWritten.",
+  "primary_relevant_files": ["middleware/wrap_writer.go"],
+  "supporting_files": ["middleware/wrap_writer_test.go"],
+  "relevant_symbols": ["httpFancyWriter.ReadFrom"],
+  "relevant_line_ranges": {"middleware/wrap_writer.go": {"start": 209, "end": 219}},
+  "provenance": {
+    "issue_url": "https://github.com/go-chi/chi/issues/1067",
+    "fix_pr_url": "https://github.com/go-chi/chi/pull/1068",
+    "fix_commit_url": "https://github.com/go-chi/chi/commit/2c567813d274099814f6912244ec670fea3b70a4"
+  },
+  "curation_notes": "Issue reproduction, merge parent, fix commit, changed files, and regression test were checked against GitHub."
+}

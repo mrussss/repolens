@@ -1,0 +1,14 @@
+{
+  "case_id": "REAL-002",
+  "fix_commit_sha": "f26981f3ad65293bc5465e722b7fbca3e0bb013e",
+  "expected_root_cause": "getCompletions appends the -- separator directly to finalArgs. When finalArgs shares its backing array with the caller's os.Args, append mutates that caller-visible slice and changes the original command arguments.",
+  "primary_relevant_files": ["completions.go"],
+  "relevant_symbols": ["(*Command).getCompletions"],
+  "relevant_line_ranges": {"completions.go": {"start": 369, "end": 377}},
+  "provenance": {
+    "issue_url": "https://github.com/spf13/cobra/issues/2257",
+    "fix_pr_url": "https://github.com/spf13/cobra/pull/2258",
+    "fix_commit_url": "https://github.com/spf13/cobra/commit/f26981f3ad65293bc5465e722b7fbca3e0bb013e"
+  },
+  "curation_notes": "Issue report, merge parent, one-file fix, and regression test were checked against GitHub."
+}

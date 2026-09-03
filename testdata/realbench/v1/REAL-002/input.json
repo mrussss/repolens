@@ -1,0 +1,9 @@
+{
+  "case_id": "REAL-002",
+  "dataset_version": "realbench-v1",
+  "repository": {"full_name": "spf13/cobra", "clone_url": "https://github.com/spf13/cobra.git"},
+  "buggy_commit_sha": "ad460ea8f249db69c943a365fb84f3a59042d54e",
+  "issue_title": "Completions modify os.Args",
+  "issue_description": "Shell completion mutates the caller argument slice, causing os.Args to gain an unexpected -- separator.",
+  "error_log": "Expected completion arguments to remain __complete, x; observed __complete, -- after completion."
+}

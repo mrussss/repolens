@@ -1,0 +1,5 @@
+{
+  "dataset_version": "realbench-v1",
+  "cases": ["REAL-001", "REAL-002", "REAL-003"],
+  "manifest_hash": "5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf"
+}
