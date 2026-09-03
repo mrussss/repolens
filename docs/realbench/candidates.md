@@ -1,5 +1,7 @@
 # RealBench v1 候选与冻结记录
 
+> `realbench-v1` 是第一版 pilot external benchmark，由 3 个真实 Go 项目历史 Bug 组成，用于验证完整外部评测链路，不代表大规模真实世界泛化结论。
+
 本轮冻结 3 个来自不同公开 Go 仓库的历史缺陷。每个案例都使用 issue 公开后的 buggy parent commit 作为输入，不把修复提交、修复 diff 或 Ground Truth 传入检索路径。
 
 | Case | Repository | Buggy commit | Fix commit | Primary file | Evidence |
