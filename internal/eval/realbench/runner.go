@@ -33,6 +33,80 @@ import (
 
 const productionStrategy = "symbol_bm25_structural"
 
+const (
+	e2eNotRequested               = "NOT_REQUESTED"
+	e2eNotRunProviderUnconfigured = "NOT_RUN_PROVIDER_NOT_CONFIGURED"
+	e2eCompleted                  = "E2E_COMPLETED"
+	e2eFailure                    = "E2E_FAILURE"
+)
+
+type failureClass string
+
+const (
+	failureExternalInfra   failureClass = "EXTERNAL_INFRA"
+	failureRepolensProduct failureClass = "REPOLENS_PRODUCT"
+)
+
+// classifiedError keeps boundary ownership explicit. Git/provider failures
+// are external; all failures in RepoLens state, indexing, retrieval, agent,
+// and artifact logic are product failures.
+type classifiedError struct {
+	class failureClass
+	stage string
+	err   error
+}
+
+func (e *classifiedError) Error() string {
+	return fmt.Sprintf("%s failed: %v", e.stage, e.err)
+}
+
+func (e *classifiedError) Unwrap() error { return e.err }
+
+func externalFailure(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *classifiedError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &classifiedError{class: failureExternalInfra, stage: stage, err: err}
+}
+
+func productFailure(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *classifiedError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &classifiedError{class: failureRepolensProduct, stage: stage, err: err}
+}
+
+func classifyFailure(err error) (status, errorClass string) {
+	var classified *classifiedError
+	if errors.As(err, &classified) && classified.class == failureExternalInfra {
+		return "INFRA_ERROR", string(failureExternalInfra)
+	}
+	return "PRODUCT_FAILURE", string(failureRepolensProduct)
+}
+
+func errorClassFor(err error) string {
+	_, class := classifyFailure(err)
+	return class
+}
+
+func e2eStatusFor(requested, providerConfigured bool) string {
+	if !requested {
+		return e2eNotRequested
+	}
+	if !providerConfigured {
+		return e2eNotRunProviderUnconfigured
+	}
+	return e2eFailure
+}
+
 type RunOptions struct {
 	CaseIDs      []string
 	CacheDir     string
@@ -161,11 +235,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		return nil, fmt.Errorf("create run artifact directory: %w", err)
 	}
 	gitCommit := currentGitCommit()
-	e2eStatus := "NOT_RUN_PROVIDER_NOT_CONFIGURED"
+	e2eStatus := e2eNotRequested
 	providerConfig, providerConfigured := loadProviderConfig()
-	if opts.RunE2E && providerConfigured {
-		e2eStatus = "READY"
-	}
+	e2eStatus = e2eStatusFor(opts.RunE2E, providerConfigured)
 	result := &RunResult{
 		RunDir: runDir,
 		Metadata: RunMetadata{
@@ -208,8 +280,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		}
 		workspace, err := prepareProductionWorkspace(ctx, inputCase.Input, caseID, filepath.Join(opts.CacheDir, caseID), caseDir, fetcher)
 		if err != nil {
-			status.Status = "INFRA_ERROR"
-			status.ErrorClass = "EXTERNAL_INFRA"
+			status.Status, status.ErrorClass = classifyFailure(err)
 			status.Error = err.Error()
 			status.LatencyMs = time.Since(started).Milliseconds()
 			result.Cases = append(result.Cases, status)
@@ -217,15 +288,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			continue
 		}
 
-		query := strings.TrimSpace(strings.Join([]string{inputCase.Input.IssueTitle, inputCase.Input.IssueDescription, inputCase.Input.ErrorLog}, "\n"))
 		searchStarted := time.Now()
-		top10, searchErr := workspace.Retriever.Search(ctx, retrieval.SearchRequest{
-			SnapshotID:       caseID,
-			CodeIndexBuildID: workspace.CodeIndexBuildID,
-			RetrievalBuildID: workspace.RetrievalBuildID,
-			Query:            query,
-			TopK:             10,
-		})
+		query, top10, searchErr := searchInput(ctx, workspace.Retriever, inputCase.Input, caseID, workspace.CodeIndexBuildID, workspace.RetrievalBuildID)
 		status.LatencyMs = time.Since(searchStarted).Milliseconds()
 		if searchErr != nil {
 			workspace.Close()
@@ -242,9 +306,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		if opts.RunE2E && providerConfigured {
 			diagnosisResult, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir)
 			if e2eErr != nil {
-				caseE2EStatus = "E2E_FAILURE"
+				caseE2EStatus = e2eFailure
 			} else {
-				caseE2EStatus = "E2E_COMPLETED"
+				caseE2EStatus = e2eCompleted
 			}
 		}
 
@@ -288,17 +352,26 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		status.HitAt5, status.HitAt10, status.ReciprocalRank = retrievalMetrics(top10, truth.PrimaryFiles)
 		status.E2EStatus = caseE2EStatus
 		status.Status = "RETRIEVAL_COMPLETED_E2E_NOT_RUN"
-		if caseE2EStatus == "E2E_COMPLETED" {
+		if caseE2EStatus == e2eCompleted {
 			status.Status = "RETRIEVAL_AND_E2E_COMPLETED"
-		} else if caseE2EStatus == "E2E_FAILURE" {
+		} else if caseE2EStatus == e2eFailure {
 			status.Status = "RETRIEVAL_COMPLETED_E2E_FAILURE"
-			status.ErrorClass = "EXTERNAL_INFRA"
+			status.ErrorClass = errorClassFor(e2eErr)
 			status.Error = e2eErr.Error()
 		}
 		result.Cases = append(result.Cases, status)
 		workspace.Close()
 		if err := writeJSON(filepath.Join(caseDir, "status.json"), status); err != nil {
 			return nil, fmt.Errorf("write %s status: %w", caseID, err)
+		}
+	}
+	if opts.RunE2E && providerConfigured {
+		result.Metadata.E2EStatus = e2eCompleted
+		for _, status := range result.Cases {
+			if status.E2EStatus == e2eFailure {
+				result.Metadata.E2EStatus = e2eFailure
+				break
+			}
 		}
 	}
 
@@ -337,22 +410,22 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 	snapshotStore := snapshotstore.NewLocalSnapshotStore(cacheDir)
 	sourceDir := snapshotStore.GetSourcePath(input.CaseID, snapshotID)
 	if err := fetcher.Fetch(ctx, input, sourceDir); err != nil {
-		return nil, err
+		return nil, externalFailure("snapshot fetch", err)
 	}
 
 	dbPath := filepath.Join(artifactDir, "state.sqlite")
 	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000&_journal_mode=WAL"), &gorm.Config{})
 	if err != nil {
-		return nil, fmt.Errorf("open benchmark state database: %w", err)
+		return nil, productFailure("open benchmark state database", err)
 	}
 	if err := mysql.AutoMigrate(db); err != nil {
-		return nil, fmt.Errorf("migrate benchmark state database: %w", err)
+		return nil, productFailure("migrate benchmark state database", err)
 	}
 	ciStore := codeintelstore.NewStore(db)
 	buildContext := codeintel.DefaultBuildContext()
 	analysis, err := codeintel.NewAnalyzer().Analyze(ctx, sourceDir, buildContext)
 	if err != nil {
-		return nil, fmt.Errorf("CodeIndex analysis failed: %w", err)
+		return nil, productFailure("CodeIndex analysis", err)
 	}
 	build := &codeintelmodel.CodeIndexBuild{
 		SnapshotID:          input.CaseID,
@@ -368,10 +441,10 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 		CreatedAt:           time.Now().UTC(),
 	}
 	if err := db.Create(build).Error; err != nil {
-		return nil, fmt.Errorf("create CodeIndexBuild: %w", err)
+		return nil, productFailure("create CodeIndexBuild", err)
 	}
 	if err := ciStore.SaveAnalysisResult(ctx, build.ID, analysis); err != nil {
-		return nil, fmt.Errorf("save CodeIndex: %w", err)
+		return nil, productFailure("save CodeIndex", err)
 	}
 
 	retrievalBuild := &codeintelmodel.RetrievalBuild{
@@ -384,10 +457,10 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 		CreatedAt:        time.Now().UTC(),
 	}
 	if err := db.Create(retrievalBuild).Error; err != nil {
-		return nil, fmt.Errorf("create RetrievalBuild: %w", err)
+		return nil, productFailure("create RetrievalBuild", err)
 	}
 	if err := ciStore.MarkRetrievalBuilding(ctx, retrievalBuild.ID); err != nil {
-		return nil, fmt.Errorf("mark RetrievalBuild building: %w", err)
+		return nil, productFailure("mark RetrievalBuild building", err)
 	}
 	idx := bm25.NewIndex(1.2, 0.75)
 	for _, symbol := range analysis.Symbols {
@@ -406,10 +479,10 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 	indexRoot := filepath.Join(artifactDir, "indexes")
 	artifactPath, artifactHash, err := artifact.NewPublisher(indexRoot).Publish(retrievalBuild.ID, "realbench", productionStrategy, idx)
 	if err != nil {
-		return nil, fmt.Errorf("publish Retrieval artifact: %w", err)
+		return nil, productFailure("publish Retrieval artifact", err)
 	}
 	if err := ciStore.CompleteRetrievalBuild(ctx, retrievalBuild.ID, artifactPath, artifactHash, idx.TotalDocs); err != nil {
-		return nil, fmt.Errorf("finalize RetrievalBuild: %w", err)
+		return nil, productFailure("finalize RetrievalBuild", err)
 	}
 	return &productionWorkspace{
 		Retriever:        retrieval.NewProductionRetriever(ciStore, indexRoot),
@@ -438,19 +511,29 @@ func loadProviderConfig() (providerConfig, bool) {
 	return config, config.BaseURL != "" && config.Model != ""
 }
 
-func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string) (*agent.ExecutionResult, error) {
-	provider := llm.NewOpenAICompatibleProviderWithAuthMode(config.APIKey, config.BaseURL, config.Model, config.AuthMode)
-	executor := agent.NewAgentRuntimeExecutor(provider, workspace.Retriever, workspace.SnapshotStore, nil, agent.DefaultGuardConfig()).WithCodeIntelStore(workspace.CodeIndexStore)
-	run := &diagnosis.DiagnosisRun{
-		ID: uuid.New().String(), RepositoryID: input.CaseID, SnapshotID: input.CaseID,
-		CodeIndexBuildID: workspace.CodeIndexBuildID, RetrievalBuildID: workspace.RetrievalBuildID,
-		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
-		Temperature: 0.1, ModelName: config.Model, PromptVersion: "v2.1", AgentVersion: "v2.1",
+type classifiedProvider struct {
+	llm.Provider
+}
+
+func (p classifiedProvider) Generate(ctx context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
+	response, err := p.Provider.Generate(ctx, request)
+	if err != nil {
+		return llm.GenerateResponse{}, externalFailure("provider Generate", err)
 	}
+	return response, nil
+}
+
+func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string) (*agent.ExecutionResult, error) {
+	provider := classifiedProvider{Provider: llm.NewOpenAICompatibleProviderWithAuthMode(config.APIKey, config.BaseURL, config.Model, config.AuthMode)}
+	executor := agent.NewAgentRuntimeExecutor(provider, workspace.Retriever, workspace.SnapshotStore, nil, agent.DefaultGuardConfig()).WithCodeIntelStore(workspace.CodeIndexStore)
+	run := buildAgentRun(input, workspace, config.Model)
 	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
 	result, err := executor.Execute(ctx, run, attempt)
 	if err != nil {
 		return nil, err
+	}
+	if result == nil {
+		return nil, productFailure("Agent runtime", errors.New("empty execution result"))
 	}
 	citations := []evidence.Citation{}
 	if result.Report != nil {
@@ -466,14 +549,39 @@ func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, co
 		if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
 			"total": len(citations), "valid": valid, "invalid": len(citations) - valid, "citations": citations,
 		}); err != nil {
-			return nil, err
+			return nil, productFailure("write citation result", err)
+		}
+		if len(citations) != 0 && valid != len(citations) {
+			return result, productFailure("citation validation", fmt.Errorf("%d of %d citations are invalid", len(citations)-valid, len(citations)))
 		}
 	} else if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
 		"total": 0, "valid": 0, "invalid": 0, "citations": []evidence.Citation{},
 	}); err != nil {
-		return nil, err
+		return nil, productFailure("write citation result", err)
 	}
 	return result, nil
+}
+
+func buildRetrievalQuery(input Input) string {
+	return strings.TrimSpace(strings.Join([]string{input.IssueTitle, input.IssueDescription, input.ErrorLog}, "\n"))
+}
+
+func searchInput(ctx context.Context, retriever retrieval.Retriever, input Input, snapshotID string, codeIndexBuildID, retrievalBuildID int64) (string, []retrieval.SearchResult, error) {
+	query := buildRetrievalQuery(input)
+	results, err := retriever.Search(ctx, retrieval.SearchRequest{
+		SnapshotID: snapshotID, CodeIndexBuildID: codeIndexBuildID, RetrievalBuildID: retrievalBuildID,
+		Query: query, TopK: 10,
+	})
+	return query, results, err
+}
+
+func buildAgentRun(input Input, workspace *productionWorkspace, model string) *diagnosis.DiagnosisRun {
+	return &diagnosis.DiagnosisRun{
+		ID: uuid.New().String(), RepositoryID: input.CaseID, SnapshotID: input.CaseID,
+		CodeIndexBuildID: workspace.CodeIndexBuildID, RetrievalBuildID: workspace.RetrievalBuildID,
+		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
+		Temperature: 0.1, ModelName: model, PromptVersion: "v2.1", AgentVersion: "v2.1",
+	}
 }
 
 func flattenCitations(report *evidence.DiagnosisReportData) []evidence.Citation {
@@ -589,6 +697,13 @@ func aggregateMetrics(cases []CaseStatus) Metrics {
 			metrics.InfraErrors++
 		case "PRODUCT_FAILURE":
 			metrics.ProductFailures++
+		}
+		if status.Status == "RETRIEVAL_COMPLETED_E2E_FAILURE" {
+			if status.ErrorClass == string(failureExternalInfra) {
+				metrics.InfraErrors++
+			} else {
+				metrics.ProductFailures++
+			}
 		}
 	}
 	if metrics.EvaluatedCases > 0 {

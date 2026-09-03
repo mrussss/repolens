@@ -7,6 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"repolens/internal/agent"
+	"repolens/internal/diagnosis"
+	"repolens/internal/llm"
+	"repolens/internal/retrieval"
 )
 
 func TestSyntheticRunnerKeepsGroundTruthOutOfPrediction(t *testing.T) {
@@ -51,6 +56,102 @@ func TestValidateRejectsGroundTruthSentinelInInput(t *testing.T) {
 	if _, err := Validate(root); err == nil || !strings.Contains(err.Error(), "leakage") {
 		t.Fatalf("expected leakage validation error, got %v", err)
 	}
+}
+
+func TestGroundTruthSentinelDoesNotReachRetriever(t *testing.T) {
+	truth := GroundTruth{ExpectedRootCause: "DO_NOT_LEAK_GROUND_TRUTH"}
+	input := Input{
+		IssueTitle: "request fails", IssueDescription: "the request returns an error", ErrorLog: "ERROR request failed",
+	}
+	if !strings.Contains(truth.ExpectedRootCause, "DO_NOT_LEAK_GROUND_TRUTH") {
+		t.Fatal("test truth sentinel was not initialized")
+	}
+	spy := &retrieverSpy{}
+	query, _, err := searchInput(context.Background(), spy, input, "snap-1", 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if query != spy.request.Query || strings.Contains(spy.request.Query, "DO_NOT_LEAK_GROUND_TRUTH") {
+		t.Fatalf("retriever received unexpected query: %q", spy.request.Query)
+	}
+}
+
+func TestGroundTruthSentinelDoesNotReachProvider(t *testing.T) {
+	truth := GroundTruth{ExpectedRootCause: "DO_NOT_LEAK_GROUND_TRUTH"}
+	input := Input{
+		CaseID: "REAL-999", IssueTitle: "request fails", IssueDescription: "the request returns an error", ErrorLog: "ERROR request failed",
+	}
+	if !strings.Contains(truth.ExpectedRootCause, "DO_NOT_LEAK_GROUND_TRUTH") {
+		t.Fatal("test truth sentinel was not initialized")
+	}
+	provider := &providerSpy{}
+	loop := agent.NewAgentLoop(provider, agent.NewToolRegistry(), nil, agent.DefaultGuardConfig())
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-leakage", RepositoryID: input.CaseID, SnapshotID: input.CaseID,
+		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
+	}
+	if _, err := loop.Run(context.Background(), run, &diagnosis.DiagnosisAttempt{ID: "attempt-leakage"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range provider.requests {
+		for _, message := range request.Messages {
+			if strings.Contains(message.Content, "DO_NOT_LEAK_GROUND_TRUTH") {
+				t.Fatalf("provider received evaluator-only sentinel in message: %q", message.Content)
+			}
+		}
+	}
+}
+
+func TestFailureClassificationKeepsExternalAndProductSeparate(t *testing.T) {
+	if status, class := classifyFailure(externalFailure("git fetch", os.ErrNotExist)); status != "INFRA_ERROR" || class != "EXTERNAL_INFRA" {
+		t.Fatalf("external failure classified as %s/%s", status, class)
+	}
+	if status, class := classifyFailure(productFailure("CodeIndex analysis", os.ErrInvalid)); status != "PRODUCT_FAILURE" || class != "REPOLENS_PRODUCT" {
+		t.Fatalf("product failure classified as %s/%s", status, class)
+	}
+	if class := errorClassFor(externalFailure("provider Generate", os.ErrDeadlineExceeded)); class != "EXTERNAL_INFRA" {
+		t.Fatalf("provider failure classified as %s", class)
+	}
+}
+
+func TestE2EStatusDistinguishesRequestedStates(t *testing.T) {
+	tests := []struct {
+		name       string
+		requested  bool
+		configured bool
+		want       string
+	}{
+		{name: "not requested", want: e2eNotRequested},
+		{name: "provider missing", requested: true, want: e2eNotRunProviderUnconfigured},
+		{name: "provider available starts as failure until completed", requested: true, configured: true, want: e2eFailure},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := e2eStatusFor(test.requested, test.configured); got != test.want {
+				t.Fatalf("e2e status = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+type retrieverSpy struct {
+	request retrieval.SearchRequest
+}
+
+func (s *retrieverSpy) Search(_ context.Context, request retrieval.SearchRequest) ([]retrieval.SearchResult, error) {
+	s.request = request
+	return nil, nil
+}
+
+type providerSpy struct {
+	requests []llm.GenerateRequest
+}
+
+func (s *providerSpy) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
+	s.requests = append(s.requests, request)
+	return llm.GenerateResponse{
+		Message: llm.Message{Role: llm.RoleAssistant, Content: `{"summary":"ok","root_cause":"input-only","findings":[],"recommended_checks":[],"confidence":0.1}`},
+	}, nil
 }
 
 type syntheticFetcher struct{}
