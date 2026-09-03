@@ -41,6 +41,14 @@ credentials.json
 *.swp
 *.swo
 *~
+
+# RealBench materialized source and run outputs
+.cache/realbench/
+artifacts/realbench/
+
+# RealBench materialized source and run outputs
+.cache/realbench/
+artifacts/realbench/
 repolens-api
 repolens-relay
 repolens-worker
