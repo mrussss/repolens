@@ -680,8 +680,16 @@ func normalizePath(path string) string {
 }
 
 func aggregateMetrics(cases []CaseStatus) Metrics {
-	metrics := Metrics{TotalCases: len(cases), CitationStatus: "NOT_RUN_RETRIEVAL_ONLY", RootCauseStatus: "NOT_RUN_PROVIDER_NOT_CONFIGURED"}
+	metrics := Metrics{TotalCases: len(cases), CitationStatus: "NOT_RUN_RETRIEVAL_ONLY", RootCauseStatus: e2eNotRequested}
 	for _, status := range cases {
+		switch status.E2EStatus {
+		case e2eNotRunProviderUnconfigured:
+			metrics.RootCauseStatus = e2eNotRunProviderUnconfigured
+		case e2eCompleted:
+			metrics.RootCauseStatus = e2eCompleted
+		case e2eFailure:
+			metrics.RootCauseStatus = e2eFailure
+		}
 		switch status.Status {
 		case "RETRIEVAL_COMPLETED_E2E_NOT_RUN", "RETRIEVAL_AND_E2E_COMPLETED", "RETRIEVAL_COMPLETED_E2E_FAILURE":
 			metrics.CompletedCases++

@@ -37,6 +37,9 @@ func TestSyntheticRunnerKeepsGroundTruthOutOfPrediction(t *testing.T) {
 	if result.Metrics.CompletedCases != 1 || result.Metrics.InfraErrors != 0 || result.Metrics.ProductFailures != 0 {
 		t.Fatalf("unexpected metrics: %+v", result.Metrics)
 	}
+	if result.Metadata.E2EStatus != e2eNotRequested || result.Cases[0].E2EStatus != e2eNotRequested {
+		t.Fatalf("unexpected not-requested E2E state: metadata=%s case=%s", result.Metadata.E2EStatus, result.Cases[0].E2EStatus)
+	}
 	data, err := os.ReadFile(filepath.Join(result.RunDir, "cases", "REAL-999", "prediction.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -112,6 +115,10 @@ func TestFailureClassificationKeepsExternalAndProductSeparate(t *testing.T) {
 	if class := errorClassFor(externalFailure("provider Generate", os.ErrDeadlineExceeded)); class != "EXTERNAL_INFRA" {
 		t.Fatalf("provider failure classified as %s", class)
 	}
+	provider := classifiedProvider{Provider: &errorProviderSpy{err: os.ErrDeadlineExceeded}}
+	if _, err := provider.Generate(context.Background(), llm.GenerateRequest{}); err == nil || errorClassFor(err) != "EXTERNAL_INFRA" {
+		t.Fatalf("provider wrapper did not preserve external classification: %v", err)
+	}
 }
 
 func TestE2EStatusDistinguishesRequestedStates(t *testing.T) {
@@ -145,6 +152,14 @@ func (s *retrieverSpy) Search(_ context.Context, request retrieval.SearchRequest
 
 type providerSpy struct {
 	requests []llm.GenerateRequest
+}
+
+type errorProviderSpy struct {
+	err error
+}
+
+func (s *errorProviderSpy) Generate(_ context.Context, _ llm.GenerateRequest) (llm.GenerateResponse, error) {
+	return llm.GenerateResponse{}, s.err
 }
 
 func (s *providerSpy) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
