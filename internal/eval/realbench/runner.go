@@ -16,10 +16,14 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	"repolens/internal/agent"
 	codeintel "repolens/internal/codeintel"
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
+	"repolens/internal/diagnosis"
+	"repolens/internal/evidence"
 	"repolens/internal/indexing"
+	"repolens/internal/llm"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/retrieval"
@@ -158,8 +162,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	}
 	gitCommit := currentGitCommit()
 	e2eStatus := "NOT_RUN_PROVIDER_NOT_CONFIGURED"
-	if opts.RunE2E {
-		e2eStatus = "NOT_RUN_PROVIDER_NOT_CONFIGURED"
+	providerConfig, providerConfigured := loadProviderConfig()
+	if opts.RunE2E && providerConfigured {
+		e2eStatus = "READY"
 	}
 	result := &RunResult{
 		RunDir: runDir,
@@ -177,6 +182,10 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			CaseCount:           len(caseInputs),
 			E2EStatus:           e2eStatus,
 		},
+	}
+	if opts.RunE2E && providerConfigured {
+		result.Metadata.Provider = "openai-compatible"
+		result.Metadata.Model = providerConfig.Model
 	}
 
 	for _, inputCase := range caseInputs {
@@ -218,14 +227,25 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			TopK:             10,
 		})
 		status.LatencyMs = time.Since(searchStarted).Milliseconds()
-		workspace.Close()
 		if searchErr != nil {
+			workspace.Close()
 			status.Status = "PRODUCT_FAILURE"
 			status.ErrorClass = "REPOLENS_PRODUCT"
 			status.Error = searchErr.Error()
 			result.Cases = append(result.Cases, status)
 			_ = writeJSON(filepath.Join(caseDir, "status.json"), status)
 			continue
+		}
+		caseE2EStatus := e2eStatus
+		var diagnosisResult *agent.ExecutionResult
+		var e2eErr error
+		if opts.RunE2E && providerConfigured {
+			diagnosisResult, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir)
+			if e2eErr != nil {
+				caseE2EStatus = "E2E_FAILURE"
+			} else {
+				caseE2EStatus = "E2E_COMPLETED"
+			}
 		}
 
 		prediction := Prediction{
@@ -237,18 +257,27 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			RetrievalStrategy: productionStrategy,
 			Top10:             top10,
 			LatencyMs:         status.LatencyMs,
-			E2EStatus:         e2eStatus,
+			E2EStatus:         caseE2EStatus,
+		}
+		if diagnosisResult != nil {
+			if err := writeJSON(filepath.Join(caseDir, "diagnosis.json"), diagnosisResult); err != nil {
+				workspace.Close()
+				return nil, fmt.Errorf("write %s diagnosis: %w", caseID, err)
+			}
 		}
 		// Persist the prediction before loading evaluator-only Ground Truth.
 		if err := writeJSON(filepath.Join(caseDir, "prediction.json"), prediction); err != nil {
+			workspace.Close()
 			return nil, fmt.Errorf("write %s prediction: %w", caseID, err)
 		}
 		if err := writeJSON(filepath.Join(caseDir, "retrieval_top10.json"), top10); err != nil {
+			workspace.Close()
 			return nil, fmt.Errorf("write %s retrieval results: %w", caseID, err)
 		}
 
 		truth, truthErr := r.Dataset.LoadGroundTruth(caseID)
 		if truthErr != nil {
+			workspace.Close()
 			status.Status = "PRODUCT_FAILURE"
 			status.ErrorClass = "REPOLENS_PRODUCT"
 			status.Error = truthErr.Error()
@@ -257,8 +286,17 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			continue
 		}
 		status.HitAt5, status.HitAt10, status.ReciprocalRank = retrievalMetrics(top10, truth.PrimaryFiles)
+		status.E2EStatus = caseE2EStatus
 		status.Status = "RETRIEVAL_COMPLETED_E2E_NOT_RUN"
+		if caseE2EStatus == "E2E_COMPLETED" {
+			status.Status = "RETRIEVAL_AND_E2E_COMPLETED"
+		} else if caseE2EStatus == "E2E_FAILURE" {
+			status.Status = "RETRIEVAL_COMPLETED_E2E_FAILURE"
+			status.ErrorClass = "EXTERNAL_INFRA"
+			status.Error = e2eErr.Error()
+		}
 		result.Cases = append(result.Cases, status)
+		workspace.Close()
 		if err := writeJSON(filepath.Join(caseDir, "status.json"), status); err != nil {
 			return nil, fmt.Errorf("write %s status: %w", caseID, err)
 		}
@@ -281,6 +319,8 @@ type productionWorkspace struct {
 	Retriever        *retrieval.ProductionRetriever
 	CodeIndexBuildID int64
 	RetrievalBuildID int64
+	SnapshotStore    snapshotstore.SnapshotStore
+	CodeIndexStore   codeintelstore.Store
 	db               *gorm.DB
 }
 
@@ -375,8 +415,73 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 		Retriever:        retrieval.NewProductionRetriever(ciStore, indexRoot),
 		CodeIndexBuildID: build.ID,
 		RetrievalBuildID: retrievalBuild.ID,
+		SnapshotStore:    snapshotStore,
+		CodeIndexStore:   ciStore,
 		db:               db,
 	}, nil
+}
+
+type providerConfig struct {
+	APIKey   string
+	BaseURL  string
+	Model    string
+	AuthMode string
+}
+
+func loadProviderConfig() (providerConfig, bool) {
+	config := providerConfig{
+		APIKey:   os.Getenv("REPOLENS_REALBENCH_API_KEY"),
+		BaseURL:  os.Getenv("REPOLENS_REALBENCH_BASE_URL"),
+		Model:    os.Getenv("REPOLENS_REALBENCH_MODEL"),
+		AuthMode: os.Getenv("REPOLENS_REALBENCH_AUTH_MODE"),
+	}
+	return config, config.BaseURL != "" && config.Model != ""
+}
+
+func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string) (*agent.ExecutionResult, error) {
+	provider := llm.NewOpenAICompatibleProviderWithAuthMode(config.APIKey, config.BaseURL, config.Model, config.AuthMode)
+	executor := agent.NewAgentRuntimeExecutor(provider, workspace.Retriever, workspace.SnapshotStore, nil, agent.DefaultGuardConfig()).WithCodeIntelStore(workspace.CodeIndexStore)
+	run := &diagnosis.DiagnosisRun{
+		ID: uuid.New().String(), RepositoryID: input.CaseID, SnapshotID: input.CaseID,
+		CodeIndexBuildID: workspace.CodeIndexBuildID, RetrievalBuildID: workspace.RetrievalBuildID,
+		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
+		Temperature: 0.1, ModelName: config.Model, PromptVersion: "v2.1", AgentVersion: "v2.1",
+	}
+	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
+	result, err := executor.Execute(ctx, run, attempt)
+	if err != nil {
+		return nil, err
+	}
+	citations := []evidence.Citation{}
+	if result.Report != nil {
+		citations = flattenCitations(result.Report)
+		validator := evidence.NewCitationValidator(workspace.SnapshotStore)
+		valid := 0
+		for i := range citations {
+			validator.Validate(ctx, input.CaseID, input.CaseID, &citations[i])
+			if citations[i].ValidationStatus == evidence.CitationValid {
+				valid++
+			}
+		}
+		if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
+			"total": len(citations), "valid": valid, "invalid": len(citations) - valid, "citations": citations,
+		}); err != nil {
+			return nil, err
+		}
+	} else if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
+		"total": 0, "valid": 0, "invalid": 0, "citations": []evidence.Citation{},
+	}); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func flattenCitations(report *evidence.DiagnosisReportData) []evidence.Citation {
+	var citations []evidence.Citation
+	for _, finding := range report.Findings {
+		citations = append(citations, finding.Citations...)
+	}
+	return citations
 }
 
 func ensureExactCheckout(ctx context.Context, cloneURL, commitSHA, sourceDir string) error {
@@ -470,7 +575,7 @@ func aggregateMetrics(cases []CaseStatus) Metrics {
 	metrics := Metrics{TotalCases: len(cases), CitationStatus: "NOT_RUN_RETRIEVAL_ONLY", RootCauseStatus: "NOT_RUN_PROVIDER_NOT_CONFIGURED"}
 	for _, status := range cases {
 		switch status.Status {
-		case "RETRIEVAL_COMPLETED_E2E_NOT_RUN":
+		case "RETRIEVAL_COMPLETED_E2E_NOT_RUN", "RETRIEVAL_AND_E2E_COMPLETED", "RETRIEVAL_COMPLETED_E2E_FAILURE":
 			metrics.CompletedCases++
 			metrics.EvaluatedCases++
 			if status.HitAt5 {
