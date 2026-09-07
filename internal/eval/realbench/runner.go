@@ -524,8 +524,21 @@ func (p classifiedProvider) Generate(ctx context.Context, request llm.GenerateRe
 }
 
 func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string) (*agent.ExecutionResult, error) {
-	provider := classifiedProvider{Provider: llm.NewOpenAICompatibleProviderWithAuthMode(config.APIKey, config.BaseURL, config.Model, config.AuthMode)}
-	executor := agent.NewAgentRuntimeExecutor(provider, workspace.Retriever, workspace.SnapshotStore, nil, agent.DefaultGuardConfig()).WithCodeIntelStore(workspace.CodeIndexStore)
+	providerClient := llm.NewOpenAICompatibleProviderWithAuthMode(
+		config.APIKey,
+		config.BaseURL,
+		config.Model,
+		config.AuthMode,
+	)
+	provider := classifiedProvider{Provider: providerClient}
+	executor := agent.NewAgentRuntimeExecutor(
+		provider,
+		workspace.Retriever,
+		workspace.SnapshotStore,
+		nil,
+		agent.DefaultGuardConfig(),
+	)
+	executor.WithCodeIntelStore(workspace.CodeIndexStore)
 	run := buildAgentRun(input, workspace, config.Model)
 	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
 	result, err := executor.Execute(ctx, run, attempt)

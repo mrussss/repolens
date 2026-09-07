@@ -87,20 +87,41 @@ func run() error {
 		cfg.ProviderType,
 		cfg.ProviderAuthMode,
 	)
-	diagnosisSvc := diagnosis.NewService(diagnosisStore, repoStore, snapshotStore).
-		WithCodeIntelStore(codeIntelStore)
+	diagnosisSvc := diagnosis.NewService(
+		diagnosisStore,
+		repoStore,
+		snapshotStore,
+	)
+	diagnosisSvc.WithCodeIntelStore(codeIntelStore)
 	diagnosisSvc.WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
 		status := providerMgr.GetPublicStatus()
 		return diagnosis.ProviderMetadata{
-			EndpointFingerprint: status.EndpointFingerprint, ConfigFingerprint: status.ConfigFingerprint,
-			NormalizedBaseURL: status.BaseURL, ModelName: status.Model,
-			PromptVersion: "v2.1", AgentVersion: "v2.1", AgentConfigHash: diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1), Temperature: 0.1,
+			EndpointFingerprint: status.EndpointFingerprint,
+			ConfigFingerprint:   status.ConfigFingerprint,
+			NormalizedBaseURL:   status.BaseURL,
+			ModelName:           status.Model,
+			PromptVersion:       "v2.1",
+			AgentVersion:        "v2.1",
+			AgentConfigHash:     diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1),
+			Temperature:         0.1,
 		}
 	})
 
 	// Handlers
-	repoHandler := repo.NewHandler(repoSvc, snapshotStore, indexStore, db.GormDB).WithSnapshotResolver(cloner, jobStore).WithSnapshotBasePath(cfg.SnapshotBasePath)
-	diagnosisHandler := diagnosis.NewHandler(diagnosisSvc, reportStore, citationStore, traceStore)
+	repoHandler := repo.NewHandler(
+		repoSvc,
+		snapshotStore,
+		indexStore,
+		db.GormDB,
+	)
+	repoHandler.WithSnapshotResolver(cloner, jobStore)
+	repoHandler.WithSnapshotBasePath(cfg.SnapshotBasePath)
+	diagnosisHandler := diagnosis.NewHandler(
+		diagnosisSvc,
+		reportStore,
+		citationStore,
+		traceStore,
+	)
 	providerHandler := provider.NewHandler(
 		providerMgr,
 		repoStore,
@@ -110,7 +131,12 @@ func run() error {
 		citationStore,
 		traceStore,
 		storeFS,
-	).WithDemoDependencies(db.GormDB, codeIntelStore, filepath.Join(cfg.SnapshotBasePath, "indexes"))
+	)
+	providerHandler.WithDemoDependencies(
+		db.GormDB,
+		codeIntelStore,
+		filepath.Join(cfg.SnapshotBasePath, "indexes"),
+	)
 	codeIntelHandler := codeintel.NewHandler(codeIntelStore, snapshotStore)
 
 	if cfg.Env == "production" {

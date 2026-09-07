@@ -68,7 +68,14 @@ func run() error {
 	if providerPath == "" {
 		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
 	}
-	providerMgr := provider.NewManagerWithAuthMode(providerPath, cfg.ProviderBaseURL, cfg.ProviderModel, cfg.ProviderAPIKey, cfg.ProviderType, cfg.ProviderAuthMode)
+	providerMgr := provider.NewManagerWithAuthMode(
+		providerPath,
+		cfg.ProviderBaseURL,
+		cfg.ProviderModel,
+		cfg.ProviderAPIKey,
+		cfg.ProviderType,
+		cfg.ProviderAuthMode,
+	)
 
 	// Pure Go Production Retrieval (BM25 + Structural Code Intelligence)
 	indexStorageDir := filepath.Join(cfg.SnapshotBasePath, "indexes")
@@ -84,7 +91,8 @@ func run() error {
 		storeFS,
 		traceStore,
 		agent.DefaultGuardConfig(),
-	).WithCodeIntelStore(codeIntelStore)
+	)
+	agentExecutor.WithCodeIntelStore(codeIntelStore)
 
 	// DB-backed Analysis Job Worker Runtime
 	jobsStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)
@@ -104,7 +112,12 @@ func run() error {
 		filter,
 		chunker,
 		nil,
-	).WithCodeIntelStore(codeIntelStore).WithResourceLimits(cfg.MaxRepoSizeMB*1024*1024, cfg.MaxFileCount)
+	)
+	snapshotJobHandler.WithCodeIntelStore(codeIntelStore)
+	snapshotJobHandler.WithResourceLimits(
+		cfg.MaxRepoSizeMB*1024*1024,
+		cfg.MaxFileCount,
+	)
 
 	codeIndexJobHandler := codeintel.NewCodeIndexJobHandler(
 		codeIntelStore,
