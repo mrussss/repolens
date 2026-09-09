@@ -1,4 +1,4 @@
-# RealBench v1
+# RealBench
 
 > `realbench-v1` 是第一版 pilot external benchmark，由 3 个真实 Go 项目历史 Bug 组成，用于验证完整外部评测链路，不代表大规模真实世界泛化结论。
 
@@ -32,3 +32,16 @@ go run ./cmd/realbench run --all --e2e
 ```
 
 真实 Agent E2E 的 pilot 记录见 [`results/v1-agent-e2e.md`](results/v1-agent-e2e.md)。其中的 API Key 只通过运行环境传入，不写入命令示例、Git 或 benchmark artifact；Retrieval 正式 baseline 仍见 [`results/v1-baseline.md`](results/v1-baseline.md)。
+
+## RealBench v2
+
+v2 使用独立的 `testdata/realbench/v2/` frozen dataset，包含 10 个来自 8 个公开 Go 仓库的真实历史 Bug；每个仓库最多 2 个 case。v1 的 3 个 case、输入、Ground Truth 和 manifest hash 完全保留。
+
+```bash
+go run ./cmd/realbench validate --dataset v2
+go run ./cmd/realbench run --dataset v2 --all
+```
+
+不传 `--dataset` 仍运行 v1，保持既有命令兼容。v2 离线 baseline 和真实 Provider E2E 证据分别见 [`results/v2-baseline.md`](results/v2-baseline.md) 与 [`results/v2-agent-e2e.md`](results/v2-agent-e2e.md)。
+
+`realbench-v1` 是第一版 pilot external benchmark，由 3 个真实 Go 项目历史 Bug 组成，用于验证完整外部评测链路，不代表大规模真实世界泛化结论；v2 同样是小规模外部历史 Bug 证据，不是 production accuracy 声明。

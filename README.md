@@ -75,6 +75,8 @@ docker compose build
 
 完整 release gate：`./scripts/release_gate.sh`。
 
+RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开仓库，Hit@5 `7/10`、Hit@10 `9/10`、MRR `0.724`。这是小规模 external benchmark，不是 production accuracy；完整方法、per-case rank 和 AnalysisQuality 见 [`docs/realbench/results/v2-baseline.md`](docs/realbench/results/v2-baseline.md)。真实 Provider Agent E2E 只记录选定 case 的证据和失败边界，见 [`docs/realbench/results/v2-agent-e2e.md`](docs/realbench/results/v2-agent-e2e.md)。
+
 ## 范围与限制
 
 - RepoLens v2.1 是 local single-user developer tool，不适合直接暴露到公网。
