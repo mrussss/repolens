@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -36,6 +37,27 @@ type Citation struct {
 	ValidationStatus CitationStatus `gorm:"size:32;not null;default:'UNCHECKED'" json:"validation_status"`
 	ValidationError  string         `gorm:"size:255" json:"validation_error,omitempty"`
 	CreatedAt        time.Time      `json:"created_at"`
+}
+
+// UnmarshalJSON accepts the concise "path" field used by the agent contract
+// as well as the persisted API field name "file_path".
+func (c *Citation) UnmarshalJSON(data []byte) error {
+	type citationAlias Citation
+	var decoded citationAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var legacy struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	*c = Citation(decoded)
+	if c.FilePath == "" {
+		c.FilePath = legacy.Path
+	}
+	return nil
 }
 
 type CitationStore interface {

@@ -55,7 +55,13 @@ Rules:
   ],
   "confidence": 0.95
 }
-Do not wrap the JSON with markdown backticks if possible, or output strictly parseable JSON.`
+Do not wrap the JSON with markdown backticks if possible, or output strictly parseable JSON.
+
+Citation requirements:
+- Use a repository-relative file path in each citation's path field.
+- Copy excerpt verbatim from one contiguous range of that file; do not use ellipses, placeholders, or paraphrases.
+- Keep the cited line range tight enough that the excerpt matches the exact source lines.
+`
 
 type LoopResult struct {
 	Report             *evidence.DiagnosisReportData

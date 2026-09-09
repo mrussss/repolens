@@ -2,6 +2,7 @@ package evidence_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,24 @@ import (
 	"repolens/internal/evidence"
 	"repolens/internal/platform/snapshotstore"
 )
+
+func TestCitationAcceptsAgentPathField(t *testing.T) {
+	var citation evidence.Citation
+	if err := json.Unmarshal([]byte(`{"path":"middleware/wrap_writer.go","start_line":10,"end_line":12}`), &citation); err != nil {
+		t.Fatalf("failed to decode agent citation: %v", err)
+	}
+	if citation.FilePath != "middleware/wrap_writer.go" {
+		t.Fatalf("file path = %q, want middleware/wrap_writer.go", citation.FilePath)
+	}
+
+	var canonical evidence.Citation
+	if err := json.Unmarshal([]byte(`{"file_path":"canonical.go","start_line":1,"end_line":1}`), &canonical); err != nil {
+		t.Fatalf("failed to decode canonical citation: %v", err)
+	}
+	if canonical.FilePath != "canonical.go" {
+		t.Fatalf("canonical file path = %q, want canonical.go", canonical.FilePath)
+	}
+}
 
 func TestCitationVerification(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "repolens_cit_test")
