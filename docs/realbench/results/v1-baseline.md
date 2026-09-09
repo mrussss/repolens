@@ -6,12 +6,15 @@
 
 - Dataset: `realbench-v1`
 - Manifest hash: `5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf`
-- RepoLens commit: `d457c75f8d28316646adfcd78cfbdf18e5b1b1c3`
-- Run ID: `20260903T104922Z-3e07e8cd`
+- RepoLens commit: `eaf5df8a55a3af3cbb2dc4e75cf719e436c754ca`
+- Run ID: `20260909T055744Z-eca68245`
 - Command: `go run ./cmd/realbench run --all`
 - Retrieval: `symbol_bm25_structural` — current Pure Go BM25 + Structural Retrieval
 - Retrieval / index version: `v2.1.0` / `v2.1.0`
 - E2E: `NOT_REQUESTED`
+- Quality artifacts: per-case `analysis_quality.json` and run-level `analysis_quality_summary.csv`
+- Environment: `go1.22.12`, `linux/amd64`, provider timeout `60s`, temperature `0.1`
+- Tracked worktree: clean at the recorded commit; the user-requested untracked root development MD remains intentionally excluded.
 
 ## Summary
 
@@ -31,8 +34,20 @@
 | Case | Repository | Top-10 primary-file rank | Hit@5 | Hit@10 | Latency |
 |---|---|---:|---:|---:|---:|
 | REAL-001 | go-chi/chi | 1 | yes | yes | 12 ms |
-| REAL-002 | spf13/cobra | 3 | yes | yes | 16 ms |
-| REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 3 ms |
+| REAL-002 | spf13/cobra | 3 | yes | yes | 22 ms |
+| REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 4 ms |
+
+## Code Intelligence quality
+
+The raw per-case quality files and CSV summary are stored in the run artifact directory. The current run reports the following completeness and uncertainty distribution:
+
+| Case | Files parsed / total | Packages typechecked / total | Symbols | Semantic relations | Unresolved relations | Related tests | Parse rate | Typecheck rate |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| REAL-001 | 66 / 67 | 11 / 12 | 357 | 1195 | 1778 | 12065 | 98.5% | 91.7% |
+| REAL-002 | 35 / 36 | 0 / 2 | 613 | 2267 | 1524 | 74484 | 97.2% | 0.0% |
+| REAL-003 | 4 / 4 | 0 / 1 | 77 | 176 | 372 | 1395 | 100.0% | 0.0% |
+
+这些质量指标保留 type-check 不完整和 unresolved 分布，不将静态分析结果包装成完整 runtime call graph。
 
 ## Failure analysis
 
