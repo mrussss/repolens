@@ -96,8 +96,8 @@ func (h *Handler) List(c *gin.Context) {
 	userID := c.GetString(string(logger.UserIDKey))
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-
-	repos, total, err := h.repoSvc.List(c.Request.Context(), userID, page, pageSize)
+	status := c.Query("status")
+	repos, total, err := h.repoSvc.List(c.Request.Context(), userID, page, pageSize, status)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

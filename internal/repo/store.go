@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -15,7 +16,7 @@ type Store interface {
 	Create(ctx context.Context, r *Repository) error
 	GetByID(ctx context.Context, id string) (*Repository, error)
 	GetByIDAndUser(ctx context.Context, id, userID string) (*Repository, error)
-	ListByUser(ctx context.Context, userID string, page, pageSize int) ([]Repository, int64, error)
+	ListByUser(ctx context.Context, userID string, page, pageSize int, status string) ([]Repository, int64, error)
 	Update(ctx context.Context, r *Repository) error
 }
 
@@ -50,7 +51,7 @@ func (s *GormStore) GetByIDAndUser(ctx context.Context, id, userID string) (*Rep
 	return &r, nil
 }
 
-func (s *GormStore) ListByUser(ctx context.Context, userID string, page, pageSize int) ([]Repository, int64, error) {
+func (s *GormStore) ListByUser(ctx context.Context, userID string, page, pageSize int, status string) ([]Repository, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -63,6 +64,9 @@ func (s *GormStore) ListByUser(ctx context.Context, userID string, page, pageSiz
 	var total int64
 
 	tx := s.db.WithContext(ctx).Model(&Repository{}).Where("user_id = ? AND status != ?", userID, StatusDeleted)
+	if status != "" {
+		tx = tx.Where("status = ?", status)
+	}
 	if err := tx.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
@@ -89,7 +93,7 @@ func NewService(store Store) *Service {
 }
 
 func (s *Service) Register(ctx context.Context, userID, name, gitURL, defaultRef string) (*Repository, error) {
-	if defaultRef == "" {
+	if strings.TrimSpace(defaultRef) == "" {
 		defaultRef = "main"
 	}
 	r := &Repository{
@@ -117,6 +121,6 @@ func (s *Service) Get(ctx context.Context, id, userID string) (*Repository, erro
 	return r, nil
 }
 
-func (s *Service) List(ctx context.Context, userID string, page, pageSize int) ([]Repository, int64, error) {
-	return s.store.ListByUser(ctx, userID, page, pageSize)
+func (s *Service) List(ctx context.Context, userID string, page, pageSize int, status string) ([]Repository, int64, error) {
+	return s.store.ListByUser(ctx, userID, page, pageSize, status)
 }
