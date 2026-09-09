@@ -6,15 +6,15 @@
 
 - Dataset: `realbench-v1`
 - Manifest hash: `5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf`
-- RepoLens commit: `eaf5df8a55a3af3cbb2dc4e75cf719e436c754ca`
-- Run ID: `20260909T055744Z-eca68245`
+- RepoLens commit: `7b49389a08b20a7b4d164b187f05036333867487`
+- Run ID: `20260909T095538Z-497061ac`
 - Command: `go run ./cmd/realbench run --all`
 - Retrieval: `symbol_bm25_structural` — current Pure Go BM25 + Structural Retrieval
 - Retrieval / index version: `v2.1.0` / `v2.1.0`
 - E2E: `NOT_REQUESTED`
 - Quality artifacts: per-case `analysis_quality.json` and run-level `analysis_quality_summary.csv`
 - Environment: `go1.22.12`, `linux/amd64`, provider timeout `60s`, temperature `0.1`
-- Tracked worktree: clean at the recorded commit; the user-requested untracked root development MD remains intentionally excluded.
+- Working tree: tracked files were clean; `working_tree_clean` in the artifact is `false` only because the user-requested untracked root development MD remains intentionally excluded.
 
 ## Summary
 
@@ -33,8 +33,8 @@
 
 | Case | Repository | Top-10 primary-file rank | Hit@5 | Hit@10 | Latency |
 |---|---|---:|---:|---:|---:|
-| REAL-001 | go-chi/chi | 1 | yes | yes | 12 ms |
-| REAL-002 | spf13/cobra | 3 | yes | yes | 22 ms |
+| REAL-001 | go-chi/chi | 1 | yes | yes | 15 ms |
+| REAL-002 | spf13/cobra | 3 | yes | yes | 21 ms |
 | REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 4 ms |
 
 ## Code Intelligence quality
@@ -54,3 +54,7 @@ The raw per-case quality files and CSV summary are stored in the run artifact di
 本次没有 Retrieval failure、Infra Error 或 Product Failure，因此没有隐藏失败 case。REAL-002 的 primary file 排名为 3，仍命中 Hit@5，但相较另外两个 case 需要更多候选排序空间；这个观察仅记录为后续 benchmark 证据，不在本任务中修改检索算法。
 
 本次没有请求 E2E（`--e2e` 未传），因此没有生成真实 Agent diagnosis、Citation validity 或 Root Cause Correct/Partial/Incorrect 分数；FakeProvider 不作为公开 E2E 成绩。若请求 E2E 但未配置 provider，状态会单独记录为 `NOT_RUN_PROVIDER_NOT_CONFIGURED`。
+
+## Agent E2E
+
+真实 Provider 的 Agent E2E 见 [v1-agent-e2e.md](v1-agent-e2e.md)。本文件的 headline 数字仍只代表无 Provider 依赖的 Retrieval baseline，不把小样本 Agent 试跑结果合并进 Retrieval 指标。

@@ -30,3 +30,5 @@ export REPOLENS_REALBENCH_API_KEY=your-key
 export REPOLENS_REALBENCH_AUTH_MODE=bearer  # 或 none
 go run ./cmd/realbench run --all --e2e
 ```
+
+真实 Agent E2E 的 pilot 记录见 [`results/v1-agent-e2e.md`](results/v1-agent-e2e.md)。其中的 API Key 只通过运行环境传入，不写入命令示例、Git 或 benchmark artifact；Retrieval 正式 baseline 仍见 [`results/v1-baseline.md`](results/v1-baseline.md)。
