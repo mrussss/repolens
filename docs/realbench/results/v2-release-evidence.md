@@ -3,7 +3,7 @@
 ## Freeze identity
 
 - Final code-under-test commit: `80f73597787393fe9f358380da5eb9c9979a4a1c`
-- Final evidence commit: `TBD` (this document is finalized in a docs-only follow-up)
+- Final evidence commit: the final docs-only commit pointed to by tag `v2.1-final-evidence` (the exact self-referential SHA is recorded in the final handoff).
 - Working tree: clean at benchmark and gate execution; the user-requested root development MD is local-only and excluded through `.git/info/exclude`.
 - Final tag: `v2.1-final-evidence` is created only after the evidence commit is finalized.
 
