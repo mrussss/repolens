@@ -38,6 +38,7 @@ COPY --from=web-builder /web/dist /app/web/dist
 COPY migrations /app/migrations
 
 VOLUME /data/repositories
+VOLUME /data/secrets
 
 EXPOSE 8080
 CMD ["/app/repolens-api"]

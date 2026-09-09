@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -32,7 +33,7 @@ func Load() *Config {
 		HTTPPort:               getEnv("HTTP_PORT", "8080"),
 		DBDriver:               getEnv("DB_DRIVER", "sqlite"),
 		DSN:                    getEnv("DB_DSN", "repolens.db"),
-		SnapshotBasePath:       getEnv("SNAPSHOT_BASE_PATH", "/data/repositories"),
+		SnapshotBasePath:       getEnv("SNAPSHOT_BASE_PATH", defaultSnapshotBasePath()),
 		AllowHosts:             splitHosts(getEnv("GIT_ALLOWED_HOSTS", "github.com")),
 		MaxRepoSizeMB:          getEnvInt64("MAX_REPO_SIZE_MB", 50),
 		MaxFileCount:           getEnvInt("MAX_FILE_COUNT", 2000),
@@ -43,9 +44,31 @@ func Load() *Config {
 		ProviderModel:          getEnv("REPOLENS_PROVIDER_MODEL", "gpt-4o"),
 		ProviderAuthMode:       getEnv("REPOLENS_PROVIDER_AUTH_MODE", "bearer"),
 		ProviderTimeoutSeconds: getEnvPositiveInt("REPOLENS_PROVIDER_TIMEOUT_SECONDS", 60),
-		ProviderSecretPath:     getEnv("PROVIDER_SECRET_PATH", ""),
+		ProviderSecretPath:     getEnv("PROVIDER_SECRET_PATH", defaultProviderSecretPath()),
 		RetrievalStrategy:      getEnv("RETRIEVAL_STRATEGY", "symbol_bm25_structural"),
 	}
+}
+
+func defaultSnapshotBasePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return filepath.Join(".", ".repolens", "repositories")
+	}
+	return filepath.Join(home, ".repolens", "repositories")
+}
+
+// DefaultSnapshotBasePath returns the writable local snapshot directory used
+// when an embedding application does not provide an explicit path.
+func DefaultSnapshotBasePath() string {
+	return defaultSnapshotBasePath()
+}
+
+func defaultProviderSecretPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return filepath.Join(".", ".repolens", "secrets", "provider.json")
+	}
+	return filepath.Join(home, ".repolens", "secrets", "provider.json")
 }
 
 func getEnvPositiveInt(key string, defaultVal int) int {

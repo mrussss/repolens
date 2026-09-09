@@ -31,12 +31,12 @@ services:
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - SNAPSHOT_BASE_PATH=/data/repositories
-      - PROVIDER_SECRET_PATH=/repolens-secrets/provider.json
+      - PROVIDER_SECRET_PATH=/data/secrets/provider.json
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - snapshot_data:/data/repositories
-      - provider_secrets:/repolens-secrets
+      - provider_secrets:/data/secrets
     depends_on:
       mysql:
         condition: service_healthy
@@ -53,10 +53,10 @@ services:
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - SNAPSHOT_BASE_PATH=/data/repositories
-      - PROVIDER_SECRET_PATH=/repolens-secrets/provider.json
+      - PROVIDER_SECRET_PATH=/data/secrets/provider.json
     volumes:
       - snapshot_data:/data/repositories
-      - provider_secrets:/repolens-secrets
+      - provider_secrets:/data/secrets
     depends_on:
       mysql:
         condition: service_healthy

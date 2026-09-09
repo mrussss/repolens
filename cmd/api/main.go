@@ -75,12 +75,8 @@ func run() error {
 
 	// Services & Managers
 	repoSvc := repo.NewService(repoStore)
-	providerPath := cfg.ProviderSecretPath
-	if providerPath == "" {
-		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
-	}
 	providerMgr := provider.NewManagerWithAuthModeAndTimeout(
-		providerPath,
+		cfg.ProviderSecretPath,
 		cfg.ProviderBaseURL,
 		cfg.ProviderModel,
 		cfg.ProviderAPIKey,

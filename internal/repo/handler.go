@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"repolens/internal/jobs"
+	"repolens/internal/platform/config"
 	"repolens/internal/platform/logger"
 	"repolens/internal/repoindex"
 	"repolens/internal/snapshot"
@@ -156,7 +157,7 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 	snapID := uuid.New().String()
 	basePath := h.snapshotBasePath
 	if basePath == "" {
-		basePath = "/data/repositories"
+		basePath = config.DefaultSnapshotBasePath()
 	}
 	matPath := filepath.Join(basePath, repoID, snapID, "source")
 

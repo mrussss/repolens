@@ -64,12 +64,8 @@ func run() error {
 	traceStore := trace.NewStore(db.GormDB)
 	citationVal := evidence.NewCitationValidator(storeFS)
 
-	providerPath := cfg.ProviderSecretPath
-	if providerPath == "" {
-		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
-	}
 	providerMgr := provider.NewManagerWithAuthModeAndTimeout(
-		providerPath,
+		cfg.ProviderSecretPath,
 		cfg.ProviderBaseURL,
 		cfg.ProviderModel,
 		cfg.ProviderAPIKey,

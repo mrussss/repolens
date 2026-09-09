@@ -41,6 +41,11 @@ type PublicProviderStatus struct {
 	UpdatedAt           string `json:"updated_at,omitempty"`
 }
 
+var (
+	ErrInvalidProviderConfig    = errors.New("invalid provider configuration")
+	ErrProviderConfigSaveFailed = errors.New("failed to save provider configuration")
+)
+
 // NormalizeBaseURL normalizes an OpenAI-compatible Base URL according to Master Spec rules:
 // - trim spaces
 // - lowercase scheme + host
@@ -156,7 +161,7 @@ func NewManagerWithAuthMode(secretFilePath, envBaseURL, envModel, envAPIKey, env
 // environment auth mode and provider request timeout.
 func NewManagerWithAuthModeAndTimeout(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, authMode string, providerTimeout time.Duration) *Manager {
 	if secretFilePath == "" {
-		secretFilePath = "/data/provider.json"
+		secretFilePath = defaultProviderSecretPath()
 	}
 	if providerTimeout <= 0 {
 		providerTimeout = 60 * time.Second
@@ -270,16 +275,16 @@ func (m *Manager) SaveConfigWithAuthMode(baseURL, model, apiKey, authMode string
 
 	normalizedBase, err := NormalizeBaseURL(baseURL)
 	if err != nil {
-		return fmt.Errorf("invalid base_url: %w", err)
+		return fmt.Errorf("%w: invalid base_url: %v", ErrInvalidProviderConfig, err)
 	}
 
 	trimmedModel := strings.TrimSpace(model)
 	if trimmedModel == "" {
-		return errors.New("model cannot be empty")
+		return fmt.Errorf("%w: model cannot be empty", ErrInvalidProviderConfig)
 	}
 	authMode = normalizeAuthMode(authMode)
 	if authMode == "bearer" && strings.TrimSpace(apiKey) == "" && !isDemo {
-		return errors.New("API key cannot be empty when bearer authentication is selected")
+		return fmt.Errorf("%w: API key cannot be empty when bearer authentication is selected", ErrInvalidProviderConfig)
 	}
 
 	cfg := ProviderConfig{
@@ -293,28 +298,39 @@ func (m *Manager) SaveConfigWithAuthMode(baseURL, model, apiKey, authMode string
 
 	dir := filepath.Dir(m.secretFilePath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("failed creating secrets directory: %w", err)
+		return fmt.Errorf("%w: failed creating secrets directory: %v", ErrProviderConfigSaveFailed, err)
 	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: marshal provider configuration: %v", ErrProviderConfigSaveFailed, err)
 	}
 
 	tmpFile := fmt.Sprintf("%s.tmp.%d", m.secretFilePath, time.Now().UnixNano())
 	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
-		return fmt.Errorf("failed writing tmp secret file: %w", err)
+		return fmt.Errorf("%w: failed writing temporary secret file: %v", ErrProviderConfigSaveFailed, err)
 	}
 
 	// Ensure 0600 permission
-	_ = os.Chmod(tmpFile, 0600)
+	if err := os.Chmod(tmpFile, 0600); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("%w: failed setting secret file permissions: %v", ErrProviderConfigSaveFailed, err)
+	}
 
 	if err := os.Rename(tmpFile, m.secretFilePath); err != nil {
 		_ = os.Remove(tmpFile)
-		return fmt.Errorf("failed committing secret file atomically: %w", err)
+		return fmt.Errorf("%w: failed committing secret file atomically: %v", ErrProviderConfigSaveFailed, err)
 	}
 
 	return nil
+}
+
+func defaultProviderSecretPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return filepath.Join(".", ".repolens", "secrets", "provider.json")
+	}
+	return filepath.Join(home, ".repolens", "secrets", "provider.json")
 }
 
 // ClearConfig removes the locally persisted credential without touching env

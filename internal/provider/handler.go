@@ -3,6 +3,7 @@ package provider
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
+	"repolens/internal/platform/logger"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
 	"repolens/internal/snapshot"
@@ -90,11 +92,14 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 
 	newBase, err := NormalizeBaseURL(req.BaseURL)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":  "INVALID_PROVIDER_CONFIG",
+			"error": "invalid provider configuration",
+		})
 		return
 	}
 	current := h.mgr.GetPublicStatus()
-	if current.EndpointFingerprint != "" && ComputeEndpointFingerprint(newBase) != current.EndpointFingerprint {
+	if h.diagnosisStore != nil && current.EndpointFingerprint != "" && ComputeEndpointFingerprint(newBase) != current.EndpointFingerprint {
 		userID := c.GetString("user_id")
 		if runs, _, listErr := h.diagnosisStore.ListByUser(c.Request.Context(), userID, 1, 100); listErr == nil {
 			for _, run := range runs {
@@ -106,7 +111,18 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 		}
 	}
 	if err := h.mgr.SaveConfigWithAuthMode(newBase, req.Model, req.APIKey, req.AuthMode, false); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		if errors.Is(err, ErrInvalidProviderConfig) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":  "INVALID_PROVIDER_CONFIG",
+				"error": "invalid provider configuration",
+			})
+			return
+		}
+		logger.L(c.Request.Context()).Error("failed to save provider configuration", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":  "PROVIDER_CONFIG_SAVE_FAILED",
+			"error": "failed to save provider configuration",
+		})
 		return
 	}
 

@@ -64,7 +64,7 @@ func TestFingerprintCalculations(t *testing.T) {
 
 func TestAtomicSecretPersistence(t *testing.T) {
 	tempDir := t.TempDir()
-	secretFile := filepath.Join(tempDir, "provider.json")
+	secretFile := filepath.Join(tempDir, "secrets", "provider.json")
 
 	mgr := provider.NewManager(secretFile, "", "", "", "")
 
@@ -89,6 +89,13 @@ func TestAtomicSecretPersistence(t *testing.T) {
 	if perm != 0600 {
 		t.Errorf("expected 0600 permissions, got %o", perm)
 	}
+	secretDirInfo, err := os.Stat(filepath.Dir(secretFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secretDirInfo.Mode().Perm()&0077 != 0 {
+		t.Errorf("secret directory is too broad: %o", secretDirInfo.Mode().Perm())
+	}
 
 	// 4. Verify public status does not leak secret
 	statusAfter := mgr.GetPublicStatus()
@@ -106,6 +113,20 @@ func TestAtomicSecretPersistence(t *testing.T) {
 	sec, err := mgr.GetSecretConfig()
 	if err != nil || sec.APIKey != "sk-secret123456" {
 		t.Errorf("failed retrieving secret config: %v", err)
+	}
+}
+
+func TestManagerDefaultSecretPathUsesUserHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	mgr := provider.NewManager("", "", "", "", "")
+	if err := mgr.SaveConfig("https://api.openai.com/v1", "model", "secret-token", false); err != nil {
+		t.Fatalf("SaveConfig with default path failed: %v", err)
+	}
+	path := filepath.Join(home, ".repolens", "secrets", "provider.json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("default provider secret path %q was not created: %v", path, err)
 	}
 }
 
