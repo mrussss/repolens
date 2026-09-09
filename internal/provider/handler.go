@@ -134,7 +134,11 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 
 func (h *Handler) ClearConfig(c *gin.Context) {
 	if err := h.mgr.ClearConfig(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logger.L(c.Request.Context()).Error("failed to clear provider configuration", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":  "PROVIDER_CONFIG_CLEAR_FAILED",
+			"error": "failed to clear provider configuration",
+		})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "provider configuration cleared", "status": h.mgr.GetPublicStatus()})

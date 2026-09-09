@@ -45,8 +45,35 @@ func TestSaveConfigValidationHasStableHTTPError(t *testing.T) {
 	}
 }
 
+func TestClearConfigFilesystemFailureHasSafeHTTPError(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "secrets", "provider.json")
+	if err := os.MkdirAll(target, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "sentinel"), []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := provider.NewHandler(provider.NewManager(target, "", "", "", ""), nil, nil, nil, nil, nil, nil, nil)
+	router := gin.New()
+	router.DELETE("/settings/provider", handler.ClearConfig)
+	response := performProviderRequestWithMethod(router, http.MethodDelete, "")
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500: %s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "PROVIDER_CONFIG_CLEAR_FAILED") || strings.Contains(body, "secrets") || strings.Contains(body, "provider.json") || strings.Contains(body, "permission denied") {
+		t.Fatalf("unsafe clear error response: %s", body)
+	}
+}
+
 func performProviderRequest(router http.Handler, body string) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(http.MethodPost, "/settings/provider", bytes.NewBufferString(body))
+	return performProviderRequestWithMethod(router, http.MethodPost, body)
+}
+
+func performProviderRequestWithMethod(router http.Handler, method, body string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, "/settings/provider", bytes.NewBufferString(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)

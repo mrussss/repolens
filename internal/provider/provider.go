@@ -42,8 +42,9 @@ type PublicProviderStatus struct {
 }
 
 var (
-	ErrInvalidProviderConfig    = errors.New("invalid provider configuration")
-	ErrProviderConfigSaveFailed = errors.New("failed to save provider configuration")
+	ErrInvalidProviderConfig     = errors.New("invalid provider configuration")
+	ErrProviderConfigSaveFailed  = errors.New("failed to save provider configuration")
+	ErrProviderConfigClearFailed = errors.New("failed to clear provider configuration")
 )
 
 // NormalizeBaseURL normalizes an OpenAI-compatible Base URL according to Master Spec rules:
@@ -300,6 +301,9 @@ func (m *Manager) SaveConfigWithAuthMode(baseURL, model, apiKey, authMode string
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("%w: failed creating secrets directory: %v", ErrProviderConfigSaveFailed, err)
 	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("%w: failed setting secrets directory permissions: %v", ErrProviderConfigSaveFailed, err)
+	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -339,7 +343,7 @@ func (m *Manager) ClearConfig() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := os.Remove(m.secretFilePath); err != nil && !os.IsNotExist(err) {
-		return err
+		return fmt.Errorf("%w: %v", ErrProviderConfigClearFailed, err)
 	}
 	return nil
 }

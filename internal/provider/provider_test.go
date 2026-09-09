@@ -116,6 +116,64 @@ func TestAtomicSecretPersistence(t *testing.T) {
 	}
 }
 
+func TestSaveConfigTightensExistingSecretDirectoryPermissions(t *testing.T) {
+	tempDir := t.TempDir()
+	secretDir := filepath.Join(tempDir, "secrets")
+	if err := os.MkdirAll(secretDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secretDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	secretFile := filepath.Join(secretDir, "provider.json")
+	mgr := provider.NewManager(secretFile, "", "", "", "")
+	if err := mgr.SaveConfig("https://api.openai.com/v1", "model", "secret-token", false); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	info, err := os.Stat(secretDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0700 {
+		t.Fatalf("secret directory mode = %o, want 0700", info.Mode().Perm())
+	}
+}
+
+func TestProviderConfigPersistsAcrossManagerRestart(t *testing.T) {
+	secretFile := filepath.Join(t.TempDir(), "repolens", "secrets", "provider.json")
+
+	managerA := provider.NewManager(secretFile, "", "", "", "")
+	if err := managerA.SaveConfigWithAuthMode("https://api.example.com/v1", "restart-model", "dummy-key", "bearer", false); err != nil {
+		t.Fatalf("manager A SaveConfig failed: %v", err)
+	}
+
+	managerB := provider.NewManager(secretFile, "", "", "", "")
+	status := managerB.GetPublicStatus()
+	if !status.IsConfigured || status.BaseURL != "https://api.example.com/v1" || status.Model != "restart-model" || status.AuthMode != "bearer" {
+		t.Fatalf("unexpected persisted public status: %+v", status)
+	}
+	secret, err := managerB.GetSecretConfig()
+	if err != nil {
+		t.Fatalf("manager B GetSecretConfig failed: %v", err)
+	}
+	if secret.APIKey != "dummy-key" {
+		t.Fatalf("manager B read API key %q, want dummy-key", secret.APIKey)
+	}
+
+	if err := managerB.ClearConfig(); err != nil {
+		t.Fatalf("manager B ClearConfig failed: %v", err)
+	}
+	managerC := provider.NewManager(secretFile, "", "", "", "")
+	if managerC.GetPublicStatus().IsConfigured {
+		t.Fatal("manager C should be unconfigured after clear")
+	}
+	if _, err := managerC.GetSecretConfig(); err == nil {
+		t.Fatal("manager C should not read cleared provider configuration")
+	}
+}
+
 func TestManagerDefaultSecretPathUsesUserHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
