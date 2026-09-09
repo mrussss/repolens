@@ -2,13 +2,16 @@ package realbench
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,6 +132,14 @@ type RunMetadata struct {
 	Timestamp           time.Time `json:"timestamp"`
 	CaseCount           int       `json:"case_count"`
 	E2EStatus           string    `json:"e2e_status"`
+	WorkingTreeClean    bool      `json:"working_tree_clean"`
+	GoVersion           string    `json:"go_version"`
+	OS                  string    `json:"os"`
+	Arch                string    `json:"arch"`
+	ProviderTimeoutSec  int       `json:"provider_timeout_seconds,omitempty"`
+	Temperature         float64   `json:"temperature,omitempty"`
+	ReasoningEffort     string    `json:"reasoning_effort,omitempty"`
+	ResponseFormat      string    `json:"response_format,omitempty"`
 }
 
 type Prediction struct {
@@ -177,6 +188,29 @@ type RunResult struct {
 	Cases    []CaseStatus `json:"cases"`
 	Metrics  Metrics      `json:"metrics"`
 	RunDir   string       `json:"-"`
+}
+
+type analysisQualityArtifact struct {
+	FilesTotal          int      `json:"files_total"`
+	FilesParsed         int      `json:"files_parsed"`
+	FilesFailed         int      `json:"files_failed"`
+	ParseRate           float64  `json:"parse_rate"`
+	PackagesTotal       int      `json:"packages_total"`
+	PackagesTypechecked int      `json:"packages_typechecked"`
+	PackagesFailed      int      `json:"packages_failed"`
+	TypecheckRate       float64  `json:"typecheck_rate"`
+	SymbolsTotal        int      `json:"symbols_total"`
+	SemanticRelations   int      `json:"semantic_relations"`
+	SyntacticRelations  int      `json:"syntactic_relations"`
+	HeuristicRelations  int      `json:"heuristic_relations"`
+	UnresolvedRelations int      `json:"unresolved_relations"`
+	RelatedTestsFound   int      `json:"related_tests_found"`
+	Warnings            []string `json:"warnings"`
+}
+
+type analysisQualityRow struct {
+	CaseID string
+	analysisQualityArtifact
 }
 
 type Runner struct {
@@ -253,8 +287,15 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			Timestamp:           time.Now().UTC(),
 			CaseCount:           len(caseInputs),
 			E2EStatus:           e2eStatus,
+			WorkingTreeClean:    workingTreeClean(),
+			GoVersion:           runtime.Version(),
+			OS:                  runtime.GOOS,
+			Arch:                runtime.GOARCH,
+			ProviderTimeoutSec:  providerTimeoutSeconds(),
+			Temperature:         0.1,
 		},
 	}
+	qualityRows := make([]analysisQualityRow, 0, len(caseInputs))
 	if opts.RunE2E && providerConfigured {
 		result.Metadata.Provider = "openai-compatible"
 		result.Metadata.Model = providerConfig.Model
@@ -286,6 +327,12 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			result.Cases = append(result.Cases, status)
 			_ = writeJSON(filepath.Join(caseDir, "status.json"), status)
 			continue
+		}
+		quality := makeAnalysisQualityArtifact(workspace.Quality, workspace.RelatedTestsFound)
+		qualityRows = append(qualityRows, analysisQualityRow{CaseID: caseID, analysisQualityArtifact: quality})
+		if err := writeJSON(filepath.Join(caseDir, "analysis_quality.json"), quality); err != nil {
+			workspace.Close()
+			return nil, fmt.Errorf("write %s analysis quality: %w", caseID, err)
 		}
 
 		searchStarted := time.Now()
@@ -376,6 +423,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	}
 
 	result.Metrics = aggregateMetrics(result.Cases)
+	if err := writeAnalysisQualitySummary(filepath.Join(runDir, "analysis_quality_summary.csv"), qualityRows); err != nil {
+		return nil, err
+	}
 	if err := writeJSON(filepath.Join(runDir, "run.json"), result.Metadata); err != nil {
 		return nil, err
 	}
@@ -389,12 +439,14 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 }
 
 type productionWorkspace struct {
-	Retriever        *retrieval.ProductionRetriever
-	CodeIndexBuildID int64
-	RetrievalBuildID int64
-	SnapshotStore    snapshotstore.SnapshotStore
-	CodeIndexStore   codeintelstore.Store
-	db               *gorm.DB
+	Retriever         *retrieval.ProductionRetriever
+	CodeIndexBuildID  int64
+	RetrievalBuildID  int64
+	SnapshotStore     snapshotstore.SnapshotStore
+	CodeIndexStore    codeintelstore.Store
+	Quality           codeintelmodel.AnalysisQuality
+	RelatedTestsFound int
+	db                *gorm.DB
 }
 
 func (w *productionWorkspace) Close() {
@@ -485,30 +537,35 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 		return nil, productFailure("finalize RetrievalBuild", err)
 	}
 	return &productionWorkspace{
-		Retriever:        retrieval.NewProductionRetriever(ciStore, indexRoot),
-		CodeIndexBuildID: build.ID,
-		RetrievalBuildID: retrievalBuild.ID,
-		SnapshotStore:    snapshotStore,
-		CodeIndexStore:   ciStore,
-		db:               db,
+		Retriever:         retrieval.NewProductionRetriever(ciStore, indexRoot),
+		CodeIndexBuildID:  build.ID,
+		RetrievalBuildID:  retrievalBuild.ID,
+		SnapshotStore:     snapshotStore,
+		CodeIndexStore:    ciStore,
+		Quality:           analysis.Quality,
+		RelatedTestsFound: len(analysis.RelatedTests),
+		db:                db,
 	}, nil
 }
 
 type providerConfig struct {
-	APIKey   string
-	BaseURL  string
-	Model    string
-	AuthMode string
+	APIKey         string
+	BaseURL        string
+	Model          string
+	AuthMode       string
+	TimeoutSeconds int
 }
 
 func loadProviderConfig() (providerConfig, bool) {
 	config := providerConfig{
-		APIKey:   os.Getenv("REPOLENS_REALBENCH_API_KEY"),
-		BaseURL:  os.Getenv("REPOLENS_REALBENCH_BASE_URL"),
-		Model:    os.Getenv("REPOLENS_REALBENCH_MODEL"),
-		AuthMode: os.Getenv("REPOLENS_REALBENCH_AUTH_MODE"),
+		APIKey:         os.Getenv("REPOLENS_REALBENCH_API_KEY"),
+		BaseURL:        os.Getenv("REPOLENS_REALBENCH_BASE_URL"),
+		Model:          os.Getenv("REPOLENS_REALBENCH_MODEL"),
+		AuthMode:       os.Getenv("REPOLENS_REALBENCH_AUTH_MODE"),
+		TimeoutSeconds: providerTimeoutSeconds(),
 	}
-	return config, config.BaseURL != "" && config.Model != ""
+	authConfigured := strings.EqualFold(strings.TrimSpace(config.AuthMode), "none") || config.APIKey != ""
+	return config, config.BaseURL != "" && config.Model != "" && authConfigured
 }
 
 type classifiedProvider struct {
@@ -524,11 +581,12 @@ func (p classifiedProvider) Generate(ctx context.Context, request llm.GenerateRe
 }
 
 func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string) (*agent.ExecutionResult, error) {
-	providerClient := llm.NewOpenAICompatibleProviderWithAuthMode(
+	providerClient := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(
 		config.APIKey,
 		config.BaseURL,
 		config.Model,
 		config.AuthMode,
+		time.Duration(config.TimeoutSeconds)*time.Second,
 	)
 	provider := classifiedProvider{Provider: providerClient}
 	executor := agent.NewAgentRuntimeExecutor(
@@ -661,6 +719,19 @@ func currentGitCommit() string {
 	return strings.TrimSpace(output)
 }
 
+func workingTreeClean() bool {
+	output, err := runGit(context.Background(), "", "status", "--porcelain")
+	return err == nil && strings.TrimSpace(output) == ""
+}
+
+func providerTimeoutSeconds() int {
+	value, err := strconv.Atoi(os.Getenv("REPOLENS_PROVIDER_TIMEOUT_SECONDS"))
+	if err != nil || value <= 0 {
+		return 60
+	}
+	return value
+}
+
 func retrievalMetrics(results []retrieval.SearchResult, relevantFiles []string) (bool, bool, float64) {
 	relevant := make(map[string]bool, len(relevantFiles))
 	for _, file := range relevantFiles {
@@ -757,4 +828,78 @@ func writeJSON(path string, value interface{}) error {
 	}
 	data = append(data, '\n')
 	return os.WriteFile(path, data, 0644)
+}
+
+func makeAnalysisQualityArtifact(quality codeintelmodel.AnalysisQuality, relatedTestsFound int) analysisQualityArtifact {
+	parseRate := 0.0
+	if quality.FilesTotal > 0 {
+		parseRate = float64(quality.FilesParsed) / float64(quality.FilesTotal)
+	}
+	typecheckRate := 0.0
+	if quality.PackagesTotal > 0 {
+		typecheckRate = float64(quality.PackagesTypechecked) / float64(quality.PackagesTotal)
+	}
+	return analysisQualityArtifact{
+		FilesTotal:          quality.FilesTotal,
+		FilesParsed:         quality.FilesParsed,
+		FilesFailed:         quality.FilesFailed,
+		ParseRate:           parseRate,
+		PackagesTotal:       quality.PackagesTotal,
+		PackagesTypechecked: quality.PackagesTypechecked,
+		PackagesFailed:      quality.PackagesFailed,
+		TypecheckRate:       typecheckRate,
+		SymbolsTotal:        quality.SymbolsTotal,
+		SemanticRelations:   quality.SemanticRelationsCount,
+		SyntacticRelations:  quality.SyntacticRelationsCount,
+		HeuristicRelations:  quality.HeuristicRelationsCount,
+		UnresolvedRelations: quality.UnresolvedRelationsCount,
+		RelatedTestsFound:   relatedTestsFound,
+		Warnings:            quality.Warnings,
+	}
+}
+
+func writeAnalysisQualitySummary(path string, rows []analysisQualityRow) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create analysis quality summary: %w", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	if err := writer.Write([]string{
+		"case_id", "files_total", "files_parsed", "files_failed", "parse_rate",
+		"packages_total", "packages_typechecked", "packages_failed", "typecheck_rate",
+		"symbols_total", "semantic_relations", "syntactic_relations", "heuristic_relations",
+		"unresolved_relations", "related_tests_found", "warnings",
+	}); err != nil {
+		return fmt.Errorf("write analysis quality header: %w", err)
+	}
+	for _, row := range rows {
+		quality := row.analysisQualityArtifact
+		if err := writer.Write([]string{
+			row.CaseID,
+			strconv.Itoa(quality.FilesTotal),
+			strconv.Itoa(quality.FilesParsed),
+			strconv.Itoa(quality.FilesFailed),
+			strconv.FormatFloat(quality.ParseRate, 'f', 6, 64),
+			strconv.Itoa(quality.PackagesTotal),
+			strconv.Itoa(quality.PackagesTypechecked),
+			strconv.Itoa(quality.PackagesFailed),
+			strconv.FormatFloat(quality.TypecheckRate, 'f', 6, 64),
+			strconv.Itoa(quality.SymbolsTotal),
+			strconv.Itoa(quality.SemanticRelations),
+			strconv.Itoa(quality.SyntacticRelations),
+			strconv.Itoa(quality.HeuristicRelations),
+			strconv.Itoa(quality.UnresolvedRelations),
+			strconv.Itoa(quality.RelatedTestsFound),
+			strings.Join(quality.Warnings, " | "),
+		}); err != nil {
+			return fmt.Errorf("write analysis quality row %s: %w", row.CaseID, err)
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("flush analysis quality summary: %w", err)
+	}
+	return nil
 }

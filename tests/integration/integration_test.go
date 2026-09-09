@@ -82,6 +82,8 @@ func TestDiagnosisCreationAndIdempotency(t *testing.T) {
 		IssueDescription: "Unbuffered channel write blocks indefinitely",
 		ErrorLog:         "panic: deadlock",
 		IdempotencyKey:   "idemp-key-001",
+		CodeIndexBuildID: 1001,
+		RetrievalBuildID: 2001,
 	}
 
 	// 1. First submission -> Create Run & AnalysisJob
@@ -139,11 +141,13 @@ func TestConcurrentWorkerClaimFencing(t *testing.T) {
 	_ = snapStore.Create(ctx, testSnap)
 
 	run, _, err := diagSvc.Create(ctx, diagnosis.CreateDiagnosisInput{
-		UserID:         "u2",
-		RepositoryID:   testRepo.ID,
-		SnapshotID:     testSnap.ID,
-		IssueTitle:     "Race Condition",
-		IdempotencyKey: "key-race",
+		UserID:           "u2",
+		RepositoryID:     testRepo.ID,
+		SnapshotID:       testSnap.ID,
+		IssueTitle:       "Race Condition",
+		IdempotencyKey:   "key-race",
+		CodeIndexBuildID: 1002,
+		RetrievalBuildID: 2002,
 	})
 	if err != nil {
 		t.Fatalf("creation failed: %v", err)
@@ -208,11 +212,13 @@ func TestDBJobWorkerPipeline(t *testing.T) {
 	defer jobsWorker.Stop()
 
 	run, _, err := diagSvc.Create(ctx, diagnosis.CreateDiagnosisInput{
-		UserID:         "u3",
-		RepositoryID:   testRepo.ID,
-		SnapshotID:     testSnap.ID,
-		IssueTitle:     "Memory Leak Bug",
-		IdempotencyKey: "k-pipeline",
+		UserID:           "u3",
+		RepositoryID:     testRepo.ID,
+		SnapshotID:       testSnap.ID,
+		IssueTitle:       "Memory Leak Bug",
+		IdempotencyKey:   "k-pipeline",
+		CodeIndexBuildID: 1003,
+		RetrievalBuildID: 2003,
 	})
 	if err != nil {
 		t.Fatalf("create failed: %v", err)
@@ -408,11 +414,13 @@ func TestApplicationRetryOn429RateLimit(t *testing.T) {
 	defer jobsWorker.Stop()
 
 	run, _, err := diagSvc.Create(ctx, diagnosis.CreateDiagnosisInput{
-		UserID:         "u4",
-		RepositoryID:   testRepo.ID,
-		SnapshotID:     testSnap.ID,
-		IssueTitle:     "Flaky LLM Test",
-		IdempotencyKey: "k-flaky",
+		UserID:           "u4",
+		RepositoryID:     testRepo.ID,
+		SnapshotID:       testSnap.ID,
+		IssueTitle:       "Flaky LLM Test",
+		IdempotencyKey:   "k-flaky",
+		CodeIndexBuildID: 1004,
+		RetrievalBuildID: 2004,
 	})
 	if err != nil {
 		t.Fatalf("create failed: %v", err)

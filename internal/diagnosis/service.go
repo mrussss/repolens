@@ -2,10 +2,12 @@ package diagnosis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
@@ -55,6 +57,8 @@ type ProviderMetadata struct {
 	AgentVersion        string
 	AgentConfigHash     string
 	Temperature         float64
+	IsConfigured        bool
+	IsDemo              bool
 }
 
 type Service struct {
@@ -63,6 +67,7 @@ type Service struct {
 	snapshotStore          snapshot.Store
 	codeIntelStore         codeintelstore.Store
 	providerMetadata       ProviderMetadata
+	providerMetadataSet    bool
 	providerMetadataSource func() ProviderMetadata
 }
 
@@ -73,6 +78,7 @@ func (s *Service) WithCodeIntelStore(store codeintelstore.Store) *Service {
 
 func (s *Service) WithProviderMetadata(metadata ProviderMetadata) *Service {
 	s.providerMetadata = metadata
+	s.providerMetadataSet = true
 	return s
 }
 
@@ -109,6 +115,18 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		return existing, false, nil
 	}
 
+	if input.CodeIndexBuildID <= 0 || input.RetrievalBuildID <= 0 {
+		return nil, false, ErrInvalidBuildSelection
+	}
+
+	metadata := s.providerMetadata
+	if s.providerMetadataSource != nil {
+		metadata = s.providerMetadataSource()
+	}
+	if (s.providerMetadataSet || s.providerMetadataSource != nil) && !metadata.IsConfigured {
+		return nil, false, ErrProviderNotConfigured
+	}
+
 	// Validate repository ownership
 	r, err := s.repoStore.GetByIDAndUser(ctx, input.RepositoryID, input.UserID)
 	if err != nil || r == nil {
@@ -127,45 +145,40 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	codeIndexBuildID := input.CodeIndexBuildID
 	retrievalBuildID := input.RetrievalBuildID
 	if s.codeIntelStore != nil {
-		if codeIndexBuildID == 0 {
-			build, err := s.codeIntelStore.GetBySnapshot(ctx, input.SnapshotID)
-			if err != nil {
-				return nil, false, fmt.Errorf("code index build for snapshot %s is not ready: %w", input.SnapshotID, err)
-			}
-			codeIndexBuildID = build.ID
-		}
-		if retrievalBuildID == 0 {
-			rb, err := s.codeIntelStore.GetRetrievalBuildByCodeIndexBuild(ctx, codeIndexBuildID)
-			if err != nil {
-				return nil, false, fmt.Errorf("retrieval build for code index build %d is not ready: %w", codeIndexBuildID, err)
-			}
-			retrievalBuildID = rb.ID
-		}
 		if err := s.codeIntelStore.ValidateLineage(ctx, input.RepositoryID, input.SnapshotID, codeIndexBuildID, retrievalBuildID); err != nil {
 			return nil, false, err
 		}
 		cib, err := s.codeIntelStore.GetByID(ctx, codeIndexBuildID)
-		if err != nil || cib.Status != codeintelmodel.BuildStatusReady {
-			return nil, false, fmt.Errorf("code index build %d is not READY", codeIndexBuildID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, false, fmt.Errorf("%w: code index build %d", ErrBuildNotReady, codeIndexBuildID)
+			}
+			return nil, false, fmt.Errorf("failed to load code index build %d: %w", codeIndexBuildID, err)
+		}
+		if cib == nil {
+			return nil, false, fmt.Errorf("%w: code index build %d", ErrBuildNotReady, codeIndexBuildID)
+		}
+		if cib.Status != codeintelmodel.BuildStatusReady {
+			return nil, false, fmt.Errorf("%w: code index build %d is %s", ErrBuildNotReady, codeIndexBuildID, cib.Status)
 		}
 		rb, err := s.codeIntelStore.GetRetrievalBuildByID(ctx, retrievalBuildID)
-		if err != nil || rb.Status != codeintelmodel.BuildStatusReady {
-			return nil, false, fmt.Errorf("retrieval build %d is not READY", retrievalBuildID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, false, fmt.Errorf("%w: retrieval build %d", ErrBuildNotReady, retrievalBuildID)
+			}
+			return nil, false, fmt.Errorf("failed to load retrieval build %d: %w", retrievalBuildID, err)
 		}
-	} else {
-		// Isolated unit fixtures may omit derived builds. Production wires the
-		// CodeIntelStore and always takes the pinned path above.
-		codeIndexBuildID = 0
-		retrievalBuildID = 0
+		if rb == nil {
+			return nil, false, fmt.Errorf("%w: retrieval build %d", ErrBuildNotReady, retrievalBuildID)
+		}
+		if rb.Status != codeintelmodel.BuildStatusReady {
+			return nil, false, fmt.Errorf("%w: retrieval build %d is %s", ErrBuildNotReady, retrievalBuildID, rb.Status)
+		}
 	}
 
 	cleanDesc := RedactSecrets(input.IssueDescription)
 	cleanLog := RedactSecrets(input.ErrorLog)
 
-	metadata := s.providerMetadata
-	if s.providerMetadataSource != nil {
-		metadata = s.providerMetadataSource()
-	}
 	if metadata.AgentConfigHash == "" {
 		metadata.AgentConfigHash = ComputeAgentConfigHash(8, 12, 2, metadata.Temperature)
 	}

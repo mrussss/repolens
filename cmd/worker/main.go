@@ -68,13 +68,14 @@ func run() error {
 	if providerPath == "" {
 		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
 	}
-	providerMgr := provider.NewManagerWithAuthMode(
+	providerMgr := provider.NewManagerWithAuthModeAndTimeout(
 		providerPath,
 		cfg.ProviderBaseURL,
 		cfg.ProviderModel,
 		cfg.ProviderAPIKey,
 		cfg.ProviderType,
 		cfg.ProviderAuthMode,
+		time.Duration(cfg.ProviderTimeoutSeconds)*time.Second,
 	)
 
 	// Pure Go Production Retrieval (BM25 + Structural Code Intelligence)

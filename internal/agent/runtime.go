@@ -15,14 +15,16 @@ import (
 )
 
 type ExecutionResult struct {
-	Report           *evidence.DiagnosisReportData
-	RawOutput        string
-	PromptTokens     int
-	CompletionTokens int
-	ToolCalls        int
-	Retryable        bool
-	ErrorCode        string
-	ErrorMessage     string
+	Report             *evidence.DiagnosisReportData
+	RawOutput          string
+	PromptTokens       int
+	CompletionTokens   int
+	CachedPromptTokens int
+	ReasoningTokens    int
+	ToolCalls          int
+	Retryable          bool
+	ErrorCode          string
+	ErrorMessage       string
 }
 
 type Executor interface {
@@ -110,11 +112,13 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	}
 
 	return &ExecutionResult{
-		Report:           res.Report,
-		RawOutput:        res.RawOutput,
-		PromptTokens:     res.PromptTokens,
-		CompletionTokens: res.CompletionTokens,
-		ToolCalls:        res.ToolCallsCount,
-		Retryable:        false,
+		Report:             res.Report,
+		RawOutput:          res.RawOutput,
+		PromptTokens:       res.PromptTokens,
+		CompletionTokens:   res.CompletionTokens,
+		CachedPromptTokens: res.CachedPromptTokens,
+		ReasoningTokens:    res.ReasoningTokens,
+		ToolCalls:          res.ToolCallsCount,
+		Retryable:          false,
 	}, nil
 }

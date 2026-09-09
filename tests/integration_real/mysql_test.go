@@ -114,6 +114,8 @@ func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
 		IssueDescription: "Two concurrent transactions acquire row locks in reverse order",
 		ErrorLog:         "Error 1213: Deadlock found when trying to get lock",
 		IdempotencyKey:   "idemp-real-001",
+		CodeIndexBuildID: 3001,
+		RetrievalBuildID: 4001,
 	}
 
 	// 1. Create DiagnosisRun and AnalysisJob transactionally on real MySQL

@@ -101,13 +101,14 @@ func ComputeConfigFingerprint(normalizedBaseURL, model string, authModes ...stri
 
 // Manager handles reading and atomic writing of provider configuration.
 type Manager struct {
-	secretFilePath string
-	envBaseURL     string
-	envModel       string
-	envAPIKey      string
-	envProvider    string
-	envAuthMode    string
-	mu             sync.RWMutex
+	secretFilePath  string
+	envBaseURL      string
+	envModel        string
+	envAPIKey       string
+	envProvider     string
+	envAuthMode     string
+	providerTimeout time.Duration
+	mu              sync.RWMutex
 }
 
 // BuildForDiagnosis loads the current secret for every execution while using
@@ -138,7 +139,7 @@ func (m *Manager) BuildForDiagnosis(ctx context.Context, run *diagnosis.Diagnosi
 	if cfg.IsDemo || m.envProvider == "fake" && normalized == "http://localhost/fake" {
 		return llm.NewFakeProvider(llm.ModeNormalStructured), nil
 	}
-	return llm.NewOpenAICompatibleProviderWithAuthMode(cfg.APIKey, normalized, modelName, cfg.AuthMode), nil
+	return llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(cfg.APIKey, normalized, modelName, cfg.AuthMode, m.providerTimeout), nil
 }
 
 // NewManager creates a new Manager instance.
@@ -148,16 +149,26 @@ func NewManager(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider str
 
 // NewManagerWithAuthMode creates a manager with an explicit environment auth mode.
 func NewManagerWithAuthMode(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, authMode string) *Manager {
+	return NewManagerWithAuthModeAndTimeout(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, authMode, 60*time.Second)
+}
+
+// NewManagerWithAuthModeAndTimeout creates a manager with an explicit
+// environment auth mode and provider request timeout.
+func NewManagerWithAuthModeAndTimeout(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, authMode string, providerTimeout time.Duration) *Manager {
 	if secretFilePath == "" {
 		secretFilePath = "/data/provider.json"
 	}
+	if providerTimeout <= 0 {
+		providerTimeout = 60 * time.Second
+	}
 	return &Manager{
-		secretFilePath: secretFilePath,
-		envBaseURL:     envBaseURL,
-		envModel:       envModel,
-		envAPIKey:      envAPIKey,
-		envProvider:    envProvider,
-		envAuthMode:    normalizeAuthMode(authMode),
+		secretFilePath:  secretFilePath,
+		envBaseURL:      envBaseURL,
+		envModel:        envModel,
+		envAPIKey:       envAPIKey,
+		envProvider:     envProvider,
+		envAuthMode:     normalizeAuthMode(authMode),
+		providerTimeout: providerTimeout,
 	}
 }
 
@@ -335,11 +346,12 @@ func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model
 	defer cancel()
 
 	// Perform a minimal dry-run completion
+	temperature := 0.0
 	_, err = provider.Generate(testCtx, llm.GenerateRequest{
 		Messages: []llm.Message{
 			{Role: llm.RoleUser, Content: "ping"},
 		},
-		Temperature: 0.0,
+		Temperature: &temperature,
 	})
 	latency := time.Since(start)
 

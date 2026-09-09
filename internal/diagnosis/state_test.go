@@ -85,6 +85,8 @@ func TestRequestHashAndIdempotencyConflict(t *testing.T) {
 	})
 
 	idempKey := "idemp-test-key-1"
+	codeIndexBuildID := int64(101)
+	retrievalBuildID := int64(202)
 
 	// 1. First creation -> SUCCESS (QUEUED)
 	run1, created1, err := diagSvc.Create(ctx, diagnosis.CreateDiagnosisInput{
@@ -95,6 +97,8 @@ func TestRequestHashAndIdempotencyConflict(t *testing.T) {
 		IssueDescription: "Goroutine panicked",
 		ErrorLog:         "nil pointer",
 		IdempotencyKey:   idempKey,
+		CodeIndexBuildID: codeIndexBuildID,
+		RetrievalBuildID: retrievalBuildID,
 	})
 	if err != nil || !created1 || run1 == nil {
 		t.Fatalf("first creation failed: %v", err)
@@ -112,6 +116,8 @@ func TestRequestHashAndIdempotencyConflict(t *testing.T) {
 		IssueDescription: "Goroutine panicked",
 		ErrorLog:         "nil pointer",
 		IdempotencyKey:   idempKey,
+		CodeIndexBuildID: codeIndexBuildID,
+		RetrievalBuildID: retrievalBuildID,
 	})
 	if err != nil || created2 || run2 == nil {
 		t.Fatalf("duplicate creation should return existing run without error: %v", err)
@@ -129,9 +135,26 @@ func TestRequestHashAndIdempotencyConflict(t *testing.T) {
 		IssueDescription: "Different description",
 		ErrorLog:         "different log",
 		IdempotencyKey:   idempKey,
+		CodeIndexBuildID: codeIndexBuildID,
+		RetrievalBuildID: retrievalBuildID,
 	})
 	if err != diagnosis.ErrIdempotencyConflict {
 		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	}
+}
+
+func TestCreateRequiresPinnedBuildIDs(t *testing.T) {
+	db := setupTestDB(t)
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+
+	_, _, err := svc.Create(context.Background(), diagnosis.CreateDiagnosisInput{
+		UserID:       "user-builds",
+		RepositoryID: "repo-builds",
+		SnapshotID:   "snapshot-builds",
+		IssueTitle:   "missing build IDs",
+	})
+	if !errors.Is(err, diagnosis.ErrInvalidBuildSelection) {
+		t.Fatalf("error = %v, want ErrInvalidBuildSelection", err)
 	}
 }
 

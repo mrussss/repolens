@@ -14,11 +14,14 @@ import (
 )
 
 var (
-	ErrIdempotencyConflict = errors.New("idempotency conflict: request payload differs from existing record")
-	ErrRunNotFound         = errors.New("diagnosis run not found")
-	ErrAttemptNotFound     = errors.New("diagnosis attempt not found")
-	ErrClaimConflict       = errors.New("run claim conflict: status is not in expected state or already claimed")
-	ErrOptimisticLock      = errors.New("optimistic lock conflict")
+	ErrIdempotencyConflict   = errors.New("idempotency conflict: request payload differs from existing record")
+	ErrInvalidBuildSelection = errors.New("code index and retrieval build IDs must be positive")
+	ErrBuildNotReady         = errors.New("diagnosis build is not ready")
+	ErrProviderNotConfigured = errors.New("provider is not configured")
+	ErrRunNotFound           = errors.New("diagnosis run not found")
+	ErrAttemptNotFound       = errors.New("diagnosis attempt not found")
+	ErrClaimConflict         = errors.New("run claim conflict: status is not in expected state or already claimed")
+	ErrOptimisticLock        = errors.New("optimistic lock conflict")
 )
 
 type Store interface {

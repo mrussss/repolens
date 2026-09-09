@@ -1,6 +1,7 @@
 package importer_test
 
 import (
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -10,6 +11,24 @@ import (
 
 	codeimporter "repolens/internal/codeintel/importer"
 )
+
+func TestOfflineImporterAllowsStdlibAndRejectsExternalAndCgo(t *testing.T) {
+	fset := token.NewFileSet()
+	imp := codeimporter.NewOfflineImporter(fset, "example.com/root", nil)
+
+	if _, err := imp.Import("fmt"); err != nil {
+		t.Fatalf("stdlib import fmt failed: %v", err)
+	}
+	if _, err := imp.Import("net/http"); err != nil {
+		t.Fatalf("stdlib import net/http failed: %v", err)
+	}
+	if _, err := imp.Import("github.com/google/uuid"); !errors.Is(err, codeimporter.ErrExternalDependencyUnresolved) {
+		t.Fatalf("external import error = %v, want ErrExternalDependencyUnresolved", err)
+	}
+	if _, err := imp.Import("C"); !errors.Is(err, codeimporter.ErrUnsupportedCgoImport) {
+		t.Fatalf("cgo import error = %v, want ErrUnsupportedCgoImport", err)
+	}
+}
 
 func TestOfflineImporterCrossPackageDoesNotDeadlock(t *testing.T) {
 	fset := token.NewFileSet()

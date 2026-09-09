@@ -47,6 +47,20 @@ func TestSyntheticRunnerKeepsGroundTruthOutOfPrediction(t *testing.T) {
 	if strings.Contains(string(data), "DO_NOT_LEAK_GROUND_TRUTH") {
 		t.Fatal("prediction contains evaluator-only sentinel")
 	}
+	quality, err := os.ReadFile(filepath.Join(result.RunDir, "cases", "REAL-999", "analysis_quality.json"))
+	if err != nil {
+		t.Fatalf("analysis quality artifact missing: %v", err)
+	}
+	if !strings.Contains(string(quality), `"parse_rate"`) || !strings.Contains(string(quality), `"typecheck_rate"`) {
+		t.Fatalf("analysis quality artifact missing rates: %s", quality)
+	}
+	summary, err := os.ReadFile(filepath.Join(result.RunDir, "analysis_quality_summary.csv"))
+	if err != nil {
+		t.Fatalf("analysis quality summary missing: %v", err)
+	}
+	if !strings.Contains(string(summary), "case_id") || !strings.Contains(string(summary), "REAL-999") {
+		t.Fatalf("analysis quality summary missing case: %s", summary)
+	}
 }
 
 func TestValidateRejectsGroundTruthSentinelInInput(t *testing.T) {

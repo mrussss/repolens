@@ -2,11 +2,13 @@ package diagnosis
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/evidence"
 	"repolens/internal/platform/logger"
 	"repolens/internal/trace"
@@ -46,6 +48,13 @@ func (h *Handler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if req.CodeIndexBuildID <= 0 || req.RetrievalBuildID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":  "INVALID_BUILD_SELECTION",
+			"error": "code_index_build_id and retrieval_build_id must be positive",
+		})
+		return
+	}
 
 	idempKey := c.GetHeader("Idempotency-Key")
 	if idempKey == "" {
@@ -66,8 +75,27 @@ func (h *Handler) Create(c *gin.Context) {
 
 	run, created, err := h.svc.Create(c.Request.Context(), input)
 	if err != nil {
-		if errors.Is(err, ErrIdempotencyConflict) {
+		switch {
+		case errors.Is(err, ErrIdempotencyConflict):
 			c.JSON(http.StatusConflict, gin.H{"error": "Idempotency conflict: key reused with differing request payload"})
+			return
+		case errors.Is(err, ErrProviderNotConfigured):
+			c.JSON(http.StatusFailedDependency, gin.H{
+				"code":  "PROVIDER_NOT_CONFIGURED",
+				"error": "provider is not configured",
+			})
+			return
+		case errors.Is(err, ErrInvalidBuildSelection):
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":  "INVALID_BUILD_SELECTION",
+				"error": "code_index_build_id and retrieval_build_id must be positive",
+			})
+			return
+		case errors.Is(err, ErrBuildNotReady), errors.Is(err, codeintelstore.ErrBuildLineageMismatch):
+			c.JSON(http.StatusConflict, gin.H{
+				"code":  "BUILD_NOT_READY_OR_MISMATCHED",
+				"error": "selected code index and retrieval builds are not a ready lineage",
+			})
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -96,7 +124,18 @@ func (h *Handler) Get(c *gin.Context) {
 
 	run, err := h.svc.Get(c.Request.Context(), id, userID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "diagnosis run not found"})
+		if errors.Is(err, ErrRunNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"code":  "DIAGNOSIS_NOT_FOUND",
+				"error": "diagnosis run not found",
+			})
+			return
+		}
+		logger.L(c.Request.Context()).Error("failed to get diagnosis run", "diagnosis_id", id, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":  "INTERNAL_ERROR",
+			"error": "internal server error",
+		})
 		return
 	}
 
@@ -105,12 +144,22 @@ func (h *Handler) Get(c *gin.Context) {
 
 func (h *Handler) List(c *gin.Context) {
 	userID := c.GetString(string(logger.UserIDKey))
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	page, pageSize, err := parsePagination(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":  "INVALID_PAGINATION",
+			"error": err.Error(),
+		})
+		return
+	}
 
 	runs, total, err := h.svc.List(c.Request.Context(), userID, page, pageSize)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logger.L(c.Request.Context()).Error("failed to list diagnosis runs", "page", page, "page_size", pageSize, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":  "INTERNAL_ERROR",
+			"error": "internal server error",
+		})
 		return
 	}
 
@@ -120,6 +169,20 @@ func (h *Handler) List(c *gin.Context) {
 		"page":           page,
 		"page_size":      pageSize,
 	})
+}
+
+func parsePagination(c *gin.Context) (page, pageSize int, err error) {
+	page, err = strconv.Atoi(c.DefaultQuery("page", "1"))
+	if err != nil || page < 1 {
+		return 0, 0, fmt.Errorf("page must be a positive integer")
+	}
+
+	pageSize, err = strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if err != nil || pageSize < 1 || pageSize > 100 {
+		return 0, 0, fmt.Errorf("page_size must be an integer between 1 and 100")
+	}
+
+	return page, pageSize, nil
 }
 
 func (h *Handler) Cancel(c *gin.Context) {

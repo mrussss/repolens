@@ -24,11 +24,18 @@ func NewOpenAICompatibleProvider(apiKey, baseURL, defaultModel string) *OpenAICo
 }
 
 func NewOpenAICompatibleProviderWithAuthMode(apiKey, baseURL, defaultModel, authMode string) *OpenAICompatibleProvider {
+	return NewOpenAICompatibleProviderWithAuthModeAndTimeout(apiKey, baseURL, defaultModel, authMode, 60*time.Second)
+}
+
+func NewOpenAICompatibleProviderWithAuthModeAndTimeout(apiKey, baseURL, defaultModel, authMode string, timeout time.Duration) *OpenAICompatibleProvider {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
 	if defaultModel == "" {
 		defaultModel = "gpt-4o"
+	}
+	if timeout <= 0 {
+		timeout = 60 * time.Second
 	}
 	return &OpenAICompatibleProvider{
 		apiKey:       apiKey,
@@ -36,17 +43,19 @@ func NewOpenAICompatibleProviderWithAuthMode(apiKey, baseURL, defaultModel, auth
 		defaultModel: defaultModel,
 		authMode:     normalizeAuthMode(authMode),
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
 
 type openAIRequest struct {
-	Model       string           `json:"model"`
-	Messages    []Message        `json:"messages"`
-	Tools       []ToolDefinition `json:"tools,omitempty"`
-	Temperature float64          `json:"temperature,omitempty"`
-	MaxTokens   int              `json:"max_tokens,omitempty"`
+	Model           string           `json:"model"`
+	Messages        []Message        `json:"messages"`
+	Tools           []ToolDefinition `json:"tools,omitempty"`
+	Temperature     *float64         `json:"temperature,omitempty"`
+	MaxTokens       int              `json:"max_tokens,omitempty"`
+	ReasoningEffort string           `json:"reasoning_effort,omitempty"`
+	ResponseFormat  *ResponseFormat  `json:"response_format,omitempty"`
 }
 
 type openAIResponse struct {
@@ -55,8 +64,14 @@ type openAIResponse struct {
 		FinishReason string  `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		PromptTokensDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		CompletionTokensDetails struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
@@ -72,11 +87,13 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 	}
 
 	payload := openAIRequest{
-		Model:       model,
-		Messages:    req.Messages,
-		Tools:       req.Tools,
-		Temperature: req.Temperature,
-		MaxTokens:   req.MaxTokens,
+		Model:           model,
+		Messages:        req.Messages,
+		Tools:           req.Tools,
+		Temperature:     req.Temperature,
+		MaxTokens:       req.MaxTokens,
+		ReasoningEffort: req.ReasoningEffort,
+		ResponseFormat:  req.ResponseFormat,
 	}
 
 	bodyBytes, err := json.Marshal(payload)
@@ -130,10 +147,12 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 
 	choice := openAIResp.Choices[0]
 	return GenerateResponse{
-		Message:          choice.Message,
-		FinishReason:     choice.FinishReason,
-		PromptTokens:     openAIResp.Usage.PromptTokens,
-		CompletionTokens: openAIResp.Usage.CompletionTokens,
+		Message:            choice.Message,
+		FinishReason:       choice.FinishReason,
+		PromptTokens:       openAIResp.Usage.PromptTokens,
+		CompletionTokens:   openAIResp.Usage.CompletionTokens,
+		CachedPromptTokens: openAIResp.Usage.PromptTokensDetails.CachedTokens,
+		ReasoningTokens:    openAIResp.Usage.CompletionTokensDetails.ReasoningTokens,
 	}, nil
 }
 

@@ -58,11 +58,13 @@ Rules:
 Do not wrap the JSON with markdown backticks if possible, or output strictly parseable JSON.`
 
 type LoopResult struct {
-	Report           *evidence.DiagnosisReportData
-	RawOutput        string
-	PromptTokens     int
-	CompletionTokens int
-	ToolCallsCount   int
+	Report             *evidence.DiagnosisReportData
+	RawOutput          string
+	PromptTokens       int
+	CompletionTokens   int
+	CachedPromptTokens int
+	ReasoningTokens    int
+	ToolCallsCount     int
 }
 
 type AgentLoop struct {
@@ -105,6 +107,8 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 	totalPromptTokens := 0
 	totalCompletionTokens := 0
+	totalCachedPromptTokens := 0
+	totalReasoningTokens := 0
 	toolCallsCount := 0
 	seq := 0
 
@@ -119,10 +123,11 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		}
 
 		startGen := time.Now()
+		temperature := run.Temperature
 		resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
 			Messages:    messages,
 			Tools:       toolsDef,
-			Temperature: run.Temperature,
+			Temperature: &temperature,
 		})
 		latency := time.Since(startGen).Milliseconds()
 
@@ -134,6 +139,8 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 		totalPromptTokens += resp.PromptTokens
 		totalCompletionTokens += resp.CompletionTokens
+		totalCachedPromptTokens += resp.CachedPromptTokens
+		totalReasoningTokens += resp.ReasoningTokens
 		metrics.TokenUsageTotal.WithLabelValues("prompt").Add(float64(resp.PromptTokens))
 		metrics.TokenUsageTotal.WithLabelValues("completion").Add(float64(resp.CompletionTokens))
 
@@ -201,11 +208,13 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		}
 
 		return &LoopResult{
-			Report:           reportData,
-			RawOutput:        finalText,
-			PromptTokens:     totalPromptTokens,
-			CompletionTokens: totalCompletionTokens,
-			ToolCallsCount:   toolCallsCount,
+			Report:             reportData,
+			RawOutput:          finalText,
+			PromptTokens:       totalPromptTokens,
+			CompletionTokens:   totalCompletionTokens,
+			CachedPromptTokens: totalCachedPromptTokens,
+			ReasoningTokens:    totalReasoningTokens,
+			ToolCallsCount:     toolCallsCount,
 		}, nil
 	}
 }

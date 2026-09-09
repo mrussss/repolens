@@ -1,13 +1,22 @@
 package importer
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/importer"
 	"go/token"
 	"go/types"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+)
+
+var (
+	ErrExternalDependencyUnresolved = errors.New("external dependency unresolved in offline mode")
+	ErrUnsupportedCgoImport         = errors.New("cgo import is unsupported in offline mode")
 )
 
 // PkgFiles represents a collection of AST files belonging to a package.
@@ -87,8 +96,15 @@ func (oi *OfflineImporter) ImportFrom(path, srcDir string, mode types.ImportMode
 	}
 	oi.mu.Unlock()
 
-	// Standard library imports are also performed without the cache lock.
-	if oi.stdlibImport != nil {
+	if path == "C" {
+		return nil, fmt.Errorf("%w: import %q", ErrUnsupportedCgoImport, path)
+	}
+
+	// Only packages backed by the current toolchain's GOROOT source tree are
+	// eligible for the standard-library importer. External packages must not
+	// become resolvable merely because a machine happens to have export data or
+	// module cache entries for them.
+	if isStdlibImport(path) && oi.stdlibImport != nil {
 		if impFrom, ok := oi.stdlibImport.(types.ImporterFrom); ok {
 			pkg, err := impFrom.ImportFrom(path, srcDir, mode)
 			if err == nil {
@@ -109,7 +125,22 @@ func (oi *OfflineImporter) ImportFrom(path, srcDir string, mode types.ImportMode
 	}
 
 	// External dependency not present in snapshot -> unresolved (strictly offline).
-	return nil, fmt.Errorf("external dependency %q unresolved (offline mode: no network resolution)", path)
+	return nil, fmt.Errorf("%w: %q", ErrExternalDependencyUnresolved, path)
+}
+
+func isStdlibImport(path string) bool {
+	if path == "unsafe" {
+		return true
+	}
+	if path == "" || strings.Contains(path, ".") {
+		return false
+	}
+	root := runtime.GOROOT()
+	if root == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(root, "src", filepath.FromSlash(path)))
+	return err == nil && info.IsDir()
 }
 
 func (oi *OfflineImporter) typeCheckPackage(pf *PkgFiles) (*types.Package, error) {

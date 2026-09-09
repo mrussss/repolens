@@ -79,13 +79,14 @@ func run() error {
 	if providerPath == "" {
 		providerPath = filepath.Join(cfg.SnapshotBasePath, "provider.json")
 	}
-	providerMgr := provider.NewManagerWithAuthMode(
+	providerMgr := provider.NewManagerWithAuthModeAndTimeout(
 		providerPath,
 		cfg.ProviderBaseURL,
 		cfg.ProviderModel,
 		cfg.ProviderAPIKey,
 		cfg.ProviderType,
 		cfg.ProviderAuthMode,
+		time.Duration(cfg.ProviderTimeoutSeconds)*time.Second,
 	)
 	diagnosisSvc := diagnosis.NewService(
 		diagnosisStore,
@@ -100,6 +101,8 @@ func run() error {
 			ConfigFingerprint:   status.ConfigFingerprint,
 			NormalizedBaseURL:   status.BaseURL,
 			ModelName:           status.Model,
+			IsConfigured:        status.IsConfigured,
+			IsDemo:              status.IsDemo,
 			PromptVersion:       "v2.1",
 			AgentVersion:        "v2.1",
 			AgentConfigHash:     diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1),

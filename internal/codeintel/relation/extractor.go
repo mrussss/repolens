@@ -79,31 +79,59 @@ func extractCallRelation(ectx *ExtractionContext, call *ast.CallExpr, funcDecl *
 	if typeInfo != nil {
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 			if selection, ok := typeInfo.Selections[sel]; ok {
-				// Method call resolved semantically
-				recvType := selection.Recv()
-				recvStr := types.TypeString(recvType, nil)
-				canonicalRecv := model.CanonicalizeReceiver(recvStr)
 				targetObj := selection.Obj()
-				targetPkgPath := ""
-				if targetObj.Pkg() != nil {
-					targetPkgPath = targetObj.Pkg().Path()
-				}
-				targetName := targetObj.Name()
+				if targetFunc, isMethod := targetObj.(*types.Func); isMethod {
+					// Use the declaration receiver, not selection.Recv(). The latter
+					// describes the expression receiver and may be a promoted or
+					// instantiated type rather than the declaring type.
+					receiverName, hasReceiver := declaredReceiverName(selection)
+					targetPkgPath := ""
+					if targetFunc.Pkg() != nil {
+						targetPkgPath = targetFunc.Pkg().Path()
+					}
+					targetName := targetFunc.Name()
+					if hasReceiver {
+						rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, receiverName, model.SymbolKindMethod, targetName)
+						if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
+							return &model.SymbolRelation{
+								FromSymbolKeyHash:   callerHash,
+								ToSymbolKeyHash:     targetSym.SymbolKeyHash,
+								RelationType:        model.RelationTypeCallCandidate,
+								ResolutionKind:      model.ResolutionKindSemantic,
+								Confidence:          1.0,
+								ReasonCode:          "SEMANTIC_METHOD_SELECTION",
+								ReasonDetail:        fmt.Sprintf("Call to method %s on declaring receiver %s resolved via go/types", targetName, receiverName),
+								TargetName:          targetName,
+								TargetPackagePath:   targetPkgPath,
+								TargetQualifiedName: fmt.Sprintf("%s.%s", receiverName, targetName),
+								FilePath:            filePath,
+								Line:                pos.Line,
+								Column:              pos.Column,
+							}
+						}
+					}
 
-				// Look up in our symbol table
-				rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, canonicalRecv, model.SymbolKindMethod, targetName)
-				if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
+					// go/types resolved a method, but the corresponding root-module
+					// symbol is absent. Do not downgrade this fact to a syntactic
+					// receiver candidate.
+					reasonCode := "SEMANTIC_TARGET_NOT_INDEXED"
+					if targetPkgPath != "" && targetPkgPath != ectx.ModulePath && !strings.HasPrefix(targetPkgPath, ectx.ModulePath+"/") {
+						reasonCode = "UNRESOLVED_EXTERNAL_METHOD"
+					}
+					qualifiedName := targetName
+					if receiverName != "" {
+						qualifiedName = receiverName + "." + targetName
+					}
 					return &model.SymbolRelation{
 						FromSymbolKeyHash:   callerHash,
-						ToSymbolKeyHash:     targetSym.SymbolKeyHash,
 						RelationType:        model.RelationTypeCallCandidate,
-						ResolutionKind:      model.ResolutionKindSemantic,
-						Confidence:          1.0,
-						ReasonCode:          "SEMANTIC_METHOD_SELECTION",
-						ReasonDetail:        fmt.Sprintf("Call to method %s on %s resolved via go/types", targetName, canonicalRecv),
+						ResolutionKind:      model.ResolutionKindUnresolved,
+						Confidence:          0,
+						ReasonCode:          reasonCode,
+						ReasonDetail:        fmt.Sprintf("go/types resolved method %s but the target symbol is not indexed", qualifiedName),
 						TargetName:          targetName,
 						TargetPackagePath:   targetPkgPath,
-						TargetQualifiedName: fmt.Sprintf("%s.%s", canonicalRecv, targetName),
+						TargetQualifiedName: qualifiedName,
 						FilePath:            filePath,
 						Line:                pos.Line,
 						Column:              pos.Column,
@@ -260,6 +288,31 @@ func extractCallRelation(ectx *ExtractionContext, call *ast.CallExpr, funcDecl *
 	}
 
 	return nil
+}
+
+func declaredReceiverName(selection *types.Selection) (string, bool) {
+	if selection == nil {
+		return "", false
+	}
+	fn, ok := selection.Obj().(*types.Func)
+	if !ok {
+		return "", false
+	}
+
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return "", false
+	}
+
+	t := types.Unalias(sig.Recv().Type())
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(ptr.Elem())
+	}
+	named, ok := t.(*types.Named)
+	if !ok || named.Obj() == nil {
+		return "", false
+	}
+	return named.Obj().Name(), true
 }
 
 func extractSelectorReference(ectx *ExtractionContext, sel *ast.SelectorExpr, callerHash, filePath, packagePath string, typeInfo *types.Info) *model.SymbolRelation {

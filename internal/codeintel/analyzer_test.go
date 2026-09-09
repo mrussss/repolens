@@ -199,9 +199,8 @@ func TestAnalyze_ParserFixtures(t *testing.T) {
 			foundSyntacticCall = true
 		}
 		if r.ResolutionKind == codeintel.ResolutionKindUnresolved {
-			foundUnresolvedCall = true
-			if r.TargetPackagePath != "github.com/external/missing" {
-				t.Errorf("unresolved relation expected package github.com/external/missing, got %s", r.TargetPackagePath)
+			if r.TargetPackagePath == "github.com/external/missing" {
+				foundUnresolvedCall = true
 			}
 		}
 	}
