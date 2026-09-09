@@ -1051,7 +1051,7 @@ func gradeRootCause(report *evidence.DiagnosisReportData, truth GroundTruth) str
 func significantTokens(text string) map[string]bool {
 	result := make(map[string]bool)
 	for _, token := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-		return r < 'a' || r > 'z' && r < '0' || r > '9'
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
 	}) {
 		if len(token) >= 5 {
 			result[token] = true

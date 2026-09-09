@@ -10,8 +10,10 @@ import (
 
 	"repolens/internal/agent"
 	"repolens/internal/diagnosis"
+	"repolens/internal/evidence"
 	"repolens/internal/llm"
 	"repolens/internal/retrieval"
+	"repolens/internal/trace"
 )
 
 func TestSyntheticRunnerKeepsGroundTruthOutOfPrediction(t *testing.T) {
@@ -116,6 +118,38 @@ func TestGroundTruthSentinelDoesNotReachProvider(t *testing.T) {
 				t.Fatalf("provider received evaluator-only sentinel in message: %q", message.Content)
 			}
 		}
+	}
+}
+
+func TestE2EMetricsRecordTraceAndUnreportedUsage(t *testing.T) {
+	collector := newTraceCollector()
+	if err := collector.Create(context.Background(), &trace.AgentStep{AttemptID: "attempt", Seq: 1, StepType: trace.StepTypeThinking}); err != nil {
+		t.Fatal(err)
+	}
+	if err := collector.Create(context.Background(), &trace.AgentStep{AttemptID: "attempt", Seq: 2, StepType: trace.StepTypeToolCall, ToolName: "search_code"}); err != nil {
+		t.Fatal(err)
+	}
+	metrics := metricsFromExecution(nil, collector, 42)
+	if metrics.AgentRounds != 1 || metrics.ToolCalls != 1 || len(metrics.ToolNames) != 1 || metrics.ToolNames[0] != "search_code" {
+		t.Fatalf("unexpected trace metrics: %+v", metrics)
+	}
+	if metrics.CachedTokens != "NOT_REPORTED" || metrics.ReasoningTokens != "NOT_REPORTED" {
+		t.Fatalf("missing usage must be explicit: %+v", metrics)
+	}
+}
+
+func TestRootCauseRubricUsesGroundTruthOnlyAfterExecution(t *testing.T) {
+	truth := GroundTruth{
+		ExpectedRootCause: "handler returns stale cache value after refresh",
+		PrimaryFiles:      []string{"handler.go"},
+	}
+	report := &evidence.DiagnosisReportData{
+		Summary:   "The handler returns a stale cache value after refresh.",
+		RootCause: "The refresh path leaves the handler cache stale.",
+		Findings:  []evidence.Finding{{Citations: []evidence.Citation{{FilePath: "handler.go"}}}},
+	}
+	if got := gradeRootCause(report, truth); got != "Correct" {
+		t.Fatalf("root cause grade = %s, want Correct", got)
 	}
 }
 
