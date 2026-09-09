@@ -248,6 +248,7 @@ func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, s
 }
 
 var jsonExtractorRegex = regexp.MustCompile(`(?s)\{.*\}`)
+var fencedJSONRegex = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
 
 func parseReportJSON(raw string) (*evidence.DiagnosisReportData, error) {
 	clean := strings.TrimSpace(raw)
@@ -255,6 +256,16 @@ func parseReportJSON(raw string) (*evidence.DiagnosisReportData, error) {
 	clean = strings.TrimPrefix(clean, "```")
 	clean = strings.TrimSuffix(clean, "```")
 	clean = strings.TrimSpace(clean)
+
+	for _, match := range fencedJSONRegex.FindAllStringSubmatch(raw, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		var report evidence.DiagnosisReportData
+		if err := json.Unmarshal([]byte(match[1]), &report); err == nil && report.RootCause != "" {
+			return &report, nil
+		}
+	}
 
 	var report evidence.DiagnosisReportData
 	if err := json.Unmarshal([]byte(clean), &report); err == nil {
