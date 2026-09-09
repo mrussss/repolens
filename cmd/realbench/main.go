@@ -5,12 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"repolens/internal/eval/realbench"
 )
 
-const defaultDataset = "testdata/realbench/v1"
+const defaultDatasetVersion = "v1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -31,22 +32,28 @@ func main() {
 
 func runValidate(args []string) {
 	flags := flag.NewFlagSet("validate", flag.ExitOnError)
-	dataRoot := flags.String("data", defaultDataset, "RealBench dataset root")
+	datasetVersion := flags.String("dataset", defaultDatasetVersion, "RealBench dataset version: v1 or v2")
+	dataRoot := flags.String("data", "", "RealBench dataset root (overrides --dataset)")
 	_ = flags.Parse(args)
+	root, err := resolveDatasetRoot(*datasetVersion, *dataRoot)
+	if err != nil {
+		fatal(err)
+	}
 
-	hash, err := realbench.Validate(*dataRoot)
+	hash, err := realbench.Validate(root)
 	if err != nil {
 		if hash != "" {
 			fmt.Fprintf(os.Stderr, "computed manifest hash: %s\n", hash)
 		}
 		fatal(err)
 	}
-	fmt.Printf("valid RealBench dataset: %s\nmanifest hash: %s\n", *dataRoot, hash)
+	fmt.Printf("valid RealBench dataset: %s\nmanifest hash: %s\n", root, hash)
 }
 
 func runBenchmark(args []string) {
 	flags := flag.NewFlagSet("run", flag.ExitOnError)
-	dataRoot := flags.String("data", defaultDataset, "RealBench dataset root")
+	datasetVersion := flags.String("dataset", defaultDatasetVersion, "RealBench dataset version: v1 or v2")
+	dataRoot := flags.String("data", "", "RealBench dataset root (overrides --dataset)")
 	cacheRoot := flags.String("cache", ".cache/realbench", "checkout cache root")
 	artifactRoot := flags.String("artifacts", "artifacts/realbench", "benchmark artifact root")
 	caseID := flags.String("case", "", "run one case, for example REAL-001")
@@ -57,7 +64,11 @@ func runBenchmark(args []string) {
 	if (*caseID == "") == !*all {
 		fatal(fmt.Errorf("choose exactly one of --case REAL-NNN or --all"))
 	}
-	dataset, err := realbench.LoadInputs(*dataRoot)
+	root, err := resolveDatasetRoot(*datasetVersion, *dataRoot)
+	if err != nil {
+		fatal(err)
+	}
+	dataset, err := realbench.LoadInputs(root)
 	if err != nil {
 		fatal(err)
 	}
@@ -82,9 +93,23 @@ func runBenchmark(args []string) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: realbench validate [--data testdata/realbench/v1]")
-	fmt.Fprintln(os.Stderr, "       realbench run --case REAL-001 [--data ...] [--e2e]")
-	fmt.Fprintln(os.Stderr, "       realbench run --all [--data ...] [--e2e]")
+	fmt.Fprintln(os.Stderr, "usage: realbench validate [--dataset v1|v2] [--data ...]")
+	fmt.Fprintln(os.Stderr, "       realbench run --dataset v1|v2 --case REAL-NNN [--data ...] [--e2e]")
+	fmt.Fprintln(os.Stderr, "       realbench run --dataset v1|v2 --all [--data ...] [--e2e]")
+}
+
+func resolveDatasetRoot(version, explicitRoot string) (string, error) {
+	if strings.TrimSpace(explicitRoot) != "" {
+		return explicitRoot, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(version)) {
+	case "v1", "1", "realbench-v1":
+		return filepath.Join("testdata", "realbench", "v1"), nil
+	case "v2", "2", "realbench-v2":
+		return filepath.Join("testdata", "realbench", "v2"), nil
+	default:
+		return "", fmt.Errorf("unsupported RealBench dataset %q; choose v1 or v2", version)
+	}
 }
 
 func fatal(err error) {

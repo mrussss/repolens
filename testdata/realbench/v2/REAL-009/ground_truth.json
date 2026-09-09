@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-009",
+  "fix_commit_sha": "3085ad8955cba641f4dcdfb55ebe7e540016ca6d",
+  "expected_root_cause": "stringToStringValue.Set parses entries and writes into the target map without first initializing it. When StringToStringVar is given a nil default map, the first assignment panics.",
+  "fix_summary": "Allocate the target map in Set when it is nil before inserting parsed key-value entries, and add a nil-default regression test.",
+  "primary_relevant_files": ["string_to_string.go"],
+  "supporting_files": ["string_to_string_test.go"],
+  "relevant_symbols": ["(*stringToStringValue).Set"],
+  "relevant_line_ranges": {"string_to_string.go": {"start": 45, "end": 75}},
+  "provenance": {
+    "issue_url": "https://github.com/spf13/pflag/pull/506",
+    "fix_pr_url": "https://github.com/spf13/pflag/pull/506",
+    "fix_commit_url": "https://github.com/spf13/pflag/commit/3085ad8955cba641f4dcdfb55ebe7e540016ca6d"
+  },
+  "curation_notes": "PR #506 adds TestS2SNilDefault and initializes the target map in the production Set method; the buggy SHA is the parent of that functional fix commit."
+}

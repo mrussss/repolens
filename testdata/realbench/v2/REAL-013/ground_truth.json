@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-013",
+  "fix_commit_sha": "46e1ba8db45d4a937f042155d9eaed116b7da271",
+  "expected_root_cause": "Redirect.Back accepts the Referer header as a redirect location without validating its origin. A cross-origin absolute Referer is therefore reflected into the Location header and creates an open redirect.",
+  "fix_summary": "Parse the Referer and reject invalid or cross-origin locations, falling back to the supplied local path; add same-origin, cross-origin, relative, and scheme validation tests.",
+  "primary_relevant_files": ["redirect.go"],
+  "supporting_files": ["redirect_test.go"],
+  "relevant_symbols": ["(*Redirect).Back", "schemeAndHostMatch"],
+  "relevant_line_ranges": {"redirect.go": {"start": 370, "end": 410}},
+  "provenance": {
+    "issue_url": "https://github.com/gofiber/fiber/pull/4370",
+    "fix_pr_url": "https://github.com/gofiber/fiber/pull/4370",
+    "fix_commit_url": "https://github.com/gofiber/fiber/commit/46e1ba8db45d4a937f042155d9eaed116b7da271"
+  },
+  "curation_notes": "PR #4370 introduces same-origin validation for Redirect.Back and regression tests for cross-origin and scheme-only Referer values."
+}

@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-011",
+  "fix_commit_sha": "2731ecef4a93d62752c9d8230c90bc68de3a3427",
+  "expected_root_cause": "When operateHeaders sees an HTTP/2 HEADERS frame with END_STREAM, it marks the stream read-done but does not enqueue a receive result. The server Recv consumer therefore has no EOF notification and waits indefinitely for a later frame.",
+  "fix_summary": "Write a recvMsg containing io.EOF when the initial headers end the stream, and add a transport regression test that asserts Recv returns EOF within the timeout.",
+  "primary_relevant_files": ["internal/transport/http2_server.go"],
+  "supporting_files": ["test/transport_test.go", "test/end2end_test.go"],
+  "relevant_symbols": ["(*http2Server).operateHeaders"],
+  "relevant_line_ranges": {"internal/transport/http2_server.go": {"start": 520, "end": 545}},
+  "provenance": {
+    "issue_url": "https://github.com/grpc/grpc-go/pull/9391",
+    "fix_pr_url": "https://github.com/grpc/grpc-go/pull/9391",
+    "fix_commit_url": "https://github.com/grpc/grpc-go/commit/2731ecef4a93d62752c9d8230c90bc68de3a3427"
+  },
+  "curation_notes": "PR #9391 adds the missing EOF receive message in internal/transport/http2_server.go and a transport-level no-hang regression test."
+}

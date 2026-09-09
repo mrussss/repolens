@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-004",
+  "fix_commit_sha": "2df018666f13470b75d6390dae0963ec715c6605",
+  "expected_root_cause": "SaveUploadedFile applies chmod to the destination directory after MkdirAll even when that directory already existed. A process may not own an existing directory such as /tmp, so the unconditional chmod returns operation not permitted and prevents the upload.",
+  "fix_summary": "Check whether the destination directory existed before MkdirAll and only apply the requested mode when this call created the directory.",
+  "primary_relevant_files": ["context.go"],
+  "supporting_files": ["context_test.go"],
+  "relevant_symbols": ["(*Context).SaveUploadedFile"],
+  "relevant_line_ranges": {"context.go": {"start": 726, "end": 760}},
+  "provenance": {
+    "issue_url": "https://github.com/gin-gonic/gin/issues/4622",
+    "fix_pr_url": "https://github.com/gin-gonic/gin/pull/4702",
+    "fix_commit_url": "https://github.com/gin-gonic/gin/commit/2df018666f13470b75d6390dae0963ec715c6605"
+  },
+  "curation_notes": "Issue #4622 and PR #4702 were checked against the fix commit and regression test; the buggy SHA is the direct parent of the functional fix commit."
+}

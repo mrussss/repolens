@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-005",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "sirupsen/logrus",
+    "clone_url": "https://github.com/sirupsen/logrus.git"
+  },
+  "buggy_commit_sha": "134c80f81c9667a2d8c306f159d474857a20b735",
+  "issue_title": "TextFormatter panics while formatting a panicking error or Stringer",
+  "issue_description": "A log field implementing error or fmt.Stringer can panic while its value is formatted. Nil pointer values behind those interfaces can also panic. Formatting a log entry should recover from the value method and emit a safe representation instead of crashing the logger.",
+  "error_log": "panic: unexpected from error.Error while TextFormatter formatted field value"
+}

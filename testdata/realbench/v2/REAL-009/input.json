@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-009",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "spf13/pflag",
+    "clone_url": "https://github.com/spf13/pflag.git"
+  },
+  "buggy_commit_sha": "4f8e9056816a26ecbac9fe26cde50968eb3626f8",
+  "issue_title": "StringToString flag with a nil default panics during parsing",
+  "issue_description": "Declaring a StringToString flag with a nil default leaves the target map nil. Parsing a valid key-value list then attempts to assign into that nil map instead of initializing it.",
+  "error_log": "panic: assignment to entry in nil map while parsing --s2s=a=1,b=2"
+}

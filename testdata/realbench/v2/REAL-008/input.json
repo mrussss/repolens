@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-008",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "spf13/pflag",
+    "clone_url": "https://github.com/spf13/pflag.git"
+  },
+  "buggy_commit_sha": "5fdac2d16c16d60605cb8baa887e8c5c38ef623f",
+  "issue_title": "FlagSet usage output ignores the configured destination",
+  "issue_description": "A caller can configure a FlagSet output writer, but invoking the default usage function still writes the usage header to process-wide stderr. Usage output should honor the destination selected by the FlagSet.",
+  "error_log": "configured usage buffer is empty; usage was written to stderr"
+}

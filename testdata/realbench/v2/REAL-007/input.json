@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-007",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "urfave/cli",
+    "clone_url": "https://github.com/urfave/cli.git"
+  },
+  "buggy_commit_sha": "0ed457cf64de75990ce1779f0b9632796f1a4962",
+  "issue_title": "Shell completion after -- executes the command action",
+  "issue_description": "When a shell completion request contains the double-dash separator, the command should stop suggesting flags and should never execute the command action. The completion state currently loses that distinction and can run normal command behavior.",
+  "error_log": "completion request unexpectedly ran command action after --"
+}

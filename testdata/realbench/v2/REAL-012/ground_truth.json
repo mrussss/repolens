@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-012",
+  "fix_commit_sha": "6ec2e187231718140cc37457d58476326ce3ef4f",
+  "expected_root_cause": "NewClient creates pools and then performs later initialization that can panic. Without a deferred cleanup path, a panic before the client is returned leaves those pools and their connections alive with no caller reference available to close them.",
+  "fix_summary": "Defer cleanup for a partially built client until construction succeeds, preserving the original panic while closing pools and background resources on failure.",
+  "primary_relevant_files": ["redis.go"],
+  "supporting_files": ["newclient_panic_cleanup_test.go"],
+  "relevant_symbols": ["NewClient"],
+  "relevant_line_ranges": {"redis.go": {"start": 2098, "end": 2220}},
+  "provenance": {
+    "issue_url": "https://github.com/redis/go-redis/pull/4003",
+    "fix_pr_url": "https://github.com/redis/go-redis/pull/4003",
+    "fix_commit_url": "https://github.com/redis/go-redis/commit/6ec2e187231718140cc37457d58476326ce3ef4f"
+  },
+  "curation_notes": "PR #4003 adds a panic cleanup defer in NewClient and a custom dialer regression test that checks every opened connection is eventually closed."
+}

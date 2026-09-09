@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-005",
+  "fix_commit_sha": "17d574b11e6e884800c2a8cfc6d3d134dcf4d452",
+  "expected_root_cause": "TextFormatter calls Error or String directly while formatting values. A panicking method or a typed-nil pointer behind the interface can panic the entire logging path instead of being rendered safely.",
+  "fix_summary": "Wrap error and Stringer formatting in recovery helpers and render typed-nil values as <nil> while preserving a diagnostic panic marker for other panics.",
+  "primary_relevant_files": ["text_formatter.go"],
+  "supporting_files": ["text_formatter_test.go"],
+  "relevant_symbols": ["(*TextFormatter).appendValue", "(*TextFormatter).appendError", "(*TextFormatter).appendStringer"],
+  "relevant_line_ranges": {"text_formatter.go": {"start": 329, "end": 446}},
+  "provenance": {
+    "issue_url": "https://github.com/sirupsen/logrus/issues/1580",
+    "fix_pr_url": "https://github.com/sirupsen/logrus/pull/1582",
+    "fix_commit_url": "https://github.com/sirupsen/logrus/commit/17d574b11e6e884800c2a8cfc6d3d134dcf4d452"
+  },
+  "curation_notes": "The PR changelog identifies the v1.10.0 formatting regression and its regression tests cover panicable error, Stringer, and typed-nil values."
+}

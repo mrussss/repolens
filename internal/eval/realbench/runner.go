@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,9 +30,11 @@ import (
 	"repolens/internal/llm"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/provider"
 	"repolens/internal/retrieval"
 	"repolens/internal/retrieval/artifact"
 	"repolens/internal/retrieval/bm25"
+	"repolens/internal/trace"
 )
 
 const productionStrategy = "symbol_bm25_structural"
@@ -118,28 +121,36 @@ type RunOptions struct {
 }
 
 type RunMetadata struct {
-	RunID               string    `json:"run_id"`
-	DatasetVersion      string    `json:"dataset_version"`
-	DatasetManifestHash string    `json:"dataset_manifest_hash"`
-	RepoLensGitCommit   string    `json:"repolens_git_commit"`
-	RetrievalStrategy   string    `json:"retrieval_strategy"`
-	RetrievalVersion    string    `json:"retrieval_version"`
-	IndexVersion        string    `json:"index_version"`
-	AgentVersion        string    `json:"agent_version,omitempty"`
-	PromptVersion       string    `json:"prompt_version,omitempty"`
-	Provider            string    `json:"provider,omitempty"`
-	Model               string    `json:"model,omitempty"`
-	Timestamp           time.Time `json:"timestamp"`
-	CaseCount           int       `json:"case_count"`
-	E2EStatus           string    `json:"e2e_status"`
-	WorkingTreeClean    bool      `json:"working_tree_clean"`
-	GoVersion           string    `json:"go_version"`
-	OS                  string    `json:"os"`
-	Arch                string    `json:"arch"`
-	ProviderTimeoutSec  int       `json:"provider_timeout_seconds,omitempty"`
-	Temperature         float64   `json:"temperature,omitempty"`
-	ReasoningEffort     string    `json:"reasoning_effort,omitempty"`
-	ResponseFormat      string    `json:"response_format,omitempty"`
+	RunID                 string    `json:"run_id"`
+	DatasetVersion        string    `json:"dataset_version"`
+	DatasetManifestHash   string    `json:"dataset_manifest_hash"`
+	RepoLensGitCommit     string    `json:"repolens_git_commit"`
+	RetrievalStrategy     string    `json:"retrieval_strategy"`
+	RetrievalVersion      string    `json:"retrieval_version"`
+	IndexVersion          string    `json:"index_version"`
+	AgentVersion          string    `json:"agent_version,omitempty"`
+	PromptVersion         string    `json:"prompt_version,omitempty"`
+	Provider              string    `json:"provider,omitempty"`
+	Model                 string    `json:"model,omitempty"`
+	BaseURLFingerprint    string    `json:"base_url_fingerprint,omitempty"`
+	AuthMode              string    `json:"auth_mode,omitempty"`
+	AgentConfigHash       string    `json:"agent_config_hash,omitempty"`
+	MaxToolCalls          int       `json:"max_tool_calls,omitempty"`
+	ToolBudget            int       `json:"tool_budget,omitempty"`
+	PreflightStatus       string    `json:"preflight_status,omitempty"`
+	Timestamp             time.Time `json:"timestamp"`
+	CaseCount             int       `json:"case_count"`
+	E2EStatus             string    `json:"e2e_status"`
+	WorkingTreeClean      bool      `json:"working_tree_clean"`
+	GoVersion             string    `json:"go_version"`
+	OS                    string    `json:"os"`
+	Arch                  string    `json:"arch"`
+	ProviderTimeoutSec    int       `json:"provider_timeout_seconds,omitempty"`
+	Temperature           float64   `json:"temperature,omitempty"`
+	ReasoningEffort       string    `json:"reasoning_effort,omitempty"`
+	ResponseFormat        string    `json:"response_format,omitempty"`
+	InputPricePerMillion  *float64  `json:"input_price_per_million,omitempty"`
+	OutputPricePerMillion *float64  `json:"output_price_per_million,omitempty"`
 }
 
 type Prediction struct {
@@ -166,6 +177,7 @@ type CaseStatus struct {
 	ReciprocalRank float64 `json:"reciprocal_rank"`
 	LatencyMs      int64   `json:"latency_ms"`
 	E2EStatus      string  `json:"e2e_status"`
+	E2ELatencyMs   int64   `json:"e2e_latency_ms,omitempty"`
 }
 
 type Metrics struct {
@@ -211,6 +223,39 @@ type analysisQualityArtifact struct {
 type analysisQualityRow struct {
 	CaseID string
 	analysisQualityArtifact
+}
+
+// E2EMetrics is deliberately an evidence artifact, not an accuracy claim.
+// Provider fields that are absent from a response are represented explicitly
+// as NOT_REPORTED instead of being confused with a reported zero.
+type E2EMetrics struct {
+	Status                string      `json:"e2e_status"`
+	RootCauseGrade        string      `json:"root_cause_grade"`
+	CitationTotal         int         `json:"citation_total"`
+	CitationValid         int         `json:"citation_valid"`
+	CitationInvalid       int         `json:"citation_invalid"`
+	CitationValidityRate  float64     `json:"citation_validity_rate"`
+	UnsupportedClaims     int         `json:"unsupported_claims"`
+	ToolCalls             int         `json:"tool_calls"`
+	ToolNames             []string    `json:"tool_names"`
+	AgentRounds           int         `json:"agent_rounds"`
+	LatencyMs             int64       `json:"latency_ms"`
+	InputTokens           int         `json:"input_tokens"`
+	OutputTokens          int         `json:"output_tokens"`
+	TotalTokens           int         `json:"total_tokens"`
+	CachedTokens          interface{} `json:"cached_tokens"`
+	ReasoningTokens       interface{} `json:"reasoning_tokens"`
+	FailureClassification string      `json:"failure_classification,omitempty"`
+	CostStatus            string      `json:"cost_status"`
+	EstimatedCostUSD      *float64    `json:"estimated_cost_usd,omitempty"`
+	Attempts              int         `json:"attempts"`
+}
+
+type e2eAttempt struct {
+	Attempt      int    `json:"attempt"`
+	Status       string `json:"status"`
+	FailureClass string `json:"failure_classification,omitempty"`
+	LatencyMs    int64  `json:"latency_ms"`
 }
 
 type Runner struct {
@@ -272,6 +317,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	e2eStatus := e2eNotRequested
 	providerConfig, providerConfigured := loadProviderConfig()
 	e2eStatus = e2eStatusFor(opts.RunE2E, providerConfigured)
+	guardConfig := agent.DefaultGuardConfig()
 	result := &RunResult{
 		RunDir: runDir,
 		Metadata: RunMetadata{
@@ -296,9 +342,31 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		},
 	}
 	qualityRows := make([]analysisQualityRow, 0, len(caseInputs))
+	inputPrice, outputPrice, pricesConfigured := configuredPrices()
+	if pricesConfigured {
+		result.Metadata.InputPricePerMillion = &inputPrice
+		result.Metadata.OutputPricePerMillion = &outputPrice
+	}
 	if opts.RunE2E && providerConfigured {
-		result.Metadata.Provider = "openai-compatible"
+		result.Metadata.Provider = providerConfig.Provider
 		result.Metadata.Model = providerConfig.Model
+		result.Metadata.BaseURLFingerprint = providerConfig.EndpointFingerprint
+		result.Metadata.AuthMode = providerConfig.AuthMode
+		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHash(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxRepeatCalls, 0.1)
+		result.Metadata.MaxToolCalls = guardConfig.MaxToolCalls
+		result.Metadata.ToolBudget = guardConfig.MaxToolCalls
+		result.Metadata.ResponseFormat = "prompt_json_contract"
+		result.Metadata.ReasoningEffort = "not_requested"
+		preflight, err := runProviderPreflight(ctx, providerConfig, guardConfig)
+		if err != nil {
+			result.Metadata.PreflightStatus = "FAIL"
+			_ = writeJSON(filepath.Join(runDir, "preflight.json"), preflight)
+			return nil, err
+		}
+		result.Metadata.PreflightStatus = "PASS"
+		if err := writeJSON(filepath.Join(runDir, "preflight.json"), preflight); err != nil {
+			return nil, fmt.Errorf("write preflight artifact: %w", err)
+		}
 	}
 
 	for _, inputCase := range caseInputs {
@@ -349,9 +417,12 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		}
 		caseE2EStatus := e2eStatus
 		var diagnosisResult *agent.ExecutionResult
+		var e2eMetrics *E2EMetrics
 		var e2eErr error
 		if opts.RunE2E && providerConfigured {
-			diagnosisResult, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir)
+			e2eStarted := time.Now()
+			diagnosisResult, e2eMetrics, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir)
+			status.E2ELatencyMs = time.Since(e2eStarted).Milliseconds()
 			if e2eErr != nil {
 				caseE2EStatus = e2eFailure
 			} else {
@@ -396,6 +467,20 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			_ = writeJSON(filepath.Join(caseDir, "status.json"), status)
 			continue
 		}
+		if e2eMetrics != nil {
+			if diagnosisResult != nil {
+				e2eMetrics.RootCauseGrade = gradeRootCause(diagnosisResult.Report, truth)
+				e2eMetrics.UnsupportedClaims = countUnsupportedClaims(diagnosisResult.Report)
+			}
+			if e2eErr != nil {
+				e2eMetrics.RootCauseGrade = "Not Scorable"
+				e2eMetrics.FailureClassification = errorClassFor(e2eErr)
+			}
+			if err := writeJSON(filepath.Join(caseDir, "e2e_metrics.json"), e2eMetrics); err != nil {
+				workspace.Close()
+				return nil, fmt.Errorf("write %s E2E metrics: %w", caseID, err)
+			}
+		}
 		status.HitAt5, status.HitAt10, status.ReciprocalRank = retrievalMetrics(top10, truth.PrimaryFiles)
 		status.E2EStatus = caseE2EStatus
 		status.Status = "RETRIEVAL_COMPLETED_E2E_NOT_RUN"
@@ -404,7 +489,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		} else if caseE2EStatus == e2eFailure {
 			status.Status = "RETRIEVAL_COMPLETED_E2E_FAILURE"
 			status.ErrorClass = errorClassFor(e2eErr)
-			status.Error = e2eErr.Error()
+			status.Error = failureSummary(e2eErr)
 		}
 		result.Cases = append(result.Cases, status)
 		workspace.Close()
@@ -549,23 +634,142 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 }
 
 type providerConfig struct {
-	APIKey         string
-	BaseURL        string
-	Model          string
-	AuthMode       string
-	TimeoutSeconds int
+	Provider            string
+	APIKey              string
+	BaseURL             string
+	Model               string
+	AuthMode            string
+	TimeoutSeconds      int
+	IsDemo              bool
+	EndpointFingerprint string
 }
 
 func loadProviderConfig() (providerConfig, bool) {
 	config := providerConfig{
+		Provider:       os.Getenv("REPOLENS_REALBENCH_PROVIDER"),
 		APIKey:         os.Getenv("REPOLENS_REALBENCH_API_KEY"),
 		BaseURL:        os.Getenv("REPOLENS_REALBENCH_BASE_URL"),
 		Model:          os.Getenv("REPOLENS_REALBENCH_MODEL"),
 		AuthMode:       os.Getenv("REPOLENS_REALBENCH_AUTH_MODE"),
 		TimeoutSeconds: providerTimeoutSeconds(),
 	}
-	authConfigured := strings.EqualFold(strings.TrimSpace(config.AuthMode), "none") || config.APIKey != ""
-	return config, config.BaseURL != "" && config.Model != "" && authConfigured
+	if config.Provider == "" {
+		config.Provider = "AIHubMix"
+	}
+	if config.BaseURL == "" && config.Model == "" && config.APIKey == "" {
+		manager := provider.NewManager("", "", "", "", "")
+		stored, err := manager.GetSecretConfig()
+		if err == nil && stored != nil {
+			config.BaseURL = stored.BaseURL
+			config.Model = stored.Model
+			config.APIKey = stored.APIKey
+			config.AuthMode = stored.AuthMode
+			config.IsDemo = stored.IsDemo
+		}
+	}
+	config.AuthMode = normalizeAuthMode(config.AuthMode)
+	normalized, err := provider.NormalizeBaseURL(config.BaseURL)
+	if err == nil {
+		config.BaseURL = normalized
+		config.EndpointFingerprint = provider.ComputeEndpointFingerprint(normalized)
+	}
+	authConfigured := config.AuthMode == "none" || config.APIKey != ""
+	return config, config.BaseURL != "" && config.Model != "" && authConfigured && !config.IsDemo
+}
+
+type providerPreflight struct {
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	Configured       bool   `json:"is_configured"`
+	Demo             bool   `json:"is_demo"`
+	NormalCompletion string `json:"normal_completion"`
+	ToolCalling      string `json:"tool_calling"`
+	AgentLoop        string `json:"agent_loop"`
+	StructuredReport string `json:"structured_report"`
+}
+
+func runProviderPreflight(ctx context.Context, config providerConfig, guardConfig agent.GuardConfig) (providerPreflight, error) {
+	result := providerPreflight{
+		Provider:   config.Provider,
+		Model:      config.Model,
+		Configured: true,
+		Demo:       config.IsDemo,
+	}
+	if config.IsDemo {
+		return result, productFailure("provider preflight", errors.New("demo provider is not allowed for formal E2E"))
+	}
+	client := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(
+		config.APIKey,
+		config.BaseURL,
+		config.Model,
+		config.AuthMode,
+		time.Duration(config.TimeoutSeconds)*time.Second,
+	)
+	temperature := 0.1
+	if _, err := client.Generate(ctx, llm.GenerateRequest{
+		Messages:    []llm.Message{{Role: llm.RoleUser, Content: "Reply with exactly OK."}},
+		Temperature: &temperature,
+	}); err != nil {
+		return result, externalFailure("preflight normal completion", err)
+	}
+	result.NormalCompletion = "PASS"
+
+	toolDefinition := llm.ToolDefinition{
+		Type: "function",
+		Function: llm.FunctionDef{
+			Name:        "repolens_preflight_echo",
+			Description: "Return the supplied text for a tool-calling round-trip check.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"text": map[string]interface{}{"type": "string"}},
+				"required":   []string{"text"},
+			},
+		},
+	}
+	toolResponse, err := client.Generate(ctx, llm.GenerateRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "Call repolens_preflight_echo exactly once with text ping."}},
+		Tools:    []llm.ToolDefinition{toolDefinition}, Temperature: &temperature,
+	})
+	if err != nil {
+		return result, externalFailure("preflight tool calling", err)
+	}
+	if len(toolResponse.Message.ToolCalls) == 0 {
+		return result, productFailure("preflight tool calling", errors.New("provider did not return a tool call"))
+	}
+	toolCall := toolResponse.Message.ToolCalls[0]
+	if toolCall.Function.Name != toolDefinition.Function.Name {
+		return result, productFailure("preflight tool calling", fmt.Errorf("provider selected unexpected tool %q", toolCall.Function.Name))
+	}
+	if _, err := client.Generate(ctx, llm.GenerateRequest{
+		Messages: []llm.Message{
+			{Role: llm.RoleUser, Content: "Call repolens_preflight_echo exactly once with text ping."},
+			toolResponse.Message,
+			{Role: llm.RoleTool, ToolCallID: toolCall.ID, Content: "ping"},
+		},
+		Tools: []llm.ToolDefinition{toolDefinition}, Temperature: &temperature,
+	}); err != nil {
+		return result, externalFailure("preflight tool round trip", err)
+	}
+	result.ToolCalling = "PASS"
+
+	loop := agent.NewAgentLoop(client, agent.NewToolRegistry(), nil, guardConfig)
+	loopResult, err := loop.Run(ctx, &diagnosis.DiagnosisRun{
+		ID: "realbench-preflight", RepositoryID: "preflight", SnapshotID: "preflight",
+		IssueTitle: "preflight structured report", IssueDescription: "Return a concise diagnosis report.",
+		Temperature: 0.1, ModelName: config.Model,
+	}, &diagnosis.DiagnosisAttempt{ID: "realbench-preflight-attempt"})
+	if err != nil {
+		return result, productOrExternalAgentFailure(err)
+	}
+	result.AgentLoop = "PASS"
+	if loopResult == nil || loopResult.Report == nil {
+		return result, productFailure("preflight structured report", errors.New("agent returned no report"))
+	}
+	if !loopResult.StructuredReport {
+		return result, productFailure("preflight structured report", errors.New("agent response was not structured JSON"))
+	}
+	result.StructuredReport = "PASS"
+	return result, nil
 }
 
 type classifiedProvider struct {
@@ -580,7 +784,37 @@ func (p classifiedProvider) Generate(ctx context.Context, request llm.GenerateRe
 	return response, nil
 }
 
-func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string) (*agent.ExecutionResult, error) {
+func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string) (*agent.ExecutionResult, *E2EMetrics, error) {
+	var lastResult *agent.ExecutionResult
+	var lastMetrics *E2EMetrics
+	var lastErr error
+	attempts := make([]e2eAttempt, 0, 3)
+	for attempt := 1; attempt <= 3; attempt++ {
+		started := time.Now()
+		result, metrics, err := runE2EOnce(ctx, input, workspace, config, caseDir, attempt, started)
+		if metrics == nil {
+			metrics = &E2EMetrics{Status: e2eFailure, RootCauseGrade: "Not Scorable", CostStatus: costStatus()}
+		}
+		metrics.Attempts = attempt
+		lastResult, lastMetrics, lastErr = result, metrics, err
+		attemptRecord := e2eAttempt{Attempt: attempt, Status: e2eCompleted, LatencyMs: time.Since(started).Milliseconds()}
+		if err != nil {
+			attemptRecord.Status = e2eFailure
+			attemptRecord.FailureClass = errorClassFor(err)
+		}
+		attempts = append(attempts, attemptRecord)
+		_ = writeJSON(filepath.Join(caseDir, "e2e_attempts.json"), attempts)
+		if err == nil {
+			return result, metrics, nil
+		}
+		if errorClassFor(err) != string(failureExternalInfra) || attempt == 3 {
+			return result, metrics, err
+		}
+	}
+	return lastResult, lastMetrics, lastErr
+}
+
+func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string, attemptNo int, started time.Time) (*agent.ExecutionResult, *E2EMetrics, error) {
 	providerClient := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(
 		config.APIKey,
 		config.BaseURL,
@@ -589,11 +823,12 @@ func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, co
 		time.Duration(config.TimeoutSeconds)*time.Second,
 	)
 	provider := classifiedProvider{Provider: providerClient}
+	collector := newTraceCollector()
 	executor := agent.NewAgentRuntimeExecutor(
 		provider,
 		workspace.Retriever,
 		workspace.SnapshotStore,
-		nil,
+		collector,
 		agent.DefaultGuardConfig(),
 	)
 	executor.WithCodeIntelStore(workspace.CodeIndexStore)
@@ -601,11 +836,26 @@ func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, co
 	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
 	result, err := executor.Execute(ctx, run, attempt)
 	if err != nil {
-		return nil, err
+		metrics := metricsFromExecution(nil, collector, time.Since(started).Milliseconds())
+		metrics.Status = e2eFailure
+		metrics.FailureClassification = errorClassFor(err)
+		metrics.CostStatus = costStatus()
+		_ = writeJSON(filepath.Join(caseDir, fmt.Sprintf("agent_trace_attempt_%d.json", attemptNo)), collector.Steps())
+		_ = writeJSON(filepath.Join(caseDir, "agent_trace.json"), collector.Steps())
+		return nil, metrics, productOrExternalAgentFailure(err)
 	}
 	if result == nil {
-		return nil, productFailure("Agent runtime", errors.New("empty execution result"))
+		err = productFailure("Agent runtime", errors.New("empty execution result"))
+		metrics := metricsFromExecution(nil, collector, time.Since(started).Milliseconds())
+		metrics.Status = e2eFailure
+		metrics.FailureClassification = errorClassFor(err)
+		metrics.CostStatus = costStatus()
+		return nil, metrics, err
 	}
+	metrics := metricsFromExecution(result, collector, time.Since(started).Milliseconds())
+	metrics.Status = e2eCompleted
+	metrics.CostStatus = costStatus()
+	metrics.EstimatedCostUSD = estimateCost(result)
 	citations := []evidence.Citation{}
 	if result.Report != nil {
 		citations = flattenCitations(result.Report)
@@ -618,19 +868,243 @@ func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, co
 			}
 		}
 		if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
-			"total": len(citations), "valid": valid, "invalid": len(citations) - valid, "citations": citations,
+			"total": len(citations), "valid": valid, "invalid": len(citations) - valid,
+			"validity_rate": citationValidityRate(len(citations), valid), "citations": citations,
 		}); err != nil {
-			return nil, productFailure("write citation result", err)
+			return nil, metrics, productFailure("write citation result", err)
 		}
+		metrics.CitationTotal = len(citations)
+		metrics.CitationValid = valid
+		metrics.CitationInvalid = len(citations) - valid
+		metrics.CitationValidityRate = citationValidityRate(len(citations), valid)
 		if len(citations) != 0 && valid != len(citations) {
-			return result, productFailure("citation validation", fmt.Errorf("%d of %d citations are invalid", len(citations)-valid, len(citations)))
+			err := productFailure("citation validation", fmt.Errorf("%d of %d citations are invalid", len(citations)-valid, len(citations)))
+			metrics.Status = e2eFailure
+			metrics.FailureClassification = errorClassFor(err)
+			_ = writeJSON(filepath.Join(caseDir, fmt.Sprintf("agent_trace_attempt_%d.json", attemptNo)), collector.Steps())
+			_ = writeJSON(filepath.Join(caseDir, "agent_trace.json"), collector.Steps())
+			return result, metrics, err
 		}
 	} else if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
-		"total": 0, "valid": 0, "invalid": 0, "citations": []evidence.Citation{},
+		"total": 0, "valid": 0, "invalid": 0, "validity_rate": 0, "citations": []evidence.Citation{},
 	}); err != nil {
-		return nil, productFailure("write citation result", err)
+		return nil, metrics, productFailure("write citation result", err)
 	}
-	return result, nil
+	_ = writeJSON(filepath.Join(caseDir, fmt.Sprintf("agent_trace_attempt_%d.json", attemptNo)), collector.Steps())
+	_ = writeJSON(filepath.Join(caseDir, "agent_trace.json"), collector.Steps())
+	return result, metrics, nil
+}
+
+func productOrExternalAgentFailure(err error) error {
+	return productFailure("Agent runtime", err)
+}
+
+type traceCollector struct {
+	mu    sync.Mutex
+	steps []trace.AgentStep
+}
+
+func newTraceCollector() *traceCollector {
+	return &traceCollector{}
+}
+
+func (c *traceCollector) Create(_ context.Context, step *trace.AgentStep) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	copyOfStep := *step
+	c.steps = append(c.steps, copyOfStep)
+	return nil
+}
+
+func (c *traceCollector) ListByAttempt(_ context.Context, attemptID string) ([]trace.AgentStep, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	steps := make([]trace.AgentStep, 0, len(c.steps))
+	for _, step := range c.steps {
+		if step.AttemptID == attemptID {
+			steps = append(steps, step)
+		}
+	}
+	return steps, nil
+}
+
+func (c *traceCollector) ListAfterSeq(ctx context.Context, attemptID string, lastSeq int) ([]trace.AgentStep, error) {
+	steps, err := c.ListByAttempt(ctx, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	filtered := steps[:0]
+	for _, step := range steps {
+		if step.Seq > lastSeq {
+			filtered = append(filtered, step)
+		}
+	}
+	return filtered, nil
+}
+
+func (c *traceCollector) Steps() []trace.AgentStep {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	steps := append([]trace.AgentStep(nil), c.steps...)
+	sort.SliceStable(steps, func(i, j int) bool { return steps[i].Seq < steps[j].Seq })
+	return steps
+}
+
+func metricsFromExecution(result *agent.ExecutionResult, collector *traceCollector, latencyMs int64) *E2EMetrics {
+	metrics := &E2EMetrics{
+		Status:          e2eFailure,
+		RootCauseGrade:  "Not Scorable",
+		ToolNames:       []string{},
+		LatencyMs:       latencyMs,
+		CachedTokens:    "NOT_REPORTED",
+		ReasoningTokens: "NOT_REPORTED",
+		CostStatus:      costStatus(),
+	}
+	if result != nil {
+		metrics.ToolCalls = result.ToolCalls
+		metrics.ToolNames = append([]string(nil), result.ToolNames...)
+		metrics.AgentRounds = result.AgentRounds
+		metrics.InputTokens = result.PromptTokens
+		metrics.OutputTokens = result.CompletionTokens
+		metrics.TotalTokens = result.PromptTokens + result.CompletionTokens
+		if result.CachedPromptTokens > 0 {
+			metrics.CachedTokens = result.CachedPromptTokens
+		}
+		if result.ReasoningTokens > 0 {
+			metrics.ReasoningTokens = result.ReasoningTokens
+		}
+		return metrics
+	}
+	for _, step := range collector.Steps() {
+		switch step.StepType {
+		case trace.StepTypeThinking:
+			metrics.AgentRounds++
+		case trace.StepTypeToolCall:
+			metrics.ToolCalls++
+			metrics.ToolNames = append(metrics.ToolNames, step.ToolName)
+		}
+	}
+	return metrics
+}
+
+func citationValidityRate(total, valid int) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(valid) / float64(total)
+}
+
+func countUnsupportedClaims(report *evidence.DiagnosisReportData) int {
+	if report == nil {
+		return 0
+	}
+	unsupported := 0
+	for _, finding := range report.Findings {
+		if len(finding.Citations) == 0 {
+			unsupported++
+		}
+	}
+	if len(report.Findings) == 0 && strings.TrimSpace(report.RootCause) != "" {
+		unsupported = 1
+	}
+	return unsupported
+}
+
+func gradeRootCause(report *evidence.DiagnosisReportData, truth GroundTruth) string {
+	if report == nil {
+		return "Not Scorable"
+	}
+	actual := strings.ToLower(report.Summary + " " + report.RootCause)
+	for _, finding := range report.Findings {
+		actual += " " + strings.ToLower(finding.Title+" "+finding.Reasoning)
+	}
+	expectedTokens := significantTokens(truth.ExpectedRootCause)
+	if len(expectedTokens) == 0 {
+		return "Not Scorable"
+	}
+	matched := 0
+	for token := range expectedTokens {
+		if strings.Contains(actual, token) {
+			matched++
+		}
+	}
+	overlap := float64(matched) / float64(len(expectedTokens))
+	fileMatch := false
+	for _, finding := range report.Findings {
+		for _, citation := range finding.Citations {
+			for _, file := range truth.PrimaryFiles {
+				if normalizePath(citation.FilePath) == normalizePath(file) {
+					fileMatch = true
+				}
+			}
+		}
+	}
+	if fileMatch && overlap >= 0.6 {
+		return "Correct"
+	}
+	if fileMatch || overlap >= 0.3 {
+		return "Partial"
+	}
+	return "Incorrect"
+}
+
+func significantTokens(text string) map[string]bool {
+	result := make(map[string]bool)
+	for _, token := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return r < 'a' || r > 'z' && r < '0' || r > '9'
+	}) {
+		if len(token) >= 5 {
+			result[token] = true
+		}
+	}
+	return result
+}
+
+func costStatus() string {
+	_, _, ok := configuredPrices()
+	if ok {
+		return "CONFIGURED"
+	}
+	return "NOT_CONFIGURED"
+}
+
+func configuredPrices() (float64, float64, bool) {
+	input, inputErr := strconv.ParseFloat(os.Getenv("REPOLENS_REALBENCH_INPUT_PRICE_PER_MILLION"), 64)
+	output, outputErr := strconv.ParseFloat(os.Getenv("REPOLENS_REALBENCH_OUTPUT_PRICE_PER_MILLION"), 64)
+	if inputErr != nil || outputErr != nil || input < 0 || output < 0 {
+		return 0, 0, false
+	}
+	return input, output, true
+}
+
+func estimateCost(result *agent.ExecutionResult) *float64 {
+	if result == nil {
+		return nil
+	}
+	inputPrice, outputPrice, ok := configuredPrices()
+	if !ok {
+		return nil
+	}
+	cost := float64(result.PromptTokens)*inputPrice/1_000_000 + float64(result.CompletionTokens)*outputPrice/1_000_000
+	return &cost
+}
+
+func failureSummary(err error) string {
+	if err == nil {
+		return ""
+	}
+	var classified *classifiedError
+	if errors.As(err, &classified) {
+		return fmt.Sprintf("%s failure at %s", classified.class, classified.stage)
+	}
+	return "REPOLENS_PRODUCT failure"
+}
+
+func normalizeAuthMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "none") {
+		return "none"
+	}
+	return "bearer"
 }
 
 func buildRetrievalQuery(input Input) string {

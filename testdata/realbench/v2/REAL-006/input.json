@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-006",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "urfave/cli",
+    "clone_url": "https://github.com/urfave/cli.git"
+  },
+  "buggy_commit_sha": "1a4deb4f5a35ee12706602698dc0527d44c14b19",
+  "issue_title": "Positional arguments lose their whitespace during parsing",
+  "issue_description": "A command receives positional arguments with leading or trailing spaces removed. The parser trims an argument to classify it while collecting that trimmed copy, but command actions need the original argument bytes and should preserve whitespace.",
+  "error_log": "action received padded argument \"padded\" instead of \"  padded  \""
+}

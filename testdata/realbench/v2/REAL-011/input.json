@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-011",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "grpc/grpc-go",
+    "clone_url": "https://github.com/grpc/grpc-go.git"
+  },
+  "buggy_commit_sha": "9f8027448a64b6446d0c7256a1efe907b1cb6b1b",
+  "issue_title": "HTTP/2 server Recv hangs when initial HEADERS has END_STREAM",
+  "issue_description": "A client can send an initial HTTP/2 HEADERS frame with END_STREAM and no data frames. The server-side streaming handler should observe EOF immediately, but the receive path waits for data and can hang.",
+  "error_log": "stream.Recv timed out after initial HEADERS END_STREAM without a DATA frame"
+}

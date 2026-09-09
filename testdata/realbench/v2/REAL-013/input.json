@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-013",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "gofiber/fiber",
+    "clone_url": "https://github.com/gofiber/fiber.git"
+  },
+  "buggy_commit_sha": "88a09322e6856384e058cb23602fd051392f18a0",
+  "issue_title": "Redirect Back trusts a cross-origin Referer and permits an open redirect",
+  "issue_description": "The Back redirect helper uses the Referer header as the redirect destination. A request carrying a Referer from another origin can make the server redirect a user to an attacker-controlled host instead of using the local fallback.",
+  "error_log": "GET /back Referer=https://evil.example/phishing returned Location=https://evil.example/phishing"
+}

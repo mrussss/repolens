@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-004",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "gin-gonic/gin",
+    "clone_url": "https://github.com/gin-gonic/gin.git"
+  },
+  "buggy_commit_sha": "d75fcd4c9ab260e5225de590f1f0f8c0e0e12d11",
+  "issue_title": "SaveUploadedFile fails when the destination directory already exists",
+  "issue_description": "Saving an uploaded file into an existing destination directory can fail with an operation-not-permitted error. The helper creates the directory if needed and then changes its mode unconditionally, so a pre-existing directory may be chmoded even though the process does not own it. Existing directories should remain usable without a permission change.",
+  "error_log": "SaveUploadedFile returned: chmod /tmp: operation not permitted"
+}

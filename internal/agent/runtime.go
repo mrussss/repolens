@@ -22,6 +22,9 @@ type ExecutionResult struct {
 	CachedPromptTokens int
 	ReasoningTokens    int
 	ToolCalls          int
+	ToolNames          []string
+	AgentRounds        int
+	StructuredReport   bool
 	Retryable          bool
 	ErrorCode          string
 	ErrorMessage       string
@@ -119,6 +122,9 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		CachedPromptTokens: res.CachedPromptTokens,
 		ReasoningTokens:    res.ReasoningTokens,
 		ToolCalls:          res.ToolCallsCount,
+		ToolNames:          res.ToolNames,
+		AgentRounds:        res.AgentRounds,
+		StructuredReport:   res.StructuredReport,
 		Retryable:          false,
 	}, nil
 }

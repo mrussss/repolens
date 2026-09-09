@@ -71,6 +71,9 @@ type LoopResult struct {
 	CachedPromptTokens int
 	ReasoningTokens    int
 	ToolCallsCount     int
+	ToolNames          []string
+	AgentRounds        int
+	StructuredReport   bool
 }
 
 type AgentLoop struct {
@@ -116,6 +119,8 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 	totalCachedPromptTokens := 0
 	totalReasoningTokens := 0
 	toolCallsCount := 0
+	toolNames := make([]string, 0)
+	agentRounds := 0
 	seq := 0
 
 	for {
@@ -129,6 +134,8 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		}
 
 		startGen := time.Now()
+		agentRounds++
+		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "")
 		temperature := run.Temperature
 		resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
 			Messages:    messages,
@@ -156,7 +163,9 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 			for _, tc := range resp.Message.ToolCalls {
 				toolCallsCount++
+				toolNames = append(toolNames, tc.Function.Name)
 				if err := guard.RecordToolCall(tc.Function.Name, tc.Function.Arguments); err != nil {
+					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, tc.Function.Arguments, "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+err.Error())
 					return nil, err
 				}
 
@@ -204,6 +213,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", finalText, "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "")
 
 		reportData, err := parseReportJSON(finalText)
+		structuredReport := err == nil
 		if err != nil {
 			logger.L(ctx).Warn("failed to parse structured report JSON from assistant output", "error", err, "raw", finalText)
 			reportData = &evidence.DiagnosisReportData{
@@ -221,6 +231,9 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 			CachedPromptTokens: totalCachedPromptTokens,
 			ReasoningTokens:    totalReasoningTokens,
 			ToolCallsCount:     toolCallsCount,
+			ToolNames:          toolNames,
+			AgentRounds:        agentRounds,
+			StructuredReport:   structuredReport,
 		}, nil
 	}
 }

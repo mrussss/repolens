@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-010",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "fsnotify/fsnotify",
+    "clone_url": "https://github.com/fsnotify/fsnotify.git"
+  },
+  "buggy_commit_sha": "76b01a6e8f502187fecedea8b025e79e5a86085c",
+  "issue_title": "WatchList becomes stale after recursively watched directories are renamed",
+  "issue_description": "When a recursively watched directory is renamed, the inotify backend updates the watch descriptor paths but does not consistently update the path lookup map. WatchList can therefore retain the old path or lose the renamed child watches.",
+  "error_log": "WatchList after rename did not contain the new directory path and retained the old watch path"
+}

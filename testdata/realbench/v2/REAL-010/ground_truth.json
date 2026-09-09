@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-010",
+  "fix_commit_sha": "4b95c6d13d68a3abe4b8d95ccd184fdb09b87c2a",
+  "expected_root_cause": "The inotify rename handler rewrites watch descriptor paths but does not keep the watches.path lookup map synchronized. After a recursive rename, WatchList reads stale path entries and cannot accurately represent renamed descendants.",
+  "fix_summary": "Update the path map while renaming each matching watch, then update the descriptor record so both lookup directions remain consistent; add rename regression coverage.",
+  "primary_relevant_files": ["backend_inotify.go"],
+  "supporting_files": ["fsnotify_test.go", "backend_inotify_test.go"],
+  "relevant_symbols": ["(*inotify).handleEvent"],
+  "relevant_line_ranges": {"backend_inotify.go": {"start": 490, "end": 530}},
+  "provenance": {
+    "issue_url": "https://github.com/fsnotify/fsnotify/pull/756",
+    "fix_pr_url": "https://github.com/fsnotify/fsnotify/pull/756",
+    "fix_commit_url": "https://github.com/fsnotify/fsnotify/commit/4b95c6d13d68a3abe4b8d95ccd184fdb09b87c2a"
+  },
+  "curation_notes": "PR #756 changes the inotify rename path map and includes cross-platform regression-script cleanup for renamed recursive watches."
+}

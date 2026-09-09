@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-007",
+  "fix_commit_sha": "d7d5ba141ccd25db3f35fafbd547eba887a83098",
+  "expected_root_cause": "The completion parser treats a request after the -- separator as no longer being a shell completion. That allows the normal command action to run even though the shell is only asking for completion and no flags are valid after --.",
+  "fix_summary": "Track completion-after-double-dash as a per-run state, keep the request in completion mode, return no suggestions, and prevent command action execution.",
+  "primary_relevant_files": ["help.go", "command_run.go"],
+  "supporting_files": ["completion_test.go", "help_test.go"],
+  "relevant_symbols": ["checkShellCompleteFlag", "shouldRunCompletion", "(*Command).run"],
+  "relevant_line_ranges": {"help.go": {"start": 487, "end": 530}, "command_run.go": {"start": 125, "end": 140}},
+  "provenance": {
+    "issue_url": "https://github.com/urfave/cli/issues/1993",
+    "fix_pr_url": "https://github.com/urfave/cli/pull/2412",
+    "fix_commit_url": "https://github.com/urfave/cli/commit/d7d5ba141ccd25db3f35fafbd547eba887a83098"
+  },
+  "curation_notes": "Issue #1993 is named in the regression tests; PR #2412 covers root and subcommand completion, state reset between runs, and the no-action invariant."
+}

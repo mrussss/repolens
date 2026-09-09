@@ -58,6 +58,7 @@ type GroundTruth struct {
 	CaseID             string               `json:"case_id"`
 	FixCommitSHA       string               `json:"fix_commit_sha"`
 	ExpectedRootCause  string               `json:"expected_root_cause"`
+	FixSummary         string               `json:"fix_summary,omitempty"`
 	PrimaryFiles       []string             `json:"primary_relevant_files"`
 	SupportingFiles    []string             `json:"supporting_files,omitempty"`
 	RelevantSymbols    []string             `json:"relevant_symbols,omitempty"`
@@ -165,6 +166,9 @@ func Validate(root string) (string, error) {
 		if err := validateNoLeakage(inputCase.Input, truth); err != nil {
 			return "", fmt.Errorf("%s leakage check: %w", inputCase.Input.CaseID, err)
 		}
+	}
+	if err := validateDatasetScale(dataset); err != nil {
+		return "", err
 	}
 
 	hash, err := ComputeManifestHash(root, dataset.Manifest.Cases)
@@ -283,6 +287,9 @@ func validateGroundTruth(manifest Manifest, truth GroundTruth) error {
 	if strings.TrimSpace(truth.ExpectedRootCause) == "" {
 		return errors.New("expected_root_cause is required")
 	}
+	if strings.EqualFold(manifest.DatasetVersion, "realbench-v2") && strings.TrimSpace(truth.FixSummary) == "" {
+		return errors.New("fix_summary is required for realbench-v2")
+	}
 	if len(truth.PrimaryFiles) == 0 {
 		return errors.New("primary_relevant_files must not be empty")
 	}
@@ -321,6 +328,28 @@ func validateGroundTruth(manifest Manifest, truth GroundTruth) error {
 	}
 	if truth.CaseID != "" && !containsCase(manifest.Cases, truth.CaseID) {
 		return fmt.Errorf("case_id %q is not listed in manifest", truth.CaseID)
+	}
+	return nil
+}
+
+func validateDatasetScale(dataset *Dataset) error {
+	if dataset == nil || !strings.EqualFold(dataset.Manifest.DatasetVersion, "realbench-v2") {
+		return nil
+	}
+	if len(dataset.Manifest.Cases) < 10 {
+		return fmt.Errorf("realbench-v2 requires at least 10 cases, got %d", len(dataset.Manifest.Cases))
+	}
+	repoCounts := make(map[string]int)
+	for _, inputCase := range dataset.Inputs {
+		repoCounts[inputCase.Input.Repository.FullName]++
+	}
+	if len(repoCounts) < 8 {
+		return fmt.Errorf("realbench-v2 requires at least 8 repositories, got %d", len(repoCounts))
+	}
+	for repo, count := range repoCounts {
+		if count > 2 {
+			return fmt.Errorf("realbench-v2 repository %q has %d cases; maximum is 2", repo, count)
+		}
 	}
 	return nil
 }

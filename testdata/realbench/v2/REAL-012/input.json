@@ -1,0 +1,12 @@
+{
+  "case_id": "REAL-012",
+  "dataset_version": "realbench-v2",
+  "repository": {
+    "full_name": "redis/go-redis",
+    "clone_url": "https://github.com/redis/go-redis.git"
+  },
+  "buggy_commit_sha": "85a7acaf465fc91b0831229eb82763ac3311e8fc",
+  "issue_title": "NewClient leaks connection pools when construction panics",
+  "issue_description": "NewClient creates connection pools before later initialization steps can panic, such as notification handler registration. If construction unwinds before returning a client, the partially created pools and their background resources become unreachable without being closed.",
+  "error_log": "panic during NewClient initialization left an opened connection that was never closed"
+}

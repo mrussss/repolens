@@ -1,0 +1,16 @@
+{
+  "case_id": "REAL-006",
+  "fix_commit_sha": "93595d0c1a03d1a950241387c3242ff7115b54d6",
+  "expected_root_cause": "parseFlags stores firstArg, a trimmed value used for classification, in positional arguments. This changes the user-visible argument instead of retaining rargs[0], which contains the original whitespace.",
+  "fix_summary": "Continue using the trimmed value to classify flags, but append the original rargs[0] to positional arguments so command actions receive exact input.",
+  "primary_relevant_files": ["command_parse.go"],
+  "supporting_files": ["command_test.go"],
+  "relevant_symbols": ["(*Command).parseFlags"],
+  "relevant_line_ranges": {"command_parse.go": {"start": 100, "end": 125}},
+  "provenance": {
+    "issue_url": "https://github.com/urfave/cli/pull/2423",
+    "fix_pr_url": "https://github.com/urfave/cli/pull/2423",
+    "fix_commit_url": "https://github.com/urfave/cli/commit/93595d0c1a03d1a950241387c3242ff7115b54d6"
+  },
+  "curation_notes": "PR #2423 adds a regression test with leading spaces and tab characters and changes only the positional argument value selected by command_parse.go."
+}

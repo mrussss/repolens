@@ -1,0 +1,15 @@
+{
+  "case_id": "REAL-008",
+  "fix_commit_sha": "b59555665abff6bc384936b9f64efa1f26d3eef4",
+  "expected_root_cause": "defaultUsage writes the Usage header to os.Stderr directly instead of the FlagSet's configured Output writer, so callers cannot capture or redirect the complete usage output.",
+  "fix_summary": "Write the usage header through CommandLine.Output so the configured FlagSet destination receives it.",
+  "primary_relevant_files": ["flag.go"],
+  "relevant_symbols": ["defaultUsage"],
+  "relevant_line_ranges": {"flag.go": {"start": 859, "end": 880}},
+  "provenance": {
+    "issue_url": "https://github.com/spf13/pflag/pull/502",
+    "fix_pr_url": "https://github.com/spf13/pflag/pull/502",
+    "fix_commit_url": "https://github.com/spf13/pflag/commit/b59555665abff6bc384936b9f64efa1f26d3eef4"
+  },
+  "curation_notes": "PR #502 changes the default usage destination from os.Stderr to the configured FlagSet output; the commit is directly based on the preceding pflag tree."
+}
