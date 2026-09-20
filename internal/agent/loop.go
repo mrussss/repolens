@@ -170,6 +170,9 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		latency := time.Since(startGen).Milliseconds()
 
 		if err != nil {
+			if attempts := llm.ProviderAttempts(err); attempts > 1 {
+				providerCalls += attempts - 1
+			}
 			// Record error step
 			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+err.Error())
 			partial := &LoopResult{
@@ -179,6 +182,9 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 				SearchCalls: searchCalls, ProviderCalls: providerCalls,
 			}
 			return partial, err
+		}
+		if resp.ProviderAttempts > 1 {
+			providerCalls += resp.ProviderAttempts - 1
 		}
 
 		totalPromptTokens += resp.PromptTokens
@@ -308,6 +314,10 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason)
 		return nil, err
 	}
+	providerCalls := rounds + 1
+	if resp.ProviderAttempts > 1 {
+		providerCalls = rounds + resp.ProviderAttempts
+	}
 	finalText := resp.Message.Content
 	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", finalText, "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason)
 	report, parseErr := parseReportJSON(finalText)
@@ -319,7 +329,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 		PromptTokens: promptTokens + resp.PromptTokens, CompletionTokens: completionTokens + resp.CompletionTokens,
 		CachedPromptTokens: cachedTokens + resp.CachedPromptTokens, ReasoningTokens: reasoningTokens + resp.ReasoningTokens,
 		ToolCallsCount: toolCalls, ToolNames: toolNames, AgentRounds: rounds + 1,
-		SearchCalls: searchCalls, ProviderCalls: rounds + 1,
+		SearchCalls: searchCalls, ProviderCalls: providerCalls,
 		StructuredReport: parseErr == nil, ParseError: errorString(parseErr), FinalizationReason: reason,
 	}, nil
 }

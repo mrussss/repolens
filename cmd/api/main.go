@@ -77,7 +77,7 @@ func run() error {
 
 	// Services & Managers
 	repoSvc := repo.NewService(repoStore)
-	providerMgr := provider.NewManagerWithAuthModeAndTimeout(
+	providerMgr := provider.NewManagerWithAuthModeAndTimeoutAndRetries(
 		cfg.ProviderSecretPath,
 		cfg.ProviderBaseURL,
 		cfg.ProviderModel,
@@ -85,6 +85,7 @@ func run() error {
 		cfg.ProviderType,
 		cfg.ProviderAuthMode,
 		time.Duration(cfg.ProviderTimeoutSeconds)*time.Second,
+		cfg.ProviderRetryAttempts,
 	)
 	diagnosisSvc := diagnosis.NewService(
 		diagnosisStore,
@@ -115,7 +116,7 @@ func run() error {
 			FinalizationTurns:      1,
 			MaxOutputTokens:        2048,
 			ProviderTimeoutSeconds: cfg.ProviderTimeoutSeconds,
-			ProviderRetryAttempts:  0,
+			ProviderRetryAttempts:  cfg.ProviderRetryAttempts,
 		}
 	})
 

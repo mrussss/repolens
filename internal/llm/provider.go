@@ -64,6 +64,7 @@ type GenerateResponse struct {
 	CompletionTokens   int     `json:"completion_tokens"`
 	CachedPromptTokens int     `json:"cached_prompt_tokens"`
 	ReasoningTokens    int     `json:"reasoning_tokens"`
+	ProviderAttempts   int     `json:"provider_attempts,omitempty"`
 }
 
 type Provider interface {

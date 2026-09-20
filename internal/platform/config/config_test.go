@@ -52,3 +52,23 @@ func TestProviderTimeoutSecondsUsesPositiveValueOrDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestProviderRetryAttemptsAllowsZeroAndRejectsNegative(t *testing.T) {
+	tests := []struct {
+		value string
+		want  int
+	}{
+		{value: "", want: 0},
+		{value: "2", want: 2},
+		{value: "-1", want: 0},
+		{value: "invalid", want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			t.Setenv("REPOLENS_PROVIDER_RETRY_ATTEMPTS", tt.value)
+			if got := Load().ProviderRetryAttempts; got != tt.want {
+				t.Fatalf("provider retry attempts = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

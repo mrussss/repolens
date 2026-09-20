@@ -1,4 +1,4 @@
-import { ProviderStatus, Repository, Snapshot, AnalysisRevision, DiagnosisRun, DiagnosisReport, AgentStep, CodeIndexBuild, CodeSymbol, SymbolRelation, QualityReport, RetrievalBuild } from './types';
+import { ProviderStatus, Repository, Snapshot, AnalysisRevision, DiagnosisRun, DiagnosisReport, DiagnosisAttempt, AgentStep, CodeIndexBuild, CodeSymbol, SymbolRelation, QualityReport, RetrievalBuild } from './types';
 
 const API_BASE = '/api/v1';
 
@@ -237,5 +237,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/diagnoses/${id}/steps`);
     const body = await handleResponse<{ steps: AgentStep[] }>(res);
     return body.steps || [];
+  },
+
+  async getDiagnosisAttempts(id: string): Promise<DiagnosisAttempt[]> {
+    const res = await fetch(`${API_BASE}/diagnoses/${id}/attempts`);
+    const body = await handleResponse<{ attempts: DiagnosisAttempt[] }>(res);
+    return body.attempts || [];
   },
 };

@@ -19,6 +19,19 @@ type OpenAICompatibleProvider struct {
 	httpClient   *http.Client
 }
 
+type HTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("llm provider returned HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+func (e *HTTPError) RetryableProviderError() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
 func NewOpenAICompatibleProvider(apiKey, baseURL, defaultModel string) *OpenAICompatibleProvider {
 	return NewOpenAICompatibleProviderWithAuthMode(apiKey, baseURL, defaultModel, "bearer")
 }
@@ -124,10 +137,10 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 	}
 
 	if resp.StatusCode == 429 {
-		return GenerateResponse{}, fmt.Errorf("rate limit exceeded (429): %s", string(respBytes))
+		return GenerateResponse{}, &HTTPError{StatusCode: resp.StatusCode, Body: string(respBytes)}
 	}
 	if resp.StatusCode >= 500 {
-		return GenerateResponse{}, fmt.Errorf("provider server error (%d): %s", resp.StatusCode, string(respBytes))
+		return GenerateResponse{}, &HTTPError{StatusCode: resp.StatusCode, Body: string(respBytes)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return GenerateResponse{}, fmt.Errorf("llm request failed with status %d: %s", resp.StatusCode, string(respBytes))

@@ -356,6 +356,26 @@ func (s *Service) Retry(ctx context.Context, id, userID string) error {
 	return s.jobStore.RetryDiagnosis(ctx, id)
 }
 
-func (s *Service) ListAttempts(ctx context.Context, runID string) ([]DiagnosisAttempt, error) {
+func (s *Service) ListAttempts(ctx context.Context, runID, userID string) ([]DiagnosisAttempt, error) {
+	if _, err := s.Get(ctx, runID, userID); err != nil {
+		return nil, err
+	}
 	return s.store.ListAttemptsByRun(ctx, runID)
+}
+
+// GetAttemptForRun authorizes the diagnosis before exposing an attempt or any
+// trace data attached to it. An attempt ID alone is not a sufficient security
+// boundary because trace rows are keyed by attempt rather than user.
+func (s *Service) GetAttemptForRun(ctx context.Context, runID, userID, attemptID string) (*DiagnosisAttempt, error) {
+	if _, err := s.Get(ctx, runID, userID); err != nil {
+		return nil, err
+	}
+	attempt, err := s.store.GetAttempt(ctx, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	if attempt.DiagnosisRunID != runID {
+		return nil, ErrAttemptNotFound
+	}
+	return attempt, nil
 }

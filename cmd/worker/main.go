@@ -66,7 +66,7 @@ func run() error {
 	traceStore := trace.NewStore(db.GormDB)
 	citationVal := evidence.NewCitationValidator(storeFS)
 
-	providerMgr := provider.NewManagerWithAuthModeAndTimeout(
+	providerMgr := provider.NewManagerWithAuthModeAndTimeoutAndRetries(
 		cfg.ProviderSecretPath,
 		cfg.ProviderBaseURL,
 		cfg.ProviderModel,
@@ -74,6 +74,7 @@ func run() error {
 		cfg.ProviderType,
 		cfg.ProviderAuthMode,
 		time.Duration(cfg.ProviderTimeoutSeconds)*time.Second,
+		cfg.ProviderRetryAttempts,
 	)
 
 	// Pure Go Production Retrieval (BM25 + Structural Code Intelligence)

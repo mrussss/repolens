@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/sqlite"
@@ -178,6 +179,52 @@ func TestDiagnosisHandlerPaginationValidation(t *testing.T) {
 	}
 }
 
+func TestDiagnosisAttemptEndpointsEnforceRunAndAttemptOwnership(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	if err := db.Create(&diagnosis.DiagnosisRun{
+		ID: "run-owner", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "owner run", IdempotencyKey: "owner-key", IdempotencyRequestHash: "owner-hash",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&diagnosis.DiagnosisRun{
+		ID: "run-other", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "other run", IdempotencyKey: "other-key", IdempotencyRequestHash: "other-hash",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&diagnosis.DiagnosisRun{
+		ID: "run-private", UserID: "another-user", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "private run", IdempotencyKey: "private-key", IdempotencyRequestHash: "private-hash",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&diagnosis.DiagnosisAttempt{
+		ID: "attempt-other", DiagnosisRunID: "run-other", AttemptNo: 1,
+		Status: diagnosis.AttemptStatusRunning, StartedAt: time.Now().UTC(),
+		HeartbeatAt: time.Now().UTC(), DeadlineAt: time.Now().UTC().Add(time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	router := diagnosisHandlerRouter(svc)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/diagnoses/run-private/attempts", nil)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || !bytes.Contains(response.Body.Bytes(), []byte(`"DIAGNOSIS_NOT_FOUND"`)) {
+		t.Fatalf("cross-user/missing attempt list response = %d %s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/diagnoses/run-owner/steps?attempt_id=attempt-other", nil)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || !bytes.Contains(response.Body.Bytes(), []byte(`"ATTEMPT_NOT_FOUND"`)) {
+		t.Fatalf("cross-run trace response = %d %s", response.Code, response.Body.String())
+	}
+}
+
 func TestDiagnosisCreateIdempotencyReplayPrecedesProviderCheck(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
 	ctx := context.Background()
@@ -240,5 +287,7 @@ func diagnosisHandlerRouter(svc *diagnosis.Service) *gin.Engine {
 	router.POST("/diagnoses", handler.Create)
 	router.GET("/diagnoses", handler.List)
 	router.GET("/diagnoses/:id", handler.Get)
+	router.GET("/diagnoses/:id/attempts", handler.ListAttempts)
+	router.GET("/diagnoses/:id/steps", handler.GetSteps)
 	return router
 }

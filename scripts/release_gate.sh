@@ -35,16 +35,20 @@ export REPOLENS_REQUIRE_REAL_INTEGRATION=1
 GOFLAGS=-mod=readonly go test -v -race ./tests/integration_real/...
 echo "✓ Real testcontainers integration tests passed (0 skips, all containers executed)"
 
-echo "[7/8] Building deterministic Web UI and running eval..."
-(cd web && npm ci && npm run build)
+echo "[7/10] Running the real-MySQL Golden Path..."
+GOFLAGS=-mod=readonly go test -v -race ./tests/e2e/...
+echo "✓ Golden Path passed"
+
+echo "[8/10] Building deterministic Web UI, running Web tests and eval..."
+(cd web && npm ci && npm run build && npm test -- --run)
 go run ./cmd/eval
 echo "✓ Eval benchmark passed"
 
-echo "[8/9] Validating Compose and image build..."
+echo "[9/10] Validating Compose and image build..."
 docker compose config >/dev/null
 docker compose build
 
-echo "[9/9] Running product smoke against the Compose stack..."
+echo "[10/10] Running product smoke against the Compose stack..."
 cleanup() { docker compose down >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 docker compose up -d

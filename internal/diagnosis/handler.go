@@ -226,7 +226,12 @@ func (h *Handler) Cancel(c *gin.Context) {
 	id := c.Param("id")
 
 	if err := h.svc.Cancel(c.Request.Context(), id, userID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		if errors.Is(err, ErrRunNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "DIAGNOSIS_NOT_FOUND", "error": "diagnosis run not found"})
+			return
+		}
+		logger.L(c.Request.Context()).Error("failed to cancel diagnosis", "diagnosis_id", id, "error", err)
+		c.JSON(http.StatusConflict, gin.H{"code": "DIAGNOSIS_CANCEL_NOT_ALLOWED", "error": "diagnosis cannot be cancelled in its current state"})
 		return
 	}
 
@@ -251,9 +256,14 @@ func (h *Handler) Retry(c *gin.Context) {
 
 func (h *Handler) ListAttempts(c *gin.Context) {
 	id := c.Param("id")
-	attempts, err := h.svc.ListAttempts(c.Request.Context(), id)
+	attempts, err := h.svc.ListAttempts(c.Request.Context(), id, c.GetString(string(logger.UserIDKey)))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		if errors.Is(err, ErrRunNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "DIAGNOSIS_NOT_FOUND", "error": "diagnosis run not found"})
+			return
+		}
+		logger.L(c.Request.Context()).Error("failed to list diagnosis attempts", "diagnosis_id", id, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"attempts": attempts})
@@ -261,6 +271,15 @@ func (h *Handler) ListAttempts(c *gin.Context) {
 
 func (h *Handler) GetReport(c *gin.Context) {
 	id := c.Param("id")
+	if _, err := h.svc.Get(c.Request.Context(), id, c.GetString(string(logger.UserIDKey))); err != nil {
+		if errors.Is(err, ErrRunNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "DIAGNOSIS_NOT_FOUND", "error": "diagnosis run not found"})
+			return
+		}
+		logger.L(c.Request.Context()).Error("failed to authorize diagnosis report", "diagnosis_id", id, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
+		return
+	}
 	report, err := h.reportStore.GetByRunID(c.Request.Context(), id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "report not found"})
@@ -276,20 +295,38 @@ func (h *Handler) GetReport(c *gin.Context) {
 }
 
 func (h *Handler) GetSteps(c *gin.Context) {
+	id := c.Param("id")
+	run, runErr := h.svc.Get(c.Request.Context(), id, c.GetString(string(logger.UserIDKey)))
+	if errors.Is(runErr, ErrRunNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"code": "DIAGNOSIS_NOT_FOUND", "error": "diagnosis run not found"})
+		return
+	}
+	if runErr != nil {
+		logger.L(c.Request.Context()).Error("failed to authorize diagnosis steps", "diagnosis_id", id, "error", runErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
+		return
+	}
 	attemptID := c.Query("attempt_id")
 	if attemptID == "" {
-		id := c.Param("id")
-		run, err := h.svc.store.GetByID(c.Request.Context(), id)
-		if err != nil || run.FinalAttemptID == "" {
+		if run.FinalAttemptID == "" {
 			c.JSON(http.StatusOK, gin.H{"steps": []trace.AgentStep{}})
 			return
 		}
 		attemptID = run.FinalAttemptID
+	} else if _, err := h.svc.GetAttemptForRun(c.Request.Context(), id, c.GetString(string(logger.UserIDKey)), attemptID); err != nil {
+		if errors.Is(err, ErrRunNotFound) || errors.Is(err, ErrAttemptNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "ATTEMPT_NOT_FOUND", "error": "diagnosis attempt not found"})
+			return
+		}
+		logger.L(c.Request.Context()).Error("failed to authorize diagnosis attempt", "diagnosis_id", id, "attempt_id", attemptID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
+		return
 	}
 
 	steps, err := h.traceStore.ListByAttempt(c.Request.Context(), attemptID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logger.L(c.Request.Context()).Error("failed to list diagnosis steps", "diagnosis_id", id, "attempt_id", attemptID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"steps": steps})

@@ -23,6 +23,7 @@ type Config struct {
 	ProviderModel          string
 	ProviderAuthMode       string
 	ProviderTimeoutSeconds int
+	ProviderRetryAttempts  int
 	ProviderSecretPath     string
 	RetrievalStrategy      string // "bm25", "symbol_bm25_structural"
 }
@@ -44,6 +45,7 @@ func Load() *Config {
 		ProviderModel:          getEnv("REPOLENS_PROVIDER_MODEL", "gpt-4o"),
 		ProviderAuthMode:       getEnv("REPOLENS_PROVIDER_AUTH_MODE", "bearer"),
 		ProviderTimeoutSeconds: getEnvPositiveInt("REPOLENS_PROVIDER_TIMEOUT_SECONDS", 60),
+		ProviderRetryAttempts:  getEnvNonNegativeInt("REPOLENS_PROVIDER_RETRY_ATTEMPTS", 0),
 		ProviderSecretPath:     getEnv("PROVIDER_SECRET_PATH", defaultProviderSecretPath()),
 		RetrievalStrategy:      getEnv("RETRIEVAL_STRATEGY", "symbol_bm25_structural"),
 	}
@@ -74,6 +76,15 @@ func defaultProviderSecretPath() string {
 func getEnvPositiveInt(key string, defaultVal int) int {
 	if val := os.Getenv(key); val != "" {
 		if i, err := strconv.Atoi(val); err == nil && i > 0 {
+			return i
+		}
+	}
+	return defaultVal
+}
+
+func getEnvNonNegativeInt(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.Atoi(val); err == nil && i >= 0 {
 			return i
 		}
 	}

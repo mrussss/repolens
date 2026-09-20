@@ -114,6 +114,7 @@ type Manager struct {
 	envProvider     string
 	envAuthMode     string
 	providerTimeout time.Duration
+	providerRetries int
 	mu              sync.RWMutex
 }
 
@@ -145,7 +146,8 @@ func (m *Manager) BuildForDiagnosis(ctx context.Context, run *diagnosis.Diagnosi
 	if cfg.IsDemo || m.envProvider == "fake" && normalized == "http://localhost/fake" {
 		return llm.NewFakeProvider(llm.ModeNormalStructured), nil
 	}
-	return llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(cfg.APIKey, normalized, modelName, cfg.AuthMode, m.providerTimeout), nil
+	baseProvider := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(cfg.APIKey, normalized, modelName, cfg.AuthMode, m.providerTimeout)
+	return llm.NewRetryingProvider(baseProvider, m.providerRetries), nil
 }
 
 // NewManager creates a new Manager instance.
@@ -161,6 +163,12 @@ func NewManagerWithAuthMode(secretFilePath, envBaseURL, envModel, envAPIKey, env
 // NewManagerWithAuthModeAndTimeout creates a manager with an explicit
 // environment auth mode and provider request timeout.
 func NewManagerWithAuthModeAndTimeout(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, authMode string, providerTimeout time.Duration) *Manager {
+	return NewManagerWithAuthModeAndTimeoutAndRetries(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, authMode, providerTimeout, 0)
+}
+
+// NewManagerWithAuthModeAndTimeoutAndRetries configures the bounded provider
+// retry policy independently from DB-backed AnalysisJob retries.
+func NewManagerWithAuthModeAndTimeoutAndRetries(secretFilePath, envBaseURL, envModel, envAPIKey, envProvider, authMode string, providerTimeout time.Duration, providerRetries int) *Manager {
 	if secretFilePath == "" {
 		secretFilePath = defaultProviderSecretPath()
 	}
@@ -175,6 +183,7 @@ func NewManagerWithAuthModeAndTimeout(secretFilePath, envBaseURL, envModel, envA
 		envProvider:     envProvider,
 		envAuthMode:     normalizeAuthMode(authMode),
 		providerTimeout: providerTimeout,
+		providerRetries: max(0, providerRetries),
 	}
 }
 

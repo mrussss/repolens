@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api';
-import { DiagnosisRun, DiagnosisReport, AgentStep } from '../types';
+import { DiagnosisRun, DiagnosisReport, DiagnosisAttempt, AgentStep } from '../types';
 import { EvidenceViewer } from './EvidenceViewer';
 import { TraceViewer } from './TraceViewer';
 import { isInvalidReport } from '../reportStatus';
@@ -15,6 +15,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
   const [run, setRun] = useState<DiagnosisRun | null>(null);
   const [report, setReport] = useState<DiagnosisReport | null>(null);
   const [steps, setSteps] = useState<AgentStep[]>([]);
+  const [attempts, setAttempts] = useState<DiagnosisAttempt[]>([]);
   const [activeTab, setActiveTab] = useState<'evidence' | 'trace'>('evidence');
   const [loading, setLoading] = useState(true);
   const [cancelling, setCancelling] = useState(false);
@@ -28,6 +29,10 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
       try {
         const r = await api.getDiagnosis(diagnosisId);
         setRun(r);
+
+        try {
+          setAttempts(await api.getDiagnosisAttempts(diagnosisId));
+        } catch {}
 
         if (r.status === 'SUCCEEDED') {
           try {
@@ -163,6 +168,16 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
           </div>
         </div>
       )}
+
+      {attempts.length > 0 && (() => {
+        const attempt = attempts[attempts.length - 1];
+        return (
+          <div className="card" style={{ marginBottom: '1.5rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+            执行详情：Attempt {attempt.attempt_no} · {attempt.status} · rounds {attempt.agent_rounds || 0} · tools {attempt.tool_calls || 0} · search {attempt.search_calls || 0} · provider calls {attempt.provider_calls || 0} · tokens {(attempt.prompt_tokens || 0) + (attempt.completion_tokens || 0)}
+            {attempt.error_code && <div style={{ color: 'var(--accent-warning)', marginTop: '0.35rem' }}>失败位置：{attempt.error_code}</div>}
+          </div>
+        );
+      })()}
 
       {/* Root Cause Card (if Succeeded) */}
       {report && (

@@ -170,6 +170,22 @@ export interface DiagnosisRun {
   updated_at: string;
 }
 
+export interface DiagnosisAttempt {
+  id: string;
+  diagnosis_run_id: string;
+  attempt_no: number;
+  status: string;
+  error_code?: string;
+  error_message?: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  tool_calls?: number;
+  agent_rounds?: number;
+  search_calls?: number;
+  provider_calls?: number;
+  retryable?: boolean;
+}
+
 export interface Citation {
   snapshot_id: string;
   file_path: string;
