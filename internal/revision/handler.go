@@ -56,8 +56,11 @@ func (h *Handler) Create(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"code": "REVISION_PREPARE_FAILED", "error": "analysis revision failed; retry explicitly", "analysis_revision": publicRevision(value)})
 		case errors.Is(err, ErrNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"code": "REPOSITORY_NOT_FOUND", "error": "repository not found"})
+		case errors.Is(err, ErrRefResolution):
+			c.JSON(http.StatusBadRequest, gin.H{"code": "REF_NOT_FOUND", "error": "repository ref could not be resolved"})
 		default:
-			c.JSON(http.StatusBadRequest, gin.H{"code": "REF_RESOLUTION_FAILED", "error": "repository ref could not be resolved"})
+			logger.L(c.Request.Context()).Error("failed to prepare analysis revision", "repository_id", c.Param("id"), "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
 		}
 		return
 	}

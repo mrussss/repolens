@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RepoLens v2.2 CreateDiagnosisRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["issue_title"],
+  "properties": {
+    "repository_id": { "type": "string" },
+    "analysis_revision_id": { "type": "string" },
+    "snapshot_id": { "type": "string" },
+    "issue_title": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "issue_description": { "type": "string" },
+    "error_log": { "type": "string" },
+    "idempotency_key": { "type": "string", "maxLength": 128 },
+    "code_index_build_id": { "type": "integer", "minimum": 0 },
+    "retrieval_build_id": { "type": "integer", "minimum": 0 }
+  }
+}

@@ -7,18 +7,20 @@ import (
 )
 
 type GuardConfig struct {
-	MaxSteps       int
-	MaxToolCalls   int
-	MaxSearchCalls int
-	MaxRepeatCalls int
+	MaxSteps        int
+	MaxToolCalls    int
+	MaxSearchCalls  int
+	MaxRepeatCalls  int
+	MaxOutputTokens int
 }
 
 func DefaultGuardConfig() GuardConfig {
 	return GuardConfig{
-		MaxSteps:       8,
-		MaxToolCalls:   12,
-		MaxSearchCalls: 3,
-		MaxRepeatCalls: 2,
+		MaxSteps:        8,
+		MaxToolCalls:    12,
+		MaxSearchCalls:  3,
+		MaxRepeatCalls:  2,
+		MaxOutputTokens: 2048,
 	}
 }
 

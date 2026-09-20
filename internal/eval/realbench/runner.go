@@ -352,7 +352,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		result.Metadata.Model = providerConfig.Model
 		result.Metadata.BaseURLFingerprint = providerConfig.EndpointFingerprint
 		result.Metadata.AuthMode = providerConfig.AuthMode
-		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHash(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxRepeatCalls, 0.1)
+		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithRuntime(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxSearchCalls, guardConfig.MaxRepeatCalls, 32*1024, 1, guardConfig.MaxOutputTokens, providerTimeoutSeconds(), 0, 0.1)
 		result.Metadata.MaxToolCalls = guardConfig.MaxToolCalls
 		result.Metadata.ToolBudget = guardConfig.MaxToolCalls
 		result.Metadata.ResponseFormat = "prompt_json_contract"

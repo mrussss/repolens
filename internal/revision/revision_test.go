@@ -1,15 +1,21 @@
 package revision_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
 	codeintelmodel "repolens/internal/codeintel/model"
 	"repolens/internal/jobs"
+	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/repo"
 	"repolens/internal/revision"
@@ -19,6 +25,12 @@ import (
 type fixedResolver struct{ sha string }
 
 func (r fixedResolver) ResolveRef(context.Context, string, string) (string, error) { return r.sha, nil }
+
+type failingResolver struct{}
+
+func (failingResolver) ResolveRef(context.Context, string, string) (string, error) {
+	return "", errors.New("remote ref does not exist")
+}
 
 func newRevisionDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -106,5 +118,46 @@ func TestRevisionTransitionsToReadyAndRetryIsExplicit(t *testing.T) {
 	}
 	if err := store.MarkFailed(ctx, value.ID, revision.StageFailed, "TEST", "failure"); err == nil {
 		t.Fatal("READY revision was allowed to fail")
+	}
+}
+
+func TestRevisionHandlerSeparatesRefFailureFromStoreFailure(t *testing.T) {
+	db := newRevisionDB(t)
+	ctx := context.Background()
+	repoStore := repo.NewStore(db)
+	if err := repoStore.Create(ctx, &repo.Repository{ID: "repo-handler", UserID: "user-handler", Name: "handler", GitURL: "https://github.com/example/handler", DefaultRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(logger.UserIDKey), "user-handler")
+		c.Next()
+	})
+	handler := revision.NewHandler(revision.NewService(revision.NewStore(db), repoStore, failingResolver{}, t.TempDir()))
+	router.POST("/repositories/:id/revisions", handler.Create)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"missing"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte(`"REF_NOT_FOUND"`)) {
+		t.Fatalf("ref failure response = %d %s", response.Code, response.Body.String())
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"main"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError || !bytes.Contains(response.Body.Bytes(), []byte(`"INTERNAL_ERROR"`)) {
+		t.Fatalf("store failure response = %d %s", response.Code, response.Body.String())
 	}
 }

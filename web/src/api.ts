@@ -2,6 +2,22 @@ import { ProviderStatus, Repository, Snapshot, AnalysisRevision, DiagnosisRun, D
 
 const API_BASE = '/api/v1';
 
+export function buildDiagnosisRequest(data: {
+  repository_id?: string;
+  analysis_revision_id?: string;
+  snapshot_id?: string;
+  issue_title: string;
+  issue_description?: string;
+  error_log?: string;
+  idempotency_key?: string;
+}): { payload: Omit<typeof data, 'idempotency_key'>; headers: Record<string, string> } {
+  const { idempotency_key, ...payload } = data;
+  return {
+    payload,
+    headers: idempotency_key ? { 'Idempotency-Key': idempotency_key } : {},
+  };
+}
+
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let errDetail = `HTTP ${res.status} ${res.statusText}`;
@@ -175,12 +191,12 @@ export const api = {
     error_log?: string;
     idempotency_key?: string;
   }): Promise<{ diagnosis_run: DiagnosisRun; is_duplicate?: boolean }> {
-    const { idempotency_key, ...payload } = data;
+    const { payload, headers } = buildDiagnosisRequest(data);
     const res = await fetch(`${API_BASE}/diagnoses`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(idempotency_key ? { 'Idempotency-Key': idempotency_key } : {}),
+        ...headers,
       },
       body: JSON.stringify(payload),
     });
@@ -209,10 +225,12 @@ export const api = {
     let findings = [];
     let recommendedChecks = [];
     let limitations = [];
+    let confirmedFacts = [];
     try { findings = JSON.parse(body.report.findings_json || '[]'); } catch {}
     try { recommendedChecks = JSON.parse(body.report.recommended_checks_json || '[]'); } catch {}
     try { limitations = JSON.parse(body.report.limitations_json || '[]'); } catch {}
-    return { ...body.report, findings, recommended_checks: recommendedChecks, limitations } as DiagnosisReport;
+    try { confirmedFacts = JSON.parse(body.report.structured_payload_json || '{}').confirmed_facts || []; } catch {}
+    return { ...body.report, findings, recommended_checks: recommendedChecks, limitations, confirmed_facts: confirmedFacts } as DiagnosisReport;
   },
 
   async getDiagnosisSteps(id: string): Promise<AgentStep[]> {

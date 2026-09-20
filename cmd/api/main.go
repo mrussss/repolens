@@ -97,16 +97,25 @@ func run() error {
 	diagnosisSvc.WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
 		status := providerMgr.GetPublicStatus()
 		return diagnosis.ProviderMetadata{
-			EndpointFingerprint: status.EndpointFingerprint,
-			ConfigFingerprint:   status.ConfigFingerprint,
-			NormalizedBaseURL:   status.BaseURL,
-			ModelName:           status.Model,
-			IsConfigured:        status.IsConfigured,
-			IsDemo:              status.IsDemo,
-			PromptVersion:       "v2.2",
-			AgentVersion:        "v2.2",
-			AgentConfigHash:     diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1),
-			Temperature:         0.1,
+			EndpointFingerprint:    status.EndpointFingerprint,
+			ConfigFingerprint:      status.ConfigFingerprint,
+			NormalizedBaseURL:      status.BaseURL,
+			ModelName:              status.Model,
+			IsConfigured:           status.IsConfigured,
+			IsDemo:                 status.IsDemo,
+			PromptVersion:          "v2.2",
+			AgentVersion:           "v2.2",
+			AgentConfigHash:        diagnosis.ComputeAgentConfigHashWithRuntime(8, 12, 3, 2, 32*1024, 1, 2048, cfg.ProviderTimeoutSeconds, 0, 0.1),
+			Temperature:            0.1,
+			MaxAgentRounds:         8,
+			MaxToolCalls:           12,
+			MaxSearchCalls:         3,
+			MaxRepeatCalls:         2,
+			MaxEvidencePacketBytes: 32 * 1024,
+			FinalizationTurns:      1,
+			MaxOutputTokens:        2048,
+			ProviderTimeoutSeconds: cfg.ProviderTimeoutSeconds,
+			ProviderRetryAttempts:  0,
 		}
 	})
 

@@ -197,6 +197,7 @@ export interface DiagnosisReport {
   recommended_checks: string[];
   confidence: number;
   model_claimed_confidence?: number;
+  confirmed_facts?: string[];
   limitations?: string[];
   finding_count?: number;
   supported_finding_count?: number;

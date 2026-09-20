@@ -32,6 +32,10 @@ type ClaimedMaterializationFinalizer interface {
 	FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 }
 
+type ClaimedMaterializationRevisionFinalizer interface {
+	FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
+}
+
 type GormStore struct {
 	db *gorm.DB
 }
@@ -142,6 +146,52 @@ func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, wo
 		}
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("snapshot %s materialization finalize conflict", snapshotID)
+		}
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+			"status": jobs.StatusSucceeded, "finished_at": readyAt, "updated_at": readyAt,
+		})
+		if jobResult.Error != nil {
+			return jobResult.Error
+		}
+		if jobResult.RowsAffected != 1 {
+			return jobs.ErrOwnershipLost
+		}
+		return nil
+	})
+}
+
+// FinalizeSnapshotSuccessWithRevision atomically publishes a snapshot,
+// advances its AnalysisRevision, and completes the claimed job.
+func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", snapshotID)
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job jobs.AnalysisJob
+		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return jobs.ErrOwnershipLost
+			}
+			return err
+		}
+		result := tx.Model(&RepositorySnapshot{}).Where("id = ? AND status = ? AND analysis_revision_id = ?", snapshotID, StatusMaterializing, revisionID).Updates(map[string]interface{}{
+			"commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
+			"total_bytes": totalBytes, "status": StatusReady, "ready_at": readyAt,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("snapshot %s materialization finalize conflict", snapshotID)
+		}
+		revisionResult := tx.Table("analysis_revisions").Where("id = ? AND status = ? AND snapshot_id = ?", revisionID, "PREPARING", snapshotID).Updates(map[string]interface{}{
+			"stage": "BUILDING_CODE_INDEX", "version": gorm.Expr("version + 1"), "updated_at": readyAt,
+		})
+		if revisionResult.Error != nil {
+			return revisionResult.Error
+		}
+		if revisionResult.RowsAffected != 1 {
+			return fmt.Errorf("analysis revision %s lineage transition conflict", revisionID)
 		}
 		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
 			"status": jobs.StatusSucceeded, "finished_at": readyAt, "updated_at": readyAt,

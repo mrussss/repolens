@@ -156,6 +156,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		findingsBytes, _ := json.Marshal(result.Report.Findings)
 		checksBytes, _ := json.Marshal(result.Report.RecommendedChecks)
 		limitationsBytes, _ := json.Marshal(result.Report.Limitations)
+		structuredPayloadBytes, _ := json.Marshal(result.Report)
 		rep := &evidence.Report{
 			ID:                     uuid.New().String(),
 			DiagnosisRunID:         run.ID,
@@ -165,6 +166,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			Summary:                result.Report.Summary,
 			FindingsJSON:           string(findingsBytes),
 			RecommendedChecksJSON:  string(checksBytes),
+			StructuredPayloadJSON:  string(structuredPayloadBytes),
 			Confidence:             result.Report.Confidence,
 			ModelClaimedConfidence: result.Report.ModelClaimedConfidence,
 			RawOutput:              result.RawOutput,

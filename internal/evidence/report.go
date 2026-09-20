@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,6 +41,7 @@ type DiagnosisReportData struct {
 	RecommendedChecks      []string       `json:"recommended_checks"`
 	Confidence             float64        `json:"confidence"`
 	ModelClaimedConfidence *float64       `json:"model_claimed_confidence,omitempty"`
+	ConfirmedFacts         []string       `json:"confirmed_facts"`
 	Limitations            []string       `json:"limitations"`
 }
 
@@ -53,6 +55,7 @@ type Report struct {
 	Summary                 string         `gorm:"type:text" json:"summary,omitempty"`
 	FindingsJSON            string         `gorm:"type:text;not null" json:"findings_json"`
 	RecommendedChecksJSON   string         `gorm:"type:text" json:"recommended_checks_json"`
+	StructuredPayloadJSON   string         `gorm:"type:mediumtext" json:"structured_payload_json,omitempty"`
 	Confidence              float64        `gorm:"default:0.0" json:"confidence"`
 	RawOutput               string         `gorm:"type:mediumtext" json:"raw_output,omitempty"`
 	ParseError              string         `gorm:"type:text" json:"parse_error,omitempty"`
@@ -90,9 +93,12 @@ func ClassifyReport(data *DiagnosisReportData, structured bool) (ReportQuality, 
 	if data.ConclusionKind != ConclusionRootCause && data.ConclusionKind != ConclusionInsufficientEvidence {
 		return ReportQuality{Status: ReportInvalid}, errors.New("conclusion_kind is invalid")
 	}
+	if err := validateReportBounds(data); err != nil {
+		return ReportQuality{Status: ReportInvalid}, err
+	}
 	if data.ConclusionKind == ConclusionInsufficientEvidence {
-		if len(data.Limitations) == 0 && len(data.RecommendedChecks) == 0 {
-			return ReportQuality{Status: ReportInvalid}, errors.New("insufficient evidence report needs limitations or next checks")
+		if len(data.ConfirmedFacts) == 0 || len(data.Limitations) == 0 || len(data.RecommendedChecks) == 0 {
+			return ReportQuality{Status: ReportInvalid}, errors.New("insufficient evidence report needs confirmed facts, limitations, and next checks")
 		}
 		return ReportQuality{Status: ReportInsufficientEvidence}, nil
 	}
@@ -129,6 +135,41 @@ func ClassifyReport(data *DiagnosisReportData, structured bool) (ReportQuality, 
 		quality.Status = ReportDegraded
 	}
 	return quality, nil
+}
+
+func validateReportBounds(data *DiagnosisReportData) error {
+	if data.ModelClaimedConfidence != nil && (*data.ModelClaimedConfidence < 0 || *data.ModelClaimedConfidence > 1) {
+		return errors.New("model_claimed_confidence must be between 0 and 1")
+	}
+	if len(data.Summary) > 16*1024 || len(data.RootCause) > 16*1024 {
+		return errors.New("report summary or root cause exceeds the configured limit")
+	}
+	if len(data.Findings) > 64 || len(data.RecommendedChecks) > 32 || len(data.ConfirmedFacts) > 32 || len(data.Limitations) > 32 {
+		return errors.New("report contains too many items")
+	}
+	values := append([]string{}, data.RecommendedChecks...)
+	values = append(values, data.ConfirmedFacts...)
+	values = append(values, data.Limitations...)
+	values = append(values, data.Summary, data.RootCause)
+	for _, value := range values {
+		if len(value) > 8*1024 {
+			return errors.New("report field exceeds the configured limit")
+		}
+	}
+	for _, finding := range data.Findings {
+		if strings.TrimSpace(finding.Title) == "" || strings.TrimSpace(finding.Reasoning) == "" {
+			return errors.New("finding title and reasoning are required")
+		}
+		if len(finding.Title) > 2*1024 || len(finding.Reasoning) > 8*1024 || len(finding.Citations) > 16 {
+			return errors.New("finding exceeds the configured limit")
+		}
+		for _, citation := range finding.Citations {
+			if len(citation.FilePath) > 255 || len(citation.Excerpt) > 32*1024 || len(citation.Reason) > 2*1024 {
+				return errors.New("citation exceeds the configured limit")
+			}
+		}
+	}
+	return nil
 }
 
 type ReportStore interface {

@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -54,8 +56,9 @@ Rules:
     "Actionable fix step 1",
     "Actionable fix step 2"
   ],
-	  "confidence": 0.95,
-	  "limitations": []
+  "confirmed_facts": ["Facts directly supported by the evidence"],
+  "confidence": 0.95,
+  "limitations": []
 }
 Do not wrap the JSON with markdown backticks if possible, or output strictly parseable JSON.
 
@@ -158,9 +161,11 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "")
 		temperature := run.Temperature
 		resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
-			Messages:    messages,
-			Tools:       toolsDef,
-			Temperature: &temperature,
+			Messages:       messages,
+			Tools:          toolsDef,
+			Temperature:    &temperature,
+			MaxTokens:      l.guardCfg.MaxOutputTokens,
+			ResponseFormat: &llm.ResponseFormat{Type: "json_object"},
 		})
 		latency := time.Since(startGen).Milliseconds()
 
@@ -187,20 +192,18 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		if len(resp.Message.ToolCalls) > 0 {
 			messages = append(messages, resp.Message)
 
-			for _, tc := range resp.Message.ToolCalls {
+			for callIndex, tc := range resp.Message.ToolCalls {
 				if tc.Function.Name == "search_code" {
 					searchCalls++
 					if err := guard.RecordSearchCall(); err != nil {
-						priorMessages := messages[:len(messages)-1]
-						return l.finalizeOnly(ctx, run, attempt, priorMessages, "SEARCH_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
+						return l.finalizeOnly(ctx, run, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "search_code budget exhausted"), "SEARCH_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 					}
 				}
 				toolCallsCount++
 				toolNames = append(toolNames, tc.Function.Name)
 				if err := guard.RecordToolCall(tc.Function.Name, tc.Function.Arguments); err != nil {
 					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, tc.Function.Arguments, "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+err.Error())
-					priorMessages := messages[:len(messages)-1]
-					return l.finalizeOnly(ctx, run, attempt, priorMessages, "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
+					return l.finalizeOnly(ctx, run, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "tool budget exhausted"), "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 				}
 
 				// Record tool call step
@@ -271,6 +274,17 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 	}
 }
 
+func appendBudgetResults(messages []llm.Message, calls []llm.ToolCall, from int, reason string) []llm.Message {
+	for _, call := range calls[from:] {
+		messages = append(messages, llm.Message{
+			Role:       llm.RoleTool,
+			ToolCallID: call.ID,
+			Content:    "Tool was not executed: " + reason,
+		})
+	}
+	return messages
+}
+
 func errorString(err error) string {
 	if err == nil {
 		return ""
@@ -283,7 +297,12 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 	finalMessages = append(finalMessages, llm.Message{Role: llm.RoleUser, Content: "FINALIZE_ONLY: exploration budget is exhausted. Do not request tools. Return the best evidence-backed structured JSON now, clearly separating confirmed facts, likely explanation, uncertainty, and next checks."})
 	temperature := run.Temperature
 	start := time.Now()
-	resp, err := l.provider.Generate(ctx, llm.GenerateRequest{Messages: finalMessages, Temperature: &temperature})
+	resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
+		Messages:       finalMessages,
+		Temperature:    &temperature,
+		MaxTokens:      l.guardCfg.MaxOutputTokens,
+		ResponseFormat: &llm.ResponseFormat{Type: "json_object"},
+	})
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason)
@@ -367,7 +386,16 @@ func parseReportJSON(raw string) (*evidence.DiagnosisReportData, error) {
 }
 
 func decodeReportJSON(data []byte, report *evidence.DiagnosisReportData) error {
-	if err := json.Unmarshal(data, report); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(report); err != nil {
+		return err
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("report JSON must contain one object")
+		}
 		return err
 	}
 	var envelope map[string]json.RawMessage

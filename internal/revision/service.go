@@ -44,7 +44,7 @@ func (s *Service) Prepare(ctx context.Context, userID, repositoryID, requestedRe
 	}
 	commitSHA, err := s.resolver.ResolveRef(ctx, repository.GitURL, requestedRef)
 	if err != nil {
-		return nil, false, fmt.Errorf("ref resolution failed: %w", err)
+		return nil, false, fmt.Errorf("%w: %v", ErrRefResolution, err)
 	}
 	fingerprint := ComputePipelineFingerprint()
 	existing, lookupErr := s.store.GetByIdentity(ctx, repositoryID, commitSHA, fingerprint)

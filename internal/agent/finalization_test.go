@@ -16,7 +16,7 @@ func (s *finalizationProviderSpy) Generate(_ context.Context, request llm.Genera
 	s.toolsLengths = append(s.toolsLengths, len(request.Tools))
 	return llm.GenerateResponse{Message: llm.Message{
 		Role:    llm.RoleAssistant,
-		Content: `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","summary":"more evidence is required","limitations":["not enough source evidence"]}`,
+		Content: `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","summary":"more evidence is required","confirmed_facts":["the available evidence is incomplete"],"limitations":["not enough source evidence"],"recommended_checks":["collect the missing source evidence"]}`,
 	}}, nil
 }
 

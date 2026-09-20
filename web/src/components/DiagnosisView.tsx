@@ -3,6 +3,7 @@ import { api } from '../api';
 import { DiagnosisRun, DiagnosisReport, AgentStep } from '../types';
 import { EvidenceViewer } from './EvidenceViewer';
 import { TraceViewer } from './TraceViewer';
+import { isInvalidReport } from '../reportStatus';
 import { RefreshCw, StopCircle, FileText, Activity, ShieldAlert, ArrowLeft } from 'lucide-react';
 
 interface Props {
@@ -179,7 +180,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
               模型自评 confidence：{report.model_claimed_confidence.toFixed(2)}
             </p>
           )}
-          {report.report_status !== 'INVALID' && report.root_cause ? (
+          {!isInvalidReport(report) && report.root_cause ? (
             <p style={{ fontSize: '0.95rem', color: 'var(--text-bright)', lineHeight: 1.6, marginTop: '0.5rem' }}>{report.root_cause}</p>
           ) : (
             <p style={{ fontSize: '0.95rem', color: 'var(--accent-warning)', lineHeight: 1.6, marginTop: '0.5rem' }}>
@@ -192,6 +193,12 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
           {report.limitations && report.limitations.length > 0 && (
             <div style={{ marginTop: '0.75rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
               限制：{report.limitations.join('；')}
+            </div>
+          )}
+
+          {report.confirmed_facts && report.confirmed_facts.length > 0 && (
+            <div style={{ marginTop: '0.75rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+              已确认事实：{report.confirmed_facts.join('；')}
             </div>
           )}
 

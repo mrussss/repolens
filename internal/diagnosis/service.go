@@ -75,16 +75,25 @@ type CreateDiagnosisInput struct {
 }
 
 type ProviderMetadata struct {
-	EndpointFingerprint string
-	ConfigFingerprint   string
-	NormalizedBaseURL   string
-	ModelName           string
-	PromptVersion       string
-	AgentVersion        string
-	AgentConfigHash     string
-	Temperature         float64
-	IsConfigured        bool
-	IsDemo              bool
+	EndpointFingerprint    string
+	ConfigFingerprint      string
+	NormalizedBaseURL      string
+	ModelName              string
+	PromptVersion          string
+	AgentVersion           string
+	AgentConfigHash        string
+	Temperature            float64
+	IsConfigured           bool
+	IsDemo                 bool
+	MaxAgentRounds         int
+	MaxToolCalls           int
+	MaxSearchCalls         int
+	MaxRepeatCalls         int
+	MaxEvidencePacketBytes int
+	FinalizationTurns      int
+	MaxOutputTokens        int
+	ProviderTimeoutSeconds int
+	ProviderRetryAttempts  int
 }
 
 type Service struct {
@@ -148,6 +157,11 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		rev, revErr := s.revisionStore.GetByID(ctx, input.AnalysisRevisionID)
 		if revErr != nil {
 			return nil, false, revErr
+		}
+		// A revision lookup by ID is not an authorization check. Resolve its
+		// repository through the user-scoped store before using its lineage.
+		if _, repoErr := s.repoStore.GetByIDAndUser(ctx, rev.RepositoryID, input.UserID); repoErr != nil {
+			return nil, false, revision.ErrNotFound
 		}
 		if input.RepositoryID != "" && input.RepositoryID != rev.RepositoryID {
 			return nil, false, codeintelstore.ErrBuildLineageMismatch
@@ -251,7 +265,31 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	cleanLog := RedactSecrets(input.ErrorLog)
 
 	if metadata.AgentConfigHash == "" {
-		metadata.AgentConfigHash = ComputeAgentConfigHash(8, 12, 2, metadata.Temperature)
+		metadata.AgentConfigHash = ComputeAgentConfigHashWithRuntime(8, 12, 3, 2, 32*1024, 1, 2048, 60, 0, metadata.Temperature)
+	}
+	if metadata.MaxAgentRounds == 0 {
+		metadata.MaxAgentRounds = 8
+	}
+	if metadata.MaxToolCalls == 0 {
+		metadata.MaxToolCalls = 12
+	}
+	if metadata.MaxSearchCalls == 0 {
+		metadata.MaxSearchCalls = 3
+	}
+	if metadata.MaxRepeatCalls == 0 {
+		metadata.MaxRepeatCalls = 2
+	}
+	if metadata.MaxEvidencePacketBytes == 0 {
+		metadata.MaxEvidencePacketBytes = 32 * 1024
+	}
+	if metadata.FinalizationTurns == 0 {
+		metadata.FinalizationTurns = 1
+	}
+	if metadata.MaxOutputTokens == 0 {
+		metadata.MaxOutputTokens = 2048
+	}
+	if metadata.ProviderTimeoutSeconds == 0 {
+		metadata.ProviderTimeoutSeconds = 60
 	}
 	run := &DiagnosisRun{
 		ID:                          uuid.New().String(),
@@ -275,6 +313,15 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		PromptVersion:               metadata.PromptVersion,
 		AgentVersion:                metadata.AgentVersion,
 		AgentConfigHash:             metadata.AgentConfigHash,
+		MaxAgentRounds:              metadata.MaxAgentRounds,
+		MaxToolCalls:                metadata.MaxToolCalls,
+		MaxSearchCalls:              metadata.MaxSearchCalls,
+		MaxRepeatCalls:              metadata.MaxRepeatCalls,
+		MaxEvidencePacketBytes:      metadata.MaxEvidencePacketBytes,
+		FinalizationTurns:           metadata.FinalizationTurns,
+		MaxOutputTokens:             metadata.MaxOutputTokens,
+		ProviderTimeoutSeconds:      metadata.ProviderTimeoutSeconds,
+		ProviderRetryAttempts:       metadata.ProviderRetryAttempts,
 		PipelineFingerprint:         revisionPipelineFingerprint(input.AnalysisRevisionID),
 		Temperature:                 metadata.Temperature,
 	}

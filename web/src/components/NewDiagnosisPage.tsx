@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { api } from '../api';
 import { AnalysisRevision, Repository } from '../types';
 import { Play } from 'lucide-react';
+import { getStableDiagnosisIdempotencyKey } from '../diagnosisSubmission';
 
 interface Props {
   initialRepoId?: string;
@@ -72,13 +73,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisi
     setError(null);
     try {
       const payloadFingerprint = JSON.stringify({ selectedRevisionId, issueTitle, issueDescription, errorLog });
-      const savedPayload = sessionStorage.getItem('repolens-diagnosis-payload');
-      let idempotencyKey = sessionStorage.getItem('repolens-diagnosis-key') || '';
-      if (savedPayload !== payloadFingerprint || !idempotencyKey) {
-        idempotencyKey = crypto.randomUUID();
-        sessionStorage.setItem('repolens-diagnosis-payload', payloadFingerprint);
-        sessionStorage.setItem('repolens-diagnosis-key', idempotencyKey);
-      }
+      const idempotencyKey = getStableDiagnosisIdempotencyKey(payloadFingerprint, sessionStorage, crypto.randomUUID);
       const res = await api.createDiagnosis({
         repository_id: selectedRepoId,
         analysis_revision_id: selectedRevisionId,

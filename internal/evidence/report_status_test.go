@@ -34,8 +34,10 @@ func TestClassifyReportSeparatesExecutionShapeFromEvidenceQuality(t *testing.T) 
 	}
 
 	quality, err = evidence.ClassifyReport(&evidence.DiagnosisReportData{
-		ConclusionKind: evidence.ConclusionInsufficientEvidence,
-		Limitations:    []string{"not enough evidence"},
+		ConclusionKind:    evidence.ConclusionInsufficientEvidence,
+		ConfirmedFacts:    []string{"the available evidence is incomplete"},
+		Limitations:       []string{"not enough evidence"},
+		RecommendedChecks: []string{"collect more evidence"},
 	}, true)
 	if err != nil || quality.Status != evidence.ReportInsufficientEvidence {
 		t.Fatalf("insufficient quality = %+v err=%v", quality, err)

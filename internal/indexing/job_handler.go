@@ -235,7 +235,14 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_SEAL_FAILED")
 		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
 	}
-	if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil {
+	stageFinalized := false
+	if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationRevisionFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil && snap.AnalysisRevisionID != "" {
+		if err := finalizer.FinalizeSnapshotSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, snap.AnalysisRevisionID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
+			return err
+		}
+		stageFinalized = true
+	} else if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil {
 		if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return err
@@ -248,7 +255,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	} else if err := h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusReady, &now); err != nil {
 		return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
 	}
-	if h.revisionStore != nil && snap.AnalysisRevisionID != "" {
+	if !stageFinalized && h.revisionStore != nil && snap.AnalysisRevisionID != "" {
 		if err := h.revisionStore.MarkSnapshotReady(ctx, snap.AnalysisRevisionID, snap.ID); err != nil {
 			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
 		}

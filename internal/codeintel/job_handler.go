@@ -108,7 +108,13 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	}
 
 	var saveErr error
+	stageFinalized := false
 	if finalizer, ok := h.store.(interface {
+		FinalizeCodeIndexSuccessWithRevision(context.Context, int64, string, string, int64, string, *model.AnalysisResult) error
+	}); ok && job.WorkerID != nil && job.ClaimToken != nil && cib.AnalysisRevisionID != "" {
+		saveErr = finalizer.FinalizeCodeIndexSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, cib.AnalysisRevisionID, analysisRes)
+		stageFinalized = saveErr == nil
+	} else if finalizer, ok := h.store.(interface {
 		FinalizeCodeIndexSuccess(context.Context, int64, string, string, int64, *model.AnalysisResult) error
 	}); ok && job.WorkerID != nil && job.ClaimToken != nil {
 		saveErr = finalizer.FinalizeCodeIndexSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, analysisRes)
@@ -122,7 +128,7 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	// Auto-create/trigger BUILD_RETRIEVAL job for derived retrieval index
 	_, _, _ = h.store.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
-	if h.revisionStore != nil && cib.AnalysisRevisionID != "" {
+	if !stageFinalized && h.revisionStore != nil && cib.AnalysisRevisionID != "" {
 		if err := h.revisionStore.MarkCodeIndexReady(ctx, cib.AnalysisRevisionID, cib.ID); err != nil {
 			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
 		}

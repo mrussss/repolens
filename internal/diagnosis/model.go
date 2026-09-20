@@ -34,6 +34,15 @@ type DiagnosisRun struct {
 	PromptVersion               string    `gorm:"size:64;not null" json:"prompt_version"`
 	AgentVersion                string    `gorm:"size:64;not null" json:"agent_version"`
 	AgentConfigHash             string    `gorm:"size:64;not null" json:"agent_config_hash"`
+	MaxAgentRounds              int       `gorm:"not null;default:8" json:"max_agent_rounds"`
+	MaxToolCalls                int       `gorm:"not null;default:12" json:"max_tool_calls"`
+	MaxSearchCalls              int       `gorm:"not null;default:3" json:"max_search_calls"`
+	MaxRepeatCalls              int       `gorm:"not null;default:2" json:"max_repeat_calls"`
+	MaxEvidencePacketBytes      int       `gorm:"not null;default:32768" json:"max_evidence_packet_bytes"`
+	FinalizationTurns           int       `gorm:"not null;default:1" json:"finalization_turns"`
+	MaxOutputTokens             int       `gorm:"not null;default:2048" json:"max_output_tokens"`
+	ProviderTimeoutSeconds      int       `gorm:"not null;default:60" json:"provider_timeout_seconds"`
+	ProviderRetryAttempts       int       `gorm:"not null;default:0" json:"provider_retry_attempts"`
 	PipelineFingerprint         string    `gorm:"size:64;not null;default:''" json:"pipeline_fingerprint,omitempty"`
 	Temperature                 float64   `gorm:"not null;default:0" json:"temperature"`
 	IdempotencyKey              string    `gorm:"size:128;not null;index:idx_user_idemp,unique" json:"idempotency_key"`

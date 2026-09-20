@@ -11,6 +11,7 @@ import (
 
 	"repolens/internal/codeintel/model"
 	"repolens/internal/jobs"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
 
@@ -233,6 +234,29 @@ func (s *GormStore) FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, w
 	})
 }
 
+// FinalizeCodeIndexSuccessWithRevision atomically publishes the code index,
+// advances its product revision, and completes the claimed job.
+func (s *GormStore) FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, revisionID string, res *model.AnalysisResult) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := requireOwnedJob(tx, jobID, workerID, claimToken); err != nil {
+			return err
+		}
+		if err := s.saveAnalysisResultTx(tx, buildID, res); err != nil {
+			return err
+		}
+		result := tx.Model(&revision.AnalysisRevision{}).
+			Where("id = ? AND status = ? AND code_index_build_id = ?", revisionID, revision.StatusPreparing, buildID).
+			Updates(map[string]interface{}{"stage": revision.StageBuildingSearch, "version": gorm.Expr("version + 1"), "updated_at": time.Now().UTC()})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return revision.ErrLineage
+		}
+		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
+	})
+}
+
 func (s *GormStore) MarkBuildBuilding(ctx context.Context, buildID int64) error {
 	result := s.db.WithContext(ctx).Model(&model.CodeIndexBuild{}).
 		Where("id = ? AND status IN (?, ?)", buildID, model.BuildStatusCreated, model.BuildStatusBuilding).
@@ -434,6 +458,40 @@ func (s *GormStore) FinalizeRetrievalSuccess(ctx context.Context, jobID int64, w
 		}
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("retrieval build %d finalize conflict", buildID)
+		}
+		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
+	})
+}
+
+// FinalizeRetrievalSuccessWithRevision atomically publishes the retrieval
+// artifact, advances the product revision, and completes the claimed job.
+func (s *GormStore) FinalizeRetrievalSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, revisionID string, artifactPath, artifactHash string, docCount int) error {
+	if artifactPath == "" || artifactHash == "" {
+		return fmt.Errorf("retrieval build %d cannot become READY without an artifact and hash", buildID)
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := requireOwnedJob(tx, jobID, workerID, claimToken); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		result := tx.Model(&model.RetrievalBuild{}).Where("id = ? AND status = ?", buildID, model.BuildStatusBuilding).Updates(map[string]interface{}{
+			"status": model.BuildStatusReady, "artifact_path": artifactPath, "artifact_hash": artifactHash,
+			"document_count": docCount, "ready_at": &now,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("retrieval build %d finalize conflict", buildID)
+		}
+		revisionResult := tx.Model(&revision.AnalysisRevision{}).
+			Where("id = ? AND status = ? AND retrieval_build_id = ?", revisionID, revision.StatusPreparing, buildID).
+			Updates(map[string]interface{}{"status": revision.StatusReady, "stage": revision.StageReady, "ready_at": now, "version": gorm.Expr("version + 1"), "updated_at": now})
+		if revisionResult.Error != nil {
+			return revisionResult.Error
+		}
+		if revisionResult.RowsAffected != 1 {
+			return revision.ErrLineage
 		}
 		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
 	})

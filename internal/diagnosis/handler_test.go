@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -18,8 +21,52 @@ import (
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/repo"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
+
+func TestDiagnosisRequestUsesSharedV22Fixture(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to locate test file")
+	}
+	fixturePath := filepath.Join(filepath.Dir(currentFile), "..", "..", "contracts", "v2.2", "diagnosis-create.request.json")
+	body, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		AnalysisRevisionID string `json:"analysis_revision_id"`
+		IssueTitle         string `json:"issue_title"`
+		CodeIndexBuildID   int64  `json:"code_index_build_id"`
+		RetrievalBuildID   int64  `json:"retrieval_build_id"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.AnalysisRevisionID == "" || request.IssueTitle == "" || request.CodeIndexBuildID != 0 || request.RetrievalBuildID != 0 {
+		t.Fatalf("shared fixture does not describe the v2.2 revision request: %+v", request)
+	}
+}
+
+func TestDiagnosisRevisionSubmissionRequiresRepositoryOwnership(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	ctx := context.Background()
+	repoStore := repo.NewStore(db)
+	if err := repoStore.Create(ctx, &repo.Repository{ID: "private-repo", UserID: "owner", Name: "private", GitURL: "https://github.com/example/private"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&revision.AnalysisRevision{ID: "private-revision", RepositoryID: "private-repo", CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2", PipelineFingerprint: "fingerprint", Status: revision.StatusReady, Stage: revision.StageReady}).Error; err != nil {
+		t.Fatal(err)
+	}
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repoStore, snapshot.NewStore(db)).WithRevisionStore(revision.NewStore(db))
+	_, _, err := svc.Create(ctx, diagnosis.CreateDiagnosisInput{
+		UserID: "attacker", AnalysisRevisionID: "private-revision", IssueTitle: "should not access", IdempotencyKey: "ownership-key",
+	})
+	if !errors.Is(err, revision.ErrNotFound) {
+		t.Fatalf("cross-user revision submission error = %v, want revision not found", err)
+	}
+}
 
 func TestDiagnosisCreateRejectsUnconfiguredProviderWithoutCreatingJob(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)

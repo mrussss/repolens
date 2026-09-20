@@ -1,0 +1,7 @@
+{
+  "repository_id": "repo-contract-fixture",
+  "analysis_revision_id": "revision-contract-fixture",
+  "issue_title": "fixture diagnosis request",
+  "issue_description": "shared API contract fixture",
+  "error_log": "fixture error"
+}

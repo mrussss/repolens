@@ -20,6 +20,7 @@ var (
 	ErrFailedRevision = errors.New("analysis revision already failed; explicit retry is required")
 	ErrInvalidState   = errors.New("invalid analysis revision state transition")
 	ErrLineage        = errors.New("analysis revision lineage is incomplete or inconsistent")
+	ErrRefResolution  = errors.New("repository ref could not be resolved")
 )
 
 type PrepareSpec struct {
@@ -287,8 +288,12 @@ func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, er
 }
 
 func (s *GormStore) MarkSnapshotReady(ctx context.Context, id, snapshotID string) error {
+	var value AnalysisRevision
+	if err := s.db.WithContext(ctx).First(&value, "id = ?", id).Error; err != nil {
+		return err
+	}
 	var snap snapshot.RepositorySnapshot
-	if err := s.db.WithContext(ctx).First(&snap, "id = ?", snapshotID).Error; err != nil || snap.Status != snapshot.StatusReady {
+	if err := s.db.WithContext(ctx).First(&snap, "id = ?", snapshotID).Error; err != nil || snap.Status != snapshot.StatusReady || snap.AnalysisRevisionID != id || snap.RepositoryID != value.RepositoryID || snap.CommitSHA != value.CommitSHA {
 		return ErrLineage
 	}
 	now := time.Now().UTC()
@@ -309,6 +314,10 @@ func (s *GormStore) MarkCodeIndexReady(ctx context.Context, id string, buildID i
 	}
 	var build codeintelmodel.CodeIndexBuild
 	if err := s.db.WithContext(ctx).First(&build, "id = ?", buildID).Error; err != nil || build.Status != codeintelmodel.BuildStatusReady || build.SnapshotID != value.SnapshotID || build.AnalysisRevisionID != id {
+		return ErrLineage
+	}
+	var snap snapshot.RepositorySnapshot
+	if err := s.db.WithContext(ctx).First(&snap, "id = ?", build.SnapshotID).Error; err != nil || snap.AnalysisRevisionID != id || snap.RepositoryID != value.RepositoryID || snap.CommitSHA != value.CommitSHA || snap.Status != snapshot.StatusReady {
 		return ErrLineage
 	}
 	result := s.db.WithContext(ctx).Model(&AnalysisRevision{}).Where("id = ? AND status = ? AND code_index_build_id = ?", id, StatusPreparing, buildID).Updates(map[string]interface{}{"stage": StageBuildingSearch, "version": gorm.Expr("version + 1"), "updated_at": time.Now().UTC()})
@@ -332,6 +341,13 @@ func (s *GormStore) MarkRetrievalReady(ctx context.Context, id string, buildID i
 	}
 	var codeBuild codeintelmodel.CodeIndexBuild
 	if err := s.db.WithContext(ctx).First(&codeBuild, "id = ?", value.CodeIndexBuildID).Error; err != nil || codeBuild.Status != codeintelmodel.BuildStatusReady || codeBuild.SnapshotID != value.SnapshotID {
+		return ErrLineage
+	}
+	if codeBuild.AnalysisRevisionID != id {
+		return ErrLineage
+	}
+	var snap snapshot.RepositorySnapshot
+	if err := s.db.WithContext(ctx).First(&snap, "id = ?", codeBuild.SnapshotID).Error; err != nil || snap.AnalysisRevisionID != id || snap.RepositoryID != value.RepositoryID || snap.CommitSHA != value.CommitSHA || snap.Status != snapshot.StatusReady {
 		return ErrLineage
 	}
 	now := time.Now().UTC()

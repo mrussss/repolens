@@ -222,8 +222,8 @@ func TestWorkerJobHandlerResumesFromProviderCheckpoint(t *testing.T) {
 		StartedAt:             time.Now().UTC(),
 		HeartbeatAt:           time.Now().UTC(),
 		DeadlineAt:            time.Now().UTC().Add(time.Minute),
-		RawOutput:             `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","limitations":["checkpoint evidence"]}`,
-		ParsedReportJSON:      `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","limitations":["checkpoint evidence"]}`,
+		RawOutput:             `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","confirmed_facts":["checkpoint evidence is incomplete"],"limitations":["checkpoint evidence"],"recommended_checks":["collect checkpoint evidence"]}`,
+		ParsedReportJSON:      `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","confirmed_facts":["checkpoint evidence is incomplete"],"limitations":["checkpoint evidence"],"recommended_checks":["collect checkpoint evidence"]}`,
 		StructuredOutputValid: true,
 		ProviderCalls:         1,
 	}).Error; err != nil {

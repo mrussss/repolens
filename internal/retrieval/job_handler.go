@@ -114,7 +114,13 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	}
 
 	var finalizeErr error
+	stageFinalized := false
 	if finalizer, ok := h.ciStore.(interface {
+		FinalizeRetrievalSuccessWithRevision(context.Context, int64, string, string, int64, string, string, string, int) error
+	}); ok && job.WorkerID != nil && job.ClaimToken != nil && rb.AnalysisRevisionID != "" {
+		finalizeErr = finalizer.FinalizeRetrievalSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, rb.ID, rb.AnalysisRevisionID, finalPath, artifactHash, idx.TotalDocs)
+		stageFinalized = finalizeErr == nil
+	} else if finalizer, ok := h.ciStore.(interface {
 		FinalizeRetrievalSuccess(context.Context, int64, string, string, int64, string, string, int) error
 	}); ok && job.WorkerID != nil && job.ClaimToken != nil {
 		finalizeErr = finalizer.FinalizeRetrievalSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, rb.ID, finalPath, artifactHash, idx.TotalDocs)
@@ -125,7 +131,7 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		log.Error("failed updating retrieval build to READY", "build_id", rb.ID, "error", finalizeErr)
 		return finalizeErr
 	}
-	if h.revisionStore != nil && rb.AnalysisRevisionID != "" {
+	if !stageFinalized && h.revisionStore != nil && rb.AnalysisRevisionID != "" {
 		if err := h.revisionStore.MarkRetrievalReady(ctx, rb.AnalysisRevisionID, rb.ID); err != nil {
 			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
 		}

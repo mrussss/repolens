@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { api } from '../api';
 import { AnalysisRevision, Repository } from '../types';
 import { GitBranch, Plus, RefreshCw, Database, Play } from 'lucide-react';
+import { shouldContinueRevisionPolling } from '../revisionPolling';
 
 interface Props {
   onSelectRepoForDiagnosis: (repoId: string, revisionId: string) => void;
@@ -17,6 +18,7 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
   const [error, setError] = useState<string | null>(null);
   const [preparingRepoId, setPreparingRepoId] = useState<string | null>(null);
   const [revisions, setRevisions] = useState<Record<string, AnalysisRevision[]>>({});
+  const [pollNonce, setPollNonce] = useState(0);
 
   useEffect(() => {
     let stopped = false;
@@ -29,9 +31,9 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
         timer = window.setTimeout(poll, 5000);
         return;
       }
-      await loadRepos();
+      const hasPreparingRevision = await loadRepos();
       delay = Math.min(5000, delay * 2);
-      if (!stopped) timer = window.setTimeout(poll, delay);
+      if (!stopped && hasPreparingRevision) timer = window.setTimeout(poll, delay);
     };
     const onVisibilityChange = () => {
       if (!document.hidden) {
@@ -47,9 +49,9 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
       if (timer !== undefined) window.clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, []);
+  }, [pollNonce]);
 
-  const loadRepos = async () => {
+  const loadRepos = async (): Promise<boolean> => {
     try {
       setLoading(true);
       const list = await api.listRepositories();
@@ -58,9 +60,12 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
         try { return [repo.id, await api.listAnalysisRevisions(repo.id)] as const; }
         catch { return [repo.id, []] as const; }
       }));
-      setRevisions(Object.fromEntries(revisionEntries));
+      const nextRevisions: Record<string, AnalysisRevision[]> = Object.fromEntries(revisionEntries);
+      setRevisions(nextRevisions);
+      return Object.values(nextRevisions).some(shouldContinueRevisionPolling);
     } catch (err: any) {
       setError(err.message || '加载仓库失败');
+      return false;
     } finally {
       setLoading(false);
     }
@@ -91,6 +96,7 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
         await api.createAnalysisRevision(repoId, ref);
       }
       await loadRepos();
+      setPollNonce((value) => value + 1);
     } catch (err: any) {
       setError(err.message || '准备分析失败');
     } finally {
