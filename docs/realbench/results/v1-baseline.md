@@ -6,11 +6,11 @@
 
 - Dataset: `realbench-v1`
 - Manifest hash: `5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf`
-- RepoLens commit: `80f73597787393fe9f358380da5eb9c9979a4a1c`
-- Run ID: `20260909T111454Z-63cd1604`
+- RepoLens commit: `58cf605a217fd1bf0df0c7df965636e890f2e1d1`
+- Run ID: `20260920T100622Z-48085399`
 - Command: `go run ./cmd/realbench run --all`
 - Retrieval: `symbol_bm25_structural` — current Pure Go BM25 + Structural Retrieval
-- Retrieval / index version: `v2.1.0` / `v2.1.0`
+- Retrieval / index version: `v2.1.0` / `v2.1.0`; Agent / Prompt version: `v2.2` / `v2.2`
 - E2E: `NOT_REQUESTED`
 - Quality artifacts: per-case `analysis_quality.json` and run-level `analysis_quality_summary.csv`
 - Environment: `go1.22.12`, `linux/amd64`, provider timeout `60s`, temperature `0.1`
@@ -33,9 +33,9 @@
 
 | Case | Repository | Top-10 primary-file rank | Hit@5 | Hit@10 | Latency |
 |---|---|---:|---:|---:|---:|
-| REAL-001 | go-chi/chi | 1 | yes | yes | 15 ms |
-| REAL-002 | spf13/cobra | 3 | yes | yes | 21 ms |
-| REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 4 ms |
+| REAL-001 | go-chi/chi | 1 | yes | yes | 12 ms |
+| REAL-002 | spf13/cobra | 3 | yes | yes | 19 ms |
+| REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 3 ms |
 
 ## Code Intelligence quality
 
