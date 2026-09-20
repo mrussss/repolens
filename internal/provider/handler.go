@@ -158,14 +158,23 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PROVIDER_CONFIG", "error": "invalid provider configuration"})
 		return
 	}
+	if _, err := NormalizeBaseURL(req.BaseURL); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"code":    "INVALID_PROVIDER_CONFIG",
+			"error":   "invalid provider configuration",
+		})
+		return
+	}
 
 	latency, err := h.mgr.TestConnectionWithAuthMode(c.Request.Context(), req.BaseURL, req.Model, req.APIKey, req.AuthMode)
 	if err != nil {
 		logger.L(c.Request.Context()).Error("provider connection test failed", "error", err)
-		c.JSON(http.StatusBadGateway, gin.H{
+		code, message, status := ClassifyTestConnectionError(err)
+		c.JSON(status, gin.H{
 			"success":    false,
-			"code":       "PROVIDER_CONNECTION_FAILED",
-			"error":      "provider connection failed",
+			"code":       code,
+			"error":      message,
 			"latency_ms": latency.Milliseconds(),
 		})
 		return

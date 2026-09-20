@@ -136,14 +136,8 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 		return GenerateResponse{}, fmt.Errorf("failed to read llm response body: %w", err)
 	}
 
-	if resp.StatusCode == 429 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return GenerateResponse{}, &HTTPError{StatusCode: resp.StatusCode, Body: string(respBytes)}
-	}
-	if resp.StatusCode >= 500 {
-		return GenerateResponse{}, &HTTPError{StatusCode: resp.StatusCode, Body: string(respBytes)}
-	}
-	if resp.StatusCode != http.StatusOK {
-		return GenerateResponse{}, fmt.Errorf("llm request failed with status %d: %s", resp.StatusCode, string(respBytes))
 	}
 
 	var openAIResp openAIResponse

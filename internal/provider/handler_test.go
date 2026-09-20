@@ -51,11 +51,11 @@ func TestTestConnectionFailureHasStableHTTPError(t *testing.T) {
 	router.POST("/settings/provider/test", handler.TestConnection)
 	response := performProviderRequestTo(router, http.MethodPost, "/settings/provider/test", `{"base_url":"http://[invalid","model":"model","api_key":"secret-token"}`)
 
-	if response.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502: %s", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	if !strings.Contains(body, "PROVIDER_CONNECTION_FAILED") || strings.Contains(body, "invalid") || strings.Contains(body, "secret-token") {
+	if !strings.Contains(body, "INVALID_PROVIDER_CONFIG") || strings.Contains(body, "invalid-url") || strings.Contains(body, "secret-token") {
 		t.Fatalf("unsafe connection error response: %s", body)
 	}
 }

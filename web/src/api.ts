@@ -21,14 +21,19 @@ export function buildDiagnosisRequest(data: {
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let errDetail = `HTTP ${res.status} ${res.statusText}`;
+    let errCode: string | undefined;
     try {
       const body = await res.json();
+      errCode = body.code;
       if (body.error) errDetail = body.error;
       else if (body.message) errDetail = body.message;
     } catch {
       // ignore
     }
-    throw new Error(errDetail);
+    const error = new Error(errDetail) as Error & { code?: string; status?: number };
+    error.code = errCode;
+    error.status = res.status;
+    throw error;
   }
   return res.json();
 }
@@ -48,7 +53,7 @@ export const api = {
     return handleResponse(res);
   },
 
-  async testProviderConnection(data: { base_url: string; model: string; api_key?: string; auth_mode: 'bearer' | 'none' }): Promise<{ success: boolean; latency_ms: number; message: string }> {
+  async testProviderConnection(data: { base_url: string; model: string; api_key?: string; auth_mode: 'bearer' | 'none' }): Promise<{ success: boolean; latency_ms: number; message: string; code?: string }> {
     const res = await fetch(`${API_BASE}/settings/provider/test`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

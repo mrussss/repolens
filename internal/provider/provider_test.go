@@ -2,6 +2,7 @@ package provider_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -207,6 +208,30 @@ func TestTestConnection(t *testing.T) {
 	}
 	if latency <= 0 {
 		t.Errorf("expected positive latency")
+	}
+}
+
+func TestClassifyTestConnectionError(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		code   string
+		status int
+	}{
+		{name: "auth", err: &llm.HTTPError{StatusCode: http.StatusUnauthorized}, code: provider.ProviderTestCodeAuthFailed, status: http.StatusBadGateway},
+		{name: "rate limit", err: &llm.HTTPError{StatusCode: http.StatusTooManyRequests}, code: provider.ProviderTestCodeRateLimited, status: http.StatusTooManyRequests},
+		{name: "timeout", err: context.DeadlineExceeded, code: provider.ProviderTestCodeTimeout, status: http.StatusGatewayTimeout},
+		{name: "model not found", err: &llm.HTTPError{StatusCode: http.StatusNotFound}, code: provider.ProviderTestCodeModelNotFound, status: http.StatusNotFound},
+		{name: "upstream", err: &llm.HTTPError{StatusCode: http.StatusBadGateway}, code: provider.ProviderTestCodeUpstreamError, status: http.StatusBadGateway},
+		{name: "network", err: errors.New("dial tcp: connection refused"), code: provider.ProviderTestCodeConnectionError, status: http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, _, status := provider.ClassifyTestConnectionError(tt.err)
+			if code != tt.code || status != tt.status {
+				t.Fatalf("classification = %s/%d, want %s/%d", code, status, tt.code, tt.status)
+			}
+		})
 	}
 }
 

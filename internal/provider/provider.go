@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -45,6 +46,20 @@ var (
 	ErrInvalidProviderConfig     = errors.New("invalid provider configuration")
 	ErrProviderConfigSaveFailed  = errors.New("failed to save provider configuration")
 	ErrProviderConfigClearFailed = errors.New("failed to clear provider configuration")
+)
+
+const (
+	providerConnectionTestTimeout   = 60 * time.Second
+	providerConnectionTestMaxTokens = 32
+)
+
+const (
+	ProviderTestCodeAuthFailed      = "PROVIDER_AUTH_FAILED"
+	ProviderTestCodeRateLimited     = "PROVIDER_RATE_LIMITED"
+	ProviderTestCodeTimeout         = "PROVIDER_TIMEOUT"
+	ProviderTestCodeModelNotFound   = "PROVIDER_MODEL_NOT_FOUND"
+	ProviderTestCodeUpstreamError   = "PROVIDER_UPSTREAM_ERROR"
+	ProviderTestCodeConnectionError = "PROVIDER_CONNECTION_FAILED"
 )
 
 // NormalizeBaseURL normalizes an OpenAI-compatible Base URL according to Master Spec rules:
@@ -377,18 +392,21 @@ func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model
 	}
 
 	start := time.Now()
-	provider := llm.NewOpenAICompatibleProviderWithAuthMode(apiKey, normBase, model, authMode)
+	provider := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(apiKey, normBase, model, authMode, providerConnectionTestTimeout)
 
-	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	testCtx, cancel := context.WithTimeout(ctx, providerConnectionTestTimeout)
 	defer cancel()
 
-	// Perform a minimal dry-run completion
+	// Perform a bounded dry-run completion. Reasoning models may spend a large
+	// budget even for "ping", so keep this probe cheap while allowing enough
+	// time for cold starts and provider-side reasoning.
 	temperature := 0.0
 	_, err = provider.Generate(testCtx, llm.GenerateRequest{
 		Messages: []llm.Message{
-			{Role: llm.RoleUser, Content: "ping"},
+			{Role: llm.RoleUser, Content: "Reply with exactly OK."},
 		},
 		Temperature: &temperature,
+		MaxTokens:   providerConnectionTestMaxTokens,
 	})
 	latency := time.Since(start)
 
@@ -397,6 +415,31 @@ func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model
 	}
 
 	return latency, nil
+}
+
+// ClassifyTestConnectionError maps provider failures to stable, safe API
+// categories. The underlying error remains available for server logs only.
+func ClassifyTestConnectionError(err error) (code, message string, status int) {
+	if err == nil {
+		return "", "", http.StatusOK
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ProviderTestCodeTimeout, "Provider 请求超时（60 秒），上游可能仍在处理请求", http.StatusGatewayTimeout
+	}
+	var httpErr *llm.HTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return ProviderTestCodeAuthFailed, "Provider 鉴权失败，请检查 API Key", http.StatusBadGateway
+		case http.StatusTooManyRequests:
+			return ProviderTestCodeRateLimited, "Provider 请求被限流或额度不足（429）", http.StatusTooManyRequests
+		case http.StatusNotFound:
+			return ProviderTestCodeModelNotFound, "Provider 模型或接口不存在，请检查 Base URL 和模型名称", http.StatusNotFound
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return ProviderTestCodeUpstreamError, "Provider 上游服务暂时不可用", http.StatusBadGateway
+		}
+	}
+	return ProviderTestCodeConnectionError, "无法连接 Provider，请检查网络和 Base URL", http.StatusBadGateway
 }
 
 func normalizeAuthMode(mode string) string {
