@@ -32,6 +32,7 @@ type Store interface {
 	ListByUser(ctx context.Context, userID string, page, pageSize int) ([]DiagnosisRun, int64, error)
 	ClaimRun(ctx context.Context, runID string, expectedStatuses []RunStatus, workerID string, attemptDeadline time.Duration) (*DiagnosisRun, *DiagnosisAttempt, error)
 	GetAttempt(ctx context.Context, attemptID string) (*DiagnosisAttempt, error)
+	GetLatestCheckpoint(ctx context.Context, runID string) (*DiagnosisAttempt, error)
 	ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error)
 	UpdateAttemptHeartbeat(ctx context.Context, attemptID string, heartbeatAt time.Time) error
 	FinishAttempt(ctx context.Context, runID, attemptID string, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool) error
@@ -130,7 +131,13 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 		}
 		now := time.Now().UTC()
 		attRes := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).
-			Updates(map[string]interface{}{"status": AttemptStatusSucceeded, "finished_at": now, "prompt_tokens": promptTokens, "completion_tokens": completionTokens, "tool_calls": toolCalls})
+			Updates(map[string]interface{}{
+				"status": AttemptStatusSucceeded, "finished_at": now,
+				"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "tool_calls": toolCalls,
+				"raw_output":              report.RawOutput,
+				"structured_output_valid": report.ReportStatus != evidence.ReportInvalid,
+				"provider_completed_at":   now,
+			})
 		if attRes.Error != nil {
 			return attRes.Error
 		}
@@ -376,6 +383,34 @@ func (s *GormStore) GetAttempt(ctx context.Context, attemptID string) (*Diagnosi
 		return nil, err
 	}
 	return &att, nil
+}
+
+func (s *GormStore) GetLatestCheckpoint(ctx context.Context, runID string) (*DiagnosisAttempt, error) {
+	var attempt DiagnosisAttempt
+	err := s.db.WithContext(ctx).
+		Where("diagnosis_run_id = ? AND raw_output <> ''", runID).
+		Order("attempt_no DESC").
+		First(&attempt).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &attempt, nil
+}
+
+// UpdateAttemptCheckpoint persists provider output before citation validation
+// or the final business transaction. A later worker retry can inspect this
+// checkpoint instead of calling the provider again.
+func (s *GormStore) UpdateAttemptCheckpoint(ctx context.Context, attemptID, rawOutput, parsedReport string, structured bool, promptTokens, completionTokens, cachedPromptTokens, reasoningTokens, toolCalls, agentRounds, searchCalls, providerCalls int, finalizationReason string) error {
+	return s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).Updates(map[string]interface{}{
+		"raw_output": rawOutput, "parsed_report_json": parsedReport, "structured_output_valid": structured,
+		"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "cached_prompt_tokens": cachedPromptTokens,
+		"reasoning_tokens": reasoningTokens, "tool_calls": toolCalls, "agent_rounds": agentRounds,
+		"search_calls": searchCalls, "provider_calls": providerCalls, "finalization_reason": finalizationReason,
+		"provider_completed_at": time.Now().UTC(),
+	}).Error
 }
 
 func (s *GormStore) ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error) {

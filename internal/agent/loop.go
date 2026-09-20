@@ -32,7 +32,8 @@ Rules:
 2. Use tools to search and read code before drawing conclusions.
 3. Your final response MUST be a valid JSON object matching this schema:
 {
-  "summary": "High-level summary of the issue",
+	  "conclusion_kind": "ROOT_CAUSE",
+	  "summary": "High-level summary of the issue",
   "root_cause": "Detailed explanation of the root cause",
   "findings": [
     {
@@ -53,7 +54,8 @@ Rules:
     "Actionable fix step 1",
     "Actionable fix step 2"
   ],
-  "confidence": 0.95
+	  "confidence": 0.95,
+	  "limitations": []
 }
 Do not wrap the JSON with markdown backticks if possible, or output strictly parseable JSON.
 
@@ -73,14 +75,26 @@ type LoopResult struct {
 	ToolCallsCount     int
 	ToolNames          []string
 	AgentRounds        int
+	SearchCalls        int
+	ProviderCalls      int
 	StructuredReport   bool
+	ParseError         string
+	FinalizationReason string
 }
 
 type AgentLoop struct {
-	provider   llm.Provider
-	registry   *ToolRegistry
-	traceStore trace.Store
-	guardCfg   GuardConfig
+	provider        llm.Provider
+	registry        *ToolRegistry
+	traceStore      trace.Store
+	guardCfg        GuardConfig
+	initialEvidence string
+	initialQuery    string
+}
+
+func (l *AgentLoop) WithInitialEvidence(query, packet string) *AgentLoop {
+	l.initialQuery = query
+	l.initialEvidence = packet
+	return l
 }
 
 func NewAgentLoop(
@@ -108,6 +122,9 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		run.IssueDescription,
 		run.ErrorLog,
 	))
+	if l.initialQuery != "" || l.initialEvidence != "" {
+		initialUserMsg += "\n\nDeterministic initial retrieval query:\n" + RedactSecrets(l.initialQuery) + "\n\nEvidence Packet (candidate evidence only; verify before concluding):\n" + RedactSecrets(l.initialEvidence)
+	}
 
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: SystemPrompt},
@@ -119,6 +136,8 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 	totalCachedPromptTokens := 0
 	totalReasoningTokens := 0
 	toolCallsCount := 0
+	searchCalls := 0
+	providerCalls := 0
 	toolNames := make([]string, 0)
 	agentRounds := 0
 	seq := 0
@@ -130,11 +149,12 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 		seq++
 		if err := guard.RecordStep(); err != nil {
-			return nil, fmt.Errorf("guard limit reached: %w", err)
+			return l.finalizeOnly(ctx, run, attempt, messages, "AGENT_ROUND_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 		}
 
 		startGen := time.Now()
 		agentRounds++
+		providerCalls++
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "")
 		temperature := run.Temperature
 		resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
@@ -147,7 +167,13 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		if err != nil {
 			// Record error step
 			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+err.Error())
-			return nil, err
+			partial := &LoopResult{
+				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens,
+				CachedPromptTokens: totalCachedPromptTokens, ReasoningTokens: totalReasoningTokens,
+				ToolCallsCount: toolCallsCount, ToolNames: toolNames, AgentRounds: agentRounds,
+				SearchCalls: searchCalls, ProviderCalls: providerCalls,
+			}
+			return partial, err
 		}
 
 		totalPromptTokens += resp.PromptTokens
@@ -162,11 +188,19 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 			messages = append(messages, resp.Message)
 
 			for _, tc := range resp.Message.ToolCalls {
+				if tc.Function.Name == "search_code" {
+					searchCalls++
+					if err := guard.RecordSearchCall(); err != nil {
+						priorMessages := messages[:len(messages)-1]
+						return l.finalizeOnly(ctx, run, attempt, priorMessages, "SEARCH_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
+					}
+				}
 				toolCallsCount++
 				toolNames = append(toolNames, tc.Function.Name)
 				if err := guard.RecordToolCall(tc.Function.Name, tc.Function.Arguments); err != nil {
 					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, tc.Function.Arguments, "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+err.Error())
-					return nil, err
+					priorMessages := messages[:len(messages)-1]
+					return l.finalizeOnly(ctx, run, attempt, priorMessages, "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 				}
 
 				// Record tool call step
@@ -215,12 +249,8 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		reportData, err := parseReportJSON(finalText)
 		structuredReport := err == nil
 		if err != nil {
-			logger.L(ctx).Warn("failed to parse structured report JSON from assistant output", "error", err, "raw", finalText)
-			reportData = &evidence.DiagnosisReportData{
-				Summary:    run.IssueTitle,
-				RootCause:  finalText,
-				Confidence: 0.7,
-			}
+			logger.L(ctx).Warn("failed to parse structured report JSON from assistant output", "error", err)
+			reportData = &evidence.DiagnosisReportData{}
 		}
 
 		return &LoopResult{
@@ -233,9 +263,46 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 			ToolCallsCount:     toolCallsCount,
 			ToolNames:          toolNames,
 			AgentRounds:        agentRounds,
+			SearchCalls:        searchCalls,
+			ProviderCalls:      providerCalls,
 			StructuredReport:   structuredReport,
+			ParseError:         errorString(err),
 		}, nil
 	}
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, messages []llm.Message, reason string, promptTokens, completionTokens, cachedTokens, reasoningTokens, toolCalls, searchCalls int, toolNames []string, rounds, seq int) (*LoopResult, error) {
+	finalMessages := append([]llm.Message{}, messages...)
+	finalMessages = append(finalMessages, llm.Message{Role: llm.RoleUser, Content: "FINALIZE_ONLY: exploration budget is exhausted. Do not request tools. Return the best evidence-backed structured JSON now, clearly separating confirmed facts, likely explanation, uncertainty, and next checks."})
+	temperature := run.Temperature
+	start := time.Now()
+	resp, err := l.provider.Generate(ctx, llm.GenerateRequest{Messages: finalMessages, Temperature: &temperature})
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason)
+		return nil, err
+	}
+	finalText := resp.Message.Content
+	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", finalText, "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason)
+	report, parseErr := parseReportJSON(finalText)
+	if parseErr != nil {
+		report = &evidence.DiagnosisReportData{}
+	}
+	return &LoopResult{
+		Report: report, RawOutput: finalText,
+		PromptTokens: promptTokens + resp.PromptTokens, CompletionTokens: completionTokens + resp.CompletionTokens,
+		CachedPromptTokens: cachedTokens + resp.CachedPromptTokens, ReasoningTokens: reasoningTokens + resp.ReasoningTokens,
+		ToolCallsCount: toolCalls, ToolNames: toolNames, AgentRounds: rounds + 1,
+		SearchCalls: searchCalls, ProviderCalls: rounds + 1,
+		StructuredReport: parseErr == nil, ParseError: errorString(parseErr), FinalizationReason: reason,
+	}, nil
 }
 
 func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, stepType trace.StepType, toolName, args, result, status string, latency int64, inTok, outTok int, errCode string) error {
@@ -275,26 +342,61 @@ func parseReportJSON(raw string) (*evidence.DiagnosisReportData, error) {
 			continue
 		}
 		var report evidence.DiagnosisReportData
-		if err := json.Unmarshal([]byte(match[1]), &report); err == nil && report.RootCause != "" {
+		if err := decodeReportJSON([]byte(match[1]), &report); err == nil && reportIsStructurallyParseable(&report) {
 			return &report, nil
 		}
 	}
 
 	var report evidence.DiagnosisReportData
-	if err := json.Unmarshal([]byte(clean), &report); err == nil {
-		if report.RootCause != "" {
+	if err := decodeReportJSON([]byte(clean), &report); err == nil {
+		if reportIsStructurallyParseable(&report) {
 			return &report, nil
 		}
 	}
 
 	m := jsonExtractorRegex.FindString(raw)
 	if m != "" {
-		if err := json.Unmarshal([]byte(m), &report); err == nil {
-			if report.RootCause != "" {
+		if err := decodeReportJSON([]byte(m), &report); err == nil {
+			if reportIsStructurallyParseable(&report) {
 				return &report, nil
 			}
 		}
 	}
 
 	return nil, errors.New("cannot parse valid structured report JSON from LLM output")
+}
+
+func decodeReportJSON(data []byte, report *evidence.DiagnosisReportData) error {
+	if err := json.Unmarshal(data, report); err != nil {
+		return err
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	if raw, ok := envelope["model_claimed_confidence"]; ok {
+		var claimed float64
+		if err := json.Unmarshal(raw, &claimed); err == nil {
+			report.ModelClaimedConfidence = &claimed
+		}
+	} else if raw, ok := envelope["confidence"]; ok {
+		var claimed float64
+		if err := json.Unmarshal(raw, &claimed); err == nil {
+			report.ModelClaimedConfidence = &claimed
+		}
+	}
+	return nil
+}
+
+func reportIsStructurallyParseable(report *evidence.DiagnosisReportData) bool {
+	if report == nil {
+		return false
+	}
+	if report.ConclusionKind == evidence.ConclusionInsufficientEvidence {
+		return true
+	}
+	if report.ConclusionKind == "" && report.RootCause != "" {
+		report.ConclusionKind = evidence.ConclusionRootCause
+	}
+	return report.ConclusionKind == evidence.ConclusionRootCause && report.RootCause != ""
 }

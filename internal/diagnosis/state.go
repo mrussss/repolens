@@ -7,6 +7,12 @@ import (
 	"strings"
 )
 
+func ComputeRequestHashForRevision(revisionID, repoID, snapshotID, title, description, errorLog string, pinnedBuildIDs ...int64) string {
+	base := ComputeRequestHash(repoID, snapshotID, title, description, errorLog, pinnedBuildIDs...)
+	h := sha256.Sum256([]byte(strings.TrimSpace(revisionID) + "|" + base))
+	return hex.EncodeToString(h[:])
+}
+
 func ComputeRequestHash(repoID, snapshotID, title, description, errorLog string, pinnedBuildIDs ...int64) string {
 	var codeIndexBuildID, retrievalBuildID int64
 	if len(pinnedBuildIDs) > 0 {

@@ -14,7 +14,7 @@ export const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<ViewMode>('setup');
   const [activeDiagnosisId, setActiveDiagnosisId] = useState<string | null>(null);
   const [preselectedRepoId, setPreselectedRepoId] = useState<string>('');
-  const [preselectedSnapId, setPreselectedSnapId] = useState<string>('');
+  const [preselectedRevisionId, setPreselectedRevisionId] = useState<string>('');
   const [recentDiagnoses, setRecentDiagnoses] = useState<DiagnosisRun[]>([]);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('repolens-theme') as 'dark' | 'light') || 'dark');
 
@@ -43,9 +43,9 @@ export const App: React.FC = () => {
     setCurrentView('diag-view');
   };
 
-  const handleSelectRepoForDiagnosis = (repoId: string, snapId: string) => {
+  const handleSelectRepoForDiagnosis = (repoId: string, revisionId: string) => {
     setPreselectedRepoId(repoId);
-    setPreselectedSnapId(snapId);
+    setPreselectedRevisionId(revisionId);
     setCurrentView('new-diag');
   };
 
@@ -65,7 +65,7 @@ export const App: React.FC = () => {
               <span style={{ fontSize: '1.2rem', fontWeight: 700, color: 'var(--text-bright)', letterSpacing: '-0.02em' }}>
                 RepoLens
               </span>
-              <span className="badge badge-info" style={{ fontSize: '0.65rem' }}>v2.1</span>
+              <span className="badge badge-info" style={{ fontSize: '0.65rem' }}>v2.2</span>
             </div>
 
             <nav style={{ display: 'flex', gap: '0.5rem' }}>
@@ -88,7 +88,7 @@ export const App: React.FC = () => {
                 style={{ background: currentView === 'new-diag' ? 'var(--bg-subtle)' : 'transparent', border: 'none' }}
                 onClick={() => {
                   setPreselectedRepoId('');
-                  setPreselectedSnapId('');
+                  setPreselectedRevisionId('');
                   setCurrentView('new-diag');
                 }}
               >
@@ -150,7 +150,7 @@ export const App: React.FC = () => {
         {currentView === 'new-diag' && (
           <NewDiagnosisPage
             initialRepoId={preselectedRepoId}
-            initialSnapshotId={preselectedSnapId}
+            initialRevisionId={preselectedRevisionId}
             onDiagnosisCreated={handleDiagnosisCreated}
           />
         )}
@@ -218,7 +218,7 @@ export const App: React.FC = () => {
       {/* Footer */}
       <footer style={{ borderTop: '1px solid var(--border-color)', padding: '1rem 0', color: 'var(--text-muted)', fontSize: '0.8rem', textAlign: 'center' }}>
         <div className="container">
-          RepoLens v2.1 本地代码智能与根因分析引擎 · 本地零泄漏存储
+          RepoLens v2.2 本地代码智能与根因分析引擎 · 本地零泄漏存储
         </div>
       </footer>
     </div>

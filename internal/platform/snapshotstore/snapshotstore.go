@@ -69,7 +69,7 @@ func (s *LocalSnapshotStore) FileExists(repoID, snapshotID, relativePath string)
 	if err != nil {
 		return false
 	}
-	info, err := os.Stat(fullPath)
+	info, err := os.Lstat(fullPath)
 	if err != nil {
 		return false
 	}
@@ -110,6 +110,13 @@ func (s *LocalSnapshotStore) safePath(repoID, snapshotID, relativePath string) (
 		return "", fmt.Errorf("path traversal denied: %s", relativePath)
 	}
 	fullPath := filepath.Join(sourceRoot, cleaned)
+	info, err := os.Lstat(fullPath)
+	if err != nil {
+		return "", fmt.Errorf("file not found: %s", relativePath)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("symlink access denied: %s", relativePath)
+	}
 	rootReal, err := filepath.EvalSymlinks(sourceRoot)
 	if err != nil {
 		return "", fmt.Errorf("snapshot root unavailable")

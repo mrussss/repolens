@@ -20,6 +20,26 @@ export interface Repository {
   snapshots?: Snapshot[];
 }
 
+export interface AnalysisRevision {
+  id: string;
+  repository_id: string;
+  source_ref: string;
+  commit_sha: string;
+  pipeline_version: string;
+  pipeline_fingerprint: string;
+  snapshot_id?: string;
+  code_index_build_id?: number;
+  retrieval_build_id?: number;
+  status: 'PREPARING' | 'READY' | 'FAILED';
+  stage: 'MATERIALIZING' | 'BUILDING_CODE_INDEX' | 'BUILDING_RETRIEVAL' | 'READY' | 'FAILED';
+  error_code?: string;
+  error_message?: string;
+  execution_generation: number;
+  created_at: string;
+  updated_at: string;
+  ready_at?: string;
+}
+
 export interface Snapshot {
   id: string;
   repository_id: string;
@@ -135,6 +155,7 @@ export interface DiagnosisRun {
   id: string;
   user_id: string;
   repository_id: string;
+  analysis_revision_id?: string;
   snapshot_id: string;
   code_index_build_id?: number;
   retrieval_build_id?: number;
@@ -169,9 +190,20 @@ export interface DiagnosisReport {
   diagnosis_run_id: string;
   attempt_id: string;
   root_cause: string;
+  conclusion_kind?: 'ROOT_CAUSE' | 'INSUFFICIENT_EVIDENCE';
+  report_status?: 'VALID' | 'DEGRADED' | 'INSUFFICIENT_EVIDENCE' | 'INVALID';
+  summary?: string;
   findings: Finding[];
   recommended_checks: string[];
   confidence: number;
+  model_claimed_confidence?: number;
+  limitations?: string[];
+  finding_count?: number;
+  supported_finding_count?: number;
+  unsupported_finding_count?: number;
+  valid_citation_count?: number;
+  invalid_citation_count?: number;
+  citation_coverage?: number;
   created_at: string;
 }
 

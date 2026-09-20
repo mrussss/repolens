@@ -88,9 +88,44 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		return h.cancelAttempt(ctx, job, run, attempt)
 	}
 
-	result, execErr := h.executor.Execute(ctx, run, attempt)
+	var result *ExecutionResult
+	var execErr error
+	if checkpointStore, ok := h.diagnosisStore.(interface {
+		GetLatestCheckpoint(context.Context, string) (*diagnosis.DiagnosisAttempt, error)
+	}); ok {
+		checkpoint, checkpointErr := checkpointStore.GetLatestCheckpoint(ctx, run.ID)
+		if checkpointErr != nil {
+			return jobs.NewRetryableError("CHECKPOINT_LOAD_FAILED", "failed loading diagnosis checkpoint", checkpointErr)
+		}
+		if checkpoint != nil {
+			result = executionResultFromCheckpoint(checkpoint)
+			log.Info("resuming diagnosis from provider checkpoint", "checkpoint_attempt_id", checkpoint.ID)
+		}
+	}
+	if result == nil {
+		result, execErr = h.executor.Execute(ctx, run, attempt)
+	}
+	if result != nil {
+		parsedReport, _ := json.Marshal(result.Report)
+		if checkpoint, ok := h.diagnosisStore.(interface {
+			UpdateAttemptCheckpoint(context.Context, string, string, string, bool, int, int, int, int, int, int, int, int, string) error
+		}); ok {
+			checkpointCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = checkpoint.UpdateAttemptCheckpoint(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason)
+			cancel()
+		}
+	}
 	if execErr != nil {
 		log.Error("agent execution failed", "error", execErr)
+		if progressErr, ok := execErr.(interface {
+			Progressed() bool
+		}); ok && progressErr.Progressed() && result != nil {
+			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, result.PromptTokens, result.CompletionTokens, result.ToolCalls, "PROVIDER_PROGRESS_ABORTED", execErr.Error(), false, 0)
+			cancelFinalize()
+			terminal := jobs.NewPermanentError("PROVIDER_PROGRESS_ABORTED", "provider failed after agent progress; explicit diagnosis retry is required", execErr)
+			return terminal
+		}
 		errClass, errCode := jobs.ClassifyError(execErr)
 		if errors.Is(execErr, context.Canceled) || errClass == jobs.ErrorClassCancelled {
 			return h.cancelAttempt(ctx, job, run, attempt)
@@ -120,20 +155,28 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	if result != nil && result.Report != nil {
 		findingsBytes, _ := json.Marshal(result.Report.Findings)
 		checksBytes, _ := json.Marshal(result.Report.RecommendedChecks)
-
+		limitationsBytes, _ := json.Marshal(result.Report.Limitations)
 		rep := &evidence.Report{
-			ID:                    uuid.New().String(),
-			DiagnosisRunID:        run.ID,
-			AttemptID:             attempt.ID,
-			RootCause:             result.Report.RootCause,
-			FindingsJSON:          string(findingsBytes),
-			RecommendedChecksJSON: string(checksBytes),
-			Confidence:            result.Report.Confidence,
-			CreatedAt:             time.Now().UTC(),
+			ID:                     uuid.New().String(),
+			DiagnosisRunID:         run.ID,
+			AttemptID:              attempt.ID,
+			RootCause:              result.Report.RootCause,
+			ConclusionKind:         result.Report.ConclusionKind,
+			Summary:                result.Report.Summary,
+			FindingsJSON:           string(findingsBytes),
+			RecommendedChecksJSON:  string(checksBytes),
+			Confidence:             result.Report.Confidence,
+			ModelClaimedConfidence: result.Report.ModelClaimedConfidence,
+			RawOutput:              result.RawOutput,
+			ParseError:             result.ParseError,
+			LimitationsJSON:        string(limitationsBytes),
+			FinalizationReason:     result.FinalizationReason,
+			CreatedAt:              time.Now().UTC(),
 		}
 		var allCitations []evidence.Citation
-		for _, f := range result.Report.Findings {
-			for _, cit := range f.Citations {
+		for findingIndex := range result.Report.Findings {
+			for citationIndex := range result.Report.Findings[findingIndex].Citations {
+				cit := result.Report.Findings[findingIndex].Citations[citationIndex]
 				cit.ReportID = rep.ID
 				cit.SnapshotID = run.SnapshotID
 				cit.CodeIndexBuildID = run.CodeIndexBuildID
@@ -141,9 +184,25 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				if h.citationVal != nil {
 					h.citationVal.Validate(ctx, run.RepositoryID, run.SnapshotID, &cit)
 				}
+				result.Report.Findings[findingIndex].Citations[citationIndex] = cit
 				allCitations = append(allCitations, cit)
 			}
 		}
+		if validatedFindings, marshalErr := json.Marshal(result.Report.Findings); marshalErr == nil {
+			rep.FindingsJSON = string(validatedFindings)
+		}
+		quality, qualityErr := evidence.ClassifyReport(result.Report, result.StructuredReport)
+		if qualityErr != nil && result.ParseError == "" {
+			result.ParseError = qualityErr.Error()
+		}
+		rep.ParseError = result.ParseError
+		rep.ReportStatus = quality.Status
+		rep.FindingCount = quality.FindingCount
+		rep.SupportedFindingCount = quality.SupportedFindingCount
+		rep.UnsupportedFindingCount = quality.UnsupportedFindingCount
+		rep.ValidCitationCount = quality.ValidCitationCount
+		rep.InvalidCitationCount = quality.InvalidCitationCount
+		rep.CitationCoverage = quality.CitationCoverage
 
 		promptTokens := 0
 		completionTokens := 0
@@ -199,6 +258,34 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	log.Info("diagnosis job completed successfully")
 	return nil
+}
+
+func executionResultFromCheckpoint(checkpoint *diagnosis.DiagnosisAttempt) *ExecutionResult {
+	result := &ExecutionResult{
+		RawOutput:          checkpoint.RawOutput,
+		PromptTokens:       checkpoint.PromptTokens,
+		CompletionTokens:   checkpoint.CompletionTokens,
+		CachedPromptTokens: checkpoint.CachedPromptTokens,
+		ReasoningTokens:    checkpoint.ReasoningTokens,
+		ToolCalls:          checkpoint.ToolCalls,
+		AgentRounds:        checkpoint.AgentRounds,
+		SearchCalls:        checkpoint.SearchCalls,
+		ProviderCalls:      checkpoint.ProviderCalls,
+		StructuredReport:   checkpoint.StructuredOutputValid,
+		FinalizationReason: checkpoint.FinalizationReason,
+	}
+	if checkpoint.ParsedReportJSON != "" {
+		var report evidence.DiagnosisReportData
+		if err := json.Unmarshal([]byte(checkpoint.ParsedReportJSON), &report); err == nil {
+			result.Report = &report
+		} else {
+			result.ParseError = "checkpoint parsed report is invalid"
+		}
+	}
+	if result.Report == nil {
+		result.Report = &evidence.DiagnosisReportData{}
+	}
+	return result
 }
 
 func (h *DiagnosisJobHandler) failDiagnosisIfTerminal(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, err error) {

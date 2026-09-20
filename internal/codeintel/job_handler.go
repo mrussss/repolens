@@ -2,6 +2,7 @@ package codeintel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -10,15 +11,20 @@ import (
 	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
 
 // CodeIndexJobHandler processes BUILD_CODE_INDEX jobs.
 type CodeIndexJobHandler struct {
-	store     store.Store
-	snapStore snapshot.Store
-	storeFS   snapshotstore.SnapshotStore
-	analyzer  *Analyzer
+	store         store.Store
+	snapStore     snapshot.Store
+	storeFS       snapshotstore.SnapshotStore
+	analyzer      *Analyzer
+	revisionStore interface {
+		MarkCodeIndexReady(context.Context, string, int64) error
+		MarkFailed(context.Context, string, revision.Stage, string, string) error
+	}
 }
 
 // NewCodeIndexJobHandler constructs a new handler for BUILD_CODE_INDEX jobs.
@@ -39,19 +45,39 @@ func NewCodeIndexJobHandler(
 	}
 }
 
+func (h *CodeIndexJobHandler) WithRevisionStore(store interface {
+	MarkCodeIndexReady(context.Context, string, int64) error
+	MarkFailed(context.Context, string, revision.Stage, string, string) error
+}) *CodeIndexJobHandler {
+	h.revisionStore = store
+	return h
+}
+
 // Execute performs full code intelligence extraction for a code_index_build.
-func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
+func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) (executeErr error) {
 	log := logger.L(ctx)
 	buildID, err := strconv.ParseInt(job.ResourceID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid build resource ID %s: %w", job.ResourceID, err)
 	}
+	defer func() {
+		if executeErr != nil && h.revisionStore != nil && job.AttemptCount >= job.MaxAttempts {
+			if build, buildErr := h.store.GetByID(context.Background(), buildID); buildErr == nil && build.AnalysisRevisionID != "" {
+				_ = h.revisionStore.MarkFailed(context.Background(), build.AnalysisRevisionID, revision.StageBuildingCode, "CODE_INDEX_BUILD_FAILED", executeErr.Error())
+			}
+		}
+	}()
 
 	cib, err := h.store.GetByID(ctx, buildID)
 	if err != nil {
 		return fmt.Errorf("failed fetching code index build %d: %w", buildID, err)
 	}
 	if cib.Status == model.BuildStatusReady {
+		if h.revisionStore != nil && cib.AnalysisRevisionID != "" {
+			if err := h.revisionStore.MarkCodeIndexReady(ctx, cib.AnalysisRevisionID, cib.ID); err != nil && !errors.Is(err, revision.ErrLineage) {
+				return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
+			}
+		}
 		return nil
 	}
 	if err := h.store.MarkBuildBuilding(ctx, cib.ID); err != nil {
@@ -61,6 +87,9 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	snap, err := h.snapStore.GetByID(ctx, cib.SnapshotID)
 	if err != nil {
 		return fmt.Errorf("failed fetching snapshot %s for build: %w", cib.SnapshotID, err)
+	}
+	if snap.Status != snapshot.StatusReady {
+		return jobs.NewRetryableError("SNAPSHOT_NOT_READY", "snapshot is not READY", nil)
 	}
 
 	snapshotDir := h.storeFS.GetSourcePath(snap.RepositoryID, snap.ID)
@@ -93,6 +122,11 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	// Auto-create/trigger BUILD_RETRIEVAL job for derived retrieval index
 	_, _, _ = h.store.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
+	if h.revisionStore != nil && cib.AnalysisRevisionID != "" {
+		if err := h.revisionStore.MarkCodeIndexReady(ctx, cib.AnalysisRevisionID, cib.ID); err != nil {
+			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
+		}
+	}
 
 	log.Info("code index build completed successfully",
 		"build_id", cib.ID,

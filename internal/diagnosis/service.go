@@ -11,8 +11,10 @@ import (
 
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
+	"repolens/internal/jobs"
 	"repolens/internal/platform/metrics"
 	"repolens/internal/repo"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
 
@@ -26,6 +28,29 @@ var (
 	}
 )
 
+var ErrInputTooLarge = errors.New("diagnosis input exceeds configured limit")
+var ErrRevisionNotReady = errors.New("analysis revision is not ready")
+
+func ValidateInput(input CreateDiagnosisInput) error {
+	if len(input.IssueTitle) == 0 || len(input.IssueTitle) > 255 {
+		return fmt.Errorf("issue_title must be between 1 and 255 bytes")
+	}
+	if len(input.IssueDescription) > 64*1024 || len(input.ErrorLog) > 256*1024 {
+		return ErrInputTooLarge
+	}
+	if len(input.IdempotencyKey) > 128 {
+		return fmt.Errorf("idempotency key exceeds maximum length")
+	}
+	return nil
+}
+
+func revisionPipelineFingerprint(revisionID string) string {
+	if revisionID == "" {
+		return ""
+	}
+	return revision.ComputePipelineFingerprint()
+}
+
 func RedactSecrets(input string) string {
 	redacted := input
 	for _, p := range secretPatterns {
@@ -37,15 +62,16 @@ func RedactSecrets(input string) string {
 }
 
 type CreateDiagnosisInput struct {
-	UserID           string
-	RepositoryID     string
-	SnapshotID       string
-	IssueTitle       string
-	IssueDescription string
-	ErrorLog         string
-	IdempotencyKey   string
-	CodeIndexBuildID int64
-	RetrievalBuildID int64
+	UserID             string
+	RepositoryID       string
+	AnalysisRevisionID string
+	SnapshotID         string
+	IssueTitle         string
+	IssueDescription   string
+	ErrorLog           string
+	IdempotencyKey     string
+	CodeIndexBuildID   int64
+	RetrievalBuildID   int64
 }
 
 type ProviderMetadata struct {
@@ -66,6 +92,8 @@ type Service struct {
 	repoStore              repo.Store
 	snapshotStore          snapshot.Store
 	codeIntelStore         codeintelstore.Store
+	revisionStore          revision.Store
+	jobStore               *jobs.Store
 	providerMetadata       ProviderMetadata
 	providerMetadataSet    bool
 	providerMetadataSource func() ProviderMetadata
@@ -73,6 +101,16 @@ type Service struct {
 
 func (s *Service) WithCodeIntelStore(store codeintelstore.Store) *Service {
 	s.codeIntelStore = store
+	return s
+}
+
+func (s *Service) WithRevisionStore(store revision.Store) *Service {
+	s.revisionStore = store
+	return s
+}
+
+func (s *Service) WithJobStore(store *jobs.Store) *Service {
+	s.jobStore = store
 	return s
 }
 
@@ -100,7 +138,23 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		input.IdempotencyKey = uuid.New().String()
 	}
 
-	reqHash := ComputeRequestHash(input.RepositoryID, input.SnapshotID, input.IssueTitle, input.IssueDescription, input.ErrorLog, input.CodeIndexBuildID, input.RetrievalBuildID)
+	if err := ValidateInput(input); err != nil {
+		return nil, false, err
+	}
+	if input.AnalysisRevisionID != "" {
+		if s.revisionStore == nil {
+			return nil, false, fmt.Errorf("analysis revision store is not configured")
+		}
+		rev, revErr := s.revisionStore.GetByID(ctx, input.AnalysisRevisionID)
+		if revErr != nil {
+			return nil, false, revErr
+		}
+		if input.RepositoryID != "" && input.RepositoryID != rev.RepositoryID {
+			return nil, false, codeintelstore.ErrBuildLineageMismatch
+		}
+		input.RepositoryID = rev.RepositoryID
+	}
+	reqHash := ComputeRequestHashForRevision(input.AnalysisRevisionID, input.RepositoryID, input.SnapshotID, input.IssueTitle, input.IssueDescription, input.ErrorLog, input.CodeIndexBuildID, input.RetrievalBuildID)
 
 	// Check idempotency
 	existing, err := s.store.GetByIdempotencyKey(ctx, input.UserID, input.IdempotencyKey)
@@ -115,7 +169,24 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		return existing, false, nil
 	}
 
-	if input.CodeIndexBuildID <= 0 || input.RetrievalBuildID <= 0 {
+	if input.AnalysisRevisionID != "" {
+		if s.revisionStore == nil {
+			return nil, false, fmt.Errorf("analysis revision store is not configured")
+		}
+		rev, revErr := s.revisionStore.GetByIDAndRepository(ctx, input.AnalysisRevisionID, input.RepositoryID)
+		if revErr != nil {
+			return nil, false, revErr
+		}
+		if rev.Status != revision.StatusReady {
+			return nil, false, ErrRevisionNotReady
+		}
+		if (input.SnapshotID != "" && input.SnapshotID != rev.SnapshotID) || (input.CodeIndexBuildID > 0 && input.CodeIndexBuildID != rev.CodeIndexBuildID) || (input.RetrievalBuildID > 0 && input.RetrievalBuildID != rev.RetrievalBuildID) {
+			return nil, false, codeintelstore.ErrBuildLineageMismatch
+		}
+		input.SnapshotID = rev.SnapshotID
+		input.CodeIndexBuildID = rev.CodeIndexBuildID
+		input.RetrievalBuildID = rev.RetrievalBuildID
+	} else if input.CodeIndexBuildID <= 0 || input.RetrievalBuildID <= 0 {
 		return nil, false, ErrInvalidBuildSelection
 	}
 
@@ -186,6 +257,7 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		ID:                          uuid.New().String(),
 		UserID:                      input.UserID,
 		RepositoryID:                input.RepositoryID,
+		AnalysisRevisionID:          input.AnalysisRevisionID,
 		SnapshotID:                  input.SnapshotID,
 		CodeIndexBuildID:            codeIndexBuildID,
 		RetrievalBuildID:            retrievalBuildID,
@@ -203,6 +275,7 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		PromptVersion:               metadata.PromptVersion,
 		AgentVersion:                metadata.AgentVersion,
 		AgentConfigHash:             metadata.AgentConfigHash,
+		PipelineFingerprint:         revisionPipelineFingerprint(input.AnalysisRevisionID),
 		Temperature:                 metadata.Temperature,
 	}
 
@@ -224,6 +297,16 @@ func (s *Service) List(ctx context.Context, userID string, page, pageSize int) (
 
 func (s *Service) Cancel(ctx context.Context, id, userID string) error {
 	return s.store.RequestCancellation(ctx, id, userID)
+}
+
+func (s *Service) Retry(ctx context.Context, id, userID string) error {
+	if s.jobStore == nil {
+		return errors.New("diagnosis retry is not configured")
+	}
+	if _, err := s.Get(ctx, id, userID); err != nil {
+		return err
+	}
+	return s.jobStore.RetryDiagnosis(ctx, id)
 }
 
 func (s *Service) ListAttempts(ctx context.Context, runID string) ([]DiagnosisAttempt, error) {

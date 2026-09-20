@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -142,6 +143,10 @@ func (s *GormStore) SaveAnalysisResult(ctx context.Context, buildID int64, res *
 }
 
 func (s *GormStore) saveAnalysisResultTx(tx *gorm.DB, buildID int64, res *model.AnalysisResult) error {
+	warnings, err := json.Marshal(res.Quality.Warnings)
+	if err != nil {
+		return fmt.Errorf("failed encoding analysis quality warnings: %w", err)
+	}
 	// 1. Batch insert CodeFiles
 	fileMap := make(map[string]int64)
 	for _, f := range res.Files {
@@ -204,6 +209,7 @@ func (s *GormStore) saveAnalysisResultTx(tx *gorm.DB, buildID int64, res *model.
 		"syntactic_relation_count":  res.Quality.SyntacticRelationsCount,
 		"heuristic_relation_count":  res.Quality.HeuristicRelationsCount,
 		"unresolved_relation_count": res.Quality.UnresolvedRelationsCount,
+		"quality_warnings_json":     string(warnings),
 		"ready_at":                  &now,
 	})
 	if result.Error != nil {

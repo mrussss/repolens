@@ -1,4 +1,4 @@
-# RepoLens v2.1
+# RepoLens v2.2
 
 RepoLens 是一个本地单用户 Go 代码诊断工具：它把固定版本的 Go 仓库物化为不可变 Snapshot，用 AST 与离线 best-effort `go/types` 建立版本化 CodeIndex，再用纯 Go BM25 + Structural Retrieval 为受控 Agent 提供证据，最后校验源码 Citation。
 
@@ -7,7 +7,7 @@ RepoLens 是一个本地单用户 Go 代码诊断工具：它把固定版本的 
 ```text
 Web → Go API → MySQL → DB-backed Analysis Jobs → Worker
 
-Repository → immutable Snapshot → CodeIndexBuild → RetrievalBuild
+Repository → AnalysisRevision → immutable Snapshot → CodeIndexBuild → RetrievalBuild
            → 5 read-only tools → bounded Agent → validated citations
 ```
 
@@ -30,12 +30,17 @@ Compose 最终只运行 `mysql`、`api`、`worker`，默认仅绑定 loopback。
 2. 创建 Snapshot；Worker 解析 exact commit，完成文件 materialization 和 manifest hash 后才置为 READY。
 3. 创建 CodeIndexBuild，查看 Symbols、References、Related Tests 和 AnalysisQuality。
 4. 创建 RetrievalBuild。
-5. 选择固定 Snapshot / CodeIndexBuild / RetrievalBuild，提交 CI/Test failure。
+5. 选择 READY AnalysisRevision，提交 CI/Test failure。
 6. 轮询 Diagnosis、Report、Evidence 和 Agent Trace。
 
-Diagnosis 会冻结 Snapshot、两个 build、Provider endpoint/model、prompt/agent 版本和配置 hash。之后重新构建索引不会改变既有 Diagnosis；相同 endpoint 的 API Key rotation 可以继续使用，endpoint 或 model drift 会被拒绝。
+Diagnosis 会冻结 AnalysisRevision、Snapshot、两个 build、Provider endpoint/model、prompt/agent 版本和配置 hash。之后重新构建索引不会改变既有 Diagnosis；相同 endpoint 的 API Key rotation 可以继续使用，endpoint 或 model drift 会被拒绝。
 
 ## API（节选）
+
+- `POST /api/v1/repositories/:id/revisions`：按 ref 解析并准备或复用 AnalysisRevision。
+- `GET /api/v1/repositories/:id/revisions`、`GET /api/v1/analysis-revisions/:id`：查询准备状态与冻结 lineage。
+- `POST /api/v1/analysis-revisions/:id/retry`：仅对 FAILED Revision 显式重试。
+- `POST /api/v1/diagnoses`：优先提交 `analysis_revision_id`，服务端冻结完整分析 lineage。
 
 主 API 前缀是 `/api/v1`：
 
@@ -79,7 +84,7 @@ RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开
 
 ## 范围与限制
 
-- RepoLens v2.1 是 local single-user developer tool，不适合直接暴露到公网。
+- RepoLens v2.2 是 local single-user developer tool，不适合直接暴露到公网。
 - 主要支持一个公开 GitHub 仓库和一个 root Go module；外部依赖可能保持 unresolved。
 - 类型分析是离线、best-effort；Reference/Call 不是完整 runtime call graph。
 - Related Test 是证据排序，不是完整 test impact analysis。
@@ -87,8 +92,8 @@ RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开
 - Agent 只读、受步数/调用次数/输出大小限制；仓库文本与 CI log 视为不可信输入。
 - Citation validation 证明源码一致性，不证明模型结论的逻辑正确性；secret redaction 是 best-effort。
 - Eval 数据集小且经过整理，Dev 与 frozen held-out 分离；Structural Retrieval 只有通过 promotion rule 才能成为生产策略。
-- v1.1 的 RabbitMQ、Outbox、Elasticsearch、Vector/RRF、SSE 和旧 Auth 仅存在于历史版本，不属于 v2.1 core。
-- v2.1 不实现自动 Snapshot/Index retention 或 GC；`make clean-data` 是破坏性的全量本地重置，请谨慎使用。
+- v1.1 的 RabbitMQ、Outbox、Elasticsearch、Vector/RRF、SSE 和旧 Auth 仅存在于历史版本，不属于 v2.2 core。
+- v2.2 不实现自动 Snapshot/Index retention 或 GC；`make clean-data` 是破坏性的全量本地重置，请谨慎使用。
 
 ## 项目结构
 

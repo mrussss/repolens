@@ -7,6 +7,7 @@ import (
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
+	"repolens/internal/jobs"
 	"repolens/internal/llm"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/retrieval"
@@ -24,10 +25,28 @@ type ExecutionResult struct {
 	ToolCalls          int
 	ToolNames          []string
 	AgentRounds        int
+	SearchCalls        int
+	ProviderCalls      int
 	StructuredReport   bool
+	ParseError         string
+	FinalizationReason string
 	Retryable          bool
 	ErrorCode          string
 	ErrorMessage       string
+}
+
+// ExecutionError carries progress already made by an Agent attempt. The job
+// layer uses it to stop an expensive full-flow retry after tools or a provider
+// response have already been observed.
+type ExecutionError struct {
+	Err      error
+	Progress *ExecutionResult
+}
+
+func (e *ExecutionError) Error() string { return e.Err.Error() }
+func (e *ExecutionError) Unwrap() error { return e.Err }
+func (e *ExecutionError) Progressed() bool {
+	return e.Progress != nil && (e.Progress.ToolCalls > 0 || e.Progress.PromptTokens > 0 || e.Progress.CompletionTokens > 0)
 }
 
 type Executor interface {
@@ -42,6 +61,7 @@ type AgentRuntimeExecutor struct {
 	storeFS         snapshotstore.SnapshotStore
 	traceStore      trace.Store
 	guardCfg        GuardConfig
+	evidenceBytes   int
 }
 
 type ProviderFactory interface {
@@ -70,6 +90,11 @@ func NewAgentRuntimeExecutorWithFactory(factory ProviderFactory, retriever retri
 
 func (e *AgentRuntimeExecutor) WithCodeIntelStore(ciStore codeintelstore.Store) *AgentRuntimeExecutor {
 	e.ciStore = ciStore
+	return e
+}
+
+func (e *AgentRuntimeExecutor) WithEvidencePacketLimit(maxBytes int) *AgentRuntimeExecutor {
+	e.evidenceBytes = maxBytes
 	return e
 }
 
@@ -109,8 +134,31 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	registry.Register(readFileTool)
 
 	loop := NewAgentLoop(provider, registry, e.traceStore, e.guardCfg)
+	if e.retriever != nil {
+		query := retrieval.BuildQuery(run.IssueTitle, run.IssueDescription, run.ErrorLog)
+		results, searchErr := e.retriever.Search(ctx, retrieval.SearchRequest{
+			SnapshotID: run.SnapshotID, CodeIndexBuildID: run.CodeIndexBuildID,
+			RetrievalBuildID: run.RetrievalBuildID, Query: query, TopK: 8,
+		})
+		if searchErr != nil {
+			return nil, jobs.NewPermanentError("RETRIEVAL_FAILED", "initial retrieval failed", searchErr)
+		}
+		loop.WithInitialEvidence(query, retrieval.BuildEvidencePacket(results, e.evidenceBytes))
+	}
 	res, err := loop.Run(ctx, run, attempt)
 	if err != nil {
+		if res != nil {
+			progress := &ExecutionResult{
+				Report: res.Report, RawOutput: res.RawOutput,
+				PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
+				CachedPromptTokens: res.CachedPromptTokens, ReasoningTokens: res.ReasoningTokens,
+				ToolCalls: res.ToolCallsCount, ToolNames: res.ToolNames, AgentRounds: res.AgentRounds,
+				SearchCalls: res.SearchCalls, ProviderCalls: res.ProviderCalls,
+				StructuredReport: res.StructuredReport, ParseError: res.ParseError,
+				FinalizationReason: res.FinalizationReason,
+			}
+			return progress, &ExecutionError{Err: fmt.Errorf("agent loop execution failed: %w", err), Progress: progress}
+		}
 		return nil, fmt.Errorf("agent loop execution failed: %w", err)
 	}
 
@@ -124,7 +172,11 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		ToolCalls:          res.ToolCallsCount,
 		ToolNames:          res.ToolNames,
 		AgentRounds:        res.AgentRounds,
+		SearchCalls:        res.SearchCalls,
+		ProviderCalls:      res.ProviderCalls,
 		StructuredReport:   res.StructuredReport,
+		ParseError:         res.ParseError,
+		FinalizationReason: res.FinalizationReason,
 		Retryable:          false,
 	}, nil
 }

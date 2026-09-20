@@ -2,6 +2,7 @@ package retrieval
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -11,12 +12,17 @@ import (
 	"repolens/internal/platform/logger"
 	"repolens/internal/retrieval/artifact"
 	"repolens/internal/retrieval/bm25"
+	"repolens/internal/revision"
 )
 
 // RetrievalJobHandler processes BUILD_RETRIEVAL jobs.
 type RetrievalJobHandler struct {
-	ciStore   codeintelstore.Store
-	publisher *artifact.Publisher
+	ciStore       codeintelstore.Store
+	publisher     *artifact.Publisher
+	revisionStore interface {
+		MarkRetrievalReady(context.Context, string, int64) error
+		MarkFailed(context.Context, string, revision.Stage, string, string) error
+	}
 }
 
 // NewRetrievalJobHandler creates a new handler for BUILD_RETRIEVAL jobs.
@@ -27,19 +33,39 @@ func NewRetrievalJobHandler(ciStore codeintelstore.Store, baseStorageDir string)
 	}
 }
 
+func (h *RetrievalJobHandler) WithRevisionStore(store interface {
+	MarkRetrievalReady(context.Context, string, int64) error
+	MarkFailed(context.Context, string, revision.Stage, string, string) error
+}) *RetrievalJobHandler {
+	h.revisionStore = store
+	return h
+}
+
 // Execute builds and atomically publishes the BM25 retrieval index for a RetrievalBuild.
-func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
+func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) (executeErr error) {
 	log := logger.L(ctx)
 	rbID, err := strconv.ParseInt(job.ResourceID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid retrieval build resource ID %s: %w", job.ResourceID, err)
 	}
+	defer func() {
+		if executeErr != nil && h.revisionStore != nil && job.AttemptCount >= job.MaxAttempts {
+			if build, buildErr := h.ciStore.GetRetrievalBuildByID(context.Background(), rbID); buildErr == nil && build.AnalysisRevisionID != "" {
+				_ = h.revisionStore.MarkFailed(context.Background(), build.AnalysisRevisionID, revision.StageBuildingSearch, "RETRIEVAL_BUILD_FAILED", executeErr.Error())
+			}
+		}
+	}()
 
 	rb, err := h.ciStore.GetRetrievalBuildByID(ctx, rbID)
 	if err != nil {
 		return fmt.Errorf("failed fetching retrieval build %d: %w", rbID, err)
 	}
 	if rb.Status == codeintelmodel.BuildStatusReady {
+		if h.revisionStore != nil && rb.AnalysisRevisionID != "" {
+			if err := h.revisionStore.MarkRetrievalReady(ctx, rb.AnalysisRevisionID, rb.ID); err != nil && !errors.Is(err, revision.ErrLineage) {
+				return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
+			}
+		}
 		return nil
 	}
 
@@ -98,6 +124,11 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	if finalizeErr != nil {
 		log.Error("failed updating retrieval build to READY", "build_id", rb.ID, "error", finalizeErr)
 		return finalizeErr
+	}
+	if h.revisionStore != nil && rb.AnalysisRevisionID != "" {
+		if err := h.revisionStore.MarkRetrievalReady(ctx, rb.AnalysisRevisionID, rb.ID); err != nil {
+			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
+		}
 	}
 
 	log.Info("retrieval build completed and published successfully",

@@ -24,6 +24,7 @@ import (
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
 	"repolens/internal/retrieval"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 	"repolens/internal/trace"
 	"repolens/internal/worker"
@@ -58,6 +59,7 @@ func run() error {
 	snapshotStore := snapshot.NewStore(db.GormDB)
 	indexStore := repoindex.NewStore(db.GormDB)
 	codeIntelStore := codeintelstore.NewStore(db.GormDB)
+	revisionStore := revision.NewStore(db.GormDB)
 	diagnosisStore := diagnosis.NewStore(db.GormDB)
 	reportStore := evidence.NewReportStore(db.GormDB)
 	citationStore := evidence.NewCitationStore(db.GormDB)
@@ -111,6 +113,7 @@ func run() error {
 		nil,
 	)
 	snapshotJobHandler.WithCodeIntelStore(codeIntelStore)
+	snapshotJobHandler.WithRevisionStore(revisionStore)
 	snapshotJobHandler.WithResourceLimits(
 		cfg.MaxRepoSizeMB*1024*1024,
 		cfg.MaxFileCount,
@@ -122,11 +125,13 @@ func run() error {
 		storeFS,
 		codeintel.NewAnalyzer(),
 	)
+	codeIndexJobHandler.WithRevisionStore(revisionStore)
 
 	retrievalJobHandler := retrieval.NewRetrievalJobHandler(
 		codeIntelStore,
 		indexStorageDir,
 	)
+	retrievalJobHandler.WithRevisionStore(revisionStore)
 
 	jobsWorker := jobs.NewWorker(jobsStore, jobs.DefaultWorkerConfig())
 	jobsWorker.RegisterHandler(jobs.JobTypeRunDiagnosis, diagJobHandler)

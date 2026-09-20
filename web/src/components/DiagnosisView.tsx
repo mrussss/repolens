@@ -17,6 +17,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
   const [activeTab, setActiveTab] = useState<'evidence' | 'trace'>('evidence');
   const [loading, setLoading] = useState(true);
   const [cancelling, setCancelling] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -74,6 +75,18 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
     }
   };
 
+  const handleRetry = async () => {
+    setRetrying(true);
+    try {
+      await api.retryDiagnosis(diagnosisId);
+      setRun(await api.getDiagnosis(diagnosisId));
+    } catch (err: any) {
+      setError(err.message || '重试诊断失败');
+    } finally {
+      setRetrying(false);
+    }
+  };
+
   const getStatusBadge = (status: string) => {
     switch (status) {
       case 'SUCCEEDED': return <span className="badge badge-success">成功</span>;
@@ -119,6 +132,11 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
             <StopCircle size={16} /> {cancelling ? '取消中…' : '取消任务'}
           </button>
         )}
+        {run?.status === 'FAILED' && (
+          <button className="btn" onClick={handleRetry} disabled={retrying}>
+            <RefreshCw size={16} /> {retrying ? '重试中…' : '重试诊断'}
+          </button>
+        )}
       </div>
 
       {error && (
@@ -147,17 +165,35 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
 
       {/* Root Cause Card (if Succeeded) */}
       {report && (
-        <div className="card" style={{ borderLeft: '4px solid var(--accent-success)', marginBottom: '1.5rem' }}>
+        <div className="card" style={{ borderLeft: `4px solid ${report.report_status === 'VALID' ? 'var(--accent-success)' : 'var(--accent-warning)'}`, marginBottom: '1.5rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
-            <ShieldAlert size={20} color="var(--accent-success)" />
+            <ShieldAlert size={20} color={report.report_status === 'VALID' ? 'var(--accent-success)' : 'var(--accent-warning)'} />
             <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: 'var(--text-bright)' }}>诊断根因</h2>
-            <span className="badge badge-success" style={{ marginLeft: 'auto' }}>
-              置信度：{Math.round(report.confidence * 100)}%
+            <span className={`badge ${report.report_status === 'VALID' ? 'badge-success' : 'badge-warning'}`} style={{ marginLeft: 'auto' }}>
+              报告：{report.report_status || 'UNKNOWN'}
             </span>
           </div>
-          <p style={{ fontSize: '0.95rem', color: 'var(--text-bright)', lineHeight: 1.6, marginTop: '0.5rem' }}>
-            {report.root_cause}
-          </p>
+          {report.summary && <p style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>{report.summary}</p>}
+          {report.model_claimed_confidence !== undefined && (
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '0.5rem' }}>
+              模型自评 confidence：{report.model_claimed_confidence.toFixed(2)}
+            </p>
+          )}
+          {report.report_status !== 'INVALID' && report.root_cause ? (
+            <p style={{ fontSize: '0.95rem', color: 'var(--text-bright)', lineHeight: 1.6, marginTop: '0.5rem' }}>{report.root_cause}</p>
+          ) : (
+            <p style={{ fontSize: '0.95rem', color: 'var(--accent-warning)', lineHeight: 1.6, marginTop: '0.5rem' }}>
+              {report.report_status === 'INSUFFICIENT_EVIDENCE'
+                ? '当前证据不足，不能将推断展示为已确认根因。'
+                : 'Provider 输出未通过结构校验，已保留原始输出供调试；当前不能展示为已确认根因。'}
+            </p>
+          )}
+
+          {report.limitations && report.limitations.length > 0 && (
+            <div style={{ marginTop: '0.75rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+              限制：{report.limitations.join('；')}
+            </div>
+          )}
 
           {/* Recommended Checks */}
           {report.recommended_checks && report.recommended_checks.length > 0 && (

@@ -658,6 +658,45 @@ func (s *Store) ManualRequeue(ctx context.Context, jobType JobType, resourceID s
 	return tx.Commit()
 }
 
+// RetryDiagnosis explicitly starts a new Diagnosis attempt after an external
+// provider failure. It is intentionally separate from the generic requeue
+// rule so a worker crash or permanent product bug is not silently replayed.
+func (s *Store) RetryDiagnosis(ctx context.Context, resourceID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var lastCode sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT last_error_code FROM analysis_jobs WHERE job_type = ? AND resource_id = ? AND status = 'FAILED'`, JobTypeRunDiagnosis, resourceID).Scan(&lastCode); err != nil {
+		return err
+	}
+	code := strings.ToUpper(lastCode.String)
+	if !strings.Contains(code, "PROVIDER") && !strings.Contains(code, "NETWORK") && !strings.Contains(code, "TIMEOUT") && !strings.Contains(code, "RATE") && !strings.Contains(code, "EXTERNAL") {
+		return fmt.Errorf("diagnosis retry is only allowed after an external provider failure")
+	}
+	now := time.Now().UTC()
+	runResult, err := tx.ExecContext(ctx, `UPDATE diagnosis_runs SET status = 'QUEUED', cancel_requested = FALSE, final_attempt_id = NULL, version = version + 1, updated_at = ? WHERE id = ? AND status = 'FAILED'`, now, resourceID)
+	if err != nil {
+		return err
+	}
+	if affected, err := runResult.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return fmt.Errorf("diagnosis %s is not in FAILED state", resourceID)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE analysis_jobs SET status = 'PENDING', execution_generation = execution_generation + 1, attempt_count = 0, next_run_at = ?, worker_id = NULL, claim_token = NULL, lease_until = NULL, cancel_requested = FALSE, last_error_class = NULL, last_error_code = NULL, last_error_message = NULL, terminal_reason = NULL, finished_at = NULL, updated_at = ? WHERE job_type = ? AND resource_id = ? AND status = 'FAILED'`, now, now, JobTypeRunDiagnosis, resourceID)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return fmt.Errorf("diagnosis job %s is not retryable", resourceID)
+	}
+	return tx.Commit()
+}
+
 func businessTable(jobType JobType) string {
 	switch jobType {
 	case JobTypeMaterializeSnapshot:

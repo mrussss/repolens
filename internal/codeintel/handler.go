@@ -1,6 +1,7 @@
 package codeintel
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -105,6 +106,10 @@ func (h *Handler) GetQuality(c *gin.Context) {
 		"heuristic_relation_count":  build.HeuristicRelationCount,
 		"unresolved_relation_count": build.UnresolvedRelationCount,
 		"status":                    build.Status,
+	}
+	var warnings []string
+	if build.QualityWarningsJSON != "" && json.Unmarshal([]byte(build.QualityWarningsJSON), &warnings) == nil {
+		quality["warnings"] = warnings
 	}
 
 	c.JSON(http.StatusOK, quality)

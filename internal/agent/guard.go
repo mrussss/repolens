@@ -9,6 +9,7 @@ import (
 type GuardConfig struct {
 	MaxSteps       int
 	MaxToolCalls   int
+	MaxSearchCalls int
 	MaxRepeatCalls int
 }
 
@@ -16,6 +17,7 @@ func DefaultGuardConfig() GuardConfig {
 	return GuardConfig{
 		MaxSteps:       8,
 		MaxToolCalls:   12,
+		MaxSearchCalls: 3,
 		MaxRepeatCalls: 2,
 	}
 }
@@ -24,9 +26,18 @@ type AgentGuard struct {
 	cfg             GuardConfig
 	stepCount       int
 	toolCallCount   int
+	searchCallCount int
 	callHistory     map[string]int
 	lastCallHash    string
 	consecutiveSame int
+}
+
+func (g *AgentGuard) RecordSearchCall() error {
+	g.searchCallCount++
+	if g.cfg.MaxSearchCalls > 0 && g.searchCallCount > g.cfg.MaxSearchCalls {
+		return fmt.Errorf("search_code budget exceeded (max: %d)", g.cfg.MaxSearchCalls)
+	}
+	return nil
 }
 
 func NewAgentGuard(cfg GuardConfig) *AgentGuard {

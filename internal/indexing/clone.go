@@ -81,9 +81,9 @@ func (c *SafeGitCloner) ResolveRef(ctx context.Context, gitURL, ref string) (str
 	}
 	resolveCtx, cancel := context.WithTimeout(ctx, c.cloneTimeout)
 	defer cancel()
-	args := []string{"ls-remote", "--refs", gitURL}
-	if ref != "" {
-		args = append(args, ref)
+	args := []string{"ls-remote", gitURL}
+	if ref != "" && !isFullCommitSHA(ref) {
+		args = append(args, ref, ref+"^{}", "refs/heads/"+ref, "refs/tags/"+ref, "refs/tags/"+ref+"^{}")
 	}
 	cmd := exec.CommandContext(resolveCtx, "git", args...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
@@ -94,11 +94,49 @@ func (c *SafeGitCloner) ResolveRef(ctx context.Context, gitURL, ref string) (str
 		}
 		return "", fmt.Errorf("git ref resolution failed: %w", err)
 	}
-	fields := strings.Fields(string(out))
-	if len(fields) == 0 || len(fields[0]) != 40 {
+	commitSHA := resolveCommitFromLsRemote(string(out), ref)
+	if commitSHA == "" {
 		return "", fmt.Errorf("git ref %q did not resolve to an exact commit SHA", ref)
 	}
-	return fields[0], nil
+	return commitSHA, nil
+}
+
+func isFullCommitSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, char := range value {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveCommitFromLsRemote(output, requestedRef string) string {
+	requestedRef = strings.TrimSpace(requestedRef)
+	var fallback string
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || len(fields[0]) != 40 {
+			continue
+		}
+		name := fields[1]
+		sha := fields[0]
+		if strings.HasSuffix(name, "^{}") {
+			base := strings.TrimSuffix(name, "^{}")
+			if requestedRef == "" || base == requestedRef || base == "refs/tags/"+requestedRef {
+				return sha
+			}
+		}
+		if requestedRef != "" && (name == requestedRef || name == "refs/heads/"+requestedRef || name == "refs/tags/"+requestedRef) {
+			fallback = sha
+		}
+		if isFullCommitSHA(requestedRef) && sha == requestedRef {
+			return sha
+		}
+	}
+	return fallback
 }
 
 func (c *SafeGitCloner) ValidateGitURL(rawURL string) error {
@@ -191,5 +229,50 @@ func (c *SafeGitCloner) CloneTo(ctx context.Context, gitURL, ref, targetDir stri
 	_ = os.RemoveAll(gitDir)
 
 	logger.L(ctx).Info("cloned repository snapshot successfully", "commit", commitSHA, "target", targetDir)
+	return commitSHA, nil
+}
+
+// CloneCommitTo materializes an immutable commit without using a movable
+// branch or tag. The caller can compare the returned HEAD with the resolved
+// commit before publishing the directory.
+func (c *SafeGitCloner) CloneCommitTo(ctx context.Context, gitURL, commitSHA, targetDir string) (string, error) {
+	if !isFullCommitSHA(commitSHA) {
+		return "", fmt.Errorf("invalid commit SHA %q", commitSHA)
+	}
+	if err := c.ValidateGitURL(gitURL); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create target dir: %w", err)
+	}
+	cloneCtx, cancel := context.WithTimeout(ctx, c.cloneTimeout)
+	defer cancel()
+	commands := [][]string{
+		{"init", targetDir},
+		{"-C", targetDir, "remote", "add", "origin", gitURL},
+		{"-C", targetDir, "fetch", "--depth", "1", "origin", commitSHA},
+		{"-C", targetDir, "checkout", "--detach", "FETCH_HEAD"},
+		{"-C", targetDir, "rev-parse", "HEAD"},
+	}
+	for index, args := range commands {
+		cmd := exec.CommandContext(cloneCtx, "git", args...)
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			_ = os.RemoveAll(targetDir)
+			if errors.Is(cloneCtx.Err(), context.DeadlineExceeded) {
+				return "", fmt.Errorf("git exact commit materialization timed out after %v", c.cloneTimeout)
+			}
+			return "", fmt.Errorf("git exact commit command %d failed: %v, output: %s", index+1, err, string(output))
+		}
+		if index == len(commands)-1 {
+			resolved := strings.TrimSpace(string(output))
+			if resolved != commitSHA {
+				_ = os.RemoveAll(targetDir)
+				return "", fmt.Errorf("git returned %s for requested commit %s", resolved, commitSHA)
+			}
+		}
+	}
+	_ = os.RemoveAll(filepath.Join(targetDir, ".git"))
 	return commitSHA, nil
 }

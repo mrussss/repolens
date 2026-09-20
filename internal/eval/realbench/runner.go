@@ -328,8 +328,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			RetrievalStrategy:   productionStrategy,
 			RetrievalVersion:    codeintelmodel.CurrentRetrievalVersion,
 			IndexVersion:        codeintelmodel.CurrentAnalyzerVersion,
-			AgentVersion:        "v2.1",
-			PromptVersion:       "v2.1",
+			AgentVersion:        "v2.2",
+			PromptVersion:       "v2.2",
 			Timestamp:           time.Now().UTC(),
 			CaseCount:           len(caseInputs),
 			E2EStatus:           e2eStatus,
@@ -1125,7 +1125,7 @@ func buildAgentRun(input Input, workspace *productionWorkspace, model string) *d
 		ID: uuid.New().String(), RepositoryID: input.CaseID, SnapshotID: input.CaseID,
 		CodeIndexBuildID: workspace.CodeIndexBuildID, RetrievalBuildID: workspace.RetrievalBuildID,
 		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
-		Temperature: 0.1, ModelName: model, PromptVersion: "v2.1", AgentVersion: "v2.1",
+		Temperature: 0.1, ModelName: model, PromptVersion: "v2.2", AgentVersion: "v2.2",
 	}
 }
 

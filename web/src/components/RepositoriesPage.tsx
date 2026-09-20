@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api';
-import { Repository } from '../types';
+import { AnalysisRevision, Repository } from '../types';
 import { GitBranch, Plus, RefreshCw, Database, Play } from 'lucide-react';
 
 interface Props {
-  onSelectRepoForDiagnosis: (repoId: string, snapId: string) => void;
+  onSelectRepoForDiagnosis: (repoId: string, revisionId: string) => void;
 }
 
 export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) => {
@@ -15,10 +15,38 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
   const [gitURL, setGitURL] = useState('');
   const [defaultRef, setDefaultRef] = useState('main');
   const [error, setError] = useState<string | null>(null);
-  const [indexingRepoId, setIndexingRepoId] = useState<string | null>(null);
+  const [preparingRepoId, setPreparingRepoId] = useState<string | null>(null);
+  const [revisions, setRevisions] = useState<Record<string, AnalysisRevision[]>>({});
 
   useEffect(() => {
-    loadRepos();
+    let stopped = false;
+    let timer: number | undefined;
+    let delay = 1000;
+
+    const poll = async () => {
+      if (stopped) return;
+      if (document.hidden) {
+        timer = window.setTimeout(poll, 5000);
+        return;
+      }
+      await loadRepos();
+      delay = Math.min(5000, delay * 2);
+      if (!stopped) timer = window.setTimeout(poll, delay);
+    };
+    const onVisibilityChange = () => {
+      if (!document.hidden) {
+        delay = 1000;
+        void poll();
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, []);
 
   const loadRepos = async () => {
@@ -26,6 +54,11 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
       setLoading(true);
       const list = await api.listRepositories();
       setRepos(list || []);
+      const revisionEntries = await Promise.all((list || []).map(async (repo) => {
+        try { return [repo.id, await api.listAnalysisRevisions(repo.id)] as const; }
+        catch { return [repo.id, []] as const; }
+      }));
+      setRevisions(Object.fromEntries(revisionEntries));
     } catch (err: any) {
       setError(err.message || '加载仓库失败');
     } finally {
@@ -47,17 +80,21 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
     }
   };
 
-  const handleTriggerIndex = async (repoId: string, ref: string) => {
-    setIndexingRepoId(repoId);
+  const handlePrepareOrRetry = async (repoId: string, ref: string) => {
+    const latest = revisions[repoId]?.[0];
+    setPreparingRepoId(repoId);
     setError(null);
     try {
-      await api.triggerIndex(repoId, ref);
-      // Refresh list after triggering
+      if (latest?.status === 'FAILED') {
+        await api.retryAnalysisRevision(latest.id);
+      } else {
+        await api.createAnalysisRevision(repoId, ref);
+      }
       await loadRepos();
     } catch (err: any) {
-      setError(err.message || '启动仓库索引失败');
+      setError(err.message || '准备分析失败');
     } finally {
-      setIndexingRepoId(null);
+      setPreparingRepoId(null);
     }
   };
 
@@ -112,9 +149,9 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
                     </span>
                     <span>{r.git_url}</span>
                   </div>
-                  {r.snapshots && r.snapshots.length > 0 && (
+                  {revisions[r.id]?.[0] && (
                     <div style={{ marginTop: '0.5rem', color: 'var(--text-muted)', fontSize: '0.75rem' }}>
-                      最新快照：<code>{r.snapshots[0].id}</code> · {r.snapshots[0].status}
+                      分析版本：<code>{revisions[r.id][0].commit_sha.slice(0, 12)}</code> · {revisions[r.id][0].status} · {revisions[r.id][0].stage}
                     </div>
                   )}
                 </div>
@@ -122,16 +159,16 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
                   <button
                     className="btn"
-                    onClick={() => handleTriggerIndex(r.id, r.default_ref)}
-                    disabled={indexingRepoId === r.id}
+                    onClick={() => handlePrepareOrRetry(r.id, r.default_ref)}
+                    disabled={preparingRepoId === r.id}
                   >
-                    {indexingRepoId === r.id ? <RefreshCw size={14} className="spin" /> : <RefreshCw size={14} />}
-                    物化并索引
+                    {preparingRepoId === r.id ? <RefreshCw size={14} className="spin" /> : <RefreshCw size={14} />}
+                    {revisions[r.id]?.[0]?.status === 'FAILED' ? '重试准备' : '准备分析'}
                   </button>
                   <button
                     className="btn btn-primary"
-                    onClick={() => onSelectRepoForDiagnosis(r.id, r.snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '')}
-                    disabled={!r.snapshots?.some((snapshot) => snapshot.status === 'READY')}
+                    onClick={() => onSelectRepoForDiagnosis(r.id, revisions[r.id]?.find((revision) => revision.status === 'READY')?.id || '')}
+                    disabled={!revisions[r.id]?.some((revision) => revision.status === 'READY')}
                   >
                     <Play size={14} /> 新建诊断
                   </button>

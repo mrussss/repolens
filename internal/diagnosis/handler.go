@@ -1,16 +1,20 @@
 package diagnosis
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/evidence"
 	"repolens/internal/platform/logger"
+	"repolens/internal/revision"
 	"repolens/internal/trace"
 )
 
@@ -31,24 +35,25 @@ func NewHandler(svc *Service, reportStore evidence.ReportStore, citationStore ev
 }
 
 type CreateDiagnosisRequest struct {
-	RepositoryID     string `json:"repository_id" binding:"required"`
-	SnapshotID       string `json:"snapshot_id" binding:"required"`
-	IssueTitle       string `json:"issue_title" binding:"required"`
-	IssueDescription string `json:"issue_description"`
-	ErrorLog         string `json:"error_log"`
-	IdempotencyKey   string `json:"idempotency_key"`
-	CodeIndexBuildID int64  `json:"code_index_build_id"`
-	RetrievalBuildID int64  `json:"retrieval_build_id"`
+	RepositoryID       string `json:"repository_id"`
+	AnalysisRevisionID string `json:"analysis_revision_id"`
+	SnapshotID         string `json:"snapshot_id"`
+	IssueTitle         string `json:"issue_title" binding:"required"`
+	IssueDescription   string `json:"issue_description"`
+	ErrorLog           string `json:"error_log"`
+	IdempotencyKey     string `json:"idempotency_key"`
+	CodeIndexBuildID   int64  `json:"code_index_build_id"`
+	RetrievalBuildID   int64  `json:"retrieval_build_id"`
 }
 
 func (h *Handler) Create(c *gin.Context) {
 	userID := c.GetString(string(logger.UserIDKey))
 	var req CreateDiagnosisRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if err := decodeCreateDiagnosisRequest(c, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INPUT_INVALID", "error": "invalid diagnosis request"})
 		return
 	}
-	if req.CodeIndexBuildID <= 0 || req.RetrievalBuildID <= 0 {
+	if req.AnalysisRevisionID == "" && (req.CodeIndexBuildID <= 0 || req.RetrievalBuildID <= 0) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code":  "INVALID_BUILD_SELECTION",
 			"error": "code_index_build_id and retrieval_build_id must be positive",
@@ -62,15 +67,16 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 
 	input := CreateDiagnosisInput{
-		UserID:           userID,
-		RepositoryID:     req.RepositoryID,
-		SnapshotID:       req.SnapshotID,
-		IssueTitle:       req.IssueTitle,
-		IssueDescription: req.IssueDescription,
-		ErrorLog:         req.ErrorLog,
-		IdempotencyKey:   idempKey,
-		CodeIndexBuildID: req.CodeIndexBuildID,
-		RetrievalBuildID: req.RetrievalBuildID,
+		UserID:             userID,
+		RepositoryID:       req.RepositoryID,
+		AnalysisRevisionID: req.AnalysisRevisionID,
+		SnapshotID:         req.SnapshotID,
+		IssueTitle:         req.IssueTitle,
+		IssueDescription:   req.IssueDescription,
+		ErrorLog:           req.ErrorLog,
+		IdempotencyKey:     idempKey,
+		CodeIndexBuildID:   req.CodeIndexBuildID,
+		RetrievalBuildID:   req.RetrievalBuildID,
 	}
 
 	run, created, err := h.svc.Create(c.Request.Context(), input)
@@ -91,6 +97,15 @@ func (h *Handler) Create(c *gin.Context) {
 				"error": "code_index_build_id and retrieval_build_id must be positive",
 			})
 			return
+		case errors.Is(err, ErrInputTooLarge):
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"code": "PAYLOAD_TOO_LARGE", "error": "diagnosis input exceeds the configured limit"})
+			return
+		case errors.Is(err, revision.ErrNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"code": "REVISION_NOT_FOUND", "error": "analysis revision not found"})
+			return
+		case errors.Is(err, ErrRevisionNotReady):
+			c.JSON(http.StatusConflict, gin.H{"code": "REVISION_NOT_READY", "error": "analysis revision is not READY"})
+			return
 		case errors.Is(err, ErrBuildNotReady), errors.Is(err, codeintelstore.ErrBuildLineageMismatch):
 			c.JSON(http.StatusConflict, gin.H{
 				"code":  "BUILD_NOT_READY_OR_MISMATCHED",
@@ -98,7 +113,7 @@ func (h *Handler) Create(c *gin.Context) {
 			})
 			return
 		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INPUT_INVALID", "error": "invalid diagnosis request"})
 		return
 	}
 
@@ -116,6 +131,27 @@ func (h *Handler) Create(c *gin.Context) {
 		"message":       "diagnosis accepted and queued for execution",
 		"is_duplicate":  false,
 	})
+}
+
+func decodeCreateDiagnosisRequest(c *gin.Context, request *CreateDiagnosisRequest) error {
+	const maxBodyBytes = 512 * 1024
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(body) == 0 || len(body) > maxBodyBytes {
+		return errors.New("invalid request body")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(request); err != nil {
+		return err
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("request body must contain one JSON object")
+	}
+	return nil
 }
 
 func (h *Handler) Get(c *gin.Context) {
@@ -198,6 +234,19 @@ func (h *Handler) Cancel(c *gin.Context) {
 		"message": "cancellation requested",
 		"id":      id,
 	})
+}
+
+func (h *Handler) Retry(c *gin.Context) {
+	userID := c.GetString(string(logger.UserIDKey))
+	if err := h.svc.Retry(c.Request.Context(), c.Param("id"), userID); err != nil {
+		if errors.Is(err, ErrRunNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "DIAGNOSIS_NOT_FOUND", "error": "diagnosis run not found"})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"code": "DIAGNOSIS_RETRY_NOT_ALLOWED", "error": "diagnosis retry is only available after an external provider failure"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"message": "diagnosis retry queued", "id": c.Param("id")})
 }
 
 func (h *Handler) ListAttempts(c *gin.Context) {

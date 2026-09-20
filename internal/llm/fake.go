@@ -118,6 +118,7 @@ func (f *FakeProvider) normalStructuredResponse() (GenerateResponse, error) {
 	content := f.CustomFinal
 	if content == "" {
 		content = `{
+  "conclusion_kind": "ROOT_CAUSE",
   "summary": "Investigated error logs and located root cause in repository configuration and logic.",
   "root_cause": "Null pointer dereference or missing validation when initializing database connection and config",
   "findings": [
@@ -137,7 +138,8 @@ func (f *FakeProvider) normalStructuredResponse() (GenerateResponse, error) {
     "Verify DSN before invoking database connection",
     "Add regression test cases"
   ],
-  "confidence": 0.92
+  "confidence": 0.92,
+  "limitations": []
 }`
 	}
 

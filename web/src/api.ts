@@ -1,4 +1,4 @@
-import { ProviderStatus, Repository, Snapshot, DiagnosisRun, DiagnosisReport, AgentStep, CodeIndexBuild, CodeSymbol, SymbolRelation, QualityReport, RetrievalBuild } from './types';
+import { ProviderStatus, Repository, Snapshot, AnalysisRevision, DiagnosisRun, DiagnosisReport, AgentStep, CodeIndexBuild, CodeSymbol, SymbolRelation, QualityReport, RetrievalBuild } from './types';
 
 const API_BASE = '/api/v1';
 
@@ -75,6 +75,34 @@ export const api = {
     return handleResponse(res);
   },
 
+  async createAnalysisRevision(repoId: string, ref?: string): Promise<{ analysis_revision: AnalysisRevision; created: boolean }> {
+    const res = await fetch(`${API_BASE}/repositories/${repoId}/revisions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ref ? { ref } : {}),
+    });
+    return handleResponse(res);
+  },
+
+  async listAnalysisRevisions(repoId: string, limit = 20): Promise<AnalysisRevision[]> {
+    const res = await fetch(`${API_BASE}/repositories/${repoId}/revisions?limit=${limit}`);
+    const body = await handleResponse<{ analysis_revisions: AnalysisRevision[] }>(res);
+    return body.analysis_revisions || [];
+  },
+
+  async getAnalysisRevision(id: string): Promise<AnalysisRevision> {
+    const res = await fetch(`${API_BASE}/analysis-revisions/${id}`);
+    const body = await handleResponse<{ analysis_revision: AnalysisRevision }>(res);
+    return body.analysis_revision;
+  },
+
+  async retryAnalysisRevision(id: string): Promise<AnalysisRevision> {
+    const res = await fetch(`${API_BASE}/analysis-revisions/${id}/retry`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    const body = await handleResponse<{ analysis_revision: AnalysisRevision }>(res);
+    return body.analysis_revision;
+  },
+
   // Code Intelligence (M5)
   async triggerCodeIndexBuild(snapshotId: string): Promise<{ code_index_build: CodeIndexBuild; status: string }> {
     const res = await fetch(`${API_BASE}/snapshots/${snapshotId}/code-index-builds`, {
@@ -139,20 +167,22 @@ export const api = {
   },
 
   async createDiagnosis(data: {
-    repository_id: string;
-    snapshot_id: string;
+    repository_id?: string;
+    analysis_revision_id?: string;
+    snapshot_id?: string;
     issue_title: string;
     issue_description?: string;
     error_log?: string;
     idempotency_key?: string;
   }): Promise<{ diagnosis_run: DiagnosisRun; is_duplicate?: boolean }> {
+    const { idempotency_key, ...payload } = data;
     const res = await fetch(`${API_BASE}/diagnoses`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(data.idempotency_key ? { 'Idempotency-Key': data.idempotency_key } : {}),
+        ...(idempotency_key ? { 'Idempotency-Key': idempotency_key } : {}),
       },
-      body: JSON.stringify(data),
+      body: JSON.stringify(payload),
     });
     return handleResponse(res);
   },
@@ -166,14 +196,23 @@ export const api = {
     return handleResponse(res);
   },
 
+  async retryDiagnosis(id: string): Promise<{ message: string }> {
+    const res = await fetch(`${API_BASE}/diagnoses/${id}/retry`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    return handleResponse(res);
+  },
+
   async getDiagnosisReport(id: string): Promise<DiagnosisReport> {
     const res = await fetch(`${API_BASE}/diagnoses/${id}/report`);
     const body = await handleResponse<{ report: any; citations: any[] }>(res);
     let findings = [];
     let recommendedChecks = [];
+    let limitations = [];
     try { findings = JSON.parse(body.report.findings_json || '[]'); } catch {}
     try { recommendedChecks = JSON.parse(body.report.recommended_checks_json || '[]'); } catch {}
-    return { ...body.report, findings, recommended_checks: recommendedChecks } as DiagnosisReport;
+    try { limitations = JSON.parse(body.report.limitations_json || '[]'); } catch {}
+    return { ...body.report, findings, recommended_checks: recommendedChecks, limitations } as DiagnosisReport;
   },
 
   async getDiagnosisSteps(id: string): Promise<AgentStep[]> {

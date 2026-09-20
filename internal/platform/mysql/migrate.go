@@ -15,6 +15,7 @@ import (
 	"repolens/internal/jobs"
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 	"repolens/internal/trace"
 )
@@ -31,6 +32,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&repoindex.RepositoryIndex{},
 		&diagnosis.DiagnosisRun{},
 		&diagnosis.DiagnosisAttempt{},
+		&revision.AnalysisRevision{},
 		&evidence.Report{},
 		&evidence.Citation{},
 		&trace.AgentStep{},

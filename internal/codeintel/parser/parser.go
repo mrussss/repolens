@@ -81,6 +81,9 @@ func DiscoverModule(rootPath string) (*ModuleInfo, error) {
 			}
 			return nil
 		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
 		if d.Name() == "go.mod" && path != rootGoMod {
 			rel, _ := filepath.Rel(rootPath, path)
 			info.NestedMods = append(info.NestedMods, rel)
@@ -120,6 +123,10 @@ func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInf
 			if nestedDirs[path] && path != rootPath {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			warnings = append(warnings, fmt.Sprintf("skipped symlink %s; symlink targets are not indexed", path))
 			return nil
 		}
 

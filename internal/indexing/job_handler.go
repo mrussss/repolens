@@ -3,6 +3,7 @@ package indexing
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
 
@@ -32,6 +34,10 @@ type SnapshotJobHandler struct {
 	indexWriter    ChunkIndexWriter
 	maxRepoBytes   int64
 	maxFileCount   int
+	revisionStore  interface {
+		MarkSnapshotReady(context.Context, string, string) error
+		MarkFailed(context.Context, string, revision.Stage, string, string) error
+	}
 }
 
 func (h *SnapshotJobHandler) WithResourceLimits(maxRepoBytes int64, maxFileCount int) *SnapshotJobHandler {
@@ -43,6 +49,10 @@ func (h *SnapshotJobHandler) WithResourceLimits(maxRepoBytes int64, maxFileCount
 type GitCloner interface {
 	CloneTo(ctx context.Context, gitURL, ref, targetDir string) (string, error)
 	ValidateGitURL(rawURL string) error
+}
+
+type ExactGitCloner interface {
+	CloneCommitTo(ctx context.Context, gitURL, commitSHA, targetDir string) (string, error)
 }
 
 // NewSnapshotJobHandler creates a new SnapshotJobHandler.
@@ -74,8 +84,18 @@ func (h *SnapshotJobHandler) WithCodeIntelStore(cis codeintelstore.Store) *Snaps
 	return h
 }
 
+// WithRevisionStore connects the product-level revision state to the
+// existing snapshot job while keeping the DB-backed job pipeline unchanged.
+func (h *SnapshotJobHandler) WithRevisionStore(store interface {
+	MarkSnapshotReady(context.Context, string, string) error
+	MarkFailed(context.Context, string, revision.Stage, string, string) error
+}) *SnapshotJobHandler {
+	h.revisionStore = store
+	return h
+}
+
 // Execute processes a MATERIALIZE_SNAPSHOT job.
-func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
+func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) (executeErr error) {
 	snapID := job.ResourceID
 	log := logger.L(ctx).With("snapshot_id", snapID, "job_id", job.ID)
 
@@ -83,9 +103,19 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	if err != nil {
 		return jobs.NewPermanentError("SNAPSHOT_NOT_FOUND", fmt.Sprintf("snapshot %s not found: %v", snapID, err), err)
 	}
+	defer func() {
+		if executeErr != nil && h.revisionStore != nil && snap.AnalysisRevisionID != "" && job.AttemptCount >= job.MaxAttempts {
+			_ = h.revisionStore.MarkFailed(context.Background(), snap.AnalysisRevisionID, revision.StageMaterializing, "SNAPSHOT_MATERIALIZATION_FAILED", executeErr.Error())
+		}
+	}()
 
 	if snap.Status == snapshot.StatusReady {
 		log.Info("snapshot already READY")
+		if h.revisionStore != nil && snap.AnalysisRevisionID != "" {
+			if err := h.revisionStore.MarkSnapshotReady(ctx, snap.AnalysisRevisionID, snap.ID); err != nil && !errors.Is(err, revision.ErrLineage) {
+				return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
+			}
+		}
 		return nil
 	}
 	if snap.Status == snapshot.StatusCreated {
@@ -107,7 +137,12 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		// retry therefore cannot expose a half-written source directory.
 		stagingDir := targetDir + ".tmp-" + jobClaimSuffix(job)
 		_ = os.RemoveAll(stagingDir)
-		cloneSHA, cloneErr := h.cloner.CloneTo(ctx, r.GitURL, snap.Ref, stagingDir)
+		cloneSHA, cloneErr := "", error(nil)
+		if exactCloner, ok := h.cloner.(ExactGitCloner); ok && snap.CommitSHA != "" && snap.CommitSHA != "pending" {
+			cloneSHA, cloneErr = exactCloner.CloneCommitTo(ctx, r.GitURL, snap.CommitSHA, stagingDir)
+		} else {
+			cloneSHA, cloneErr = h.cloner.CloneTo(ctx, r.GitURL, snap.Ref, stagingDir)
+		}
 		if cloneErr != nil {
 			log.Error("failed to clone repository for snapshot", "error", cloneErr)
 			if err := h.cloner.ValidateGitURL(r.GitURL); err != nil {
@@ -213,6 +248,11 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	} else if err := h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusReady, &now); err != nil {
 		return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
 	}
+	if h.revisionStore != nil && snap.AnalysisRevisionID != "" {
+		if err := h.revisionStore.MarkSnapshotReady(ctx, snap.AnalysisRevisionID, snap.ID); err != nil {
+			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
+		}
+	}
 
 	// Auto-chain BUILD_CODE_INDEX job if codeIntelStore is wired
 	if h.codeIntelStore != nil {
@@ -230,6 +270,9 @@ func sealSnapshot(root string) error {
 		}
 		if info.IsDir() {
 			return os.Chmod(path, 0555)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
 		}
 		return os.Chmod(path, 0444)
 	})

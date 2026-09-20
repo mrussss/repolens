@@ -1,18 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api';
-import { Repository } from '../types';
+import { AnalysisRevision, Repository } from '../types';
 import { Play } from 'lucide-react';
 
 interface Props {
   initialRepoId?: string;
-  initialSnapshotId?: string;
+  initialRevisionId?: string;
   onDiagnosisCreated: (diagnosisId: string) => void;
 }
 
-export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapshotId, onDiagnosisCreated }) => {
+export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisionId, onDiagnosisCreated }) => {
   const [repos, setRepos] = useState<Repository[]>([]);
   const [selectedRepoId, setSelectedRepoId] = useState(initialRepoId || '');
-  const [selectedSnapshotId, setSelectedSnapshotId] = useState(initialSnapshotId || '');
+  const [selectedRevisionId, setSelectedRevisionId] = useState(initialRevisionId || '');
+  const [revisions, setRevisions] = useState<AnalysisRevision[]>([]);
   const [issueTitle, setIssueTitle] = useState('');
   const [issueDescription, setIssueDescription] = useState('');
   const [errorLog, setErrorLog] = useState('');
@@ -23,19 +24,32 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
     loadRepos();
   }, []);
 
+  useEffect(() => {
+    if (!selectedRepoId) return;
+    loadRevisions(selectedRepoId);
+  }, [selectedRepoId]);
+
   const loadRepos = async () => {
     try {
       const list = await api.listRepositories();
       setRepos(list || []);
       if (!selectedRepoId && list?.length > 0) {
         setSelectedRepoId(list[0].id);
-        setSelectedSnapshotId(list[0].snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '');
-      } else if (!selectedSnapshotId && selectedRepoId) {
-        const selected = list.find((item) => item.id === selectedRepoId);
-        setSelectedSnapshotId(selected?.snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '');
       }
     } catch (err: any) {
       setError(err.message || '加载仓库失败');
+    }
+  };
+
+  const loadRevisions = async (repoId: string) => {
+    try {
+      const values = await api.listAnalysisRevisions(repoId);
+      setRevisions(values);
+      if (!initialRevisionId && !selectedRevisionId) {
+        setSelectedRevisionId(values.find((revision) => revision.status === 'READY')?.id || '');
+      }
+    } catch (err: any) {
+      setError(err.message || '加载分析版本失败');
     }
   };
 
@@ -49,23 +63,32 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
       setError('请填写问题标题');
       return;
     }
-    if (!selectedSnapshotId) {
-      setError('请先选择 READY 快照');
+    if (!selectedRevisionId) {
+      setError('请先选择 READY 分析版本');
       return;
     }
 
     setLoading(true);
     setError(null);
     try {
-      const idempotencyKey = 'idemp-ui-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
+      const payloadFingerprint = JSON.stringify({ selectedRevisionId, issueTitle, issueDescription, errorLog });
+      const savedPayload = sessionStorage.getItem('repolens-diagnosis-payload');
+      let idempotencyKey = sessionStorage.getItem('repolens-diagnosis-key') || '';
+      if (savedPayload !== payloadFingerprint || !idempotencyKey) {
+        idempotencyKey = crypto.randomUUID();
+        sessionStorage.setItem('repolens-diagnosis-payload', payloadFingerprint);
+        sessionStorage.setItem('repolens-diagnosis-key', idempotencyKey);
+      }
       const res = await api.createDiagnosis({
         repository_id: selectedRepoId,
-        snapshot_id: selectedSnapshotId,
+        analysis_revision_id: selectedRevisionId,
         issue_title: issueTitle,
         issue_description: issueDescription,
         error_log: errorLog,
         idempotency_key: idempotencyKey,
       });
+      sessionStorage.removeItem('repolens-diagnosis-payload');
+      sessionStorage.removeItem('repolens-diagnosis-key');
       onDiagnosisCreated(res.diagnosis_run.id);
     } catch (err: any) {
       setError(err.message || '启动诊断失败');
@@ -99,8 +122,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
               onChange={(e) => {
                 const repoId = e.target.value;
                 setSelectedRepoId(repoId);
-                const repo = repos.find((item) => item.id === repoId);
-                setSelectedSnapshotId(repo?.snapshots?.find((snapshot) => snapshot.status === 'READY')?.id || '');
+                setSelectedRevisionId('');
               }}
               required
             >
@@ -114,11 +136,11 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
           </div>
 
           <div className="form-group">
-            <label className="form-label">READY 快照</label>
-            <select className="input-field" value={selectedSnapshotId} onChange={(e) => setSelectedSnapshotId(e.target.value)} required>
-              <option value="" disabled>选择 READY 快照</option>
-              {(repos.find((r) => r.id === selectedRepoId)?.snapshots || []).filter((snap) => snap.status === 'READY').map((snap) => (
-                <option key={snap.id} value={snap.id}>{snap.id} ({snap.commit_sha.slice(0, 12)})</option>
+            <label className="form-label">READY 分析版本</label>
+            <select className="input-field" value={selectedRevisionId} onChange={(e) => setSelectedRevisionId(e.target.value)} required>
+              <option value="" disabled>选择 READY 分析版本</option>
+              {revisions.filter((revision) => revision.status === 'READY').map((revision) => (
+                <option key={revision.id} value={revision.id}>{revision.source_ref} · {revision.commit_sha.slice(0, 12)}</option>
               ))}
             </select>
           </div>
@@ -160,7 +182,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialSnapsh
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1.5rem' }}>
-            <button type="submit" className="btn btn-primary" disabled={loading || !selectedRepoId || !selectedSnapshotId || !issueTitle}>
+            <button type="submit" className="btn btn-primary" disabled={loading || !selectedRepoId || !selectedRevisionId || !issueTitle}>
               <Play size={16} /> {loading ? '提交中…' : '运行有依据的诊断'}
             </button>
           </div>

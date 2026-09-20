@@ -18,6 +18,15 @@ import (
 	"repolens/internal/worker"
 )
 
+type checkpointCountingExecutor struct {
+	calls int
+}
+
+func (e *checkpointCountingExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+	e.calls++
+	return nil, errors.New("provider should not be called when a checkpoint exists")
+}
+
 func setupTestEnvironment(t *testing.T) (*gorm.DB, *jobs.Store) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "worker_test.db")
@@ -181,5 +190,63 @@ func TestWorkerJobHandler_CancellationFinalizesWithIndependentContext(t *testing
 	}
 	if job.Status != jobs.StatusCancelled {
 		t.Fatalf("job status = %s, want CANCELLED", job.Status)
+	}
+}
+
+func TestWorkerJobHandlerResumesFromProviderCheckpoint(t *testing.T) {
+	db, jobsStore := setupTestEnvironment(t)
+	ctx := context.Background()
+	diagStore := diagnosis.NewStore(db)
+	repStore := evidence.NewReportStore(db)
+	citStore := evidence.NewCitationStore(db)
+	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	citVal := evidence.NewCitationValidator(storeFS)
+	run := &diagnosis.DiagnosisRun{
+		ID:                     "run-checkpoint-resume",
+		UserID:                 "user-checkpoint",
+		RepositoryID:           "repo-checkpoint",
+		SnapshotID:             "snap-checkpoint",
+		IssueTitle:             "checkpoint",
+		IdempotencyKey:         "checkpoint-key",
+		IdempotencyRequestHash: "checkpoint-hash",
+	}
+	if err := diagStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&diagnosis.DiagnosisAttempt{
+		ID:                    "checkpoint-old",
+		DiagnosisRunID:        run.ID,
+		AttemptNo:             1,
+		WorkerID:              "old-worker",
+		Status:                diagnosis.AttemptStatusFailedRetryable,
+		StartedAt:             time.Now().UTC(),
+		HeartbeatAt:           time.Now().UTC(),
+		DeadlineAt:            time.Now().UTC().Add(time.Minute),
+		RawOutput:             `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","limitations":["checkpoint evidence"]}`,
+		ParsedReportJSON:      `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","limitations":["checkpoint evidence"]}`,
+		StructuredOutputValid: true,
+		ProviderCalls:         1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-checkpoint", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("failed to claim checkpoint job: err=%v jobs=%d", err, len(claimed))
+	}
+	executor := &checkpointCountingExecutor{}
+	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, citVal, executor)
+	if err := handler.Execute(ctx, claimed[0]); err != nil {
+		t.Fatal(err)
+	}
+	if executor.calls != 0 {
+		t.Fatalf("executor calls = %d, want checkpoint resume without provider", executor.calls)
+	}
+	savedRun, err := diagStore.GetByID(ctx, run.ID)
+	if err != nil || savedRun.Status != diagnosis.StatusSucceeded {
+		t.Fatalf("saved run = %+v err=%v, want SUCCEEDED", savedRun, err)
+	}
+	report, err := repStore.GetByRunID(ctx, run.ID)
+	if err != nil || report.ReportStatus != evidence.ReportInsufficientEvidence {
+		t.Fatalf("checkpoint report = %+v err=%v", report, err)
 	}
 }

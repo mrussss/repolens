@@ -31,6 +31,7 @@ import (
 	"repolens/internal/provider"
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 	"repolens/internal/trace"
 )
@@ -72,6 +73,7 @@ func run() error {
 	traceStore := trace.NewStore(db.GormDB)
 	jobStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)
 	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
+	revisionStore := revision.NewStore(db.GormDB)
 
 	// Services & Managers
 	repoSvc := repo.NewService(repoStore)
@@ -90,6 +92,8 @@ func run() error {
 		snapshotStore,
 	)
 	diagnosisSvc.WithCodeIntelStore(codeIntelStore)
+	diagnosisSvc.WithRevisionStore(revisionStore)
+	diagnosisSvc.WithJobStore(jobStore)
 	diagnosisSvc.WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
 		status := providerMgr.GetPublicStatus()
 		return diagnosis.ProviderMetadata{
@@ -99,8 +103,8 @@ func run() error {
 			ModelName:           status.Model,
 			IsConfigured:        status.IsConfigured,
 			IsDemo:              status.IsDemo,
-			PromptVersion:       "v2.1",
-			AgentVersion:        "v2.1",
+			PromptVersion:       "v2.2",
+			AgentVersion:        "v2.2",
 			AgentConfigHash:     diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1),
 			Temperature:         0.1,
 		}
@@ -115,6 +119,13 @@ func run() error {
 	)
 	repoHandler.WithSnapshotResolver(cloner, jobStore)
 	repoHandler.WithSnapshotBasePath(cfg.SnapshotBasePath)
+	revisionSvc := revision.NewService(
+		revisionStore,
+		repoStore,
+		cloner,
+		cfg.SnapshotBasePath,
+	)
+	revisionHandler := revision.NewHandler(revisionSvc)
 	diagnosisHandler := diagnosis.NewHandler(
 		diagnosisSvc,
 		reportStore,
@@ -190,6 +201,10 @@ func run() error {
 		v1.GET("/repositories", repoHandler.List)
 		v1.GET("/repositories/:id", repoHandler.Get)
 		v1.POST("/repositories/:id/index", repoHandler.TriggerIndex)
+		v1.POST("/repositories/:id/revisions", revisionHandler.Create)
+		v1.GET("/repositories/:id/revisions", revisionHandler.List)
+		v1.GET("/analysis-revisions/:id", revisionHandler.Get)
+		v1.POST("/analysis-revisions/:id/retry", revisionHandler.Retry)
 
 		// Code Intelligence (M5)
 		v1.POST("/snapshots/:id/code-index-builds", codeIntelHandler.TriggerCodeIndexBuild)
@@ -207,6 +222,7 @@ func run() error {
 		v1.GET("/diagnoses", diagnosisHandler.List)
 		v1.GET("/diagnoses/:id", diagnosisHandler.Get)
 		v1.POST("/diagnoses/:id/cancel", diagnosisHandler.Cancel)
+		v1.POST("/diagnoses/:id/retry", diagnosisHandler.Retry)
 		v1.GET("/diagnoses/:id/attempts", diagnosisHandler.ListAttempts)
 		v1.GET("/diagnoses/:id/report", diagnosisHandler.GetReport)
 		v1.GET("/diagnoses/:id/steps", diagnosisHandler.GetSteps)
@@ -224,6 +240,7 @@ func run() error {
 		root.GET("/diagnoses", diagnosisHandler.List)
 		root.GET("/diagnoses/:id", diagnosisHandler.Get)
 		root.POST("/diagnoses/:id/cancel", diagnosisHandler.Cancel)
+		root.POST("/diagnoses/:id/retry", diagnosisHandler.Retry)
 		root.GET("/diagnoses/:id/attempts", diagnosisHandler.ListAttempts)
 		root.GET("/diagnoses/:id/report", diagnosisHandler.GetReport)
 		root.GET("/diagnoses/:id/steps", diagnosisHandler.GetSteps)
