@@ -6,9 +6,10 @@
 
 - Dataset: `realbench-v1`
 - Manifest hash: `5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf`
-- RepoLens commit: `0233130869239696d235ff2447a5facf891bdf4a`
-- Run ID: `20260920T132009Z-404659fd`
+- RepoLens commit: `5a31801da919bf8d9fd739b6ab1458c5f733e28b`
+- Run ID: `20260920T133244Z-b0e40972`
 - Command: `go run ./cmd/realbench run --all`
+- Validation: `go run ./cmd/realbench validate`; single-case smoke test `go run ./cmd/realbench run --case REAL-001`
 - Retrieval: `symbol_bm25_structural` — current Pure Go BM25 + Structural Retrieval
 - Retrieval / index version: `v2.1.0` / `v2.1.0`; Agent / Prompt version: `v2.2` / `v2.2`
 - E2E: `NOT_REQUESTED`
@@ -34,25 +35,25 @@
 
 | Case | Repository | Top-10 primary-file rank | Hit@5 | Hit@10 | Latency |
 |---|---|---:|---:|---:|---:|
-| REAL-001 | go-chi/chi | 1 | yes | yes | 12 ms |
-| REAL-002 | spf13/cobra | 3 | yes | yes | 18 ms |
-| REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 2 ms |
+| REAL-001 | go-chi/chi | 1 | yes | yes | 11 ms |
+| REAL-002 | spf13/cobra | 3 | yes | yes | 16 ms |
+| REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 4 ms |
 
 ## Code Intelligence quality
 
 The raw per-case quality files and CSV summary are stored in the run artifact directory. The current run reports the following completeness and uncertainty distribution:
 
-| Case | Files parsed / total | Packages typechecked / total | Symbols | Semantic relations | Unresolved relations | Related tests | Parse rate | Typecheck rate |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| REAL-001 | 66 / 67 | 11 / 12 | 357 | 1195 | 1778 | 12065 | 98.5% | 91.7% |
-| REAL-002 | 35 / 36 | 0 / 2 | 613 | 2267 | 1524 | 74484 | 97.2% | 0.0% |
-| REAL-003 | 4 / 4 | 0 / 1 | 77 | 176 | 372 | 1395 | 100.0% | 0.0% |
+| Case | Files parsed / total | Packages typechecked / total | Symbols | Semantic relations | Unresolved relations | Symlinks skipped | Related tests | Parse rate | Typecheck rate |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| REAL-001 | 66 / 67 | 11 / 12 | 357 | 1195 | 1778 | 0 | 12065 | 98.5% | 91.7% |
+| REAL-002 | 35 / 36 | 0 / 2 | 613 | 2267 | 1524 | 0 | 74484 | 97.2% | 0.0% |
+| REAL-003 | 4 / 4 | 0 / 1 | 77 | 176 | 372 | 0 | 1395 | 100.0% | 0.0% |
 
 这些质量指标保留 type-check 不完整和 unresolved 分布，不将静态分析结果包装成完整 runtime call graph。
 
 ## Failure analysis
 
-本次在 clean HEAD `0233130` 重跑没有 Retrieval failure、Infra Error 或 Product Failure，因此没有隐藏失败 case。REAL-002 的 primary file 排名为 3，仍命中 Hit@5，但相较另外两个 case 需要更多候选排序空间；这个观察仅记录为 benchmark 证据，不在本任务中修改检索算法。
+本次在 clean HEAD `5a31801` 重跑没有 Retrieval failure、Infra Error 或 Product Failure，因此没有隐藏失败 case。REAL-002 的 primary file 排名为 3，仍命中 Hit@5，但相较另外两个 case 需要更多候选排序空间；这个观察仅记录为 benchmark 证据，不在本任务中修改检索算法。
 
 本次没有请求 E2E（`--e2e` 未传），因此没有生成真实 Agent diagnosis、Citation validity 或 Root Cause Correct/Partial/Incorrect 分数；FakeProvider 不作为公开 E2E 成绩。若请求 E2E 但未配置 provider，状态会单独记录为 `NOT_RUN_PROVIDER_NOT_CONFIGURED`。
 
