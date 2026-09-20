@@ -216,6 +216,7 @@ type analysisQualityArtifact struct {
 	SyntacticRelations  int      `json:"syntactic_relations"`
 	HeuristicRelations  int      `json:"heuristic_relations"`
 	UnresolvedRelations int      `json:"unresolved_relations"`
+	SymlinksSkipped     int      `json:"symlinks_skipped"`
 	RelatedTestsFound   int      `json:"related_tests_found"`
 	Warnings            []string `json:"warnings"`
 }
@@ -1327,6 +1328,7 @@ func makeAnalysisQualityArtifact(quality codeintelmodel.AnalysisQuality, related
 		SyntacticRelations:  quality.SyntacticRelationsCount,
 		HeuristicRelations:  quality.HeuristicRelationsCount,
 		UnresolvedRelations: quality.UnresolvedRelationsCount,
+		SymlinksSkipped:     quality.SymlinksSkipped,
 		RelatedTestsFound:   relatedTestsFound,
 		Warnings:            quality.Warnings,
 	}
@@ -1344,7 +1346,7 @@ func writeAnalysisQualitySummary(path string, rows []analysisQualityRow) error {
 		"case_id", "files_total", "files_parsed", "files_failed", "parse_rate",
 		"packages_total", "packages_typechecked", "packages_failed", "typecheck_rate",
 		"symbols_total", "semantic_relations", "syntactic_relations", "heuristic_relations",
-		"unresolved_relations", "related_tests_found", "warnings",
+		"unresolved_relations", "symlinks_skipped", "related_tests_found", "warnings",
 	}); err != nil {
 		return fmt.Errorf("write analysis quality header: %w", err)
 	}
@@ -1365,6 +1367,7 @@ func writeAnalysisQualitySummary(path string, rows []analysisQualityRow) error {
 			strconv.Itoa(quality.SyntacticRelations),
 			strconv.Itoa(quality.HeuristicRelations),
 			strconv.Itoa(quality.UnresolvedRelations),
+			strconv.Itoa(quality.SymlinksSkipped),
 			strconv.Itoa(quality.RelatedTestsFound),
 			strings.Join(quality.Warnings, " | "),
 		}); err != nil {

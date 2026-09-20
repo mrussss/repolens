@@ -210,6 +210,7 @@ func (s *GormStore) saveAnalysisResultTx(tx *gorm.DB, buildID int64, res *model.
 		"syntactic_relation_count":  res.Quality.SyntacticRelationsCount,
 		"heuristic_relation_count":  res.Quality.HeuristicRelationsCount,
 		"unresolved_relation_count": res.Quality.UnresolvedRelationsCount,
+		"symlinks_skipped":          res.Quality.SymlinksSkipped,
 		"quality_warnings_json":     string(warnings),
 		"ready_at":                  &now,
 	})

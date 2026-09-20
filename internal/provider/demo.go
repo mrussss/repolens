@@ -75,7 +75,7 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 	}
 	demoDir := h.storeFS.GetSourcePath(demoRepoID, demoSnapID)
 	if err := makeDemoSource(demoDir); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
 
@@ -83,7 +83,7 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 	if repository == nil {
 		repository = &repo.Repository{ID: demoRepoID, UserID: userID, Name: "order-service（Demo）", GitURL: "https://github.com/repolens/demo-order-service", DefaultRef: "main", Status: "ACTIVE"}
 		if err := h.repoStore.Create(ctx, repository); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 			return
 		}
 	}
@@ -95,14 +95,14 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 	now := time.Now().UTC()
 	contentHash, fileCount, totalBytes, err := hashDemoSource(demoDir)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
 	demoSnapshot, _ := h.snapshotStore.GetByID(ctx, demoSnapID)
 	if demoSnapshot == nil {
 		demoSnapshot = &snapshot.RepositorySnapshot{ID: demoSnapID, RepositoryID: demoRepoID, CommitSHA: demoCommit, Ref: "main", MaterializedPath: demoDir, Status: snapshot.StatusReady, ContentHash: contentHash, FileCount: fileCount, TotalBytes: totalBytes, ReadyAt: &now}
 		if err := h.snapshotStore.Create(ctx, demoSnapshot); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 			return
 		}
 	} else {
@@ -111,7 +111,7 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 
 	build, _, err := h.codeIntelStore.GetOrCreateBuild(ctx, demoSnapID, "github.com/repolens/demo-order-service/orders", codeintelmodel.DefaultBuildContext())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
 	if build.Status == codeintelmodel.BuildStatusReady && build.SymbolCount == 0 {
@@ -120,16 +120,16 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 	build, _ = h.codeIntelStore.GetByID(ctx, build.ID)
 	if build.Status != codeintelmodel.BuildStatusReady {
 		if err := h.codeIntelStore.MarkBuildBuilding(ctx, build.ID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 			return
 		}
 		analysis, analyzeErr := codeintel.NewAnalyzer().Analyze(ctx, demoDir, codeintelmodel.DefaultBuildContext())
 		if analyzeErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": analyzeErr.Error()})
+			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", analyzeErr)
 			return
 		}
 		if err := h.codeIntelStore.SaveAnalysisResult(ctx, build.ID, analysis); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 			return
 		}
 	}
@@ -137,7 +137,7 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 
 	retrievalBuild, _, err := h.codeIntelStore.GetOrCreateRetrievalBuild(ctx, build.ID, "symbol_bm25_structural")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
 	if retrievalBuild.Status == codeintelmodel.BuildStatusReady && retrievalBuild.DocumentCount == 0 {
@@ -146,11 +146,11 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 	retrievalBuild, _ = h.codeIntelStore.GetRetrievalBuildByID(ctx, retrievalBuild.ID)
 	if retrievalBuild.Status != codeintelmodel.BuildStatusReady {
 		if err := h.codeIntelStore.MarkRetrievalBuilding(ctx, retrievalBuild.ID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 			return
 		}
 		if err := publishDemoRetrieval(ctx, h.codeIntelStore, build.ID, retrievalBuild, h.indexStorageDir); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 			return
 		}
 	}
@@ -164,13 +164,13 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 	issueTitle := "[Demo] 高并发下订单提交 Worker 死锁"
 	demoRun := &diagnosis.DiagnosisRun{ID: runID, UserID: userID, RepositoryID: demoRepoID, SnapshotID: demoSnapID, CodeIndexBuildID: build.ID, RetrievalBuildID: retrievalBuild.ID, IssueTitle: issueTitle, IssueDescription: "高并发订单负载下 HTTP 处理器挂起，超过 100 个请求后不再接受新订单。", ErrorLog: "panic: deadlock detected in goroutine 42 [chan send]: orders.(*OrderProcessor).SubmitOrder processor.go:14", Status: diagnosis.StatusSucceeded, IdempotencyKey: "idemp-demo-" + uuid.New().String()[:8], IdempotencyRequestHash: "hash-demo", Version: 1, CreatedAt: now, UpdatedAt: now}
 	if err := h.db.Create(demoRun).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
 	attemptID := "attempt-demo-" + uuid.New().String()[:8]
 	attempt := &diagnosis.DiagnosisAttempt{ID: attemptID, DiagnosisRunID: runID, AttemptNo: 1, WorkerID: "demo", Status: diagnosis.AttemptStatusSucceeded, StartedAt: now.Add(-2 * time.Second), HeartbeatAt: now, DeadlineAt: now.Add(time.Hour), FinishedAt: &now, PromptTokens: 430, CompletionTokens: 380, ToolCalls: 2}
 	if err := h.db.Create(attempt).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
 	h.db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", runID).Updates(map[string]interface{}{"final_attempt_id": attemptID})
@@ -180,7 +180,7 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 	checksJSON, _ := json.Marshal([]string{"为 jobsChan 增加容量并评估背压策略", "在 SubmitOrder 中使用 ctx.Done() 或超时兜底", "增加高并发 channel 排空集成测试"})
 	report := &evidence.Report{ID: "report-demo-" + uuid.New().String()[:8], DiagnosisRunID: runID, AttemptID: attemptID, RootCause: "无缓冲 jobsChan 将订单提交变成同步阻塞操作；没有消费者时所有 HTTP 请求都会卡在发送处。", FindingsJSON: string(findingsJSON), RecommendedChecksJSON: string(checksJSON), Confidence: 0.98, CreatedAt: now}
 	if err := h.reportStore.Create(ctx, report); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
 	citation := evidence.Citation{ID: uuid.New().String(), ReportID: report.ID, SnapshotID: demoSnapID, CodeIndexBuildID: build.ID, FilePath: "processor.go", StartLine: 10, EndLine: 16, Reason: "无缓冲 channel 的阻塞发送", CreatedAt: now}
@@ -195,18 +195,13 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 }
 
 func makeDemoSource(dir string) error {
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return os.Chmod(path, 0755)
-		}
-		return os.Chmod(path, 0644)
-	})
+	return nil
 }
 
 func hashDemoSource(dir string) (string, int, int64, error) {

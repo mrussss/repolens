@@ -67,13 +67,14 @@ func (h *Handler) Register(c *gin.Context) {
 	userID := c.GetString(string(logger.UserIDKey))
 	var req RegisterRepoRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_REPOSITORY_REQUEST", "error": "invalid repository request"})
 		return
 	}
 
 	r, err := h.repoSvc.Register(c.Request.Context(), userID, req.Name, req.GitURL, req.DefaultRef)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logger.L(c.Request.Context()).Error("failed to register repository", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "REPOSITORY_CREATE_FAILED", "error": "failed to create repository"})
 		return
 	}
 
@@ -86,7 +87,7 @@ func (h *Handler) Get(c *gin.Context) {
 
 	r, err := h.repoSvc.Get(c.Request.Context(), id, userID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"code": "REPOSITORY_NOT_FOUND", "error": "repository not found"})
 		return
 	}
 
@@ -100,7 +101,8 @@ func (h *Handler) List(c *gin.Context) {
 	status := c.Query("status")
 	repos, total, err := h.repoSvc.List(c.Request.Context(), userID, page, pageSize, status)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		logger.L(c.Request.Context()).Error("failed to list repositories", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "REPOSITORY_LIST_FAILED", "error": "failed to list repositories"})
 		return
 	}
 
@@ -139,13 +141,15 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 	}
 	commitSHA, err := h.resolver.ResolveRef(c.Request.Context(), r.GitURL, req.Ref)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed resolving repository ref: " + err.Error()})
+		logger.L(c.Request.Context()).Error("failed to resolve repository ref", "error", err)
+		c.JSON(http.StatusBadRequest, gin.H{"code": "REF_RESOLUTION_FAILED", "error": "failed to resolve repository ref"})
 		return
 	}
 	if existing, lookupErr := h.snapshotStore.GetByCommit(c.Request.Context(), repoID, commitSHA); lookupErr == nil {
 		if existing.Status == snapshot.StatusFailed && h.jobStore != nil {
 			if requeueErr := h.jobStore.ManualRequeue(c.Request.Context(), jobs.JobTypeMaterializeSnapshot, existing.ID); requeueErr != nil {
-				c.JSON(http.StatusConflict, gin.H{"error": "snapshot already failed and cannot be requeued: " + requeueErr.Error()})
+				logger.L(c.Request.Context()).Error("failed to requeue failed snapshot", "error", requeueErr)
+				c.JSON(http.StatusConflict, gin.H{"code": "SNAPSHOT_REQUEUE_FAILED", "error": "snapshot already failed and cannot be requeued"})
 				return
 			}
 			existing, _ = h.snapshotStore.GetByID(c.Request.Context(), existing.ID)
@@ -196,7 +200,8 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 			c.JSON(http.StatusAccepted, gin.H{"snapshot": existing, "message": "snapshot already exists for this commit"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to trigger indexing: " + err.Error()})
+		logger.L(c.Request.Context()).Error("failed to trigger snapshot indexing", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "SNAPSHOT_QUEUE_FAILED", "error": "failed to queue snapshot indexing"})
 		return
 	}
 

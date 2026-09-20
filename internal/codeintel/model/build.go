@@ -50,6 +50,7 @@ type CodeIndexBuild struct {
 	SyntacticRelationCount  int    `json:"syntactic_relation_count" gorm:"not null;default:0"`
 	HeuristicRelationCount  int    `json:"heuristic_relation_count" gorm:"not null;default:0"`
 	UnresolvedRelationCount int    `json:"unresolved_relation_count" gorm:"not null;default:0"`
+	SymlinksSkipped         int    `json:"symlinks_skipped" gorm:"not null;default:0"`
 	QualityWarningsJSON     string `json:"quality_warnings_json,omitempty" gorm:"type:text"`
 
 	ErrorCode string     `json:"error_code,omitempty" gorm:"size:64"`

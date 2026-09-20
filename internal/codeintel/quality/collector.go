@@ -1,6 +1,8 @@
 package quality
 
 import (
+	"strings"
+
 	"repolens/internal/codeintel/model"
 )
 
@@ -13,6 +15,11 @@ func ComputeQuality(files []*model.CodeFile, symbols []*model.Symbol, relations 
 		PackagesFailed:      pkgFailed,
 		SymbolsTotal:        len(symbols),
 		Warnings:            warnings,
+	}
+	for _, warning := range warnings {
+		if strings.HasPrefix(warning, "skipped symlink ") {
+			q.SymlinksSkipped++
+		}
 	}
 
 	for _, f := range files {

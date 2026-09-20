@@ -340,7 +340,7 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 		return ErrOwnershipLost
 	}
 	if isTerminal {
-		if err := s.failBusinessTx(ctx, tx, jobID, false); err != nil {
+		if err := s.failBusinessTx(ctx, tx, jobID, false, errCode, errMsg); err != nil {
 			return err
 		}
 	}
@@ -350,15 +350,19 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 // failBusinessTx keeps terminal execution failure and business failure in one
 // claim-fenced transaction. The SQL is intentionally keyed by the fixed job
 // type enum, never by user input.
-func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, reaped bool) error {
+func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, reaped bool, errorCode, errorMessage string) error {
 	var jobType JobType
 	var resourceID string
 	if err := tx.QueryRowContext(ctx, `SELECT job_type, resource_id FROM analysis_jobs WHERE id = ?`, jobID).Scan(&jobType, &resourceID); err != nil {
 		return err
 	}
 	code := "JOB_FAILED"
+	message := errorMessage
 	if reaped {
 		code = "LEASE_EXPIRED_EXHAUSTED"
+		message = "Job lease expired and max attempts exceeded"
+	} else if errorCode != "" {
+		code = errorCode
 	}
 	var query string
 	switch jobType {
@@ -388,6 +392,39 @@ func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, rea
 		if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts SET status = ?, finished_at = ? WHERE diagnosis_run_id = ? AND status = 'RUNNING'`, attemptStatus, time.Now().UTC(), resourceID); err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 			return fmt.Errorf("failed terminal diagnosis attempt transition for %s: %w", resourceID, err)
 		}
+	}
+	if err := s.failAnalysisRevisionTx(ctx, tx, jobType, resourceID, code, message); err != nil {
+		return err
+	}
+	return nil
+}
+
+// failAnalysisRevisionTx keeps the product-facing pipeline state in sync with
+// a terminal stage job failure. Older isolated job-store tests do not create
+// the v2.2 revision table, so that schema omission remains harmless here.
+func (s *Store) failAnalysisRevisionTx(ctx context.Context, tx *sql.Tx, jobType JobType, resourceID, errorCode, errorMessage string) error {
+	var predicate string
+	var stage string
+	switch jobType {
+	case JobTypeMaterializeSnapshot:
+		predicate = "snapshot_id = ?"
+		stage = "MATERIALIZING"
+	case JobTypeBuildCodeIndex:
+		predicate = "code_index_build_id = ?"
+		stage = "BUILDING_CODE_INDEX"
+	case JobTypeBuildRetrieval:
+		predicate = "retrieval_build_id = ?"
+		stage = "BUILDING_RETRIEVAL"
+	default:
+		return nil
+	}
+	query := `UPDATE analysis_revisions
+		SET status = 'FAILED', stage = ?, error_code = ?, error_message = ?,
+		    version = version + 1, updated_at = ?
+		WHERE status = 'PREPARING' AND ` + predicate
+	_, err := tx.ExecContext(ctx, query, stage, errorCode, errorMessage, time.Now().UTC(), resourceID)
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+		return fmt.Errorf("failed terminal analysis revision transition for %s/%s: %w", jobType, resourceID, err)
 	}
 	return nil
 }
@@ -565,7 +602,7 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 }
 
 func (s *Store) failBusinessForReapedJob(ctx context.Context, tx *sql.Tx, jobID int64) error {
-	return s.failBusinessTx(ctx, tx, jobID, true)
+	return s.failBusinessTx(ctx, tx, jobID, true, "LEASE_EXPIRED_EXHAUSTED", "Job lease expired and max attempts exceeded")
 }
 
 // ManualRequeueTx executes the Manual Requeue Rule for natural-identity resources within a transaction.

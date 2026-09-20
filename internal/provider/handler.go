@@ -86,7 +86,7 @@ type SaveProviderRequest struct {
 func (h *Handler) SaveConfig(c *gin.Context) {
 	var req SaveProviderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PROVIDER_CONFIG", "error": "invalid provider configuration"})
 		return
 	}
 
@@ -155,15 +155,17 @@ type TestConnectionRequest struct {
 func (h *Handler) TestConnection(c *gin.Context) {
 	var req TestConnectionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PROVIDER_CONFIG", "error": "invalid provider configuration"})
 		return
 	}
 
 	latency, err := h.mgr.TestConnectionWithAuthMode(c.Request.Context(), req.BaseURL, req.Model, req.APIKey, req.AuthMode)
 	if err != nil {
+		logger.L(c.Request.Context()).Error("provider connection test failed", "error", err)
 		c.JSON(http.StatusBadGateway, gin.H{
 			"success":    false,
-			"error":      err.Error(),
+			"code":       "PROVIDER_CONNECTION_FAILED",
+			"error":      "provider connection failed",
 			"latency_ms": latency.Milliseconds(),
 		})
 		return
@@ -174,6 +176,11 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		"latency_ms": latency.Milliseconds(),
 		"message":    fmt.Sprintf("Connection successful! Latency: %dms", latency.Milliseconds()),
 	})
+}
+
+func writeProviderInternalError(c *gin.Context, code, message string, err error) {
+	logger.L(c.Request.Context()).Error(message, "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"code": code, "error": message})
 }
 
 // TriggerDemo creates a deterministic bundled demo repository, snapshot, and diagnosis run.
@@ -283,7 +290,7 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 	}
 
 	if err := h.diagnosisStore.Create(ctx, demoRun); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed creating demo diagnosis: " + err.Error()})
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
 

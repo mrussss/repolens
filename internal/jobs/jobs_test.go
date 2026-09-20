@@ -379,6 +379,48 @@ func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
 	}
 }
 
+func TestStore_TerminalStageFailureSynchronizesAnalysisRevision(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	for _, ddl := range []string{
+		`CREATE TABLE code_index_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
+		`CREATE TABLE analysis_revisions (id TEXT PRIMARY KEY, snapshot_id TEXT, code_index_build_id TEXT, retrieval_build_id TEXT, status TEXT NOT NULL, stage TEXT NOT NULL, error_code TEXT, error_message TEXT, version INTEGER NOT NULL, updated_at DATETIME)`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO code_index_builds (id, status) VALUES ('build-terminal', 'BUILDING')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO analysis_revisions (id, code_index_build_id, status, stage, version) VALUES ('revision-terminal', 'build-terminal', 'PREPARING', 'BUILDING_CODE_INDEX', 2)`); err != nil {
+		t.Fatal(err)
+	}
+
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "build-terminal", MaxAttempts: 1}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "worker-terminal", 1, time.Second)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim failed: %v", err)
+	}
+	claim := claimed[0]
+	if err := store.ConditionalFinalizeFailure(ctx, claim.ID, "worker-terminal", *claim.ClaimToken, jobs.ErrorClassPermanent, "CODE_INDEX_ANALYSIS_FAILED", "analysis failed", nil, true, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var status, stage, code, message string
+	if err := db.QueryRow(`SELECT status, stage, error_code, error_message FROM analysis_revisions WHERE id='revision-terminal'`).Scan(&status, &stage, &code, &message); err != nil {
+		t.Fatal(err)
+	}
+	if status != "FAILED" || stage != "BUILDING_CODE_INDEX" || code != "CODE_INDEX_ANALYSIS_FAILED" || message != "analysis failed" {
+		t.Fatalf("revision terminal state = %s/%s/%s/%s", status, stage, code, message)
+	}
+}
+
 func TestWorkerRuntime_ConcurrentExecution(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

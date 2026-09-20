@@ -235,6 +235,7 @@ type AnalysisQuality struct {
 	SyntacticRelationsCount  int      `json:"syntactic_relations_count"`
 	HeuristicRelationsCount  int      `json:"heuristic_relations_count"`
 	UnresolvedRelationsCount int      `json:"unresolved_relations_count"`
+	SymlinksSkipped          int      `json:"symlinks_skipped"`
 	Warnings                 []string `json:"warnings"`
 }
 

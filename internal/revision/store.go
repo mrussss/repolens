@@ -188,6 +188,9 @@ func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, er
 		if err := tx.First(&snap, "id = ?", value.SnapshotID).Error; err != nil {
 			return err
 		}
+		if snap.AnalysisRevisionID != value.ID || snap.RepositoryID != value.RepositoryID || snap.CommitSHA != value.CommitSHA {
+			return ErrLineage
+		}
 		if snap.Status != snapshot.StatusReady {
 			if err := tx.Model(&snapshot.RepositorySnapshot{}).Where("id = ?", snap.ID).Updates(map[string]interface{}{"status": snapshot.StatusMaterializing, "error_code": "", "ready_at": nil}).Error; err != nil {
 				return err
@@ -228,6 +231,9 @@ func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, er
 		if err := tx.First(&build, "id = ?", value.CodeIndexBuildID).Error; err != nil {
 			return err
 		}
+		if build.SnapshotID != value.SnapshotID || build.AnalysisRevisionID != value.ID {
+			return ErrLineage
+		}
 		if build.Status != codeintelmodel.BuildStatusReady {
 			value.Stage = StageBuildingCode
 			if err := resetCodeBuildTx(tx, build.ID); err != nil {
@@ -257,6 +263,9 @@ func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, er
 		var rb codeintelmodel.RetrievalBuild
 		if err := tx.First(&rb, "id = ?", value.RetrievalBuildID).Error; err != nil {
 			return err
+		}
+		if rb.CodeIndexBuildID != value.CodeIndexBuildID || rb.AnalysisRevisionID != value.ID {
+			return ErrLineage
 		}
 		if rb.Status != codeintelmodel.BuildStatusReady {
 			value.Stage = StageBuildingSearch

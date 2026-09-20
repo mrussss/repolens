@@ -10,6 +10,7 @@ import (
 
 	"repolens/internal/codeintel/model"
 	"repolens/internal/codeintel/store"
+	"repolens/internal/platform/logger"
 	"repolens/internal/snapshot"
 )
 
@@ -45,7 +46,7 @@ func (h *Handler) TriggerCodeIndexBuild(c *gin.Context) {
 	bc := model.DefaultBuildContext()
 	build, created, err := h.ciStore.GetOrCreateBuild(ctx, snap.ID, snap.RepositoryID, bc)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeCodeIntelInternalError(c, "CODE_INDEX_BUILD_CREATE_FAILED", "failed to create code index build", err)
 		return
 	}
 
@@ -67,7 +68,7 @@ func (h *Handler) GetCodeIndexBuild(c *gin.Context) {
 
 	build, err := h.ciStore.GetByID(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"code": "CODE_INDEX_BUILD_NOT_FOUND", "error": "code index build not found"})
 		return
 	}
 
@@ -85,7 +86,7 @@ func (h *Handler) GetQuality(c *gin.Context) {
 
 	build, err := h.ciStore.GetByID(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"code": "CODE_INDEX_BUILD_NOT_FOUND", "error": "code index build not found"})
 		return
 	}
 
@@ -105,6 +106,7 @@ func (h *Handler) GetQuality(c *gin.Context) {
 		"syntactic_relation_count":  build.SyntacticRelationCount,
 		"heuristic_relation_count":  build.HeuristicRelationCount,
 		"unresolved_relation_count": build.UnresolvedRelationCount,
+		"symlinks_skipped":          build.SymlinksSkipped,
 		"status":                    build.Status,
 	}
 	var warnings []string
@@ -129,7 +131,7 @@ func (h *Handler) ListSymbols(c *gin.Context) {
 
 	symbols, err := h.ciStore.ListSymbols(c.Request.Context(), id, query, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeCodeIntelInternalError(c, "CODE_SYMBOL_LIST_FAILED", "failed to list code symbols", err)
 		return
 	}
 
@@ -162,7 +164,7 @@ func (h *Handler) GetSymbolReferences(c *gin.Context) {
 
 	rels, err := h.ciStore.ListRelationsForSymbol(c.Request.Context(), cibID, id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeCodeIntelInternalError(c, "CODE_REFERENCE_LIST_FAILED", "failed to list symbol references", err)
 		return
 	}
 
@@ -177,7 +179,7 @@ func (h *Handler) GetSymbolTests(c *gin.Context) {
 
 	tests, err := h.ciStore.ListRelatedTests(c.Request.Context(), cibID, keyHash)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeCodeIntelInternalError(c, "CODE_TEST_LIST_FAILED", "failed to list related tests", err)
 		return
 	}
 
@@ -206,7 +208,7 @@ func (h *Handler) TriggerRetrievalBuild(c *gin.Context) {
 	strategy := c.DefaultQuery("strategy", "BM25")
 	rb, created, err := h.ciStore.GetOrCreateRetrievalBuild(c.Request.Context(), cib.ID, strategy)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeCodeIntelInternalError(c, "RETRIEVAL_BUILD_CREATE_FAILED", "failed to create retrieval build", err)
 		return
 	}
 
@@ -228,7 +230,7 @@ func (h *Handler) GetRetrievalBuild(c *gin.Context) {
 
 	rb, err := h.ciStore.GetRetrievalBuildByID(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"code": "RETRIEVAL_BUILD_NOT_FOUND", "error": "retrieval build not found"})
 		return
 	}
 
@@ -240,4 +242,9 @@ func calcPct(num, den int) string {
 		return "0.0%"
 	}
 	return fmt.Sprintf("%.1f%%", float64(num)/float64(den)*100.0)
+}
+
+func writeCodeIntelInternalError(c *gin.Context, code, message string, err error) {
+	logger.L(c.Request.Context()).Error(message, "error", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"code": code, "error": message})
 }
