@@ -6,8 +6,8 @@
 
 - Dataset: `realbench-v1`
 - Manifest hash: `5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf`
-- RepoLens commit: `f1f9a13f631de95bc5daf1623da38ceb1e30c0a8`
-- Run ID: `20260920T104549Z-457d9ffd`
+- RepoLens commit: `0233130869239696d235ff2447a5facf891bdf4a`
+- Run ID: `20260920T132009Z-404659fd`
 - Command: `go run ./cmd/realbench run --all`
 - Retrieval: `symbol_bm25_structural` — current Pure Go BM25 + Structural Retrieval
 - Retrieval / index version: `v2.1.0` / `v2.1.0`; Agent / Prompt version: `v2.2` / `v2.2`
@@ -34,9 +34,9 @@
 
 | Case | Repository | Top-10 primary-file rank | Hit@5 | Hit@10 | Latency |
 |---|---|---:|---:|---:|---:|
-| REAL-001 | go-chi/chi | 1 | yes | yes | 14 ms |
-| REAL-002 | spf13/cobra | 3 | yes | yes | 19 ms |
-| REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 4 ms |
+| REAL-001 | go-chi/chi | 1 | yes | yes | 12 ms |
+| REAL-002 | spf13/cobra | 3 | yes | yes | 18 ms |
+| REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 2 ms |
 
 ## Code Intelligence quality
 
@@ -52,7 +52,7 @@ The raw per-case quality files and CSV summary are stored in the run artifact di
 
 ## Failure analysis
 
-本次在 clean HEAD `f1f9a13` 重跑没有 Retrieval failure、Infra Error 或 Product Failure，因此没有隐藏失败 case。REAL-002 的 primary file 排名为 3，仍命中 Hit@5，但相较另外两个 case 需要更多候选排序空间；这个观察仅记录为 benchmark 证据，不在本任务中修改检索算法。
+本次在 clean HEAD `0233130` 重跑没有 Retrieval failure、Infra Error 或 Product Failure，因此没有隐藏失败 case。REAL-002 的 primary file 排名为 3，仍命中 Hit@5，但相较另外两个 case 需要更多候选排序空间；这个观察仅记录为 benchmark 证据，不在本任务中修改检索算法。
 
 本次没有请求 E2E（`--e2e` 未传），因此没有生成真实 Agent diagnosis、Citation validity 或 Root Cause Correct/Partial/Incorrect 分数；FakeProvider 不作为公开 E2E 成绩。若请求 E2E 但未配置 provider，状态会单独记录为 `NOT_RUN_PROVIDER_NOT_CONFIGURED`。
 
