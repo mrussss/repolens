@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	codeintelmodel "repolens/internal/codeintel/model"
 	"repolens/internal/jobs"
 )
 
@@ -33,7 +35,7 @@ type ClaimedMaterializationFinalizer interface {
 }
 
 type ClaimedMaterializationRevisionFinalizer interface {
-	FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
+	FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 }
 
 type GormStore struct {
@@ -162,7 +164,7 @@ func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, wo
 
 // FinalizeSnapshotSuccessWithRevision atomically publishes a snapshot,
 // advances its AnalysisRevision, and completes the claimed job.
-func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
 	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
 		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", snapshotID)
 	}
@@ -184,8 +186,52 @@ func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, job
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("snapshot %s materialization finalize conflict", snapshotID)
 		}
+
+		var existingCodeIndexID sql.NullInt64
+		if err := tx.Raw("SELECT code_index_build_id FROM analysis_revisions WHERE id = ? AND status = ? AND snapshot_id = ?", revisionID, "PREPARING", snapshotID).Scan(&existingCodeIndexID).Error; err != nil {
+			return err
+		}
+		codeIndexID := int64(0)
+		if existingCodeIndexID.Valid {
+			codeIndexID = existingCodeIndexID.Int64
+		}
+		if codeIndexID == 0 {
+			bc := codeintelmodel.DefaultBuildContext()
+			build := &codeintelmodel.CodeIndexBuild{
+				AnalysisRevisionID:  revisionID,
+				SnapshotID:          snapshotID,
+				ParserVersion:       codeintelmodel.CurrentParserVersion,
+				AnalyzerVersion:     codeintelmodel.CurrentAnalyzerVersion,
+				SymbolSchemaVersion: codeintelmodel.CurrentSymbolSchemaVersion,
+				BuildContextHash:    bc.BuildContextHash(),
+				ModulePath:          modulePath,
+				GOOS:                bc.GOOS,
+				GOARCH:              bc.GOARCH,
+				BuildTagsHash:       bc.BuildTagsHash(),
+				Status:              codeintelmodel.BuildStatusCreated,
+				CreatedAt:           readyAt,
+			}
+			if err := tx.Create(build).Error; err != nil {
+				return err
+			}
+			codeIndexID = build.ID
+		}
+
+		codeIndexJob := &jobs.AnalysisJob{}
+		jobLookup := tx.Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", codeIndexID)).First(codeIndexJob)
+		if errors.Is(jobLookup.Error, gorm.ErrRecordNotFound) {
+			if err := tx.Create(&jobs.AnalysisJob{
+				JobType: jobs.JobTypeBuildCodeIndex, ResourceID: fmt.Sprintf("%d", codeIndexID),
+				Status: jobs.StatusPending, ExecutionGeneration: job.ExecutionGeneration, MaxAttempts: 3, NextRunAt: readyAt,
+			}).Error; err != nil {
+				return err
+			}
+		} else if jobLookup.Error != nil {
+			return jobLookup.Error
+		}
+
 		revisionResult := tx.Table("analysis_revisions").Where("id = ? AND status = ? AND snapshot_id = ?", revisionID, "PREPARING", snapshotID).Updates(map[string]interface{}{
-			"stage": "BUILDING_CODE_INDEX", "version": gorm.Expr("version + 1"), "updated_at": readyAt,
+			"stage": "BUILDING_CODE_INDEX", "code_index_build_id": codeIndexID, "version": gorm.Expr("version + 1"), "updated_at": readyAt,
 		})
 		if revisionResult.Error != nil {
 			return revisionResult.Error

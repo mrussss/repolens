@@ -237,7 +237,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 	stageFinalized := false
 	if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationRevisionFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil && snap.AnalysisRevisionID != "" {
-		if err := finalizer.FinalizeSnapshotSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, snap.AnalysisRevisionID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+		if err := finalizer.FinalizeSnapshotSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, snap.AnalysisRevisionID, r.Name, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return err
 		}
@@ -262,7 +262,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 
 	// Auto-chain BUILD_CODE_INDEX job if codeIntelStore is wired
-	if h.codeIntelStore != nil {
+	if h.codeIntelStore != nil && !stageFinalized {
 		_, _, _ = h.codeIntelStore.GetOrCreateBuild(ctx, snap.ID, r.Name, codeintelmodel.DefaultBuildContext())
 	}
 

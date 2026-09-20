@@ -43,7 +43,7 @@ func (m *MemoryBM25Retriever) Search(ctx context.Context, req retrieval.SearchRe
 
 func main() {
 	fmt.Println("=========================================================================================================")
-	fmt.Println("              RepoLens v2.1 — AI Code Intelligence & Diagnosis Platform (Benchmark Runner)              ")
+	fmt.Println("              RepoLens v2.2 — AI Code Intelligence & Diagnosis Platform (Benchmark Runner)              ")
 	fmt.Println("=========================================================================================================")
 
 	dataDir := "testdata/eval"

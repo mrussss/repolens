@@ -5,7 +5,7 @@ import "testing"
 func TestParseReportJSONSkipsProseBracesBeforeFencedJSON(t *testing.T) {
 	raw := "Analysis note: if shouldRedirect { shouldRedirect = false }\n\n" +
 		"```json\n" +
-		`{"summary":"summary","root_cause":"root cause","findings":[]}` +
+		`{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[]}` +
 		"\n```"
 
 	report, err := parseReportJSON(raw)

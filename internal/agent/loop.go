@@ -433,8 +433,5 @@ func reportIsStructurallyParseable(report *evidence.DiagnosisReportData) bool {
 	if report.ConclusionKind == evidence.ConclusionInsufficientEvidence {
 		return true
 	}
-	if report.ConclusionKind == "" && report.RootCause != "" {
-		report.ConclusionKind = evidence.ConclusionRootCause
-	}
 	return report.ConclusionKind == evidence.ConclusionRootCause && report.RootCause != ""
 }

@@ -72,7 +72,6 @@ func (r *Runner) RunRetrievalEval(ctx context.Context, strategy string, retrieve
 		PromptVersion:       "v2.2",
 		AgentVersion:        "v2.2",
 		Model:               "fake-deterministic",
-		EmbeddingModel:      "pseudo-embed-128",
 		DatasetManifestHash: DatasetManifestHash(r.cases),
 		AgentConfigHash:     diagnosis.ComputeAgentConfigHash(8, 12, 2, 0.1),
 		TotalCases:          len(r.cases),
@@ -82,7 +81,7 @@ func (r *Runner) RunRetrievalEval(ctx context.Context, strategy string, retrieve
 	var results []CaseEvalResult
 
 	for _, c := range r.cases {
-		query := c.IssueTitle + " " + c.ErrorLog
+		query := retrieval.BuildQuery(c.IssueTitle, c.IssueDescription, c.ErrorLog)
 		start := time.Now()
 
 		searchRes, err := retriever.Search(ctx, retrieval.SearchRequest{
@@ -143,7 +142,7 @@ func (r *Runner) RunEndToEndDiagnosisEval(ctx context.Context, provider llm.Prov
 		start := time.Now()
 
 		// 1. Evaluate Retrieval on the case query against ground-truth relevant files
-		query := c.IssueTitle + " " + c.ErrorLog
+		query := retrieval.BuildQuery(c.IssueTitle, c.IssueDescription, c.ErrorLog)
 		searchRes, _ := retriever.Search(ctx, retrieval.SearchRequest{
 			SnapshotID: c.SnapshotSHA,
 			Query:      query,

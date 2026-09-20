@@ -9,23 +9,25 @@ import (
 )
 
 type EvalRun struct {
-	ID                  string    `json:"id"`
-	DatasetVersion      string    `json:"dataset_version"`
-	GitCommit           string    `json:"git_commit"`
-	SnapshotSHA         string    `json:"snapshot_sha"`
-	RetrievalStrategy   string    `json:"retrieval_strategy"`
-	RetrievalVersion    string    `json:"retrieval_version"`
-	IndexVersion        string    `json:"index_version"`
-	PromptVersion       string    `json:"prompt_version"`
-	AgentVersion        string    `json:"agent_version"`
-	Model               string    `json:"model"`
-	DatasetManifestHash string    `json:"dataset_manifest_hash"`
-	AgentConfigHash     string    `json:"agent_config_hash"`
-	EmbeddingModel      string    `json:"embedding_model"`
-	TotalCases          int       `json:"total_cases"`
-	StartedAt           time.Time `json:"started_at"`
-	FinishedAt          time.Time `json:"finished_at"`
-	Metrics             Metrics   `json:"metrics"`
+	ID                  string `json:"id"`
+	DatasetVersion      string `json:"dataset_version"`
+	GitCommit           string `json:"git_commit"`
+	SnapshotSHA         string `json:"snapshot_sha"`
+	RetrievalStrategy   string `json:"retrieval_strategy"`
+	RetrievalVersion    string `json:"retrieval_version"`
+	IndexVersion        string `json:"index_version"`
+	PromptVersion       string `json:"prompt_version"`
+	AgentVersion        string `json:"agent_version"`
+	Model               string `json:"model"`
+	DatasetManifestHash string `json:"dataset_manifest_hash"`
+	AgentConfigHash     string `json:"agent_config_hash"`
+	// Kept for backwards-compatible result decoding. Current production
+	// retrieval does not use embeddings, so new runs leave this empty.
+	EmbeddingModel string    `json:"embedding_model,omitempty"`
+	TotalCases     int       `json:"total_cases"`
+	StartedAt      time.Time `json:"started_at"`
+	FinishedAt     time.Time `json:"finished_at"`
+	Metrics        Metrics   `json:"metrics"`
 }
 
 // DatasetManifestHash is the reproducibility fingerprint for the exact case

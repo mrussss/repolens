@@ -125,37 +125,7 @@ func (s *GormStore) CreatePreparation(ctx context.Context, spec PrepareSpec) (*A
 		Status:             snapshot.StatusMaterializing,
 		CreatedAt:          now,
 	}
-	bc := codeintelmodel.DefaultBuildContext()
-	build := &codeintelmodel.CodeIndexBuild{
-		AnalysisRevisionID:  revision.ID,
-		SnapshotID:          snap.ID,
-		ParserVersion:       codeintelmodel.CurrentParserVersion,
-		AnalyzerVersion:     codeintelmodel.CurrentAnalyzerVersion,
-		SymbolSchemaVersion: codeintelmodel.CurrentSymbolSchemaVersion,
-		BuildContextHash:    bc.BuildContextHash(),
-		ModulePath:          spec.ModulePath,
-		GOOS:                bc.GOOS,
-		GOARCH:              bc.GOARCH,
-		BuildTagsHash:       bc.BuildTagsHash(),
-		Status:              codeintelmodel.BuildStatusCreated,
-		CreatedAt:           now,
-	}
-	retrievalBuild := &codeintelmodel.RetrievalBuild{
-		AnalysisRevisionID: revision.ID,
-		CodeIndexBuildID:   build.ID,
-		// The current production adapter is Pure Go BM25 plus structural
-		// expansion; BM25 remains the persisted build strategy for v2.1
-		// compatibility and avoids creating a duplicate derived build.
-		Strategy:         "BM25",
-		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion,
-		TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
-		ConfigHash:       "config-v2.1",
-		Status:           codeintelmodel.BuildStatusCreated,
-		CreatedAt:        now,
-	}
 	revision.SnapshotID = snap.ID
-	revision.CodeIndexBuildID = 0
-	revision.RetrievalBuildID = 0
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(revision).Error; err != nil {
@@ -164,34 +134,16 @@ func (s *GormStore) CreatePreparation(ctx context.Context, spec PrepareSpec) (*A
 		if err := tx.Create(snap).Error; err != nil {
 			return err
 		}
-		if err := tx.Create(build).Error; err != nil {
+		job := &jobs.AnalysisJob{
+			JobType:             jobs.JobTypeMaterializeSnapshot,
+			ResourceID:          snap.ID,
+			Status:              jobs.StatusPending,
+			ExecutionGeneration: 1,
+			MaxAttempts:         3,
+			NextRunAt:           now,
+		}
+		if err := createJobGorm(tx, job); err != nil {
 			return err
-		}
-		retrievalBuild.CodeIndexBuildID = build.ID
-		if err := tx.Create(retrievalBuild).Error; err != nil {
-			return err
-		}
-		revision.CodeIndexBuildID = build.ID
-		revision.RetrievalBuildID = retrievalBuild.ID
-		if err := tx.Model(&AnalysisRevision{}).Where("id = ?", revision.ID).Updates(map[string]interface{}{
-			"code_index_build_id": build.ID,
-			"retrieval_build_id":  retrievalBuild.ID,
-		}).Error; err != nil {
-			return err
-		}
-		jobsToCreate := []*jobs.AnalysisJob{
-			{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: snap.ID},
-			{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: fmt.Sprintf("%d", build.ID)},
-			{JobType: jobs.JobTypeBuildRetrieval, ResourceID: fmt.Sprintf("%d", retrievalBuild.ID)},
-		}
-		for _, job := range jobsToCreate {
-			job.Status = jobs.StatusPending
-			job.ExecutionGeneration = 1
-			job.MaxAttempts = 3
-			job.NextRunAt = now
-			if err := createJobGorm(tx, job); err != nil {
-				return err
-			}
 		}
 		return nil
 	})
@@ -217,16 +169,18 @@ func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, er
 		if value.Status != StatusFailed {
 			return ErrInvalidState
 		}
+		now := time.Now().UTC()
 		value.Status = StatusPreparing
 		value.Stage = StageMaterializing
 		value.ErrorCode = ""
 		value.ErrorMessage = ""
+		value.ReadyAt = nil
 		value.ExecutionGeneration++
 		value.Version++
-		value.UpdatedAt = time.Now().UTC()
+		value.UpdatedAt = now
 		if err := tx.Model(&AnalysisRevision{}).Where("id = ? AND status = ?", id, StatusFailed).Updates(map[string]interface{}{
 			"status": StatusPreparing, "stage": StageMaterializing, "error_code": "", "error_message": "",
-			"execution_generation": value.ExecutionGeneration, "version": value.Version,
+			"ready_at": nil, "execution_generation": value.ExecutionGeneration, "version": value.Version,
 		}).Error; err != nil {
 			return err
 		}
@@ -234,50 +188,94 @@ func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, er
 		if err := tx.First(&snap, "id = ?", value.SnapshotID).Error; err != nil {
 			return err
 		}
+		if snap.Status != snapshot.StatusReady {
+			if err := tx.Model(&snapshot.RepositorySnapshot{}).Where("id = ?", snap.ID).Updates(map[string]interface{}{"status": snapshot.StatusMaterializing, "error_code": "", "ready_at": nil}).Error; err != nil {
+				return err
+			}
+			if value.CodeIndexBuildID > 0 {
+				if err := resetCodeBuildTx(tx, value.CodeIndexBuildID); err != nil {
+					return err
+				}
+			}
+			if value.RetrievalBuildID > 0 {
+				if err := resetRetrievalBuildTx(tx, value.RetrievalBuildID); err != nil {
+					return err
+				}
+			}
+			return resetJobTx(tx, jobs.JobTypeMaterializeSnapshot, snap.ID, value.ExecutionGeneration, now)
+		}
+
+		if value.CodeIndexBuildID == 0 {
+			modulePath, err := repositoryModulePathTx(tx, value.RepositoryID)
+			if err != nil {
+				return err
+			}
+			build, err := ensureCodeIndexBuildTx(tx, value.ID, snap.ID, modulePath, now)
+			if err != nil {
+				return err
+			}
+			value.CodeIndexBuildID = build.ID
+			value.Stage = StageBuildingCode
+			if err := tx.Model(&AnalysisRevision{}).Where("id = ?", id).Updates(map[string]interface{}{
+				"stage": StageBuildingCode, "code_index_build_id": build.ID, "updated_at": now,
+			}).Error; err != nil {
+				return err
+			}
+			return resetJobTx(tx, jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", build.ID), value.ExecutionGeneration, now)
+		}
+
 		var build codeintelmodel.CodeIndexBuild
 		if err := tx.First(&build, "id = ?", value.CodeIndexBuildID).Error; err != nil {
 			return err
 		}
+		if build.Status != codeintelmodel.BuildStatusReady {
+			value.Stage = StageBuildingCode
+			if err := resetCodeBuildTx(tx, build.ID); err != nil {
+				return err
+			}
+			if err := tx.Model(&AnalysisRevision{}).Where("id = ?", id).Updates(map[string]interface{}{"stage": StageBuildingCode, "updated_at": now}).Error; err != nil {
+				return err
+			}
+			return resetJobTx(tx, jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", build.ID), value.ExecutionGeneration, now)
+		}
+
+		if value.RetrievalBuildID == 0 {
+			rb, err := ensureRetrievalBuildTx(tx, value.ID, build.ID, now)
+			if err != nil {
+				return err
+			}
+			value.RetrievalBuildID = rb.ID
+			value.Stage = StageBuildingSearch
+			if err := tx.Model(&AnalysisRevision{}).Where("id = ?", id).Updates(map[string]interface{}{
+				"stage": StageBuildingSearch, "retrieval_build_id": rb.ID, "updated_at": now,
+			}).Error; err != nil {
+				return err
+			}
+			return resetJobTx(tx, jobs.JobTypeBuildRetrieval, fmt.Sprintf("%d", rb.ID), value.ExecutionGeneration, now)
+		}
+
 		var rb codeintelmodel.RetrievalBuild
 		if err := tx.First(&rb, "id = ?", value.RetrievalBuildID).Error; err != nil {
 			return err
 		}
-		if snap.Status != snapshot.StatusReady {
-			_ = tx.Model(&snapshot.RepositorySnapshot{}).Where("id = ?", snap.ID).Updates(map[string]interface{}{"status": snapshot.StatusMaterializing, "error_code": ""})
-			_ = tx.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Updates(map[string]interface{}{"status": codeintelmodel.BuildStatusCreated, "error_code": ""})
-			_ = tx.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", rb.ID).Updates(map[string]interface{}{"status": codeintelmodel.BuildStatusCreated, "error_code": ""})
-		} else if build.Status != codeintelmodel.BuildStatusReady {
-			value.Stage = StageBuildingCode
-			_ = tx.Model(&AnalysisRevision{}).Where("id = ?", id).Updates(map[string]interface{}{"stage": StageBuildingCode})
-			_ = tx.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Updates(map[string]interface{}{"status": codeintelmodel.BuildStatusCreated, "error_code": ""})
-			_ = tx.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", rb.ID).Updates(map[string]interface{}{"status": codeintelmodel.BuildStatusCreated, "error_code": ""})
-		} else if rb.Status != codeintelmodel.BuildStatusReady {
+		if rb.Status != codeintelmodel.BuildStatusReady {
 			value.Stage = StageBuildingSearch
-			_ = tx.Model(&AnalysisRevision{}).Where("id = ?", id).Updates(map[string]interface{}{"stage": StageBuildingSearch})
-			_ = tx.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", rb.ID).Updates(map[string]interface{}{"status": codeintelmodel.BuildStatusCreated, "error_code": ""})
-		} else {
-			value.Status = StatusReady
-			value.Stage = StageReady
-			now := time.Now().UTC()
-			value.ReadyAt = &now
-			_ = tx.Model(&AnalysisRevision{}).Where("id = ?", id).Updates(map[string]interface{}{"status": StatusReady, "stage": StageReady, "ready_at": now})
-		}
-		for _, item := range []struct {
-			typ      jobs.JobType
-			resource string
-		}{
-			{jobs.JobTypeMaterializeSnapshot, snap.ID},
-			{jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", build.ID)},
-			{jobs.JobTypeBuildRetrieval, fmt.Sprintf("%d", rb.ID)},
-		} {
-			if err := tx.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", item.typ, item.resource).Updates(map[string]interface{}{
-				"status": jobs.StatusPending, "execution_generation": value.ExecutionGeneration, "attempt_count": 0,
-				"next_run_at": time.Now().UTC(), "worker_id": nil, "claim_token": nil, "lease_until": nil,
-				"cancel_requested": false, "terminal_reason": nil, "last_error_class": nil, "last_error_code": nil,
-				"last_error_message": nil, "finished_at": nil,
-			}).Error; err != nil {
+			if err := resetRetrievalBuildTx(tx, rb.ID); err != nil {
 				return err
 			}
+			if err := tx.Model(&AnalysisRevision{}).Where("id = ?", id).Updates(map[string]interface{}{"stage": StageBuildingSearch, "updated_at": now}).Error; err != nil {
+				return err
+			}
+			return resetJobTx(tx, jobs.JobTypeBuildRetrieval, fmt.Sprintf("%d", rb.ID), value.ExecutionGeneration, now)
+		}
+
+		value.Status = StatusReady
+		value.Stage = StageReady
+		value.ReadyAt = &now
+		if err := tx.Model(&AnalysisRevision{}).Where("id = ?", id).Updates(map[string]interface{}{
+			"status": StatusReady, "stage": StageReady, "ready_at": now, "updated_at": now,
+		}).Error; err != nil {
+			return err
 		}
 		return nil
 	})
@@ -285,6 +283,106 @@ func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, er
 		return nil, err
 	}
 	return &value, nil
+}
+
+func resetJobTx(tx *gorm.DB, jobType jobs.JobType, resourceID string, generation int, now time.Time) error {
+	updates := map[string]interface{}{
+		"status": jobs.StatusPending, "execution_generation": generation, "attempt_count": 0,
+		"next_run_at": now, "worker_id": nil, "claim_token": nil, "lease_until": nil,
+		"cancel_requested": false, "terminal_reason": nil, "last_error_class": nil,
+		"last_error_code": nil, "last_error_message": nil, "finished_at": nil,
+	}
+	result := tx.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobType, resourceID).Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return createJobGorm(tx, &jobs.AnalysisJob{
+			JobType: jobType, ResourceID: resourceID, Status: jobs.StatusPending,
+			ExecutionGeneration: generation, MaxAttempts: 3, NextRunAt: now,
+		})
+	}
+	return nil
+}
+
+func resetCodeBuildTx(tx *gorm.DB, buildID int64) error {
+	return tx.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", buildID).Updates(map[string]interface{}{
+		"status": codeintelmodel.BuildStatusCreated, "error_code": "", "ready_at": nil,
+	}).Error
+}
+
+func resetRetrievalBuildTx(tx *gorm.DB, buildID int64) error {
+	return tx.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", buildID).Updates(map[string]interface{}{
+		"status": codeintelmodel.BuildStatusCreated, "error_code": "", "artifact_path": "", "artifact_hash": "", "ready_at": nil,
+	}).Error
+}
+
+func repositoryModulePathTx(tx *gorm.DB, repositoryID string) (string, error) {
+	var modulePath string
+	if err := tx.Table("repositories").Select("name").Where("id = ?", repositoryID).Scan(&modulePath).Error; err != nil {
+		return "", err
+	}
+	if modulePath == "" {
+		modulePath = repositoryID
+	}
+	return modulePath, nil
+}
+
+func ensureCodeIndexBuildTx(tx *gorm.DB, revisionID, snapshotID, modulePath string, now time.Time) (*codeintelmodel.CodeIndexBuild, error) {
+	bc := codeintelmodel.DefaultBuildContext()
+	var build codeintelmodel.CodeIndexBuild
+	err := tx.Where("snapshot_id = ? AND parser_version = ? AND analyzer_version = ? AND symbol_schema_version = ? AND build_context_hash = ?", snapshotID, codeintelmodel.CurrentParserVersion, codeintelmodel.CurrentAnalyzerVersion, codeintelmodel.CurrentSymbolSchemaVersion, bc.BuildContextHash()).First(&build).Error
+	if err == nil {
+		if build.AnalysisRevisionID == "" {
+			if err := tx.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Update("analysis_revision_id", revisionID).Error; err != nil {
+				return nil, err
+			}
+			build.AnalysisRevisionID = revisionID
+		}
+		return &build, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	build = codeintelmodel.CodeIndexBuild{
+		AnalysisRevisionID: revisionID, SnapshotID: snapshotID,
+		ParserVersion: codeintelmodel.CurrentParserVersion, AnalyzerVersion: codeintelmodel.CurrentAnalyzerVersion,
+		SymbolSchemaVersion: codeintelmodel.CurrentSymbolSchemaVersion, BuildContextHash: bc.BuildContextHash(),
+		ModulePath: modulePath, GOOS: bc.GOOS, GOARCH: bc.GOARCH, BuildTagsHash: bc.BuildTagsHash(),
+		Status: codeintelmodel.BuildStatusCreated, CreatedAt: now,
+	}
+	if err := tx.Create(&build).Error; err != nil {
+		return nil, err
+	}
+	return &build, nil
+}
+
+func ensureRetrievalBuildTx(tx *gorm.DB, revisionID string, codeIndexBuildID int64, now time.Time) (*codeintelmodel.RetrievalBuild, error) {
+	const strategy = "BM25"
+	const configHash = "config-v2.1"
+	var build codeintelmodel.RetrievalBuild
+	err := tx.Where("code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?", codeIndexBuildID, strategy, codeintelmodel.CurrentRetrievalVersion, codeintelmodel.CurrentTokenizerVersion, configHash).First(&build).Error
+	if err == nil {
+		if build.AnalysisRevisionID == "" {
+			if err := tx.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", build.ID).Update("analysis_revision_id", revisionID).Error; err != nil {
+				return nil, err
+			}
+			build.AnalysisRevisionID = revisionID
+		}
+		return &build, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	build = codeintelmodel.RetrievalBuild{
+		AnalysisRevisionID: revisionID, CodeIndexBuildID: codeIndexBuildID, Strategy: strategy,
+		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion, TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
+		ConfigHash: configHash, Status: codeintelmodel.BuildStatusCreated, CreatedAt: now,
+	}
+	if err := tx.Create(&build).Error; err != nil {
+		return nil, err
+	}
+	return &build, nil
 }
 
 func (s *GormStore) MarkSnapshotReady(ctx context.Context, id, snapshotID string) error {

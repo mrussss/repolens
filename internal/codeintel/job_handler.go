@@ -126,8 +126,11 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		return saveErr
 	}
 
-	// Auto-create/trigger BUILD_RETRIEVAL job for derived retrieval index
-	_, _, _ = h.store.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
+	// The revision-aware finalizer creates the next stage in the same
+	// transaction. Keep this fallback for legacy/non-revision stores only.
+	if !stageFinalized {
+		_, _, _ = h.store.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
+	}
 	if !stageFinalized && h.revisionStore != nil && cib.AnalysisRevisionID != "" {
 		if err := h.revisionStore.MarkCodeIndexReady(ctx, cib.AnalysisRevisionID, cib.ID); err != nil {
 			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)

@@ -85,11 +85,6 @@ func ClassifyReport(data *DiagnosisReportData, structured bool) (ReportQuality, 
 	if !structured || data == nil {
 		return ReportQuality{Status: ReportInvalid}, errors.New("structured report is invalid")
 	}
-	if data.ConclusionKind == "" && data.RootCause != "" {
-		// Compatibility for v2.1 Scripted/Fake providers. New provider output
-		// is prompted to emit the explicit field.
-		data.ConclusionKind = ConclusionRootCause
-	}
 	if data.ConclusionKind != ConclusionRootCause && data.ConclusionKind != ConclusionInsufficientEvidence {
 		return ReportQuality{Status: ReportInvalid}, errors.New("conclusion_kind is invalid")
 	}

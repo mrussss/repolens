@@ -59,7 +59,7 @@ func TestPrepareCreatesOneProductRevisionAndLineage(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("first prepare = created=%v err=%v", created, err)
 	}
-	if first.Status != revision.StatusPreparing || first.Stage != revision.StageMaterializing || first.SnapshotID == "" || first.CodeIndexBuildID == 0 || first.RetrievalBuildID == 0 {
+	if first.Status != revision.StatusPreparing || first.Stage != revision.StageMaterializing || first.SnapshotID == "" || first.CodeIndexBuildID != 0 || first.RetrievalBuildID != 0 {
 		t.Fatalf("incomplete revision lineage: %+v", first)
 	}
 
@@ -71,8 +71,8 @@ func TestPrepareCreatesOneProductRevisionAndLineage(t *testing.T) {
 	if err := db.Model(&jobs.AnalysisJob{}).Count(&jobCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if jobCount != 3 {
-		t.Fatalf("job count = %d, want one job per preparation stage", jobCount)
+	if jobCount != 1 {
+		t.Fatalf("job count = %d, want only the current preparation stage job", jobCount)
 	}
 
 	snap, err := snapshot.NewStore(db).GetByID(ctx, first.SnapshotID)
@@ -100,16 +100,35 @@ func TestRevisionTransitionsToReadyAndRetryIsExplicit(t *testing.T) {
 	if err := store.MarkSnapshotReady(ctx, value.ID, value.SnapshotID); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", value.CodeIndexBuildID).Update("status", codeintelmodel.BuildStatusReady).Error; err != nil {
+	bc := codeintelmodel.DefaultBuildContext()
+	codeBuild := &codeintelmodel.CodeIndexBuild{
+		SnapshotID: value.SnapshotID, AnalysisRevisionID: value.ID,
+		ParserVersion: codeintelmodel.CurrentParserVersion, AnalyzerVersion: codeintelmodel.CurrentAnalyzerVersion,
+		SymbolSchemaVersion: codeintelmodel.CurrentSymbolSchemaVersion, BuildContextHash: bc.BuildContextHash(),
+		ModulePath: "state", GOOS: bc.GOOS, GOARCH: bc.GOARCH, BuildTagsHash: bc.BuildTagsHash(),
+		Status: codeintelmodel.BuildStatusReady,
+	}
+	if err := db.Create(codeBuild).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkCodeIndexReady(ctx, value.ID, value.CodeIndexBuildID); err != nil {
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", value.ID).Update("code_index_build_id", codeBuild.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", value.RetrievalBuildID).Update("status", codeintelmodel.BuildStatusReady).Error; err != nil {
+	if err := store.MarkCodeIndexReady(ctx, value.ID, codeBuild.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkRetrievalReady(ctx, value.ID, value.RetrievalBuildID); err != nil {
+	retrievalBuild := &codeintelmodel.RetrievalBuild{
+		CodeIndexBuildID: codeBuild.ID, AnalysisRevisionID: value.ID, Strategy: "BM25",
+		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion, TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
+		ConfigHash: "config-v2.1", Status: codeintelmodel.BuildStatusReady,
+	}
+	if err := db.Create(retrievalBuild).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", value.ID).Update("retrieval_build_id", retrievalBuild.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkRetrievalReady(ctx, value.ID, retrievalBuild.ID); err != nil {
 		t.Fatal(err)
 	}
 	ready, err := store.GetByID(ctx, value.ID)

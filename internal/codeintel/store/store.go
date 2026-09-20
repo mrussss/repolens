@@ -244,9 +244,47 @@ func (s *GormStore) FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jo
 		if err := s.saveAnalysisResultTx(tx, buildID, res); err != nil {
 			return err
 		}
+		now := time.Now().UTC()
+		var productRevision revision.AnalysisRevision
+		if err := tx.Where("id = ? AND status = ? AND code_index_build_id = ?", revisionID, revision.StatusPreparing, buildID).First(&productRevision).Error; err != nil {
+			return revision.ErrLineage
+		}
+		retrievalBuildID := productRevision.RetrievalBuildID
+		if retrievalBuildID == 0 {
+			retrievalBuild := &model.RetrievalBuild{
+				AnalysisRevisionID: revisionID,
+				CodeIndexBuildID:   buildID,
+				Strategy:           "BM25",
+				RetrievalVersion:   model.CurrentRetrievalVersion,
+				TokenizerVersion:   model.CurrentTokenizerVersion,
+				ConfigHash:         "config-v2.1",
+				Status:             model.BuildStatusCreated,
+				CreatedAt:          now,
+			}
+			if err := tx.Create(retrievalBuild).Error; err != nil {
+				return err
+			}
+			retrievalBuildID = retrievalBuild.ID
+		} else if err := tx.Model(&model.RetrievalBuild{}).Where("id = ?", retrievalBuildID).Updates(map[string]interface{}{"analysis_revision_id": revisionID}).Error; err != nil {
+			return err
+		}
+
+		retrievalJob := &jobs.AnalysisJob{}
+		jobLookup := tx.Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildRetrieval, fmt.Sprintf("%d", retrievalBuildID)).First(retrievalJob)
+		if errors.Is(jobLookup.Error, gorm.ErrRecordNotFound) {
+			if err := tx.Create(&jobs.AnalysisJob{
+				JobType: jobs.JobTypeBuildRetrieval, ResourceID: fmt.Sprintf("%d", retrievalBuildID),
+				Status: jobs.StatusPending, ExecutionGeneration: productRevision.ExecutionGeneration,
+				MaxAttempts: 3, NextRunAt: now,
+			}).Error; err != nil {
+				return err
+			}
+		} else if jobLookup.Error != nil {
+			return jobLookup.Error
+		}
 		result := tx.Model(&revision.AnalysisRevision{}).
 			Where("id = ? AND status = ? AND code_index_build_id = ?", revisionID, revision.StatusPreparing, buildID).
-			Updates(map[string]interface{}{"stage": revision.StageBuildingSearch, "version": gorm.Expr("version + 1"), "updated_at": time.Now().UTC()})
+			Updates(map[string]interface{}{"stage": revision.StageBuildingSearch, "retrieval_build_id": retrievalBuildID, "version": gorm.Expr("version + 1"), "updated_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
