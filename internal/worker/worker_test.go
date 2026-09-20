@@ -22,6 +22,14 @@ type checkpointCountingExecutor struct {
 	calls int
 }
 
+type checkpointFailingStore struct {
+	*diagnosis.GormStore
+}
+
+func (s checkpointFailingStore) UpdateAttemptCheckpoint(context.Context, string, string, string, bool, int, int, int, int, int, int, int, int, string) error {
+	return errors.New("checkpoint storage unavailable")
+}
+
 func (e *checkpointCountingExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	e.calls++
 	return nil, errors.New("provider should not be called when a checkpoint exists")
@@ -248,5 +256,42 @@ func TestWorkerJobHandlerResumesFromProviderCheckpoint(t *testing.T) {
 	report, err := repStore.GetByRunID(ctx, run.ID)
 	if err != nil || report.ReportStatus != evidence.ReportInsufficientEvidence {
 		t.Fatalf("checkpoint report = %+v err=%v", report, err)
+	}
+}
+
+func TestWorkerJobHandlerCheckpointFailureStopsAutomaticRetry(t *testing.T) {
+	db, jobsStore := setupTestEnvironment(t)
+	ctx := context.Background()
+	baseStore := diagnosis.NewStore(db)
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-checkpoint-failure", UserID: "user-checkpoint-failure", RepositoryID: "repo-checkpoint-failure",
+		SnapshotID: "snap-checkpoint-failure", IssueTitle: "checkpoint failure", IdempotencyKey: "checkpoint-failure-key", IdempotencyRequestHash: "checkpoint-failure-hash",
+	}
+	if err := baseStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-checkpoint-failure", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("failed to claim checkpoint job: err=%v jobs=%d", err, len(claimed))
+	}
+	store := checkpointFailingStore{GormStore: baseStore}
+	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	handler := worker.NewDiagnosisJobHandler(
+		store,
+		evidence.NewReportStore(db),
+		evidence.NewCitationStore(db),
+		evidence.NewCitationValidator(storeFS),
+		worker.NewFakeDiagnosisExecutor(),
+	)
+	if err := handler.Execute(ctx, claimed[0]); err == nil {
+		t.Fatal("expected checkpoint failure")
+	}
+	savedRun, err := baseStore.GetByID(ctx, run.ID)
+	if err != nil || savedRun.Status != diagnosis.StatusFailed {
+		t.Fatalf("run after checkpoint failure = %+v err=%v, want FAILED", savedRun, err)
+	}
+	attempts, err := baseStore.ListAttemptsByRun(ctx, run.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusFailedTerminal || attempts[0].ErrorCode != "CHECKPOINT_SAVE_FAILED" {
+		t.Fatalf("attempts after checkpoint failure = %+v err=%v", attempts, err)
 	}
 }

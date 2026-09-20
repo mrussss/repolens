@@ -56,20 +56,80 @@ func BuildEvidencePacket(results []SearchResult, maxBytes int) string {
 		maxBytes = 32 * 1024
 	}
 	seen := make(map[string]struct{})
+	accepted := make([]SearchResult, 0, len(results))
 	var builder strings.Builder
 	for _, result := range results {
 		key := result.Path + ":" + resultLineKey(result)
 		if _, ok := seen[key]; ok {
 			continue
 		}
+		if overlapsAccepted(result, accepted) {
+			continue
+		}
 		seen[key] = struct{}{}
-		entry := "- " + result.Path + ":" + resultLineKey(result) + " score=" + formatScore(result.Score) + "\n" + result.Snippet + "\n"
+		reason := result.RetrievalReason
+		if reason == "" {
+			reason = result.RetrievalSource
+		}
+		entry := "- " + result.Path + ":" + resultLineKey(result) + " score=" + formatScore(result.Score) + " reason=" + reason + " matched_terms=" + strings.Join(result.MatchedTerms, ",") + " symbol_keys=" + strings.Join(result.SymbolKeys, ",") + "\n" + result.Snippet + "\n"
 		if builder.Len()+len(entry) > maxBytes {
 			break
 		}
+		accepted = append(accepted, result)
 		builder.WriteString(entry)
 	}
 	return builder.String()
+}
+
+func overlapsAccepted(candidate SearchResult, accepted []SearchResult) bool {
+	for _, previous := range accepted {
+		if previous.Path != candidate.Path {
+			continue
+		}
+		start := previous.StartLine
+		if candidate.StartLine > start {
+			start = candidate.StartLine
+		}
+		end := previous.EndLine
+		if candidate.EndLine < end {
+			end = candidate.EndLine
+		}
+		if end < start {
+			continue
+		}
+		overlap := end - start + 1
+		previousLength := previous.EndLine - previous.StartLine + 1
+		candidateLength := candidate.EndLine - candidate.StartLine + 1
+		shorter := previousLength
+		if candidateLength < shorter {
+			shorter = candidateLength
+		}
+		if shorter > 0 && overlap*2 >= shorter {
+			return true
+		}
+	}
+	return false
+}
+
+func matchedTerms(query, content string) []string {
+	terms := strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsPunct(r)
+	})
+	lowerContent := strings.ToLower(content)
+	seen := make(map[string]struct{}, len(terms))
+	matched := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if len(term) < 2 {
+			continue
+		}
+		if _, ok := seen[term]; ok || !strings.Contains(lowerContent, term) {
+			continue
+		}
+		seen[term] = struct{}{}
+		matched = append(matched, term)
+	}
+	sort.Strings(matched)
+	return matched
 }
 
 func resultLineKey(result SearchResult) string {

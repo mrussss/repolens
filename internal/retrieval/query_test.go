@@ -18,3 +18,16 @@ func TestBuildQueryBoundsErrorLogAndEvidencePacket(t *testing.T) {
 		t.Fatalf("unexpected evidence packet: %q", packet)
 	}
 }
+
+func TestBuildEvidencePacketCarriesExplainabilityAndDeduplicatesOverlap(t *testing.T) {
+	packet := retrieval.BuildEvidencePacket([]retrieval.SearchResult{
+		{Path: "worker.go", StartLine: 10, EndLine: 20, Score: 1.2, Snippet: "source excerpt", RetrievalSource: "symbol_bm25_structural", RetrievalReason: "RELATED_TEST_DISCOVERY", MatchedTerms: []string{"worker"}, SymbolKeys: []string{"symbol-hash"}},
+		{Path: "worker.go", StartLine: 12, EndLine: 18, Score: 1.1, Snippet: "overlapping excerpt"},
+	}, 4096)
+	if !strings.Contains(packet, "reason=RELATED_TEST_DISCOVERY") || !strings.Contains(packet, "matched_terms=worker") || !strings.Contains(packet, "symbol_keys=symbol-hash") || !strings.Contains(packet, "source excerpt") {
+		t.Fatalf("packet lost explainability fields: %q", packet)
+	}
+	if strings.Contains(packet, "overlapping excerpt") {
+		t.Fatalf("overlapping result was not deduplicated: %q", packet)
+	}
+}

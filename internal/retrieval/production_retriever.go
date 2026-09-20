@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	codeintelmodel "repolens/internal/codeintel/model"
@@ -90,6 +91,14 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 	// 4. Map to generic SearchResult
 	var searchResults []SearchResult
 	for _, sr := range structResults {
+		reason := strings.Join(sr.StructuralReasons, ",")
+		if reason == "" {
+			reason = "BM25"
+		}
+		symbolKeys := []string(nil)
+		if sr.Document.SymbolKeyHash != "" {
+			symbolKeys = []string{sr.Document.SymbolKeyHash}
+		}
 		searchResults = append(searchResults, SearchResult{
 			ChunkID:         fmt.Sprintf("%s:%d-%d", sr.Document.FilePath, sr.Document.StartLine, sr.Document.EndLine),
 			Path:            sr.Document.FilePath,
@@ -100,6 +109,9 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 			Snippet:         sr.Document.Content,
 			Score:           sr.FinalScore,
 			RetrievalSource: "symbol_bm25_structural",
+			MatchedTerms:    matchedTerms(req.Query, sr.Document.Content+" "+sr.Document.SymbolName+" "+sr.Document.FilePath),
+			SymbolKeys:      symbolKeys,
+			RetrievalReason: reason,
 		})
 	}
 

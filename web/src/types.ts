@@ -148,6 +148,7 @@ export interface QualityReport {
   syntactic_relation_count: number;
   heuristic_relation_count: number;
   unresolved_relation_count: number;
+  symlinks_skipped?: number;
   status: string;
 }
 

@@ -14,15 +14,18 @@ type SearchRequest struct {
 }
 
 type SearchResult struct {
-	ChunkID         string  `json:"chunk_id"`
-	Path            string  `json:"path"`
-	Language        string  `json:"language"`
-	Symbol          string  `json:"symbol,omitempty"`
-	StartLine       int     `json:"start_line"`
-	EndLine         int     `json:"end_line"`
-	Snippet         string  `json:"snippet"`
-	Score           float64 `json:"score"`
-	RetrievalSource string  `json:"retrieval_source"` // "lexical", "bm25", "vector", "hybrid_rrf"
+	ChunkID         string   `json:"chunk_id"`
+	Path            string   `json:"path"`
+	Language        string   `json:"language"`
+	Symbol          string   `json:"symbol,omitempty"`
+	StartLine       int      `json:"start_line"`
+	EndLine         int      `json:"end_line"`
+	Snippet         string   `json:"snippet"`
+	Score           float64  `json:"score"`
+	RetrievalSource string   `json:"retrieval_source"` // "lexical", "bm25", "vector", "hybrid_rrf"
+	MatchedTerms    []string `json:"matched_terms,omitempty"`
+	SymbolKeys      []string `json:"symbol_keys,omitempty"`
+	RetrievalReason string   `json:"retrieval_reason,omitempty"`
 }
 
 type Retriever interface {

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
@@ -133,7 +134,30 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	registry.Register(findTestTool)
 	registry.Register(readFileTool)
 
-	loop := NewAgentLoop(provider, registry, e.traceStore, e.guardCfg)
+	guardCfg := e.guardCfg
+	if run.MaxAgentRounds > 0 {
+		guardCfg.MaxSteps = run.MaxAgentRounds
+	}
+	if run.MaxToolCalls > 0 {
+		guardCfg.MaxToolCalls = run.MaxToolCalls
+	}
+	if run.MaxSearchCalls > 0 {
+		guardCfg.MaxSearchCalls = run.MaxSearchCalls
+	}
+	if run.MaxRepeatCalls > 0 {
+		guardCfg.MaxRepeatCalls = run.MaxRepeatCalls
+	}
+	if run.MaxToolResultBytes > 0 {
+		guardCfg.MaxToolResultBytes = run.MaxToolResultBytes
+	}
+	if run.MaxOutputTokens > 0 {
+		guardCfg.MaxOutputTokens = run.MaxOutputTokens
+	}
+	packetBytes := e.evidenceBytes
+	if run.MaxEvidencePacketBytes > 0 {
+		packetBytes = run.MaxEvidencePacketBytes
+	}
+	loop := NewAgentLoop(provider, registry, e.traceStore, guardCfg)
 	if e.retriever != nil {
 		query := retrieval.BuildQuery(run.IssueTitle, run.IssueDescription, run.ErrorLog)
 		results, searchErr := e.retriever.Search(ctx, retrieval.SearchRequest{
@@ -143,7 +167,23 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		if searchErr != nil {
 			return nil, jobs.NewPermanentError("RETRIEVAL_FAILED", "initial retrieval failed", searchErr)
 		}
-		loop.WithInitialEvidence(query, retrieval.BuildEvidencePacket(results, e.evidenceBytes))
+		for i := range results {
+			if e.storeFS == nil || results[i].Path == "" {
+				continue
+			}
+			startLine := results[i].StartLine
+			endLine := results[i].EndLine
+			if startLine <= 0 {
+				startLine = 1
+			}
+			if endLine < startLine || endLine-startLine >= 80 {
+				endLine = startLine + 79
+			}
+			if excerpt, readErr := e.storeFS.ReadFile(ctx, run.RepositoryID, run.SnapshotID, results[i].Path, startLine, endLine); readErr == nil && strings.TrimSpace(excerpt) != "" {
+				results[i].Snippet = excerpt
+			}
+		}
+		loop.WithInitialEvidence(query, retrieval.BuildEvidencePacket(results, packetBytes))
 	}
 	res, err := loop.Run(ctx, run, attempt)
 	if err != nil {

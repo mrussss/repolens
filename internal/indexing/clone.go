@@ -79,6 +79,23 @@ func (c *SafeGitCloner) ResolveRef(ctx context.Context, gitURL, ref string) (str
 	if err := c.ValidateGitURL(gitURL); err != nil {
 		return "", err
 	}
+	if isFullCommitSHA(ref) {
+		resolveCtx, cancel := context.WithTimeout(ctx, c.cloneTimeout)
+		defer cancel()
+		targetDir, err := os.MkdirTemp("", "repolens-resolve-")
+		if err != nil {
+			return "", fmt.Errorf("failed to create temporary git resolution directory: %w", err)
+		}
+		defer os.RemoveAll(targetDir)
+		resolved, err := c.CloneCommitTo(resolveCtx, gitURL, ref, targetDir)
+		if err != nil {
+			if errors.Is(resolveCtx.Err(), context.DeadlineExceeded) {
+				return "", fmt.Errorf("git commit resolution timed out after %v", c.cloneTimeout)
+			}
+			return "", fmt.Errorf("git commit %s is not fetchable: %w", ref, err)
+		}
+		return resolved, nil
+	}
 	resolveCtx, cancel := context.WithTimeout(ctx, c.cloneTimeout)
 	defer cancel()
 	args := []string{"ls-remote", gitURL}

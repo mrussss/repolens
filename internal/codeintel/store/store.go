@@ -242,14 +242,21 @@ func (s *GormStore) FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jo
 		if err := requireOwnedJob(tx, jobID, workerID, claimToken); err != nil {
 			return err
 		}
-		if err := s.saveAnalysisResultTx(tx, buildID, res); err != nil {
-			return err
-		}
-		now := time.Now().UTC()
 		var productRevision revision.AnalysisRevision
 		if err := tx.Where("id = ? AND status = ? AND code_index_build_id = ?", revisionID, revision.StatusPreparing, buildID).First(&productRevision).Error; err != nil {
 			return revision.ErrLineage
 		}
+		var codeBuild model.CodeIndexBuild
+		if err := tx.First(&codeBuild, "id = ?", buildID).Error; err != nil {
+			return err
+		}
+		if codeBuild.AnalysisRevisionID != revisionID || codeBuild.SnapshotID != productRevision.SnapshotID || codeBuild.Status != model.BuildStatusBuilding {
+			return revision.ErrLineage
+		}
+		if err := s.saveAnalysisResultTx(tx, buildID, res); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
 		retrievalBuildID := productRevision.RetrievalBuildID
 		if retrievalBuildID == 0 {
 			retrievalBuild := &model.RetrievalBuild{
@@ -266,8 +273,19 @@ func (s *GormStore) FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jo
 				return err
 			}
 			retrievalBuildID = retrievalBuild.ID
-		} else if err := tx.Model(&model.RetrievalBuild{}).Where("id = ?", retrievalBuildID).Updates(map[string]interface{}{"analysis_revision_id": revisionID}).Error; err != nil {
-			return err
+		} else {
+			var retrievalBuild model.RetrievalBuild
+			if err := tx.First(&retrievalBuild, "id = ?", retrievalBuildID).Error; err != nil {
+				return err
+			}
+			if retrievalBuild.CodeIndexBuildID != buildID || (retrievalBuild.AnalysisRevisionID != "" && retrievalBuild.AnalysisRevisionID != revisionID) {
+				return revision.ErrLineage
+			}
+			if retrievalBuild.AnalysisRevisionID == "" {
+				if err := tx.Model(&model.RetrievalBuild{}).Where("id = ?", retrievalBuildID).Update("analysis_revision_id", revisionID).Error; err != nil {
+					return err
+				}
+			}
 		}
 
 		retrievalJob := &jobs.AnalysisJob{}
@@ -511,6 +529,24 @@ func (s *GormStore) FinalizeRetrievalSuccessWithRevision(ctx context.Context, jo
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := requireOwnedJob(tx, jobID, workerID, claimToken); err != nil {
 			return err
+		}
+		var productRevision revision.AnalysisRevision
+		if err := tx.Where("id = ? AND status = ? AND retrieval_build_id = ?", revisionID, revision.StatusPreparing, buildID).First(&productRevision).Error; err != nil {
+			return revision.ErrLineage
+		}
+		var retrievalBuild model.RetrievalBuild
+		if err := tx.First(&retrievalBuild, "id = ?", buildID).Error; err != nil {
+			return err
+		}
+		if retrievalBuild.AnalysisRevisionID != revisionID || retrievalBuild.CodeIndexBuildID != productRevision.CodeIndexBuildID || retrievalBuild.Status != model.BuildStatusBuilding {
+			return revision.ErrLineage
+		}
+		var codeBuild model.CodeIndexBuild
+		if err := tx.First(&codeBuild, "id = ?", productRevision.CodeIndexBuildID).Error; err != nil {
+			return err
+		}
+		if codeBuild.AnalysisRevisionID != revisionID || codeBuild.SnapshotID != productRevision.SnapshotID || codeBuild.Status != model.BuildStatusReady {
+			return revision.ErrLineage
 		}
 		now := time.Now().UTC()
 		result := tx.Model(&model.RetrievalBuild{}).Where("id = ? AND status = ?", buildID, model.BuildStatusBuilding).Updates(map[string]interface{}{

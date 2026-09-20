@@ -23,12 +23,18 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let interval: any = null;
+    let stopped = false;
+    let timer: number | undefined;
+    let delay = 1000;
 
-    const fetchAll = async () => {
+    const fetchAll = async (): Promise<boolean> => {
+      if (stopped) return false;
+      let active = false;
       try {
         const r = await api.getDiagnosis(diagnosisId);
+        if (stopped) return false;
         setRun(r);
+        active = r.status === 'RUNNING' || r.status === 'QUEUED';
 
         try {
           setAttempts(await api.getDiagnosisAttempts(diagnosisId));
@@ -54,19 +60,37 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
       } finally {
         setLoading(false);
       }
+      return active;
     };
 
-    fetchAll();
-
-    // Poll every 1.5s while active
-    interval = setInterval(() => {
-      if (!run || run.status === 'QUEUED' || run.status === 'RUNNING') {
-        fetchAll();
+    const poll = async () => {
+      if (stopped) return;
+      if (document.hidden) {
+        timer = window.setTimeout(poll, 5000);
+        return;
       }
-    }, 1500);
+      const active = await fetchAll();
+      if (stopped || !active) return;
+      delay = Math.min(5000, delay * 2);
+      timer = window.setTimeout(poll, delay);
+    };
+    const onVisibilityChange = () => {
+      if (!document.hidden) {
+        delay = 1000;
+        if (timer !== undefined) window.clearTimeout(timer);
+        void poll();
+      }
+    };
 
-    return () => clearInterval(interval);
-  }, [diagnosisId, run?.status]);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    void poll();
+
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [diagnosisId]);
 
   const handleCancel = async () => {
     setCancelling(true);

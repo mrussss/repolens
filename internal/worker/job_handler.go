@@ -111,8 +111,18 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			UpdateAttemptCheckpoint(context.Context, string, string, string, bool, int, int, int, int, int, int, int, int, string) error
 		}); ok {
 			checkpointCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = checkpoint.UpdateAttemptCheckpoint(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason)
+			checkpointErr := checkpoint.UpdateAttemptCheckpoint(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason)
 			cancel()
+			if checkpointErr != nil {
+				log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
+				finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
+				finalizeErr := h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, result.PromptTokens, result.CompletionTokens, result.ToolCalls, "CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", false, 0)
+				cancelFinalize()
+				if finalizeErr != nil {
+					log.Error("failed to terminalize diagnosis after checkpoint failure", "error", finalizeErr)
+				}
+				return jobs.NewPermanentError("CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", checkpointErr)
+			}
 		}
 	}
 	if execErr != nil {

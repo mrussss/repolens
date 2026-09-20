@@ -232,10 +232,14 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 						metrics.ToolCallsTotal.WithLabelValues(tc.Function.Name, "success").Inc()
 					}
 
-					// Apply secret redaction and size limit (max 32KB)
+					// Apply secret redaction and the frozen per-run size limit.
 					toolResult = RedactSecrets(toolResult)
-					if len(toolResult) > 32*1024 {
-						toolResult = toolResult[:32*1024] + "\n...[truncated size limit 32KB]"
+					maxToolResultBytes := l.guardCfg.MaxToolResultBytes
+					if maxToolResultBytes <= 0 {
+						maxToolResultBytes = 32 * 1024
+					}
+					if len(toolResult) > maxToolResultBytes {
+						toolResult = toolResult[:maxToolResultBytes] + fmt.Sprintf("\n...[truncated size limit %d bytes]", maxToolResultBytes)
 					}
 
 					seq++
@@ -312,7 +316,13 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason)
-		return nil, err
+		return &LoopResult{
+			PromptTokens: promptTokens, CompletionTokens: completionTokens,
+			CachedPromptTokens: cachedTokens, ReasoningTokens: reasoningTokens,
+			ToolCallsCount: toolCalls, ToolNames: toolNames, AgentRounds: rounds,
+			SearchCalls: searchCalls, ProviderCalls: rounds + maxProviderAttempts(err),
+			FinalizationReason: reason,
+		}, err
 	}
 	providerCalls := rounds + 1
 	if resp.ProviderAttempts > 1 {
@@ -332,6 +342,13 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 		SearchCalls: searchCalls, ProviderCalls: providerCalls,
 		StructuredReport: parseErr == nil, ParseError: errorString(parseErr), FinalizationReason: reason,
 	}, nil
+}
+
+func maxProviderAttempts(err error) int {
+	if attempts := llm.ProviderAttempts(err); attempts > 0 {
+		return attempts
+	}
+	return 1
 }
 
 func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, stepType trace.StepType, toolName, args, result, status string, latency int64, inTok, outTok int, errCode string) error {

@@ -146,8 +146,16 @@ func (m *Manager) BuildForDiagnosis(ctx context.Context, run *diagnosis.Diagnosi
 	if cfg.IsDemo || m.envProvider == "fake" && normalized == "http://localhost/fake" {
 		return llm.NewFakeProvider(llm.ModeNormalStructured), nil
 	}
-	baseProvider := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(cfg.APIKey, normalized, modelName, cfg.AuthMode, m.providerTimeout)
-	return llm.NewRetryingProvider(baseProvider, m.providerRetries), nil
+	timeout := m.providerTimeout
+	if run.ProviderTimeoutSeconds > 0 {
+		timeout = time.Duration(run.ProviderTimeoutSeconds) * time.Second
+	}
+	retries := m.providerRetries
+	if run.ProviderRetryAttempts >= 0 {
+		retries = run.ProviderRetryAttempts
+	}
+	baseProvider := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(cfg.APIKey, normalized, modelName, cfg.AuthMode, timeout)
+	return llm.NewRetryingProvider(baseProvider, retries), nil
 }
 
 // NewManager creates a new Manager instance.

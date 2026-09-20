@@ -342,6 +342,9 @@ func ensureCodeIndexBuildTx(tx *gorm.DB, revisionID, snapshotID, modulePath stri
 	var build codeintelmodel.CodeIndexBuild
 	err := tx.Where("snapshot_id = ? AND parser_version = ? AND analyzer_version = ? AND symbol_schema_version = ? AND build_context_hash = ?", snapshotID, codeintelmodel.CurrentParserVersion, codeintelmodel.CurrentAnalyzerVersion, codeintelmodel.CurrentSymbolSchemaVersion, bc.BuildContextHash()).First(&build).Error
 	if err == nil {
+		if build.AnalysisRevisionID != "" && build.AnalysisRevisionID != revisionID {
+			return nil, ErrLineage
+		}
 		if build.AnalysisRevisionID == "" {
 			if err := tx.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Update("analysis_revision_id", revisionID).Error; err != nil {
 				return nil, err
@@ -372,6 +375,9 @@ func ensureRetrievalBuildTx(tx *gorm.DB, revisionID string, codeIndexBuildID int
 	var build codeintelmodel.RetrievalBuild
 	err := tx.Where("code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?", codeIndexBuildID, strategy, codeintelmodel.CurrentRetrievalVersion, codeintelmodel.CurrentTokenizerVersion, configHash).First(&build).Error
 	if err == nil {
+		if build.AnalysisRevisionID != "" && build.AnalysisRevisionID != revisionID {
+			return nil, ErrLineage
+		}
 		if build.AnalysisRevisionID == "" {
 			if err := tx.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", build.ID).Update("analysis_revision_id", revisionID).Error; err != nil {
 				return nil, err

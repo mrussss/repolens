@@ -195,6 +195,15 @@ func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, job
 		if existingCodeIndexID.Valid {
 			codeIndexID = existingCodeIndexID.Int64
 		}
+		if codeIndexID != 0 {
+			var existingBuild codeintelmodel.CodeIndexBuild
+			if err := tx.First(&existingBuild, "id = ?", codeIndexID).Error; err != nil {
+				return err
+			}
+			if existingBuild.AnalysisRevisionID != revisionID || existingBuild.SnapshotID != snapshotID {
+				return fmt.Errorf("analysis revision lineage is incomplete or inconsistent")
+			}
+		}
 		if codeIndexID == 0 {
 			bc := codeintelmodel.DefaultBuildContext()
 			build := &codeintelmodel.CodeIndexBuild{

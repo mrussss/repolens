@@ -44,13 +44,6 @@ func ValidateInput(input CreateDiagnosisInput) error {
 	return nil
 }
 
-func revisionPipelineFingerprint(revisionID string) string {
-	if revisionID == "" {
-		return ""
-	}
-	return revision.ComputePipelineFingerprint()
-}
-
 func RedactSecrets(input string) string {
 	redacted := input
 	for _, p := range secretPatterns {
@@ -90,6 +83,7 @@ type ProviderMetadata struct {
 	MaxSearchCalls         int
 	MaxRepeatCalls         int
 	MaxEvidencePacketBytes int
+	MaxToolResultBytes     int
 	FinalizationTurns      int
 	MaxOutputTokens        int
 	ProviderTimeoutSeconds int
@@ -150,6 +144,7 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	if err := ValidateInput(input); err != nil {
 		return nil, false, err
 	}
+	var selectedRevision *revision.AnalysisRevision
 	if input.AnalysisRevisionID != "" {
 		if s.revisionStore == nil {
 			return nil, false, fmt.Errorf("analysis revision store is not configured")
@@ -167,6 +162,7 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 			return nil, false, codeintelstore.ErrBuildLineageMismatch
 		}
 		input.RepositoryID = rev.RepositoryID
+		selectedRevision = rev
 	}
 	reqHash := ComputeRequestHashForRevision(input.AnalysisRevisionID, input.RepositoryID, input.SnapshotID, input.IssueTitle, input.IssueDescription, input.ErrorLog, input.CodeIndexBuildID, input.RetrievalBuildID)
 
@@ -200,6 +196,7 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		input.SnapshotID = rev.SnapshotID
 		input.CodeIndexBuildID = rev.CodeIndexBuildID
 		input.RetrievalBuildID = rev.RetrievalBuildID
+		selectedRevision = rev
 	} else if input.CodeIndexBuildID <= 0 || input.RetrievalBuildID <= 0 {
 		return nil, false, ErrInvalidBuildSelection
 	}
@@ -226,6 +223,9 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	if snap.Status != snapshot.StatusReady {
 		return nil, false, fmt.Errorf("snapshot %s is not READY (current status: %s)", input.SnapshotID, snap.Status)
 	}
+	if selectedRevision != nil && (snap.AnalysisRevisionID != selectedRevision.ID || snap.RepositoryID != selectedRevision.RepositoryID || snap.CommitSHA != selectedRevision.CommitSHA) {
+		return nil, false, codeintelstore.ErrBuildLineageMismatch
+	}
 
 	codeIndexBuildID := input.CodeIndexBuildID
 	retrievalBuildID := input.RetrievalBuildID
@@ -243,6 +243,9 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		if cib == nil {
 			return nil, false, fmt.Errorf("%w: code index build %d", ErrBuildNotReady, codeIndexBuildID)
 		}
+		if selectedRevision != nil && cib.AnalysisRevisionID != selectedRevision.ID {
+			return nil, false, codeintelstore.ErrBuildLineageMismatch
+		}
 		if cib.Status != codeintelmodel.BuildStatusReady {
 			return nil, false, fmt.Errorf("%w: code index build %d is %s", ErrBuildNotReady, codeIndexBuildID, cib.Status)
 		}
@@ -256,6 +259,9 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		if rb == nil {
 			return nil, false, fmt.Errorf("%w: retrieval build %d", ErrBuildNotReady, retrievalBuildID)
 		}
+		if selectedRevision != nil && (rb.AnalysisRevisionID != selectedRevision.ID || rb.CodeIndexBuildID != cib.ID) {
+			return nil, false, codeintelstore.ErrBuildLineageMismatch
+		}
 		if rb.Status != codeintelmodel.BuildStatusReady {
 			return nil, false, fmt.Errorf("%w: retrieval build %d is %s", ErrBuildNotReady, retrievalBuildID, rb.Status)
 		}
@@ -264,9 +270,6 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	cleanDesc := RedactSecrets(input.IssueDescription)
 	cleanLog := RedactSecrets(input.ErrorLog)
 
-	if metadata.AgentConfigHash == "" {
-		metadata.AgentConfigHash = ComputeAgentConfigHashWithRuntime(8, 12, 3, 2, 32*1024, 1, 2048, 60, 0, metadata.Temperature)
-	}
 	if metadata.MaxAgentRounds == 0 {
 		metadata.MaxAgentRounds = 8
 	}
@@ -282,6 +285,9 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	if metadata.MaxEvidencePacketBytes == 0 {
 		metadata.MaxEvidencePacketBytes = 32 * 1024
 	}
+	if metadata.MaxToolResultBytes == 0 {
+		metadata.MaxToolResultBytes = 32 * 1024
+	}
 	if metadata.FinalizationTurns == 0 {
 		metadata.FinalizationTurns = 1
 	}
@@ -290,6 +296,21 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	}
 	if metadata.ProviderTimeoutSeconds == 0 {
 		metadata.ProviderTimeoutSeconds = 60
+	}
+	if metadata.AgentConfigHash == "" {
+		metadata.AgentConfigHash = ComputeAgentConfigHashWithRuntimeAndToolLimit(
+			metadata.MaxAgentRounds,
+			metadata.MaxToolCalls,
+			metadata.MaxSearchCalls,
+			metadata.MaxRepeatCalls,
+			metadata.MaxEvidencePacketBytes,
+			metadata.MaxToolResultBytes,
+			metadata.FinalizationTurns,
+			metadata.MaxOutputTokens,
+			metadata.ProviderTimeoutSeconds,
+			metadata.ProviderRetryAttempts,
+			metadata.Temperature,
+		)
 	}
 	run := &DiagnosisRun{
 		ID:                          uuid.New().String(),
@@ -318,12 +339,15 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		MaxSearchCalls:              metadata.MaxSearchCalls,
 		MaxRepeatCalls:              metadata.MaxRepeatCalls,
 		MaxEvidencePacketBytes:      metadata.MaxEvidencePacketBytes,
+		MaxToolResultBytes:          metadata.MaxToolResultBytes,
 		FinalizationTurns:           metadata.FinalizationTurns,
 		MaxOutputTokens:             metadata.MaxOutputTokens,
 		ProviderTimeoutSeconds:      metadata.ProviderTimeoutSeconds,
 		ProviderRetryAttempts:       metadata.ProviderRetryAttempts,
-		PipelineFingerprint:         revisionPipelineFingerprint(input.AnalysisRevisionID),
 		Temperature:                 metadata.Temperature,
+	}
+	if selectedRevision != nil {
+		run.PipelineFingerprint = selectedRevision.PipelineFingerprint
 	}
 
 	if err := s.store.Create(ctx, run); err != nil {
