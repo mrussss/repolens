@@ -141,6 +141,33 @@ func TestE2EMetricsRecordTraceAndUnreportedUsage(t *testing.T) {
 	}
 }
 
+func TestE2EMetricsRecordFinishReasonFromExecution(t *testing.T) {
+	metrics := metricsFromExecution(&agent.ExecutionResult{
+		FinishReason:     "length",
+		PromptTokens:     10,
+		CompletionTokens: 20,
+		ReasoningTokens:  20,
+	}, newTraceCollector(), 42)
+	if metrics.FinishReason != "length" || metrics.OutputTokens != 20 || metrics.ReasoningTokens != 20 {
+		t.Fatalf("truncation evidence was not preserved: %+v", metrics)
+	}
+}
+
+func TestConfiguredRealBenchMaxOutputTokens(t *testing.T) {
+	t.Setenv("REPOLENS_REALBENCH_MAX_OUTPUT_TOKENS", "")
+	if got := configuredRealBenchMaxOutputTokens(); got != 0 {
+		t.Fatalf("unset override = %d, want 0", got)
+	}
+	t.Setenv("REPOLENS_REALBENCH_MAX_OUTPUT_TOKENS", "4096")
+	if got := configuredRealBenchMaxOutputTokens(); got != 4096 {
+		t.Fatalf("configured override = %d, want 4096", got)
+	}
+	t.Setenv("REPOLENS_REALBENCH_MAX_OUTPUT_TOKENS", "invalid")
+	if got := configuredRealBenchMaxOutputTokens(); got != 0 {
+		t.Fatalf("invalid override = %d, want 0", got)
+	}
+}
+
 func TestRootCauseRubricUsesGroundTruthOnlyAfterExecution(t *testing.T) {
 	truth := GroundTruth{
 		ExpectedRootCause: "handler returns stale cache value after refresh",
@@ -187,6 +214,13 @@ func TestFailedE2EMetricsPreserveExternalClassification(t *testing.T) {
 	metrics := failedE2EMetrics(externalFailure("provider preflight", errors.New("429")))
 	if metrics.Status != e2eFailure || metrics.FailureClassification != string(failureExternalInfra) || metrics.ReportStatus != "NOT_AVAILABLE" || metrics.CitationIntegrityGate != "NOT_RUN" {
 		t.Fatalf("unexpected preflight failure metrics: %+v", metrics)
+	}
+}
+
+func TestFailedE2EMetricsPreserveTruncationClassification(t *testing.T) {
+	metrics := failedE2EMetrics(productFailure("Agent runtime", agent.ErrModelOutputTruncated))
+	if metrics.Status != e2eFailure || metrics.FailureClassification != string(failureRepolensProduct) || metrics.ErrorCode != agent.ErrCodeModelOutputTruncated || metrics.RootCauseGrade != "Not Scorable" || metrics.ReportStatus != "NOT_AVAILABLE" || metrics.CitationIntegrityGate != "NOT_RUN" {
+		t.Fatalf("unexpected truncation metrics: %+v", metrics)
 	}
 }
 

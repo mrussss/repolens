@@ -117,6 +117,15 @@ func TestAgentLoopExecutionWithToolCalling(t *testing.T) {
 	if err != nil || len(steps) == 0 {
 		t.Fatalf("expected trace steps persisted in DB, got %d (err: %v)", len(steps), err)
 	}
+	var finalStep *trace.AgentStep
+	for i := range steps {
+		if steps[i].StepType == trace.StepTypeFinalOutput {
+			finalStep = &steps[i]
+		}
+	}
+	if finalStep == nil || finalStep.FinishReason != "stop" {
+		t.Fatalf("final trace finish reason = %v, want stop", finalStep)
+	}
 }
 
 func TestSecretRedaction(t *testing.T) {

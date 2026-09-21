@@ -146,6 +146,7 @@ type RunMetadata struct {
 	OS                    string    `json:"os"`
 	Arch                  string    `json:"arch"`
 	ProviderTimeoutSec    int       `json:"provider_timeout_seconds,omitempty"`
+	MaxOutputTokens       int       `json:"max_output_tokens,omitempty"`
 	Temperature           float64   `json:"temperature,omitempty"`
 	ReasoningEffort       string    `json:"reasoning_effort,omitempty"`
 	ResponseFormat        string    `json:"response_format,omitempty"`
@@ -171,6 +172,7 @@ type CaseStatus struct {
 	BuggyCommitSHA        string  `json:"buggy_commit_sha"`
 	Status                string  `json:"status"`
 	ErrorClass            string  `json:"error_class,omitempty"`
+	ErrorCode             string  `json:"error_code,omitempty"`
 	Error                 string  `json:"error,omitempty"`
 	HitAt5                bool    `json:"hit_at_5"`
 	HitAt10               bool    `json:"hit_at_10"`
@@ -181,6 +183,7 @@ type CaseStatus struct {
 	ReportStatus          string  `json:"report_status,omitempty"`
 	CitationIntegrityGate string  `json:"citation_integrity_gate,omitempty"`
 	E2ELatencyMs          int64   `json:"e2e_latency_ms,omitempty"`
+	FinishReason          string  `json:"finish_reason,omitempty"`
 }
 
 type Metrics struct {
@@ -257,6 +260,8 @@ type E2EMetrics struct {
 	TotalTokens             int         `json:"total_tokens"`
 	CachedTokens            interface{} `json:"cached_tokens"`
 	ReasoningTokens         interface{} `json:"reasoning_tokens"`
+	FinishReason            string      `json:"finish_reason,omitempty"`
+	ErrorCode               string      `json:"error_code,omitempty"`
 	FailureClassification   string      `json:"failure_classification,omitempty"`
 	CostStatus              string      `json:"cost_status"`
 	EstimatedCostUSD        *float64    `json:"estimated_cost_usd,omitempty"`
@@ -330,6 +335,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	providerConfig, providerConfigured := loadProviderConfig()
 	e2eStatus = e2eStatusFor(opts.RunE2E, providerConfigured)
 	guardConfig := agent.DefaultGuardConfig()
+	if maxOutputTokens := configuredRealBenchMaxOutputTokens(); maxOutputTokens > 0 {
+		guardConfig.MaxOutputTokens = maxOutputTokens
+	}
 	result := &RunResult{
 		RunDir: runDir,
 		Metadata: RunMetadata{
@@ -350,6 +358,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			OS:                  runtime.GOOS,
 			Arch:                runtime.GOARCH,
 			ProviderTimeoutSec:  providerTimeoutSeconds(),
+			MaxOutputTokens:     guardConfig.MaxOutputTokens,
 			Temperature:         0.1,
 		},
 	}
@@ -440,7 +449,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 				e2eErr = preflightErr
 				e2eMetrics = failedE2EMetrics(preflightErr)
 			} else {
-				diagnosisResult, e2eMetrics, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir)
+				diagnosisResult, e2eMetrics, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir, guardConfig)
 			}
 			status.E2ELatencyMs = time.Since(e2eStarted).Milliseconds()
 			if e2eErr != nil {
@@ -492,6 +501,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			continue
 		}
 		if e2eMetrics != nil {
+			status.FinishReason = e2eMetrics.FinishReason
+			status.ErrorCode = e2eMetrics.ErrorCode
 			if diagnosisResult != nil {
 				e2eMetrics.RootCauseGrade = gradeRootCause(diagnosisResult.Report, truth)
 				e2eMetrics.UnsupportedClaims = countUnsupportedClaims(diagnosisResult.Report)
@@ -716,14 +727,23 @@ func loadProviderConfig() (providerConfig, bool) {
 }
 
 type providerPreflight struct {
-	Provider         string `json:"provider"`
-	Model            string `json:"model"`
-	Configured       bool   `json:"is_configured"`
-	Demo             bool   `json:"is_demo"`
-	NormalCompletion string `json:"normal_completion"`
-	ToolCalling      string `json:"tool_calling"`
-	AgentLoop        string `json:"agent_loop"`
-	StructuredReport string `json:"structured_report"`
+	Provider              string `json:"provider"`
+	Model                 string `json:"model"`
+	Configured            bool   `json:"is_configured"`
+	Demo                  bool   `json:"is_demo"`
+	NormalCompletion      string `json:"normal_completion"`
+	ToolCalling           string `json:"tool_calling"`
+	AgentLoop             string `json:"agent_loop"`
+	StructuredReport      string `json:"structured_report"`
+	AgentFinishReason     string `json:"agent_finish_reason,omitempty"`
+	AgentPromptTokens     int    `json:"agent_prompt_tokens,omitempty"`
+	AgentCompletionTokens int    `json:"agent_completion_tokens,omitempty"`
+	AgentReasoningTokens  int    `json:"agent_reasoning_tokens,omitempty"`
+	AgentToolCalls        int    `json:"agent_tool_calls,omitempty"`
+	AgentRounds           int    `json:"agent_rounds,omitempty"`
+	AgentStructuredReport bool   `json:"agent_structured_report"`
+	AgentErrorCode        string `json:"agent_error_code,omitempty"`
+	AgentFailureClass     string `json:"agent_failure_class,omitempty"`
 }
 
 func runProviderPreflight(ctx context.Context, config providerConfig, guardConfig agent.GuardConfig) (providerPreflight, error) {
@@ -790,13 +810,24 @@ func runProviderPreflight(ctx context.Context, config providerConfig, guardConfi
 	}
 	result.ToolCalling = "PASS"
 
-	loop := agent.NewAgentLoop(client, agent.NewToolRegistry(), nil, guardConfig)
+	loop := agent.NewAgentLoop(classifiedProvider{Provider: client}, agent.NewToolRegistry(), nil, guardConfig)
 	loopResult, err := loop.Run(ctx, &diagnosis.DiagnosisRun{
 		ID: "realbench-preflight", RepositoryID: "preflight", SnapshotID: "preflight",
 		IssueTitle: "preflight structured report", IssueDescription: "Return a concise diagnosis report.",
 		Temperature: 0.1, ModelName: config.Model,
 	}, &diagnosis.DiagnosisAttempt{ID: "realbench-preflight-attempt"})
+	if loopResult != nil {
+		result.AgentFinishReason = loopResult.FinishReason
+		result.AgentPromptTokens = loopResult.PromptTokens
+		result.AgentCompletionTokens = loopResult.CompletionTokens
+		result.AgentReasoningTokens = loopResult.ReasoningTokens
+		result.AgentToolCalls = loopResult.ToolCallsCount
+		result.AgentRounds = loopResult.AgentRounds
+		result.AgentStructuredReport = loopResult.StructuredReport
+	}
 	if err != nil {
+		result.AgentErrorCode = e2eErrorCode(err)
+		result.AgentFailureClass = errorClassFor(err)
 		return result, productOrExternalAgentFailure(err)
 	}
 	result.AgentLoop = "PASS"
@@ -814,6 +845,14 @@ type classifiedProvider struct {
 	llm.Provider
 }
 
+func executionProgress(err error) *agent.ExecutionResult {
+	var executionErr *agent.ExecutionError
+	if errors.As(err, &executionErr) {
+		return executionErr.Progress
+	}
+	return nil
+}
+
 func (p classifiedProvider) Generate(ctx context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
 	response, err := p.Provider.Generate(ctx, request)
 	if err != nil {
@@ -822,14 +861,14 @@ func (p classifiedProvider) Generate(ctx context.Context, request llm.GenerateRe
 	return response, nil
 }
 
-func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string) (*agent.ExecutionResult, *E2EMetrics, error) {
+func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string, guardConfig agent.GuardConfig) (*agent.ExecutionResult, *E2EMetrics, error) {
 	var lastResult *agent.ExecutionResult
 	var lastMetrics *E2EMetrics
 	var lastErr error
 	attempts := make([]e2eAttempt, 0, 3)
 	for attempt := 1; attempt <= 3; attempt++ {
 		started := time.Now()
-		result, metrics, err := runE2EOnce(ctx, input, workspace, config, caseDir, attempt, started)
+		result, metrics, err := runE2EOnce(ctx, input, workspace, config, caseDir, attempt, started, guardConfig)
 		if metrics == nil {
 			metrics = &E2EMetrics{Status: e2eFailure, RootCauseGrade: "Not Scorable", CostStatus: costStatus()}
 		}
@@ -852,7 +891,7 @@ func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, co
 	return lastResult, lastMetrics, lastErr
 }
 
-func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string, attemptNo int, started time.Time) (*agent.ExecutionResult, *E2EMetrics, error) {
+func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string, attemptNo int, started time.Time, guardConfig agent.GuardConfig) (*agent.ExecutionResult, *E2EMetrics, error) {
 	providerClient := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(
 		config.APIKey,
 		config.BaseURL,
@@ -873,17 +912,19 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 	evidenceStore := evidence.NewEvidenceStore(workspace.db)
 	evidenceIssuer := evidence.NewEvidenceIssuerWithStore(workspace.SnapshotStore, evidenceStore)
 	executor.WithEvidenceIssuer(evidenceIssuer)
-	run := buildAgentRun(input, workspace, config.Model)
+	run := buildAgentRun(input, workspace, config.Model, guardConfig.MaxOutputTokens)
 	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
 	result, err := executor.Execute(ctx, run, attempt)
 	if err != nil {
-		metrics := metricsFromExecution(nil, collector, time.Since(started).Milliseconds())
+		progress := executionProgress(err)
+		metrics := metricsFromExecution(progress, collector, time.Since(started).Milliseconds())
 		metrics.Status = e2eFailure
 		metrics.FailureClassification = errorClassFor(err)
+		metrics.ErrorCode = e2eErrorCode(err)
 		metrics.CostStatus = costStatus()
 		_ = writeJSON(filepath.Join(caseDir, fmt.Sprintf("agent_trace_attempt_%d.json", attemptNo)), collector.Steps())
 		_ = writeJSON(filepath.Join(caseDir, "agent_trace.json"), collector.Steps())
-		return nil, metrics, productOrExternalAgentFailure(err)
+		return progress, metrics, productOrExternalAgentFailure(err)
 	}
 	if result == nil {
 		err = productFailure("Agent runtime", errors.New("empty execution result"))
@@ -1046,6 +1087,7 @@ func metricsFromExecution(result *agent.ExecutionResult, collector *traceCollect
 		metrics.InputTokens = result.PromptTokens
 		metrics.OutputTokens = result.CompletionTokens
 		metrics.TotalTokens = result.PromptTokens + result.CompletionTokens
+		metrics.FinishReason = result.FinishReason
 		if result.CachedPromptTokens > 0 {
 			metrics.CachedTokens = result.CachedPromptTokens
 		}
@@ -1073,11 +1115,19 @@ func failedE2EMetrics(err error) *E2EMetrics {
 		ReportStatus:          "NOT_AVAILABLE",
 		CitationIntegrityGate: "NOT_RUN",
 		FailureClassification: errorClassFor(err),
+		ErrorCode:             e2eErrorCode(err),
 		ToolNames:             []string{},
 		CachedTokens:          "NOT_REPORTED",
 		ReasoningTokens:       "NOT_REPORTED",
 		CostStatus:            costStatus(),
 	}
+}
+
+func e2eErrorCode(err error) string {
+	if errors.Is(err, agent.ErrModelOutputTruncated) {
+		return agent.ErrCodeModelOutputTruncated
+	}
+	return ""
 }
 
 func citationValidityRate(total, valid int) float64 {
@@ -1230,12 +1280,13 @@ func searchInput(ctx context.Context, retriever retrieval.Retriever, input Input
 	return query, results, err
 }
 
-func buildAgentRun(input Input, workspace *productionWorkspace, model string) *diagnosis.DiagnosisRun {
+func buildAgentRun(input Input, workspace *productionWorkspace, model string, maxOutputTokens int) *diagnosis.DiagnosisRun {
 	return &diagnosis.DiagnosisRun{
 		ID: uuid.New().String(), RepositoryID: input.CaseID, SnapshotID: input.CaseID,
 		CodeIndexBuildID: workspace.CodeIndexBuildID, RetrievalBuildID: workspace.RetrievalBuildID,
 		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
 		Temperature: 0.1, ModelName: model, PromptVersion: diagnosis.CurrentPromptVersion, AgentVersion: diagnosis.CurrentAgentVersion,
+		MaxOutputTokens: maxOutputTokens,
 	}
 }
 
@@ -1312,6 +1363,14 @@ func providerTimeoutSeconds() int {
 	value, err := strconv.Atoi(os.Getenv("REPOLENS_PROVIDER_TIMEOUT_SECONDS"))
 	if err != nil || value <= 0 {
 		return 60
+	}
+	return value
+}
+
+func configuredRealBenchMaxOutputTokens() int {
+	value, err := strconv.Atoi(os.Getenv("REPOLENS_REALBENCH_MAX_OUTPUT_TOKENS"))
+	if err != nil || value <= 0 {
+		return 0
 	}
 	return value
 }
