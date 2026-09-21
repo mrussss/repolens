@@ -6,6 +6,11 @@ import (
 	"encoding/json"
 )
 
+const (
+	CurrentPromptVersion = "v2.2-evidence-1"
+	CurrentAgentVersion  = "v2.2.1"
+)
+
 // ComputeAgentConfigHash returns the stable identity of the agent configuration
 // that is persisted on each diagnosis run.
 func ComputeAgentConfigHash(maxSteps, maxToolCalls, maxRepeatCalls int, temperature float64) string {
@@ -40,7 +45,7 @@ func ComputeAgentConfigHashWithRuntimeAndToolLimit(maxSteps, maxToolCalls, maxSe
 		ProviderRetryAttempts  int     `json:"provider_retry_attempts"`
 		ToolSetVersion         string  `json:"tool_set_version"`
 		Temperature            float64 `json:"temperature"`
-	}{"v2.2", "v2.2", maxSteps, maxToolCalls, maxSearchCalls, maxRepeatCalls, maxEvidencePacketBytes, maxToolResultBytes, finalizationTurns, maxOutputTokens, providerTimeoutSeconds, providerRetryAttempts, "v2.2-readonly-tools", temperature}
+	}{CurrentPromptVersion, CurrentAgentVersion, maxSteps, maxToolCalls, maxSearchCalls, maxRepeatCalls, maxEvidencePacketBytes, maxToolResultBytes, finalizationTurns, maxOutputTokens, providerTimeoutSeconds, providerRetryAttempts, "v2.2-readonly-tools-evidence", temperature}
 	b, _ := json.Marshal(payload)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])

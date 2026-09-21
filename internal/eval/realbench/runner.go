@@ -166,33 +166,37 @@ type Prediction struct {
 }
 
 type CaseStatus struct {
-	CaseID         string  `json:"case_id"`
-	Repository     string  `json:"repository"`
-	BuggyCommitSHA string  `json:"buggy_commit_sha"`
-	Status         string  `json:"status"`
-	ErrorClass     string  `json:"error_class,omitempty"`
-	Error          string  `json:"error,omitempty"`
-	HitAt5         bool    `json:"hit_at_5"`
-	HitAt10        bool    `json:"hit_at_10"`
-	ReciprocalRank float64 `json:"reciprocal_rank"`
-	LatencyMs      int64   `json:"latency_ms"`
-	E2EStatus      string  `json:"e2e_status"`
-	E2ELatencyMs   int64   `json:"e2e_latency_ms,omitempty"`
+	CaseID                string  `json:"case_id"`
+	Repository            string  `json:"repository"`
+	BuggyCommitSHA        string  `json:"buggy_commit_sha"`
+	Status                string  `json:"status"`
+	ErrorClass            string  `json:"error_class,omitempty"`
+	Error                 string  `json:"error,omitempty"`
+	HitAt5                bool    `json:"hit_at_5"`
+	HitAt10               bool    `json:"hit_at_10"`
+	ReciprocalRank        float64 `json:"reciprocal_rank"`
+	LatencyMs             int64   `json:"latency_ms"`
+	E2EStatus             string  `json:"e2e_status"`
+	ExecutionStatus       string  `json:"execution_status"`
+	ReportStatus          string  `json:"report_status,omitempty"`
+	CitationIntegrityGate string  `json:"citation_integrity_gate,omitempty"`
+	E2ELatencyMs          int64   `json:"e2e_latency_ms,omitempty"`
 }
 
 type Metrics struct {
-	TotalCases      int     `json:"total_cases"`
-	CompletedCases  int     `json:"completed_cases"`
-	InfraErrors     int     `json:"infra_errors"`
-	ProductFailures int     `json:"product_failures"`
-	EvaluatedCases  int     `json:"evaluated_cases"`
-	HitAt5Count     int     `json:"hit_at_5_count"`
-	HitAt10Count    int     `json:"hit_at_10_count"`
-	HitAt5          float64 `json:"hit_at_5"`
-	HitAt10         float64 `json:"hit_at_10"`
-	MRR             float64 `json:"mrr"`
-	CitationStatus  string  `json:"citation_status"`
-	RootCauseStatus string  `json:"root_cause_status"`
+	TotalCases           int     `json:"total_cases"`
+	CompletedCases       int     `json:"completed_cases"`
+	InfraErrors          int     `json:"infra_errors"`
+	ProductFailures      int     `json:"product_failures"`
+	EvaluatedCases       int     `json:"evaluated_cases"`
+	HitAt5Count          int     `json:"hit_at_5_count"`
+	HitAt10Count         int     `json:"hit_at_10_count"`
+	HitAt5               float64 `json:"hit_at_5"`
+	HitAt10              float64 `json:"hit_at_10"`
+	MRR                  float64 `json:"mrr"`
+	CitationStatus       string  `json:"citation_status"`
+	CitationGateFailures int     `json:"citation_gate_failures"`
+	RootCauseStatus      string  `json:"root_cause_status"`
 }
 
 type RunResult struct {
@@ -230,26 +234,33 @@ type analysisQualityRow struct {
 // Provider fields that are absent from a response are represented explicitly
 // as NOT_REPORTED instead of being confused with a reported zero.
 type E2EMetrics struct {
-	Status                string      `json:"e2e_status"`
-	RootCauseGrade        string      `json:"root_cause_grade"`
-	CitationTotal         int         `json:"citation_total"`
-	CitationValid         int         `json:"citation_valid"`
-	CitationInvalid       int         `json:"citation_invalid"`
-	CitationValidityRate  float64     `json:"citation_validity_rate"`
-	UnsupportedClaims     int         `json:"unsupported_claims"`
-	ToolCalls             int         `json:"tool_calls"`
-	ToolNames             []string    `json:"tool_names"`
-	AgentRounds           int         `json:"agent_rounds"`
-	LatencyMs             int64       `json:"latency_ms"`
-	InputTokens           int         `json:"input_tokens"`
-	OutputTokens          int         `json:"output_tokens"`
-	TotalTokens           int         `json:"total_tokens"`
-	CachedTokens          interface{} `json:"cached_tokens"`
-	ReasoningTokens       interface{} `json:"reasoning_tokens"`
-	FailureClassification string      `json:"failure_classification,omitempty"`
-	CostStatus            string      `json:"cost_status"`
-	EstimatedCostUSD      *float64    `json:"estimated_cost_usd,omitempty"`
-	Attempts              int         `json:"attempts"`
+	Status                  string      `json:"e2e_status"`
+	RootCauseGrade          string      `json:"root_cause_grade"`
+	CitationTotal           int         `json:"citation_total"`
+	CitationValid           int         `json:"citation_valid"`
+	CitationInvalid         int         `json:"citation_invalid"`
+	CitationValidityRate    float64     `json:"citation_validity_rate"`
+	ReportStatus            string      `json:"report_status"`
+	CitationIntegrityGate   string      `json:"citation_integrity_gate"`
+	EvidenceItemsIssued     int         `json:"evidence_items_issued"`
+	EvidenceItemsReferenced int         `json:"evidence_items_referenced"`
+	UnknownEvidenceIDs      int         `json:"unknown_evidence_ids"`
+	CrossScopeEvidenceIDs   int         `json:"cross_scope_evidence_ids"`
+	EvidenceReferenceRate   float64     `json:"evidence_reference_rate"`
+	UnsupportedClaims       int         `json:"unsupported_claims"`
+	ToolCalls               int         `json:"tool_calls"`
+	ToolNames               []string    `json:"tool_names"`
+	AgentRounds             int         `json:"agent_rounds"`
+	LatencyMs               int64       `json:"latency_ms"`
+	InputTokens             int         `json:"input_tokens"`
+	OutputTokens            int         `json:"output_tokens"`
+	TotalTokens             int         `json:"total_tokens"`
+	CachedTokens            interface{} `json:"cached_tokens"`
+	ReasoningTokens         interface{} `json:"reasoning_tokens"`
+	FailureClassification   string      `json:"failure_classification,omitempty"`
+	CostStatus              string      `json:"cost_status"`
+	EstimatedCostUSD        *float64    `json:"estimated_cost_usd,omitempty"`
+	Attempts                int         `json:"attempts"`
 }
 
 type e2eAttempt struct {
@@ -329,8 +340,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			RetrievalStrategy:   productionStrategy,
 			RetrievalVersion:    codeintelmodel.CurrentRetrievalVersion,
 			IndexVersion:        codeintelmodel.CurrentAnalyzerVersion,
-			AgentVersion:        "v2.2",
-			PromptVersion:       "v2.2",
+			AgentVersion:        diagnosis.CurrentAgentVersion,
+			PromptVersion:       diagnosis.CurrentPromptVersion,
 			Timestamp:           time.Now().UTC(),
 			CaseCount:           len(caseInputs),
 			E2EStatus:           e2eStatus,
@@ -353,7 +364,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		result.Metadata.Model = providerConfig.Model
 		result.Metadata.BaseURLFingerprint = providerConfig.EndpointFingerprint
 		result.Metadata.AuthMode = providerConfig.AuthMode
-		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithRuntime(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxSearchCalls, guardConfig.MaxRepeatCalls, 32*1024, 1, guardConfig.MaxOutputTokens, providerTimeoutSeconds(), 0, 0.1)
+		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithRuntimeAndToolLimit(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxSearchCalls, guardConfig.MaxRepeatCalls, 32*1024, guardConfig.MaxToolResultBytes, 1, guardConfig.MaxOutputTokens, providerTimeoutSeconds(), 0, 0.1)
 		result.Metadata.MaxToolCalls = guardConfig.MaxToolCalls
 		result.Metadata.ToolBudget = guardConfig.MaxToolCalls
 		result.Metadata.ResponseFormat = "prompt_json_contract"
@@ -377,11 +388,12 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("create artifact directory for %s: %w", caseID, err)
 		}
 		status := CaseStatus{
-			CaseID:         caseID,
-			Repository:     inputCase.Input.Repository.FullName,
-			BuggyCommitSHA: inputCase.Input.BuggyCommitSHA,
-			Status:         "PENDING",
-			E2EStatus:      e2eStatus,
+			CaseID:          caseID,
+			Repository:      inputCase.Input.Repository.FullName,
+			BuggyCommitSHA:  inputCase.Input.BuggyCommitSHA,
+			Status:          "PENDING",
+			E2EStatus:       e2eStatus,
+			ExecutionStatus: e2eStatus,
 		}
 		started := time.Now()
 		fetcher := r.Fetcher
@@ -428,6 +440,10 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 				caseE2EStatus = e2eFailure
 			} else {
 				caseE2EStatus = e2eCompleted
+			}
+			if e2eMetrics != nil {
+				status.ReportStatus = e2eMetrics.ReportStatus
+				status.CitationIntegrityGate = e2eMetrics.CitationIntegrityGate
 			}
 		}
 
@@ -484,6 +500,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		}
 		status.HitAt5, status.HitAt10, status.ReciprocalRank = retrievalMetrics(top10, truth.PrimaryFiles)
 		status.E2EStatus = caseE2EStatus
+		status.ExecutionStatus = caseE2EStatus
 		status.Status = "RETRIEVAL_COMPLETED_E2E_NOT_RUN"
 		if caseE2EStatus == e2eCompleted {
 			status.Status = "RETRIEVAL_AND_E2E_COMPLETED"
@@ -833,6 +850,9 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 		agent.DefaultGuardConfig(),
 	)
 	executor.WithCodeIntelStore(workspace.CodeIndexStore)
+	evidenceStore := evidence.NewEvidenceStore(workspace.db)
+	evidenceIssuer := evidence.NewEvidenceIssuerWithStore(workspace.SnapshotStore, evidenceStore)
+	executor.WithEvidenceIssuer(evidenceIssuer)
 	run := buildAgentRun(input, workspace, config.Model)
 	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
 	result, err := executor.Execute(ctx, run, attempt)
@@ -858,41 +878,77 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 	metrics.CostStatus = costStatus()
 	metrics.EstimatedCostUSD = estimateCost(result)
 	citations := []evidence.Citation{}
+	issuedItems, _ := evidenceIssuer.ListByAttempt(ctx, attempt.ID)
+	metrics.EvidenceItemsIssued = len(issuedItems)
 	if result.Report != nil {
 		citations = flattenCitations(result.Report)
 		validator := evidence.NewCitationValidator(workspace.SnapshotStore)
 		valid := 0
 		for i := range citations {
-			validator.Validate(ctx, input.CaseID, input.CaseID, &citations[i])
+			if citations[i].EvidenceID == "" && citations[i].FilePath != "" {
+				validator.Validate(ctx, input.CaseID, input.CaseID, &citations[i])
+			}
 			if citations[i].ValidationStatus == evidence.CitationValid {
 				valid++
 			}
-		}
-		if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
-			"total": len(citations), "valid": valid, "invalid": len(citations) - valid,
-			"validity_rate": citationValidityRate(len(citations), valid), "citations": citations,
-		}); err != nil {
-			return nil, metrics, productFailure("write citation result", err)
 		}
 		metrics.CitationTotal = len(citations)
 		metrics.CitationValid = valid
 		metrics.CitationInvalid = len(citations) - valid
 		metrics.CitationValidityRate = citationValidityRate(len(citations), valid)
-		if len(citations) != 0 && valid != len(citations) {
-			err := productFailure("citation validation", fmt.Errorf("%d of %d citations are invalid", len(citations)-valid, len(citations)))
-			metrics.Status = e2eFailure
-			metrics.FailureClassification = errorClassFor(err)
-			_ = writeJSON(filepath.Join(caseDir, fmt.Sprintf("agent_trace_attempt_%d.json", attemptNo)), collector.Steps())
-			_ = writeJSON(filepath.Join(caseDir, "agent_trace.json"), collector.Steps())
-			return result, metrics, err
+		referencedIDs := make(map[string]struct{})
+		for _, citation := range citations {
+			if citation.EvidenceID == "" {
+				continue
+			}
+			if _, seen := referencedIDs[citation.EvidenceID]; seen {
+				continue
+			}
+			referencedIDs[citation.EvidenceID] = struct{}{}
+			metrics.EvidenceItemsReferenced++
+			if citation.ValidationStatus != evidence.CitationInvalid {
+				continue
+			}
+			switch citation.ValidationError {
+			case "EVIDENCE_NOT_FOUND":
+				if foreign, findErr := evidenceIssuer.FindByID(ctx, citation.EvidenceID); findErr == nil && foreign != nil && foreign.AttemptID != attempt.ID {
+					metrics.CrossScopeEvidenceIDs++
+				} else {
+					metrics.UnknownEvidenceIDs++
+				}
+			case "EVIDENCE_ATTEMPT_MISMATCH", "EVIDENCE_LINEAGE_MISMATCH":
+				metrics.CrossScopeEvidenceIDs++
+			}
 		}
+		metrics.EvidenceReferenceRate = evidenceReferenceRate(metrics.EvidenceItemsIssued, metrics.EvidenceItemsReferenced)
 	} else if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
-		"total": 0, "valid": 0, "invalid": 0, "validity_rate": 0, "citations": []evidence.Citation{},
+		"total": 0, "valid": 0, "invalid": 0, "validity_rate": 0, "evidence_items_issued": metrics.EvidenceItemsIssued, "evidence_items_referenced": 0, "citations": []evidence.Citation{},
 	}); err != nil {
 		return nil, metrics, productFailure("write citation result", err)
 	}
 	_ = writeJSON(filepath.Join(caseDir, fmt.Sprintf("agent_trace_attempt_%d.json", attemptNo)), collector.Steps())
 	_ = writeJSON(filepath.Join(caseDir, "agent_trace.json"), collector.Steps())
+	quality, qualityErr := evidence.ClassifyReport(result.Report, result.StructuredReport)
+	if qualityErr == nil {
+		metrics.ReportStatus = string(quality.Status)
+	} else {
+		metrics.ReportStatus = string(evidence.ReportInvalid)
+	}
+	if metrics.CitationInvalid == 0 {
+		metrics.CitationIntegrityGate = "PASSED"
+	} else {
+		metrics.CitationIntegrityGate = "FAILED"
+	}
+	if err := writeJSON(filepath.Join(caseDir, "citation_result.json"), map[string]interface{}{
+		"total": metrics.CitationTotal, "valid": metrics.CitationValid, "invalid": metrics.CitationInvalid,
+		"validity_rate": metrics.CitationValidityRate, "report_status": metrics.ReportStatus,
+		"citation_integrity_gate": metrics.CitationIntegrityGate,
+		"evidence_items_issued":   metrics.EvidenceItemsIssued, "evidence_items_referenced": metrics.EvidenceItemsReferenced,
+		"unknown_evidence_ids": metrics.UnknownEvidenceIDs, "cross_scope_evidence_ids": metrics.CrossScopeEvidenceIDs,
+		"evidence_reference_rate": metrics.EvidenceReferenceRate, "citations": citations,
+	}); err != nil {
+		return nil, metrics, productFailure("write citation result", err)
+	}
 	return result, metrics, nil
 }
 
@@ -995,13 +1051,27 @@ func citationValidityRate(total, valid int) float64 {
 	return float64(valid) / float64(total)
 }
 
+func evidenceReferenceRate(issued, referenced int) float64 {
+	if issued == 0 {
+		return 0
+	}
+	return float64(referenced) / float64(issued)
+}
+
 func countUnsupportedClaims(report *evidence.DiagnosisReportData) int {
 	if report == nil {
 		return 0
 	}
 	unsupported := 0
 	for _, finding := range report.Findings {
-		if len(finding.Citations) == 0 {
+		supported := false
+		for _, citation := range finding.Citations {
+			if citation.ValidationStatus == evidence.CitationValid {
+				supported = true
+				break
+			}
+		}
+		if !supported {
 			unsupported++
 		}
 	}
@@ -1126,7 +1196,7 @@ func buildAgentRun(input Input, workspace *productionWorkspace, model string) *d
 		ID: uuid.New().String(), RepositoryID: input.CaseID, SnapshotID: input.CaseID,
 		CodeIndexBuildID: workspace.CodeIndexBuildID, RetrievalBuildID: workspace.RetrievalBuildID,
 		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
-		Temperature: 0.1, ModelName: model, PromptVersion: "v2.2", AgentVersion: "v2.2",
+		Temperature: 0.1, ModelName: model, PromptVersion: diagnosis.CurrentPromptVersion, AgentVersion: diagnosis.CurrentAgentVersion,
 	}
 }
 
@@ -1272,6 +1342,14 @@ func aggregateMetrics(cases []CaseStatus) Metrics {
 				metrics.ProductFailures++
 			}
 		}
+		if status.CitationIntegrityGate == "FAILED" {
+			metrics.CitationGateFailures++
+		}
+	}
+	if metrics.CitationGateFailures > 0 {
+		metrics.CitationStatus = "FAILED"
+	} else if metrics.RootCauseStatus == e2eCompleted {
+		metrics.CitationStatus = "PASSED"
 	}
 	if metrics.EvaluatedCases > 0 {
 		metrics.HitAt5 = float64(metrics.HitAt5Count) / float64(metrics.EvaluatedCases)

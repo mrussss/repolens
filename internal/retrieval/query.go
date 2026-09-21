@@ -71,7 +71,7 @@ func BuildEvidencePacket(results []SearchResult, maxBytes int) string {
 		if reason == "" {
 			reason = result.RetrievalSource
 		}
-		entry := "- " + result.Path + ":" + resultLineKey(result) + " score=" + formatScore(result.Score) + " reason=" + reason + " matched_terms=" + strings.Join(result.MatchedTerms, ",") + " symbol_keys=" + strings.Join(result.SymbolKeys, ",") + "\n" + result.Snippet + "\n"
+		entry := "- evidence_id=" + result.EvidenceID + " " + result.Path + ":" + resultLineKey(result) + " score=" + formatScore(result.Score) + " reason=" + reason + " matched_terms=" + strings.Join(result.MatchedTerms, ",") + " symbol_keys=" + strings.Join(result.SymbolKeys, ",") + "\n" + result.Snippet + "\n"
 		if builder.Len()+len(entry) > maxBytes {
 			break
 		}

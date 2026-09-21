@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"repolens/internal/evidence"
 	"repolens/internal/llm"
 	"repolens/internal/platform/snapshotstore"
 )
@@ -51,6 +52,20 @@ type ReadFileTool struct {
 	storeFS    snapshotstore.SnapshotStore
 	repoID     string
 	snapshotID string
+	evidence   evidence.EvidenceIssuer
+	attemptID  string
+	runID      string
+	buildID    int64
+	maxBytes   int
+}
+
+func (t *ReadFileTool) WithEvidenceIssuer(issuer evidence.EvidenceIssuer, attemptID, runID string, buildID int64, maxBytes int) *ReadFileTool {
+	t.evidence = issuer
+	t.attemptID = attemptID
+	t.runID = runID
+	t.buildID = buildID
+	t.maxBytes = maxBytes
+	return t
 }
 
 func NewReadFileTool(storeFS snapshotstore.SnapshotStore, repoID, snapshotID string) *ReadFileTool {
@@ -66,7 +81,7 @@ func (t *ReadFileTool) Name() string {
 }
 
 func (t *ReadFileTool) Description() string {
-	return "Read source file content in the repository snapshot by line range with security guards."
+	return "Read source file content in the repository snapshot by line range with security guards. The returned evidence_id is the only supported way to cite this source range in the final report."
 }
 
 func (t *ReadFileTool) Definition() llm.ToolDefinition {
@@ -126,6 +141,29 @@ func (t *ReadFileTool) Execute(ctx context.Context, argsJSON string) (string, er
 		return "", fmt.Errorf("file not found in snapshot: %s", cleanPath)
 	}
 
+	if t.evidence != nil {
+		maxBytes := t.maxBytes
+		if maxBytes <= 0 {
+			maxBytes = 24 * 1024
+		}
+		item, err := t.evidence.Issue(ctx, evidence.IssueRequest{
+			AttemptID:        t.attemptID,
+			DiagnosisRunID:   t.runID,
+			RepositoryID:     t.repoID,
+			SnapshotID:       t.snapshotID,
+			CodeIndexBuildID: t.buildID,
+			SourceKind:       evidence.SourceReadFile,
+			FilePath:         cleanPath,
+			StartLine:        args.StartLine,
+			EndLine:          args.EndLine,
+			MaxBytes:         maxBytes,
+		})
+		if err != nil {
+			return "", err
+		}
+		return marshalEvidenceResponse(item)
+	}
+
 	content, err := t.storeFS.ReadFile(ctx, t.repoID, t.snapshotID, cleanPath, args.StartLine, args.EndLine)
 	if err != nil {
 		return "", err
@@ -138,4 +176,34 @@ func (t *ReadFileTool) Execute(ctx context.Context, argsJSON string) (string, er
 	}
 
 	return content, nil
+}
+
+type evidenceToolResponse struct {
+	EvidenceID       string `json:"evidence_id,omitempty"`
+	Path             string `json:"path"`
+	StartLine        int    `json:"start_line"`
+	EndLine          int    `json:"end_line"`
+	TotalLines       int    `json:"total_lines"`
+	Content          string `json:"content"`
+	ContentHash      string `json:"content_hash"`
+	RedactionApplied bool   `json:"redaction_applied"`
+	Truncated        bool   `json:"truncated"`
+}
+
+func marshalEvidenceResponse(item *evidence.AttemptEvidenceItem) (string, error) {
+	response, err := json.Marshal(evidenceToolResponse{
+		EvidenceID:       item.ID,
+		Path:             item.FilePath,
+		StartLine:        item.StartLine,
+		EndLine:          item.EndLine,
+		TotalLines:       item.TotalLines,
+		Content:          item.DisplayExcerpt,
+		ContentHash:      item.RawContentHash,
+		RedactionApplied: item.RedactionApplied,
+		Truncated:        item.Truncated,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal evidence response: %w", err)
+	}
+	return string(response), nil
 }

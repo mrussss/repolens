@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"repolens/internal/evidence"
 	"repolens/internal/llm"
+	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/retrieval"
 )
 
@@ -14,6 +16,26 @@ type SearchCodeTool struct {
 	snapshotID       string
 	codeIndexBuildID int64
 	retrievalBuildID int64
+	repositoryID     string
+	storeFS          snapshotstore.SnapshotStore
+	evidence         evidence.EvidenceIssuer
+	attemptID        string
+	runID            string
+	maxBytes         int
+}
+
+func (t *SearchCodeTool) WithEvidenceIssuer(storeFS snapshotstore.SnapshotStore, issuer evidence.EvidenceIssuer, attemptID, runID string, maxBytes int) *SearchCodeTool {
+	t.storeFS = storeFS
+	t.evidence = issuer
+	t.attemptID = attemptID
+	t.runID = runID
+	t.maxBytes = maxBytes
+	return t
+}
+
+func (t *SearchCodeTool) WithEvidenceRepositoryID(repositoryID string) *SearchCodeTool {
+	t.repositoryID = repositoryID
+	return t
 }
 
 func NewPinnedSearchCodeTool(retriever retrieval.Retriever, snapshotID string, codeIndexBuildID, retrievalBuildID int64) *SearchCodeTool {
@@ -32,7 +54,7 @@ func (t *SearchCodeTool) Name() string {
 }
 
 func (t *SearchCodeTool) Description() string {
-	return "Searches the codebase using code-aware BM25 and structural code intelligence. Returns ranked code symbols, files, scores, and structural reasoning."
+	return "Searches the codebase using code-aware BM25 and structural code intelligence. Results include server-issued evidence_id values; only those IDs may be cited in the final report."
 }
 
 func (t *SearchCodeTool) Definition() llm.ToolDefinition {
@@ -85,6 +107,37 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 
 	if len(results) == 0 {
 		return "No code matches found for the query.", nil
+	}
+	if t.evidence != nil {
+		maxBytes := t.maxBytes
+		if maxBytes <= 0 {
+			maxBytes = 24 * 1024
+		}
+		for i := range results {
+			if results[i].Path == "" {
+				continue
+			}
+			item, issueErr := t.evidence.Issue(ctx, evidence.IssueRequest{
+				AttemptID:        t.attemptID,
+				DiagnosisRunID:   t.runID,
+				RepositoryID:     t.repositoryID,
+				SnapshotID:       t.snapshotID,
+				CodeIndexBuildID: t.codeIndexBuildID,
+				SourceKind:       evidence.SourceSearchCode,
+				RetrievalChunkID: results[i].ChunkID,
+				FilePath:         results[i].Path,
+				StartLine:        results[i].StartLine,
+				EndLine:          results[i].EndLine,
+				MaxBytes:         maxBytes,
+			})
+			if issueErr != nil {
+				return "", issueErr
+			}
+			results[i].EvidenceID = item.ID
+			results[i].StartLine = item.StartLine
+			results[i].EndLine = item.EndLine
+			results[i].Snippet = item.DisplayExcerpt
+		}
 	}
 
 	outBytes, err := json.MarshalIndent(results, "", "  ")

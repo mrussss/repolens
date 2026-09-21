@@ -30,6 +30,10 @@ func (s checkpointFailingStore) UpdateAttemptCheckpoint(context.Context, string,
 	return errors.New("checkpoint storage unavailable")
 }
 
+func (s checkpointFailingStore) UpdateAttemptCheckpointWithDraft(context.Context, string, string, string, string, string, string, bool, int, int, int, int, int, int, int, int, string) error {
+	return errors.New("checkpoint storage unavailable")
+}
+
 func (e *checkpointCountingExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	e.calls++
 	return nil, errors.New("provider should not be called when a checkpoint exists")
@@ -126,6 +130,56 @@ func TestWorkerJobHandler_ExecutionSuccess(t *testing.T) {
 	}
 	if job.Status != jobs.StatusSucceeded {
 		t.Errorf("expected job status SUCCEEDED, got %s", job.Status)
+	}
+}
+
+type invalidEvidenceExecutor struct{}
+
+func (invalidEvidenceExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+	return &worker.ExecutionResult{
+		Report: &evidence.DiagnosisReportData{
+			ConclusionKind: evidence.ConclusionRootCause,
+			Summary:        "summary",
+			RootCause:      "root cause",
+			Findings: []evidence.Finding{{
+				Title: "finding", Reasoning: "reasoning",
+				Citations: []evidence.Citation{{
+					EvidenceID: "ev_fake", ValidationStatus: evidence.CitationInvalid, ValidationError: "EVIDENCE_NOT_FOUND",
+				}},
+			}},
+		},
+		StructuredReport: true,
+	}, nil
+}
+
+func TestWorkerJobHandler_InvalidEvidenceDegradesButSucceeds(t *testing.T) {
+	db, jobsStore := setupTestEnvironment(t)
+	ctx := context.Background()
+	diagStore := diagnosis.NewStore(db)
+	repStore := evidence.NewReportStore(db)
+	citStore := evidence.NewCitationStore(db)
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-invalid-evidence", UserID: "user-invalid-evidence", RepositoryID: "repo-invalid-evidence",
+		SnapshotID: "snap-invalid-evidence", IssueTitle: "invalid evidence", IdempotencyKey: "invalid-evidence-key", IdempotencyRequestHash: "invalid-evidence-hash",
+	}
+	if err := diagStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-invalid-evidence", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("failed to claim invalid-evidence job: err=%v jobs=%d", err, len(claimed))
+	}
+	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, nil, invalidEvidenceExecutor{})
+	if err := handler.Execute(ctx, claimed[0]); err != nil {
+		t.Fatal(err)
+	}
+	savedRun, err := diagStore.GetByID(ctx, run.ID)
+	if err != nil || savedRun.Status != diagnosis.StatusSucceeded {
+		t.Fatalf("run = %+v err=%v, want SUCCEEDED", savedRun, err)
+	}
+	report, err := repStore.GetByRunID(ctx, run.ID)
+	if err != nil || report.ReportStatus != evidence.ReportDegraded || report.InvalidCitationCount != 1 {
+		t.Fatalf("report = %+v err=%v, want DEGRADED with one invalid citation", report, err)
 	}
 }
 

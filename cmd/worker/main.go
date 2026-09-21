@@ -65,6 +65,7 @@ func run() error {
 	citationStore := evidence.NewCitationStore(db.GormDB)
 	traceStore := trace.NewStore(db.GormDB)
 	citationVal := evidence.NewCitationValidator(storeFS)
+	evidenceIssuer := evidence.NewEvidenceIssuer(db.GormDB, storeFS)
 
 	providerMgr := provider.NewManagerWithAuthModeAndTimeoutAndRetries(
 		cfg.ProviderSecretPath,
@@ -93,6 +94,7 @@ func run() error {
 		agent.DefaultGuardConfig(),
 	)
 	agentExecutor.WithCodeIntelStore(codeIntelStore)
+	agentExecutor.WithEvidenceIssuer(evidenceIssuer)
 
 	// DB-backed Analysis Job Worker Runtime
 	jobsStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)

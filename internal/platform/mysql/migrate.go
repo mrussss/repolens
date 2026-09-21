@@ -35,6 +35,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&revision.AnalysisRevision{},
 		&evidence.Report{},
 		&evidence.Citation{},
+		&evidence.AttemptEvidenceItem{},
 		&trace.AgentStep{},
 		&jobs.AnalysisJob{},
 	)

@@ -2,6 +2,8 @@ package e2e_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -112,7 +114,7 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 		storeFS,
 		trace.NewStore(db),
 		agent.DefaultGuardConfig(),
-	).WithCodeIntelStore(codeIndexStore).WithEvidencePacketLimit(32 * 1024)
+	).WithCodeIntelStore(codeIndexStore).WithEvidencePacketLimit(32 * 1024).WithEvidenceIssuer(evidence.NewEvidenceIssuer(db, storeFS))
 	diagnosisHandler := worker.NewDiagnosisJobHandler(
 		diagnosisStore,
 		reportStore,
@@ -256,12 +258,23 @@ type scriptedProvider struct {
 	calls int32
 }
 
-func (p *scriptedProvider) Generate(context.Context, llm.GenerateRequest) (llm.GenerateResponse, error) {
+func (p *scriptedProvider) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
 	atomic.AddInt32(&p.calls, 1)
+	evidenceID := "ev_missing"
+	for _, message := range request.Messages {
+		var payload struct {
+			EvidenceID string `json:"evidence_id"`
+		}
+		if json.Unmarshal([]byte(message.Content), &payload) == nil && payload.EvidenceID != "" {
+			evidenceID = payload.EvidenceID
+			break
+		}
+	}
+	content := fmt.Sprintf(`{"conclusion_kind":"ROOT_CAUSE","summary":"The fixture checkout path returns without applying the expected processing behavior.","root_cause":"ProcessCheckout is the source location captured for the checkout behavior.","findings":[{"title":"Checkout processing implementation","reasoning":"The deterministic fixture provider identified the checkout implementation and attached a source citation.","citations":[{"evidence_id":%q,"reason":"checkout implementation"}]}],"recommended_checks":["Add a regression test for checkout processing"],"confirmed_facts":["The checkout implementation is present in the prepared snapshot."],"limitations":[],"confidence":0.9}`, evidenceID)
 	return llm.GenerateResponse{
 		Message: llm.Message{
 			Role:    llm.RoleAssistant,
-			Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"The fixture checkout path returns without applying the expected processing behavior.","root_cause":"ProcessCheckout is the source location captured for the checkout behavior.","findings":[{"title":"Checkout processing implementation","reasoning":"The deterministic fixture provider identified the checkout implementation and attached a source citation.","citations":[{"path":"checkout.go","start_line":3,"end_line":5,"excerpt":"func ProcessCheckout(id string) error {\n\treturn nil\n}","reason":"checkout implementation"}]}],"recommended_checks":["Add a regression test for checkout processing"],"confirmed_facts":["The checkout implementation is present in the prepared snapshot."],"limitations":[],"confidence":0.9}`,
+			Content: content,
 		},
 		FinishReason:     "stop",
 		PromptTokens:     32,

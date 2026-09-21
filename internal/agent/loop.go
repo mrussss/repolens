@@ -43,10 +43,7 @@ Rules:
       "reasoning": "Technical reasoning",
       "citations": [
         {
-          "path": "path/to/file.ext",
-          "start_line": 10,
-          "end_line": 25,
-          "excerpt": "relevant snippet",
+          "evidence_id": "ev_...",
           "reason": "why this line is relevant"
         }
       ]
@@ -57,19 +54,24 @@ Rules:
     "Actionable fix step 2"
   ],
   "confirmed_facts": ["Facts directly supported by the evidence"],
-  "confidence": 0.95,
+	"model_claimed_confidence": 0.95,
   "limitations": []
 }
 Do not wrap the JSON with markdown backticks if possible, or output strictly parseable JSON.
 
 Citation requirements:
-- Use a repository-relative file path in each citation's path field.
-- Copy excerpt verbatim from one contiguous range of that file; do not use ellipses, placeholders, or paraphrases.
-- Keep the cited line range tight enough that the excerpt matches the exact source lines.
+- Cite only evidence_id values returned by a tool in this attempt.
+- Never invent or edit an evidence_id.
+- Do not output file paths, line ranges, excerpts, or content hashes as citation facts.
+- Explain why each selected evidence_id supports the finding in the citation reason.
+- If evidence is insufficient, use INSUFFICIENT_EVIDENCE instead of inventing a citation.
 `
 
 type LoopResult struct {
-	Report             *evidence.DiagnosisReportData
+	// Report is retained as a compatibility alias for callers that only need
+	// the parsed draft. Runtime persistence uses ReportDraft explicitly.
+	Report             *evidence.ReportDraft
+	ReportDraft        *evidence.ReportDraft
 	RawOutput          string
 	PromptTokens       int
 	CompletionTokens   int
@@ -263,11 +265,12 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		structuredReport := err == nil
 		if err != nil {
 			logger.L(ctx).Warn("failed to parse structured report JSON from assistant output", "error", err)
-			reportData = &evidence.DiagnosisReportData{}
+			reportData = &evidence.ReportDraft{}
 		}
 
 		return &LoopResult{
 			Report:             reportData,
+			ReportDraft:        reportData,
 			RawOutput:          finalText,
 			PromptTokens:       totalPromptTokens,
 			CompletionTokens:   totalCompletionTokens,
@@ -332,10 +335,10 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", finalText, "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason)
 	report, parseErr := parseReportJSON(finalText)
 	if parseErr != nil {
-		report = &evidence.DiagnosisReportData{}
+		report = &evidence.ReportDraft{}
 	}
 	return &LoopResult{
-		Report: report, RawOutput: finalText,
+		Report: report, ReportDraft: report, RawOutput: finalText,
 		PromptTokens: promptTokens + resp.PromptTokens, CompletionTokens: completionTokens + resp.CompletionTokens,
 		CachedPromptTokens: cachedTokens + resp.CachedPromptTokens, ReasoningTokens: reasoningTokens + resp.ReasoningTokens,
 		ToolCallsCount: toolCalls, ToolNames: toolNames, AgentRounds: rounds + 1,
@@ -376,7 +379,7 @@ func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, s
 var jsonExtractorRegex = regexp.MustCompile(`(?s)\{.*\}`)
 var fencedJSONRegex = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
 
-func parseReportJSON(raw string) (*evidence.DiagnosisReportData, error) {
+func parseReportJSON(raw string) (*evidence.ReportDraft, error) {
 	clean := strings.TrimSpace(raw)
 	clean = strings.TrimPrefix(clean, "```json")
 	clean = strings.TrimPrefix(clean, "```")
@@ -387,13 +390,13 @@ func parseReportJSON(raw string) (*evidence.DiagnosisReportData, error) {
 		if len(match) < 2 {
 			continue
 		}
-		var report evidence.DiagnosisReportData
+		var report evidence.ReportDraft
 		if err := decodeReportJSON([]byte(match[1]), &report); err == nil && reportIsStructurallyParseable(&report) {
 			return &report, nil
 		}
 	}
 
-	var report evidence.DiagnosisReportData
+	var report evidence.ReportDraft
 	if err := decodeReportJSON([]byte(clean), &report); err == nil {
 		if reportIsStructurallyParseable(&report) {
 			return &report, nil
@@ -412,7 +415,7 @@ func parseReportJSON(raw string) (*evidence.DiagnosisReportData, error) {
 	return nil, errors.New("cannot parse valid structured report JSON from LLM output")
 }
 
-func decodeReportJSON(data []byte, report *evidence.DiagnosisReportData) error {
+func decodeReportJSON(data []byte, report *evidence.ReportDraft) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(report); err != nil {
@@ -437,13 +440,13 @@ func decodeReportJSON(data []byte, report *evidence.DiagnosisReportData) error {
 	} else if raw, ok := envelope["confidence"]; ok {
 		var claimed float64
 		if err := json.Unmarshal(raw, &claimed); err == nil {
-			report.ModelClaimedConfidence = &claimed
+			report.LegacyConfidence = &claimed
 		}
 	}
 	return nil
 }
 
-func reportIsStructurallyParseable(report *evidence.DiagnosisReportData) bool {
+func reportIsStructurallyParseable(report *evidence.ReportDraft) bool {
 	if report == nil {
 		return false
 	}

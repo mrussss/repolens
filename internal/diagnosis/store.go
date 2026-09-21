@@ -413,6 +413,20 @@ func (s *GormStore) UpdateAttemptCheckpoint(ctx context.Context, attemptID, rawO
 	}).Error
 }
 
+// UpdateAttemptCheckpointWithDraft persists the parsed model draft alongside
+// the resolved compatibility report. A retry can therefore finish persistence
+// without calling the provider again.
+func (s *GormStore) UpdateAttemptCheckpointWithDraft(ctx context.Context, attemptID, rawOutput, parsedReport, parsedDraft, promptVersion, agentVersion string, structured bool, promptTokens, completionTokens, cachedPromptTokens, reasoningTokens, toolCalls, agentRounds, searchCalls, providerCalls int, finalizationReason string) error {
+	return s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).Updates(map[string]interface{}{
+		"raw_output": rawOutput, "parsed_report_json": parsedReport, "parsed_report_draft_json": parsedDraft,
+		"checkpoint_prompt_version": promptVersion, "checkpoint_agent_version": agentVersion,
+		"structured_output_valid": structured,
+		"prompt_tokens":           promptTokens, "completion_tokens": completionTokens, "cached_prompt_tokens": cachedPromptTokens, "reasoning_tokens": reasoningTokens,
+		"tool_calls": toolCalls, "agent_rounds": agentRounds, "search_calls": searchCalls, "provider_calls": providerCalls,
+		"finalization_reason": finalizationReason, "provider_completed_at": time.Now().UTC(),
+	}).Error
+}
+
 func (s *GormStore) ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error) {
 	var attempts []DiagnosisAttempt
 	err := s.db.WithContext(ctx).Where("diagnosis_run_id = ?", runID).Order("attempt_no ASC").Find(&attempts).Error

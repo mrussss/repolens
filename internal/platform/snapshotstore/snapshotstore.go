@@ -2,16 +2,29 @@ package snapshotstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
+var ErrLineTooLong = errors.New("snapshot file line exceeds the configured range limit")
+
+type FileRange struct {
+	Path       string
+	StartLine  int
+	EndLine    int
+	TotalLines int
+	Content    string
+	Truncated  bool
+}
+
 type SnapshotStore interface {
 	GetSourcePath(repoID, snapshotID string) string
 	EnsureDir(repoID, snapshotID string) (string, error)
 	ReadFile(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine int) (string, error)
+	ReadFileRange(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int) (FileRange, error)
 	FileExists(repoID, snapshotID, relativePath string) bool
 	WalkFiles(repoID, snapshotID string, fn func(relPath string, info os.FileInfo) error) error
 }
@@ -37,14 +50,25 @@ func (s *LocalSnapshotStore) EnsureDir(repoID, snapshotID string) (string, error
 }
 
 func (s *LocalSnapshotStore) ReadFile(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine int) (string, error) {
-	fullPath, err := s.safePath(repoID, snapshotID, relativePath)
+	result, err := s.ReadFileRange(ctx, repoID, snapshotID, relativePath, startLine, endLine, 0)
 	if err != nil {
 		return "", err
+	}
+	return result.Content, nil
+}
+
+func (s *LocalSnapshotStore) ReadFileRange(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int) (FileRange, error) {
+	if err := ctx.Err(); err != nil {
+		return FileRange{}, err
+	}
+	fullPath, err := s.safePath(repoID, snapshotID, relativePath)
+	if err != nil {
+		return FileRange{}, err
 	}
 
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read file: %w", err)
+		return FileRange{}, fmt.Errorf("failed to read file: %w", err)
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -57,11 +81,43 @@ func (s *LocalSnapshotStore) ReadFile(ctx context.Context, repoID, snapshotID, r
 		endLine = totalLines
 	}
 	if startLine > endLine {
-		return "", fmt.Errorf("invalid line range: %d to %d (total lines %d)", startLine, endLine, totalLines)
+		return FileRange{}, fmt.Errorf("invalid line range: %d to %d (total lines %d)", startLine, endLine, totalLines)
 	}
 
 	selected := lines[startLine-1 : endLine]
-	return strings.Join(selected, "\n"), nil
+	content := strings.Join(selected, "\n")
+	result := FileRange{
+		Path:       filepath.ToSlash(filepath.Clean(relativePath)),
+		StartLine:  startLine,
+		EndLine:    endLine,
+		TotalLines: totalLines,
+		Content:    content,
+	}
+	if maxBytes > 0 && len(content) > maxBytes {
+		var kept []string
+		used := 0
+		for _, line := range selected {
+			extra := len(line)
+			if len(kept) > 0 {
+				extra++
+			}
+			if used+extra > maxBytes {
+				if len(kept) == 0 {
+					return FileRange{}, ErrLineTooLong
+				}
+				break
+			}
+			kept = append(kept, line)
+			used += extra
+		}
+		result.Content = strings.Join(kept, "\n")
+		result.EndLine = startLine + len(kept) - 1
+		result.Truncated = result.EndLine < endLine
+	}
+	if err := ctx.Err(); err != nil {
+		return FileRange{}, err
+	}
+	return result, nil
 }
 
 func (s *LocalSnapshotStore) FileExists(repoID, snapshotID, relativePath string) bool {

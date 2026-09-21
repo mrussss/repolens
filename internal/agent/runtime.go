@@ -18,6 +18,7 @@ import (
 
 type ExecutionResult struct {
 	Report             *evidence.DiagnosisReportData
+	ReportDraft        *evidence.ReportDraft
 	RawOutput          string
 	PromptTokens       int
 	CompletionTokens   int
@@ -63,6 +64,7 @@ type AgentRuntimeExecutor struct {
 	traceStore      trace.Store
 	guardCfg        GuardConfig
 	evidenceBytes   int
+	evidenceIssuer  evidence.EvidenceIssuer
 }
 
 type ProviderFactory interface {
@@ -96,6 +98,11 @@ func (e *AgentRuntimeExecutor) WithCodeIntelStore(ciStore codeintelstore.Store) 
 
 func (e *AgentRuntimeExecutor) WithEvidencePacketLimit(maxBytes int) *AgentRuntimeExecutor {
 	e.evidenceBytes = maxBytes
+	return e
+}
+
+func (e *AgentRuntimeExecutor) WithEvidenceIssuer(issuer evidence.EvidenceIssuer) *AgentRuntimeExecutor {
+	e.evidenceIssuer = issuer
 	return e
 }
 
@@ -153,6 +160,15 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	if run.MaxOutputTokens > 0 {
 		guardCfg.MaxOutputTokens = run.MaxOutputTokens
 	}
+	if e.evidenceIssuer != nil {
+		maxEvidenceBytes := guardCfg.MaxToolResultBytes
+		if maxEvidenceBytes <= 0 {
+			maxEvidenceBytes = 32 * 1024
+		}
+		searchTool.WithEvidenceIssuer(e.storeFS, e.evidenceIssuer, attempt.ID, run.ID, maxEvidenceBytes)
+		searchTool.WithEvidenceRepositoryID(run.RepositoryID)
+		readFileTool.WithEvidenceIssuer(e.evidenceIssuer, attempt.ID, run.ID, run.CodeIndexBuildID, maxEvidenceBytes)
+	}
 	packetBytes := e.evidenceBytes
 	if run.MaxEvidencePacketBytes > 0 {
 		packetBytes = run.MaxEvidencePacketBytes
@@ -179,7 +195,29 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 			if endLine < startLine || endLine-startLine >= 80 {
 				endLine = startLine + 79
 			}
-			if excerpt, readErr := e.storeFS.ReadFile(ctx, run.RepositoryID, run.SnapshotID, results[i].Path, startLine, endLine); readErr == nil && strings.TrimSpace(excerpt) != "" {
+			if e.evidenceIssuer != nil {
+				item, issueErr := e.evidenceIssuer.Issue(ctx, evidence.IssueRequest{
+					AttemptID:        attempt.ID,
+					DiagnosisRunID:   run.ID,
+					RepositoryID:     run.RepositoryID,
+					SnapshotID:       run.SnapshotID,
+					CodeIndexBuildID: run.CodeIndexBuildID,
+					SourceKind:       evidence.SourceInitialRetrieval,
+					RetrievalChunkID: results[i].ChunkID,
+					FilePath:         results[i].Path,
+					StartLine:        startLine,
+					EndLine:          endLine,
+					MaxBytes:         packetBytes,
+				})
+				if issueErr != nil {
+					return nil, jobs.NewPermanentError("EVIDENCE_ISSUE_FAILED", "initial evidence could not be issued", issueErr)
+				}
+				results[i].EvidenceID = item.ID
+				results[i].Path = item.FilePath
+				results[i].StartLine = item.StartLine
+				results[i].EndLine = item.EndLine
+				results[i].Snippet = item.DisplayExcerpt
+			} else if excerpt, readErr := e.storeFS.ReadFile(ctx, run.RepositoryID, run.SnapshotID, results[i].Path, startLine, endLine); readErr == nil && strings.TrimSpace(excerpt) != "" {
 				results[i].Snippet = excerpt
 			}
 		}
@@ -189,7 +227,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	if err != nil {
 		if res != nil {
 			progress := &ExecutionResult{
-				Report: res.Report, RawOutput: res.RawOutput,
+				Report: resolveDraft(ctx, e.evidenceIssuer, res.ReportDraft, run, attempt), ReportDraft: res.ReportDraft, RawOutput: res.RawOutput,
 				PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
 				CachedPromptTokens: res.CachedPromptTokens, ReasoningTokens: res.ReasoningTokens,
 				ToolCalls: res.ToolCallsCount, ToolNames: res.ToolNames, AgentRounds: res.AgentRounds,
@@ -203,7 +241,8 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	}
 
 	return &ExecutionResult{
-		Report:             res.Report,
+		Report:             resolveDraft(ctx, e.evidenceIssuer, res.ReportDraft, run, attempt),
+		ReportDraft:        res.ReportDraft,
 		RawOutput:          res.RawOutput,
 		PromptTokens:       res.PromptTokens,
 		CompletionTokens:   res.CompletionTokens,
@@ -219,4 +258,21 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		FinalizationReason: res.FinalizationReason,
 		Retryable:          false,
 	}, nil
+}
+
+func resolveDraft(ctx context.Context, issuer evidence.EvidenceIssuer, draft *evidence.ReportDraft, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) *evidence.DiagnosisReportData {
+	if draft == nil {
+		return &evidence.DiagnosisReportData{}
+	}
+	report, _ := evidence.ResolveReportDraft(ctx, issuer, draft, evidence.DraftLineage{
+		AttemptID:        attempt.ID,
+		DiagnosisRunID:   run.ID,
+		RepositoryID:     run.RepositoryID,
+		SnapshotID:       run.SnapshotID,
+		CodeIndexBuildID: run.CodeIndexBuildID,
+	})
+	if report == nil {
+		return &evidence.DiagnosisReportData{}
+	}
+	return report
 }

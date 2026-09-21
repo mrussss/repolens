@@ -26,6 +26,7 @@ const (
 type Citation struct {
 	ID               string         `gorm:"primaryKey;size:36" json:"id"`
 	ReportID         string         `gorm:"size:36;index" json:"report_id,omitempty"`
+	EvidenceID       string         `gorm:"size:64;index" json:"evidence_id,omitempty"`
 	SnapshotID       string         `gorm:"size:36;not null;index" json:"snapshot_id"`
 	CodeIndexBuildID int64          `gorm:"not null;default:0;index" json:"code_index_build_id"`
 	FilePath         string         `gorm:"size:255;not null" json:"file_path"`

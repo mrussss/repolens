@@ -15,6 +15,7 @@ type SearchRequest struct {
 
 type SearchResult struct {
 	ChunkID         string   `json:"chunk_id"`
+	EvidenceID      string   `json:"evidence_id,omitempty"`
 	Path            string   `json:"path"`
 	Language        string   `json:"language"`
 	Symbol          string   `json:"symbol,omitempty"`
