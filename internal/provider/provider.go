@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -432,7 +433,7 @@ func ClassifyTestConnectionError(err error) (code, message string, status int) {
 		case http.StatusUnauthorized, http.StatusForbidden:
 			return ProviderTestCodeAuthFailed, "Provider 鉴权失败，请检查 API Key", http.StatusBadGateway
 		case http.StatusTooManyRequests:
-			return ProviderTestCodeRateLimited, "Provider 请求被限流或额度不足（429）", http.StatusTooManyRequests
+			return ProviderTestCodeRateLimited, classifyRateLimitMessage(httpErr.Body), http.StatusTooManyRequests
 		case http.StatusNotFound:
 			return ProviderTestCodeModelNotFound, "Provider 模型或接口不存在，请检查 Base URL 和模型名称", http.StatusNotFound
 		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
@@ -440,6 +441,57 @@ func ClassifyTestConnectionError(err error) (code, message string, status int) {
 		}
 	}
 	return ProviderTestCodeConnectionError, "无法连接 Provider，请检查网络和 Base URL", http.StatusBadGateway
+}
+
+type upstreamErrorPayload struct {
+	Code    json.RawMessage `json:"code"`
+	Message string          `json:"message"`
+	Error   *struct {
+		Code    json.RawMessage `json:"code"`
+		Message string          `json:"message"`
+	} `json:"error"`
+}
+
+func classifyRateLimitMessage(body string) string {
+	const genericMessage = "请求过于频繁，请稍后重试（429）"
+
+	var payload upstreamErrorPayload
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return genericMessage
+	}
+
+	code := normalizeUpstreamCode(payload.Code)
+	if payload.Error != nil {
+		if nestedCode := normalizeUpstreamCode(payload.Error.Code); nestedCode != "" {
+			code = nestedCode
+		}
+	}
+
+	// AIHubMix uses code 1310 for a model's exhausted monthly quota. Keep this
+	// provider-specific detail in the user-facing message while hiding the raw
+	// upstream response and any request identifiers.
+	if code == "1310" {
+		return "该模型当前月度额度已耗尽（AIHubMix code 1310）"
+	}
+	return genericMessage
+}
+
+func normalizeUpstreamCode(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var numericCode int
+	if err := json.Unmarshal(raw, &numericCode); err == nil {
+		return strconv.Itoa(numericCode)
+	}
+
+	var stringCode string
+	if err := json.Unmarshal(raw, &stringCode); err == nil {
+		return strings.TrimSpace(stringCode)
+	}
+
+	return ""
 }
 
 func normalizeAuthMode(mode string) string {

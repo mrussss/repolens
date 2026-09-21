@@ -60,6 +60,27 @@ func TestTestConnectionFailureHasStableHTTPError(t *testing.T) {
 	}
 }
 
+func TestTestConnectionQuotaFailureHasPreciseHTTPError(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"The model's quota has reached its monthly limit.","code":1310}}`))
+	}))
+	defer mockServer.Close()
+
+	handler := provider.NewHandler(provider.NewManager(filepath.Join(t.TempDir(), "provider.json"), "", "", "", ""), nil, nil, nil, nil, nil, nil, nil)
+	router := gin.New()
+	router.POST("/settings/provider/test", handler.TestConnection)
+	response := performProviderRequestTo(router, http.MethodPost, "/settings/provider/test", `{"base_url":"`+mockServer.URL+`","model":"model","api_key":"secret-token"}`)
+
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "该模型当前月度额度已耗尽（AIHubMix code 1310）") {
+		t.Fatalf("response = %s", response.Body.String())
+	}
+}
+
 func TestClearConfigFilesystemFailureHasSafeHTTPError(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "secrets", "provider.json")
 	if err := os.MkdirAll(target, 0700); err != nil {

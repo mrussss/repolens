@@ -213,23 +213,26 @@ func TestTestConnection(t *testing.T) {
 
 func TestClassifyTestConnectionError(t *testing.T) {
 	tests := []struct {
-		name   string
-		err    error
-		code   string
-		status int
+		name    string
+		err     error
+		code    string
+		message string
+		status  int
 	}{
-		{name: "auth", err: &llm.HTTPError{StatusCode: http.StatusUnauthorized}, code: provider.ProviderTestCodeAuthFailed, status: http.StatusBadGateway},
-		{name: "rate limit", err: &llm.HTTPError{StatusCode: http.StatusTooManyRequests}, code: provider.ProviderTestCodeRateLimited, status: http.StatusTooManyRequests},
-		{name: "timeout", err: context.DeadlineExceeded, code: provider.ProviderTestCodeTimeout, status: http.StatusGatewayTimeout},
-		{name: "model not found", err: &llm.HTTPError{StatusCode: http.StatusNotFound}, code: provider.ProviderTestCodeModelNotFound, status: http.StatusNotFound},
-		{name: "upstream", err: &llm.HTTPError{StatusCode: http.StatusBadGateway}, code: provider.ProviderTestCodeUpstreamError, status: http.StatusBadGateway},
-		{name: "network", err: errors.New("dial tcp: connection refused"), code: provider.ProviderTestCodeConnectionError, status: http.StatusBadGateway},
+		{name: "auth", err: &llm.HTTPError{StatusCode: http.StatusUnauthorized}, code: provider.ProviderTestCodeAuthFailed, message: "Provider 鉴权失败，请检查 API Key", status: http.StatusBadGateway},
+		{name: "rate limit", err: &llm.HTTPError{StatusCode: http.StatusTooManyRequests}, code: provider.ProviderTestCodeRateLimited, message: "请求过于频繁，请稍后重试（429）", status: http.StatusTooManyRequests},
+		{name: "monthly quota", err: &llm.HTTPError{StatusCode: http.StatusTooManyRequests, Body: `{"error":{"message":"The model's quota has reached its monthly limit.","code":1310}}`}, code: provider.ProviderTestCodeRateLimited, message: "该模型当前月度额度已耗尽（AIHubMix code 1310）", status: http.StatusTooManyRequests},
+		{name: "string monthly quota code", err: &llm.HTTPError{StatusCode: http.StatusTooManyRequests, Body: `{"error":{"message":"quota exhausted","code":"1310"}}`}, code: provider.ProviderTestCodeRateLimited, message: "该模型当前月度额度已耗尽（AIHubMix code 1310）", status: http.StatusTooManyRequests},
+		{name: "timeout", err: context.DeadlineExceeded, code: provider.ProviderTestCodeTimeout, message: "Provider 请求超时（60 秒），上游可能仍在处理请求", status: http.StatusGatewayTimeout},
+		{name: "model not found", err: &llm.HTTPError{StatusCode: http.StatusNotFound}, code: provider.ProviderTestCodeModelNotFound, message: "Provider 模型或接口不存在，请检查 Base URL 和模型名称", status: http.StatusNotFound},
+		{name: "upstream", err: &llm.HTTPError{StatusCode: http.StatusBadGateway}, code: provider.ProviderTestCodeUpstreamError, message: "Provider 上游服务暂时不可用", status: http.StatusBadGateway},
+		{name: "network", err: errors.New("dial tcp: connection refused"), code: provider.ProviderTestCodeConnectionError, message: "无法连接 Provider，请检查网络和 Base URL", status: http.StatusBadGateway},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			code, _, status := provider.ClassifyTestConnectionError(tt.err)
-			if code != tt.code || status != tt.status {
-				t.Fatalf("classification = %s/%d, want %s/%d", code, status, tt.code, tt.status)
+			code, message, status := provider.ClassifyTestConnectionError(tt.err)
+			if code != tt.code || message != tt.message || status != tt.status {
+				t.Fatalf("classification = %s/%q/%d, want %s/%q/%d", code, message, status, tt.code, tt.message, tt.status)
 			}
 		})
 	}
