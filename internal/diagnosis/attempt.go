@@ -37,6 +37,7 @@ type DiagnosisAttempt struct {
 	AgentRounds             int           `gorm:"default:0" json:"agent_rounds"`
 	SearchCalls             int           `gorm:"default:0" json:"search_calls"`
 	ProviderCalls           int           `gorm:"default:0" json:"provider_calls"`
+	FinishReason            string        `gorm:"size:32" json:"finish_reason,omitempty"`
 	RawOutput               string        `gorm:"type:mediumtext" json:"raw_output,omitempty"`
 	ParsedReportJSON        string        `gorm:"type:mediumtext" json:"parsed_report_json,omitempty"`
 	ParsedReportDraftJSON   string        `gorm:"type:mediumtext" json:"parsed_report_draft_json,omitempty"`

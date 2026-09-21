@@ -388,7 +388,7 @@ func (s *GormStore) GetAttempt(ctx context.Context, attemptID string) (*Diagnosi
 func (s *GormStore) GetLatestCheckpoint(ctx context.Context, runID string) (*DiagnosisAttempt, error) {
 	var attempt DiagnosisAttempt
 	err := s.db.WithContext(ctx).
-		Where("diagnosis_run_id = ? AND raw_output <> ''", runID).
+		Where("diagnosis_run_id = ? AND (raw_output <> '' OR finish_reason <> '')", runID).
 		Order("attempt_no DESC").
 		First(&attempt).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -403,12 +403,12 @@ func (s *GormStore) GetLatestCheckpoint(ctx context.Context, runID string) (*Dia
 // UpdateAttemptCheckpoint persists provider output before citation validation
 // or the final business transaction. A later worker retry can inspect this
 // checkpoint instead of calling the provider again.
-func (s *GormStore) UpdateAttemptCheckpoint(ctx context.Context, attemptID, rawOutput, parsedReport string, structured bool, promptTokens, completionTokens, cachedPromptTokens, reasoningTokens, toolCalls, agentRounds, searchCalls, providerCalls int, finalizationReason string) error {
+func (s *GormStore) UpdateAttemptCheckpoint(ctx context.Context, attemptID, rawOutput, parsedReport string, structured bool, promptTokens, completionTokens, cachedPromptTokens, reasoningTokens, toolCalls, agentRounds, searchCalls, providerCalls int, finalizationReason, finishReason string) error {
 	return s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).Updates(map[string]interface{}{
 		"raw_output": rawOutput, "parsed_report_json": parsedReport, "structured_output_valid": structured,
 		"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "cached_prompt_tokens": cachedPromptTokens,
 		"reasoning_tokens": reasoningTokens, "tool_calls": toolCalls, "agent_rounds": agentRounds,
-		"search_calls": searchCalls, "provider_calls": providerCalls, "finalization_reason": finalizationReason,
+		"search_calls": searchCalls, "provider_calls": providerCalls, "finalization_reason": finalizationReason, "finish_reason": finishReason,
 		"provider_completed_at": time.Now().UTC(),
 	}).Error
 }
@@ -416,14 +416,14 @@ func (s *GormStore) UpdateAttemptCheckpoint(ctx context.Context, attemptID, rawO
 // UpdateAttemptCheckpointWithDraft persists the parsed model draft alongside
 // the resolved compatibility report. A retry can therefore finish persistence
 // without calling the provider again.
-func (s *GormStore) UpdateAttemptCheckpointWithDraft(ctx context.Context, attemptID, rawOutput, parsedReport, parsedDraft, promptVersion, agentVersion string, structured bool, promptTokens, completionTokens, cachedPromptTokens, reasoningTokens, toolCalls, agentRounds, searchCalls, providerCalls int, finalizationReason string) error {
+func (s *GormStore) UpdateAttemptCheckpointWithDraft(ctx context.Context, attemptID, rawOutput, parsedReport, parsedDraft, promptVersion, agentVersion string, structured bool, promptTokens, completionTokens, cachedPromptTokens, reasoningTokens, toolCalls, agentRounds, searchCalls, providerCalls int, finalizationReason, finishReason string) error {
 	return s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).Updates(map[string]interface{}{
 		"raw_output": rawOutput, "parsed_report_json": parsedReport, "parsed_report_draft_json": parsedDraft,
 		"checkpoint_prompt_version": promptVersion, "checkpoint_agent_version": agentVersion,
 		"structured_output_valid": structured,
 		"prompt_tokens":           promptTokens, "completion_tokens": completionTokens, "cached_prompt_tokens": cachedPromptTokens, "reasoning_tokens": reasoningTokens,
 		"tool_calls": toolCalls, "agent_rounds": agentRounds, "search_calls": searchCalls, "provider_calls": providerCalls,
-		"finalization_reason": finalizationReason, "provider_completed_at": time.Now().UTC(),
+		"finalization_reason": finalizationReason, "finish_reason": finishReason, "provider_completed_at": time.Now().UTC(),
 	}).Error
 }
 

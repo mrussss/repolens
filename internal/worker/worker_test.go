@@ -28,11 +28,11 @@ type checkpointFailingStore struct {
 	*diagnosis.GormStore
 }
 
-func (s checkpointFailingStore) UpdateAttemptCheckpoint(context.Context, string, string, string, bool, int, int, int, int, int, int, int, int, string) error {
+func (s checkpointFailingStore) UpdateAttemptCheckpoint(context.Context, string, string, string, bool, int, int, int, int, int, int, int, int, string, string) error {
 	return errors.New("checkpoint storage unavailable")
 }
 
-func (s checkpointFailingStore) UpdateAttemptCheckpointWithDraft(context.Context, string, string, string, string, string, string, bool, int, int, int, int, int, int, int, int, string) error {
+func (s checkpointFailingStore) UpdateAttemptCheckpointWithDraft(context.Context, string, string, string, string, string, string, bool, int, int, int, int, int, int, int, int, string, string) error {
 	return errors.New("checkpoint storage unavailable")
 }
 

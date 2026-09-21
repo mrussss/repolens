@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"repolens/internal/agent"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
@@ -129,10 +130,10 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		parsedReport, _ := json.Marshal(result.Report)
 		parsedDraft, _ := json.Marshal(result.ReportDraft)
 		if checkpointDraft, ok := h.diagnosisStore.(interface {
-			UpdateAttemptCheckpointWithDraft(context.Context, string, string, string, string, string, string, bool, int, int, int, int, int, int, int, int, string) error
+			UpdateAttemptCheckpointWithDraft(context.Context, string, string, string, string, string, string, bool, int, int, int, int, int, int, int, int, string, string) error
 		}); ok {
 			checkpointCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			checkpointErr := checkpointDraft.UpdateAttemptCheckpointWithDraft(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), string(parsedDraft), run.PromptVersion, run.AgentVersion, result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason)
+			checkpointErr := checkpointDraft.UpdateAttemptCheckpointWithDraft(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), string(parsedDraft), run.PromptVersion, run.AgentVersion, result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason, result.FinishReason)
 			cancel()
 			if checkpointErr != nil {
 				log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
@@ -145,10 +146,10 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				return jobs.NewPermanentError("CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", checkpointErr)
 			}
 		} else if checkpoint, ok := h.diagnosisStore.(interface {
-			UpdateAttemptCheckpoint(context.Context, string, string, string, bool, int, int, int, int, int, int, int, int, string) error
+			UpdateAttemptCheckpoint(context.Context, string, string, string, bool, int, int, int, int, int, int, int, int, string, string) error
 		}); ok {
 			checkpointCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			checkpointErr := checkpoint.UpdateAttemptCheckpoint(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason)
+			checkpointErr := checkpoint.UpdateAttemptCheckpoint(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason, result.FinishReason)
 			cancel()
 			if checkpointErr != nil {
 				log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
@@ -164,6 +165,18 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	}
 	if execErr != nil {
 		log.Error("agent execution failed", "error", execErr)
+		if errors.Is(execErr, agent.ErrModelOutputTruncated) {
+			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelFinalize()
+			promptTokens, completionTokens, toolCalls := 0, 0, 0
+			if result != nil {
+				promptTokens, completionTokens, toolCalls = result.PromptTokens, result.CompletionTokens, result.ToolCalls
+			}
+			if finalizeErr := h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, promptTokens, completionTokens, toolCalls, agent.ErrCodeModelOutputTruncated, execErr.Error(), false, 0); finalizeErr != nil {
+				log.Error("failed to terminalize truncated diagnosis", "error", finalizeErr)
+			}
+			return jobs.NewPermanentError(agent.ErrCodeModelOutputTruncated, "agent output was truncated before a tool call or structured report", execErr)
+		}
 		if progressErr, ok := execErr.(interface {
 			Progressed() bool
 		}); ok && progressErr.Progressed() && result != nil {
@@ -385,6 +398,7 @@ func executionResultFromCheckpoint(checkpoint *diagnosis.DiagnosisAttempt) *Exec
 		AgentRounds:        checkpoint.AgentRounds,
 		SearchCalls:        checkpoint.SearchCalls,
 		ProviderCalls:      checkpoint.ProviderCalls,
+		FinishReason:       checkpoint.FinishReason,
 		StructuredReport:   checkpoint.StructuredOutputValid,
 		FinalizationReason: checkpoint.FinalizationReason,
 	}

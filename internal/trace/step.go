@@ -31,6 +31,7 @@ type AgentStep struct {
 	InputTokens       int       `gorm:"default:0" json:"input_tokens"`
 	OutputTokens      int       `gorm:"default:0" json:"output_tokens"`
 	ErrorCode         string    `gorm:"size:64" json:"error_code,omitempty"`
+	FinishReason      string    `gorm:"size:32" json:"finish_reason,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 }
 

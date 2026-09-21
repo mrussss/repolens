@@ -82,6 +82,7 @@ type LoopResult struct {
 	AgentRounds        int
 	SearchCalls        int
 	ProviderCalls      int
+	FinishReason       string
 	StructuredReport   bool
 	ParseError         string
 	FinalizationReason string
@@ -143,6 +144,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 	toolCallsCount := 0
 	searchCalls := 0
 	providerCalls := 0
+	lastFinishReason := ""
 	toolNames := make([]string, 0)
 	agentRounds := 0
 	seq := 0
@@ -160,7 +162,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		startGen := time.Now()
 		agentRounds++
 		providerCalls++
-		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "")
+		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "", "")
 		temperature := run.Temperature
 		resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
 			Messages:       messages,
@@ -176,12 +178,12 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 				providerCalls += attempts - 1
 			}
 			// Record error step
-			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+RedactSecrets(err.Error()))
+			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+RedactSecrets(err.Error()), "")
 			partial := &LoopResult{
 				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens,
 				CachedPromptTokens: totalCachedPromptTokens, ReasoningTokens: totalReasoningTokens,
 				ToolCallsCount: toolCallsCount, ToolNames: toolNames, AgentRounds: agentRounds,
-				SearchCalls: searchCalls, ProviderCalls: providerCalls,
+				SearchCalls: searchCalls, ProviderCalls: providerCalls, FinishReason: lastFinishReason,
 			}
 			return partial, err
 		}
@@ -193,8 +195,28 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		totalCompletionTokens += resp.CompletionTokens
 		totalCachedPromptTokens += resp.CachedPromptTokens
 		totalReasoningTokens += resp.ReasoningTokens
+		lastFinishReason = resp.FinishReason
 		metrics.TokenUsageTotal.WithLabelValues("prompt").Add(float64(resp.PromptTokens))
 		metrics.TokenUsageTotal.WithLabelValues("completion").Add(float64(resp.CompletionTokens))
+
+		if isTruncatedResponse(resp, l.guardCfg.MaxOutputTokens) {
+			truncationErr := modelOutputTruncatedError(resp, l.guardCfg.MaxOutputTokens)
+			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, resp.PromptTokens, resp.CompletionTokens, ErrCodeModelOutputTruncated, resp.FinishReason)
+			return &LoopResult{
+				PromptTokens:       totalPromptTokens,
+				CompletionTokens:   totalCompletionTokens,
+				CachedPromptTokens: totalCachedPromptTokens,
+				ReasoningTokens:    totalReasoningTokens,
+				ToolCallsCount:     toolCallsCount,
+				ToolNames:          toolNames,
+				AgentRounds:        agentRounds,
+				SearchCalls:        searchCalls,
+				ProviderCalls:      providerCalls,
+				FinishReason:       resp.FinishReason,
+				StructuredReport:   false,
+				ParseError:         ErrCodeModelOutputTruncated,
+			}, truncationErr
+		}
 
 		// Check if assistant called tools
 		if len(resp.Message.ToolCalls) > 0 {
@@ -210,12 +232,12 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 				toolCallsCount++
 				toolNames = append(toolNames, tc.Function.Name)
 				if err := guard.RecordToolCall(tc.Function.Name, tc.Function.Arguments); err != nil {
-					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+RedactSecrets(err.Error()))
+					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+RedactSecrets(err.Error()), resp.FinishReason)
 					return l.finalizeOnly(ctx, run, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "tool budget exhausted"), "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 				}
 
 				// Record tool call step
-				_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolCall, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "")
+				_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolCall, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "", resp.FinishReason)
 
 				// Execute tool
 				t, err := l.registry.Get(tc.Function.Name)
@@ -246,7 +268,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 					toolResult = boundToolResult(tc.Function.Name, toolResult, maxToolResultBytes)
 
 					seq++
-					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolResult, tc.Function.Name, "", toolResult, "COMPLETED", toolExecLatency, 0, 0, "")
+					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolResult, tc.Function.Name, "", toolResult, "COMPLETED", toolExecLatency, 0, 0, "", resp.FinishReason)
 				}
 
 				messages = append(messages, llm.Message{
@@ -260,7 +282,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 		// Final response received
 		finalText := resp.Message.Content
-		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "")
+		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "", resp.FinishReason)
 
 		reportData, err := parseReportJSON(finalText)
 		structuredReport := err == nil
@@ -282,6 +304,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 			AgentRounds:        agentRounds,
 			SearchCalls:        searchCalls,
 			ProviderCalls:      providerCalls,
+			FinishReason:       resp.FinishReason,
 			StructuredReport:   structuredReport,
 			ParseError:         errorString(err),
 		}, nil
@@ -316,6 +339,20 @@ func errorString(err error) string {
 	return err.Error()
 }
 
+func isTruncatedResponse(resp llm.GenerateResponse, maxOutputTokens int) bool {
+	if strings.EqualFold(strings.TrimSpace(resp.FinishReason), "length") {
+		return true
+	}
+	return maxOutputTokens > 0 &&
+		strings.TrimSpace(resp.Message.Content) == "" &&
+		len(resp.Message.ToolCalls) == 0 &&
+		resp.CompletionTokens >= maxOutputTokens
+}
+
+func modelOutputTruncatedError(resp llm.GenerateResponse, maxOutputTokens int) error {
+	return fmt.Errorf("%w: finish_reason=%q completion_tokens=%d reasoning_tokens=%d max_output_tokens=%d", ErrModelOutputTruncated, resp.FinishReason, resp.CompletionTokens, resp.ReasoningTokens, maxOutputTokens)
+}
+
 func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, messages []llm.Message, reason string, promptTokens, completionTokens, cachedTokens, reasoningTokens, toolCalls, searchCalls int, toolNames []string, rounds, seq int) (*LoopResult, error) {
 	finalMessages := append([]llm.Message{}, messages...)
 	finalMessages = append(finalMessages, llm.Message{Role: llm.RoleUser, Content: "FINALIZE_ONLY: exploration budget is exhausted. Do not request tools. Return the best evidence-backed structured JSON now, clearly separating confirmed facts, likely explanation, uncertainty, and next checks."})
@@ -329,7 +366,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 	})
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
-		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason)
+		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason, "")
 		return &LoopResult{
 			PromptTokens: promptTokens, CompletionTokens: completionTokens,
 			CachedPromptTokens: cachedTokens, ReasoningTokens: reasoningTokens,
@@ -338,12 +375,31 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 			FinalizationReason: reason,
 		}, err
 	}
+	if isTruncatedResponse(resp, l.guardCfg.MaxOutputTokens) {
+		truncationErr := modelOutputTruncatedError(resp, l.guardCfg.MaxOutputTokens)
+		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, resp.PromptTokens, resp.CompletionTokens, ErrCodeModelOutputTruncated, resp.FinishReason)
+		return &LoopResult{
+			PromptTokens:       promptTokens + resp.PromptTokens,
+			CompletionTokens:   completionTokens + resp.CompletionTokens,
+			CachedPromptTokens: cachedTokens + resp.CachedPromptTokens,
+			ReasoningTokens:    reasoningTokens + resp.ReasoningTokens,
+			ToolCallsCount:     toolCalls,
+			ToolNames:          toolNames,
+			AgentRounds:        rounds + 1,
+			SearchCalls:        searchCalls,
+			ProviderCalls:      rounds + 1,
+			FinishReason:       resp.FinishReason,
+			StructuredReport:   false,
+			ParseError:         ErrCodeModelOutputTruncated,
+			FinalizationReason: reason,
+		}, truncationErr
+	}
 	providerCalls := rounds + 1
 	if resp.ProviderAttempts > 1 {
 		providerCalls = rounds + resp.ProviderAttempts
 	}
 	finalText := resp.Message.Content
-	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason)
+	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason, resp.FinishReason)
 	report, parseErr := parseReportJSON(finalText)
 	if parseErr != nil {
 		report = &evidence.ReportDraft{}
@@ -353,7 +409,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 		PromptTokens: promptTokens + resp.PromptTokens, CompletionTokens: completionTokens + resp.CompletionTokens,
 		CachedPromptTokens: cachedTokens + resp.CachedPromptTokens, ReasoningTokens: reasoningTokens + resp.ReasoningTokens,
 		ToolCallsCount: toolCalls, ToolNames: toolNames, AgentRounds: rounds + 1,
-		SearchCalls: searchCalls, ProviderCalls: providerCalls,
+		SearchCalls: searchCalls, ProviderCalls: providerCalls, FinishReason: resp.FinishReason,
 		StructuredReport: parseErr == nil, ParseError: errorString(parseErr), FinalizationReason: reason,
 	}, nil
 }
@@ -365,7 +421,7 @@ func maxProviderAttempts(err error) int {
 	return 1
 }
 
-func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, stepType trace.StepType, toolName, args, result, status string, latency int64, inTok, outTok int, errCode string) error {
+func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, stepType trace.StepType, toolName, args, result, status string, latency int64, inTok, outTok int, errCode, finishReason string) error {
 	if l.traceStore == nil {
 		return nil
 	}
@@ -382,6 +438,7 @@ func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, s
 		InputTokens:       inTok,
 		OutputTokens:      outTok,
 		ErrorCode:         errCode,
+		FinishReason:      finishReason,
 		CreatedAt:         time.Now(),
 	}
 	return l.traceStore.Create(ctx, step)

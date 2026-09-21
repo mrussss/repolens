@@ -29,6 +29,7 @@ type ExecutionResult struct {
 	AgentRounds        int
 	SearchCalls        int
 	ProviderCalls      int
+	FinishReason       string
 	StructuredReport   bool
 	ParseError         string
 	FinalizationReason string
@@ -228,7 +229,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 				PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
 				CachedPromptTokens: res.CachedPromptTokens, ReasoningTokens: res.ReasoningTokens,
 				ToolCalls: res.ToolCallsCount, ToolNames: res.ToolNames, AgentRounds: res.AgentRounds,
-				SearchCalls: res.SearchCalls, ProviderCalls: res.ProviderCalls,
+				SearchCalls: res.SearchCalls, ProviderCalls: res.ProviderCalls, FinishReason: res.FinishReason,
 				StructuredReport: res.StructuredReport, ParseError: res.ParseError,
 				FinalizationReason: res.FinalizationReason,
 			}
@@ -250,6 +251,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		AgentRounds:        res.AgentRounds,
 		SearchCalls:        res.SearchCalls,
 		ProviderCalls:      res.ProviderCalls,
+		FinishReason:       res.FinishReason,
 		StructuredReport:   res.StructuredReport,
 		ParseError:         res.ParseError,
 		FinalizationReason: res.FinalizationReason,

@@ -1,10 +1,88 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"repolens/internal/diagnosis"
+	"repolens/internal/llm"
 )
+
+type loopResponseProvider struct {
+	response llm.GenerateResponse
+}
+
+func (p loopResponseProvider) Generate(context.Context, llm.GenerateRequest) (llm.GenerateResponse, error) {
+	return p.response, nil
+}
+
+func runLoopResponseTest(t *testing.T, response llm.GenerateResponse, maxOutputTokens int) (*LoopResult, error) {
+	t.Helper()
+	loop := NewAgentLoop(loopResponseProvider{response: response}, NewToolRegistry(), nil, GuardConfig{
+		MaxSteps:        2,
+		MaxToolCalls:    2,
+		MaxSearchCalls:  1,
+		MaxRepeatCalls:  1,
+		MaxOutputTokens: maxOutputTokens,
+	})
+	return loop.Run(context.Background(), &diagnosis.DiagnosisRun{
+		ID: "run-loop-response", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "issue", IssueDescription: "description", ErrorLog: "error",
+	}, &diagnosis.DiagnosisAttempt{ID: "attempt-loop-response"})
+}
+
+func TestAgentLoopRejectsLengthTruncationBeforeParsing(t *testing.T) {
+	result, err := runLoopResponseTest(t, llm.GenerateResponse{
+		Message:          llm.Message{Role: llm.RoleAssistant},
+		FinishReason:     "length",
+		CompletionTokens: 100,
+		ReasoningTokens:  100,
+	}, 2048)
+	if err == nil || !strings.Contains(err.Error(), "MODEL_OUTPUT_TRUNCATED") {
+		t.Fatalf("expected MODEL_OUTPUT_TRUNCATED, result=%+v err=%v", result, err)
+	}
+	if result == nil || result.StructuredReport {
+		t.Fatalf("truncated response should not be structured: %+v", result)
+	}
+	if result.FinishReason != "length" || result.ParseError != ErrCodeModelOutputTruncated {
+		t.Fatalf("truncation evidence = finish_reason=%q parse_error=%q", result.FinishReason, result.ParseError)
+	}
+}
+
+func TestAgentLoopDetectsBudgetExhaustionWithoutFinishReason(t *testing.T) {
+	_, err := runLoopResponseTest(t, llm.GenerateResponse{
+		Message:          llm.Message{Role: llm.RoleAssistant},
+		CompletionTokens: 2048,
+	}, 2048)
+	if err == nil || !strings.Contains(err.Error(), "MODEL_OUTPUT_TRUNCATED") {
+		t.Fatalf("expected budget exhaustion truncation, got %v", err)
+	}
+}
+
+func TestAgentLoopKeepsNormalStopAndInvalidJSONSeparateFromTruncation(t *testing.T) {
+	valid, err := runLoopResponseTest(t, llm.GenerateResponse{
+		Message:          llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[]}`},
+		FinishReason:     "stop",
+		CompletionTokens: 100,
+	}, 2048)
+	if err != nil || valid == nil || !valid.StructuredReport {
+		t.Fatalf("valid stop response was not accepted: result=%+v err=%v", valid, err)
+	}
+	if valid.FinishReason != "stop" {
+		t.Fatalf("finish reason = %q, want stop", valid.FinishReason)
+	}
+
+	invalid, err := runLoopResponseTest(t, llm.GenerateResponse{
+		Message:          llm.Message{Role: llm.RoleAssistant, Content: "not json"},
+		FinishReason:     "stop",
+		CompletionTokens: 100,
+	}, 2048)
+	if err != nil || invalid == nil || invalid.StructuredReport || invalid.ParseError == "MODEL_OUTPUT_TRUNCATED" {
+		t.Fatalf("invalid stop response took truncation path: result=%+v err=%v", invalid, err)
+	}
+}
 
 func TestParseReportJSONSkipsProseBracesBeforeFencedJSON(t *testing.T) {
 	raw := "Analysis note: if shouldRedirect { shouldRedirect = false }\n\n" +
