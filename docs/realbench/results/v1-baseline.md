@@ -6,8 +6,8 @@
 
 - Dataset: `realbench-v1`
 - Manifest hash: `5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf`
-- RepoLens commit: `3f7833c8baf6981b3f448f3db4c80928edc06ed0`
-- Run ID: `20260921T103105Z-4c1f5c42`
+- RepoLens commit: `0a2cbd2d17c6ed9e45444a0d269900addeca8c1d`
+- Run ID: `20260921T103622Z-b0f118ce`
 - Command: `go run ./cmd/realbench run --case REAL-001`; `go run ./cmd/realbench run --all`
 - Validation: `go run ./cmd/realbench validate` — PASS; single-case run — PASS
 - Retrieval: `symbol_bm25_structural` — current Pure Go BM25 + Structural Retrieval
