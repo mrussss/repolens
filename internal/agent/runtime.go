@@ -161,10 +161,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		guardCfg.MaxOutputTokens = run.MaxOutputTokens
 	}
 	if e.evidenceIssuer != nil {
-		maxEvidenceBytes := guardCfg.MaxToolResultBytes
-		if maxEvidenceBytes <= 0 {
-			maxEvidenceBytes = 32 * 1024
-		}
+		maxEvidenceBytes := evidenceContentBudget(guardCfg.MaxToolResultBytes)
 		searchTool.WithEvidenceIssuer(e.storeFS, e.evidenceIssuer, attempt.ID, run.ID, maxEvidenceBytes)
 		searchTool.WithEvidenceRepositoryID(run.RepositoryID)
 		readFileTool.WithEvidenceIssuer(e.evidenceIssuer, attempt.ID, run.ID, run.CodeIndexBuildID, maxEvidenceBytes)
@@ -258,6 +255,20 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		FinalizationReason: res.FinalizationReason,
 		Retryable:          false,
 	}, nil
+}
+
+func evidenceContentBudget(toolResultLimit int) int {
+	if toolResultLimit <= 0 {
+		toolResultLimit = 32 * 1024
+	}
+	// Leave room for the structured evidence envelope (and, for search_code,
+	// the JSON array and metadata) so the Agent loop never needs to slice a
+	// canonical response after the tool has returned it.
+	const envelopeReserve = 4096
+	if toolResultLimit > envelopeReserve {
+		return toolResultLimit - envelopeReserve
+	}
+	return toolResultLimit
 }
 
 func resolveDraft(ctx context.Context, issuer evidence.EvidenceIssuer, draft *evidence.ReportDraft, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) *evidence.DiagnosisReportData {

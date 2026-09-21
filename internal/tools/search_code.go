@@ -113,6 +113,13 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 		if maxBytes <= 0 {
 			maxBytes = 24 * 1024
 		}
+		itemMaxBytes := maxBytes
+		if topK > 1 {
+			itemMaxBytes = maxBytes / topK
+			if itemMaxBytes <= 0 {
+				itemMaxBytes = 1
+			}
+		}
 		for i := range results {
 			if results[i].Path == "" {
 				continue
@@ -128,7 +135,7 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 				FilePath:         results[i].Path,
 				StartLine:        results[i].StartLine,
 				EndLine:          results[i].EndLine,
-				MaxBytes:         maxBytes,
+				MaxBytes:         itemMaxBytes,
 			})
 			if issueErr != nil {
 				return "", issueErr
@@ -138,6 +145,7 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 			results[i].EndLine = item.EndLine
 			results[i].Snippet = item.DisplayExcerpt
 		}
+		results = resultsWithinBudget(results, maxBytes)
 	}
 
 	outBytes, err := json.MarshalIndent(results, "", "  ")
@@ -146,4 +154,20 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 	}
 
 	return string(outBytes), nil
+}
+
+func resultsWithinBudget(results []retrieval.SearchResult, maxBytes int) []retrieval.SearchResult {
+	if maxBytes <= 0 {
+		return results
+	}
+	accepted := make([]retrieval.SearchResult, 0, len(results))
+	for _, result := range results {
+		candidate := append(append([]retrieval.SearchResult(nil), accepted...), result)
+		encoded, err := json.MarshalIndent(candidate, "", "  ")
+		if err != nil || len(encoded) > maxBytes {
+			break
+		}
+		accepted = append(accepted, result)
+	}
+	return accepted
 }

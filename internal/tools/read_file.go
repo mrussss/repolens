@@ -164,18 +164,14 @@ func (t *ReadFileTool) Execute(ctx context.Context, argsJSON string) (string, er
 		return marshalEvidenceResponse(item)
 	}
 
-	content, err := t.storeFS.ReadFile(ctx, t.repoID, t.snapshotID, cleanPath, args.StartLine, args.EndLine)
+	// Keep the legacy no-issuer path bounded at complete lines as well. The
+	// evidence-enabled path above is canonical; neither path should slice a
+	// source string after reading it.
+	contentRange, err := t.storeFS.ReadFileRange(ctx, t.repoID, t.snapshotID, cleanPath, args.StartLine, args.EndLine, 64*1024)
 	if err != nil {
 		return "", err
 	}
-
-	// Truncate output if exceeding 64KB
-	maxBytes := 64 * 1024
-	if len(content) > maxBytes {
-		content = content[:maxBytes] + "\n\n...[OUTPUT TRUNCATED DUE TO SIZE LIMIT]..."
-	}
-
-	return content, nil
+	return contentRange.Content, nil
 }
 
 type evidenceToolResponse struct {

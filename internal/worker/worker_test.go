@@ -2,7 +2,9 @@ package worker_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -310,6 +312,97 @@ func TestWorkerJobHandlerResumesFromProviderCheckpoint(t *testing.T) {
 	report, err := repStore.GetByRunID(ctx, run.ID)
 	if err != nil || report.ReportStatus != evidence.ReportInsufficientEvidence {
 		t.Fatalf("checkpoint report = %+v err=%v", report, err)
+	}
+}
+
+func TestWorkerJobHandlerRebindsCheckpointEvidenceToNewAttempt(t *testing.T) {
+	db, jobsStore := setupTestEnvironment(t)
+	ctx := context.Background()
+	diagStore := diagnosis.NewStore(db)
+	repStore := evidence.NewReportStore(db)
+	citStore := evidence.NewCitationStore(db)
+	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	root, err := storeFS.EnsureDir("repo-checkpoint-evidence", "snap-checkpoint-evidence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	evidenceIssuer := evidence.NewEvidenceIssuerWithStore(storeFS, evidence.NewEvidenceStore(db))
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-checkpoint-evidence", UserID: "user-checkpoint-evidence", RepositoryID: "repo-checkpoint-evidence",
+		SnapshotID: "snap-checkpoint-evidence", CodeIndexBuildID: 1, IssueTitle: "checkpoint evidence",
+		IdempotencyKey: "checkpoint-evidence-key", IdempotencyRequestHash: "checkpoint-evidence-hash",
+		PromptVersion: diagnosis.CurrentPromptVersion, AgentVersion: diagnosis.CurrentAgentVersion,
+	}
+	if err := diagStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	oldItem, err := evidenceIssuer.Issue(ctx, evidence.IssueRequest{
+		AttemptID: "checkpoint-old-evidence", DiagnosisRunID: run.ID, RepositoryID: run.RepositoryID,
+		SnapshotID: run.SnapshotID, CodeIndexBuildID: run.CodeIndexBuildID, SourceKind: evidence.SourceReadFile,
+		FilePath: "main.go", StartLine: 1, EndLine: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := evidence.ReportDraft{
+		ConclusionKind: evidence.ConclusionRootCause, Summary: "summary", RootCause: "root cause",
+		Findings: []evidence.FindingDraft{{Title: "finding", Reasoning: "reasoning", Citations: []evidence.CitationRef{{EvidenceID: oldItem.ID, Reason: "supports"}}}},
+	}
+	draftJSON, err := json.Marshal(draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&diagnosis.DiagnosisAttempt{
+		ID: "checkpoint-old-evidence", DiagnosisRunID: run.ID, AttemptNo: 1, WorkerID: "old-worker",
+		Status: diagnosis.AttemptStatusFailedRetryable, StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),
+		DeadlineAt: time.Now().UTC().Add(time.Minute), RawOutput: string(draftJSON), ParsedReportDraftJSON: string(draftJSON),
+		CheckpointPromptVersion: diagnosis.CurrentPromptVersion, CheckpointAgentVersion: diagnosis.CurrentAgentVersion,
+		StructuredOutputValid: true, ProviderCalls: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-checkpoint-evidence", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("failed to claim checkpoint job: err=%v jobs=%d", err, len(claimed))
+	}
+	executor := &checkpointCountingExecutor{}
+	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, nil, executor).WithEvidenceIssuer(evidenceIssuer)
+	if err := handler.Execute(ctx, claimed[0]); err != nil {
+		t.Fatal(err)
+	}
+	if executor.calls != 0 {
+		t.Fatalf("executor calls = %d, want checkpoint resume without provider", executor.calls)
+	}
+	report, err := repStore.GetByRunID(ctx, run.ID)
+	if err != nil || report.ReportStatus != evidence.ReportValid {
+		t.Fatalf("checkpoint report = %+v err=%v, want VALID", report, err)
+	}
+	citations, err := citStore.ListByReportID(ctx, report.ID)
+	if err != nil || len(citations) != 1 || citations[0].ValidationStatus != evidence.CitationValid {
+		t.Fatalf("checkpoint citations = %+v err=%v, want one VALID citation", citations, err)
+	}
+	if citations[0].EvidenceID == oldItem.ID {
+		t.Fatal("checkpoint reused an evidence ID from the old attempt")
+	}
+	attempts, err := diagStore.ListAttemptsByRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var currentAttemptID string
+	for _, attempt := range attempts {
+		if attempt.ID != oldItem.AttemptID && attempt.Status == diagnosis.AttemptStatusSucceeded {
+			currentAttemptID = attempt.ID
+		}
+	}
+	if currentAttemptID == "" {
+		t.Fatalf("no succeeded replacement attempt: %+v", attempts)
+	}
+	issued, err := evidenceIssuer.ListByAttempt(ctx, currentAttemptID)
+	if err != nil || len(issued) != 1 || issued[0].ID != citations[0].EvidenceID {
+		t.Fatalf("replacement evidence = %+v err=%v, want citation-scoped item", issued, err)
 	}
 }
 

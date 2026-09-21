@@ -3,8 +3,8 @@ package evidence
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // CitationRef is the only citation shape accepted from the Agent protocol.
@@ -134,7 +134,11 @@ func ResolveReportDraft(ctx context.Context, issuer EvidenceIssuer, draft *Repor
 func limitCitationReason(reason string) string {
 	reason = strings.TrimSpace(reason)
 	if len(reason) > 2048 {
-		return reason[:2048]
+		cut := 2048
+		for cut > 0 && !utf8.ValidString(reason[:cut]) {
+			cut--
+		}
+		return reason[:cut]
 	}
 	return reason
 }
@@ -149,7 +153,9 @@ func evidenceResolveError(err error) string {
 		return "EVIDENCE_LINEAGE_MISMATCH"
 	case errors.Is(err, ErrEvidenceHashMismatch):
 		return "EVIDENCE_CONTENT_HASH_MISMATCH"
+	case errors.Is(err, ErrEvidenceSourceUnavailable):
+		return "EVIDENCE_SOURCE_UNAVAILABLE"
 	default:
-		return fmt.Sprintf("EVIDENCE_SOURCE_UNAVAILABLE: %v", err)
+		return "EVIDENCE_SOURCE_UNAVAILABLE"
 	}
 }

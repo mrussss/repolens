@@ -359,6 +359,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		result.Metadata.InputPricePerMillion = &inputPrice
 		result.Metadata.OutputPricePerMillion = &outputPrice
 	}
+	var preflightErr error
 	if opts.RunE2E && providerConfigured {
 		result.Metadata.Provider = providerConfig.Provider
 		result.Metadata.Model = providerConfig.Model
@@ -370,12 +371,12 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		result.Metadata.ResponseFormat = "prompt_json_contract"
 		result.Metadata.ReasoningEffort = "not_requested"
 		preflight, err := runProviderPreflight(ctx, providerConfig, guardConfig)
-		if err != nil {
+		preflightErr = err
+		if preflightErr != nil {
 			result.Metadata.PreflightStatus = "FAIL"
-			_ = writeJSON(filepath.Join(runDir, "preflight.json"), preflight)
-			return nil, err
+		} else {
+			result.Metadata.PreflightStatus = "PASS"
 		}
-		result.Metadata.PreflightStatus = "PASS"
 		if err := writeJSON(filepath.Join(runDir, "preflight.json"), preflight); err != nil {
 			return nil, fmt.Errorf("write preflight artifact: %w", err)
 		}
@@ -434,7 +435,13 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		var e2eErr error
 		if opts.RunE2E && providerConfigured {
 			e2eStarted := time.Now()
-			diagnosisResult, e2eMetrics, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir)
+			if preflightErr != nil {
+				caseE2EStatus = e2eFailure
+				e2eErr = preflightErr
+				e2eMetrics = failedE2EMetrics(preflightErr)
+			} else {
+				diagnosisResult, e2eMetrics, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir)
+			}
 			status.E2ELatencyMs = time.Since(e2eStarted).Milliseconds()
 			if e2eErr != nil {
 				caseE2EStatus = e2eFailure
@@ -516,7 +523,11 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		}
 	}
 	if opts.RunE2E && providerConfigured {
-		result.Metadata.E2EStatus = e2eCompleted
+		if preflightErr != nil {
+			result.Metadata.E2EStatus = e2eFailure
+		} else {
+			result.Metadata.E2EStatus = e2eCompleted
+		}
 		for _, status := range result.Cases {
 			if status.E2EStatus == e2eFailure {
 				result.Metadata.E2EStatus = e2eFailure
@@ -675,7 +686,16 @@ func loadProviderConfig() (providerConfig, bool) {
 		config.Provider = "AIHubMix"
 	}
 	if config.BaseURL == "" && config.Model == "" && config.APIKey == "" {
-		manager := provider.NewManager("", "", "", "", "")
+		manager := provider.NewManagerWithAuthModeAndTimeoutAndRetries(
+			os.Getenv("PROVIDER_SECRET_PATH"),
+			os.Getenv("REPOLENS_PROVIDER_BASE_URL"),
+			os.Getenv("REPOLENS_PROVIDER_MODEL"),
+			os.Getenv("REPOLENS_PROVIDER_API_KEY"),
+			os.Getenv("REPOLENS_PROVIDER_TYPE"),
+			os.Getenv("REPOLENS_PROVIDER_AUTH_MODE"),
+			time.Duration(providerTimeoutSeconds())*time.Second,
+			0,
+		)
 		stored, err := manager.GetSecretConfig()
 		if err == nil && stored != nil {
 			config.BaseURL = stored.BaseURL
@@ -1009,13 +1029,15 @@ func (c *traceCollector) Steps() []trace.AgentStep {
 
 func metricsFromExecution(result *agent.ExecutionResult, collector *traceCollector, latencyMs int64) *E2EMetrics {
 	metrics := &E2EMetrics{
-		Status:          e2eFailure,
-		RootCauseGrade:  "Not Scorable",
-		ToolNames:       []string{},
-		LatencyMs:       latencyMs,
-		CachedTokens:    "NOT_REPORTED",
-		ReasoningTokens: "NOT_REPORTED",
-		CostStatus:      costStatus(),
+		Status:                e2eFailure,
+		RootCauseGrade:        "Not Scorable",
+		ReportStatus:          "NOT_AVAILABLE",
+		CitationIntegrityGate: "NOT_RUN",
+		ToolNames:             []string{},
+		LatencyMs:             latencyMs,
+		CachedTokens:          "NOT_REPORTED",
+		ReasoningTokens:       "NOT_REPORTED",
+		CostStatus:            costStatus(),
 	}
 	if result != nil {
 		metrics.ToolCalls = result.ToolCalls
@@ -1042,6 +1064,20 @@ func metricsFromExecution(result *agent.ExecutionResult, collector *traceCollect
 		}
 	}
 	return metrics
+}
+
+func failedE2EMetrics(err error) *E2EMetrics {
+	return &E2EMetrics{
+		Status:                e2eFailure,
+		RootCauseGrade:        "Not Scorable",
+		ReportStatus:          "NOT_AVAILABLE",
+		CitationIntegrityGate: "NOT_RUN",
+		FailureClassification: errorClassFor(err),
+		ToolNames:             []string{},
+		CachedTokens:          "NOT_REPORTED",
+		ReasoningTokens:       "NOT_REPORTED",
+		CostStatus:            costStatus(),
+	}
 }
 
 func citationValidityRate(total, valid int) float64 {
@@ -1110,7 +1146,10 @@ func gradeRootCause(report *evidence.DiagnosisReportData, truth GroundTruth) str
 			}
 		}
 	}
-	if fileMatch && overlap >= 0.6 {
+	// Root-cause grading measures the diagnosis text. Citation integrity is a
+	// separate gate; an invalid or stale handle must not turn an otherwise
+	// correct explanation into an Incorrect grade.
+	if overlap >= 0.6 {
 		return "Correct"
 	}
 	if fileMatch || overlap >= 0.3 {

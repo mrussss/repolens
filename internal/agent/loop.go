@@ -176,7 +176,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 				providerCalls += attempts - 1
 			}
 			// Record error step
-			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+err.Error())
+			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+RedactSecrets(err.Error()))
 			partial := &LoopResult{
 				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens,
 				CachedPromptTokens: totalCachedPromptTokens, ReasoningTokens: totalReasoningTokens,
@@ -210,12 +210,12 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 				toolCallsCount++
 				toolNames = append(toolNames, tc.Function.Name)
 				if err := guard.RecordToolCall(tc.Function.Name, tc.Function.Arguments); err != nil {
-					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, tc.Function.Arguments, "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+err.Error())
+					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+RedactSecrets(err.Error()))
 					return l.finalizeOnly(ctx, run, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "tool budget exhausted"), "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 				}
 
 				// Record tool call step
-				_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolCall, tc.Function.Name, tc.Function.Arguments, "", "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "")
+				_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolCall, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "")
 
 				// Execute tool
 				t, err := l.registry.Get(tc.Function.Name)
@@ -234,15 +234,16 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 						metrics.ToolCallsTotal.WithLabelValues(tc.Function.Name, "success").Inc()
 					}
 
-					// Apply secret redaction and the frozen per-run size limit.
+					// Apply secret redaction and the frozen per-run size limit. Tool
+					// implementations own canonical evidence boundaries; a second
+					// arbitrary byte slice here could corrupt JSON or split UTF-8/source
+					// lines. Return a short structured error instead.
 					toolResult = RedactSecrets(toolResult)
 					maxToolResultBytes := l.guardCfg.MaxToolResultBytes
 					if maxToolResultBytes <= 0 {
 						maxToolResultBytes = 32 * 1024
 					}
-					if len(toolResult) > maxToolResultBytes {
-						toolResult = toolResult[:maxToolResultBytes] + fmt.Sprintf("\n...[truncated size limit %d bytes]", maxToolResultBytes)
-					}
+					toolResult = boundToolResult(tc.Function.Name, toolResult, maxToolResultBytes)
 
 					seq++
 					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolResult, tc.Function.Name, "", toolResult, "COMPLETED", toolExecLatency, 0, 0, "")
@@ -259,7 +260,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 		// Final response received
 		finalText := resp.Message.Content
-		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", finalText, "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "")
+		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "")
 
 		reportData, err := parseReportJSON(finalText)
 		structuredReport := err == nil
@@ -285,6 +286,16 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 			ParseError:         errorString(err),
 		}, nil
 	}
+}
+
+func boundToolResult(toolName, result string, maxBytes int) string {
+	if maxBytes <= 0 || len(result) <= maxBytes {
+		return result
+	}
+	if toolName == "read_file" || toolName == "search_code" {
+		return `{"error":"TOOL_RESULT_TOO_LARGE","message":"tool output exceeded the configured limit; narrow the file range or search query"}`
+	}
+	return "Tool output exceeded the configured limit; narrow the request."
 }
 
 func appendBudgetResults(messages []llm.Message, calls []llm.ToolCall, from int, reason string) []llm.Message {
@@ -332,7 +343,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 		providerCalls = rounds + resp.ProviderAttempts
 	}
 	finalText := resp.Message.Content
-	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", finalText, "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason)
+	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason)
 	report, parseErr := parseReportJSON(finalText)
 	if parseErr != nil {
 		report = &evidence.ReportDraft{}

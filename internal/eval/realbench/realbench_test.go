@@ -3,6 +3,9 @@ package realbench
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,6 +153,80 @@ func TestRootCauseRubricUsesGroundTruthOnlyAfterExecution(t *testing.T) {
 	}
 	if got := gradeRootCause(report, truth); got != "Correct" {
 		t.Fatalf("root cause grade = %s, want Correct", got)
+	}
+}
+
+func TestCitationFailureDoesNotOverrideRootCauseGrade(t *testing.T) {
+	truth := GroundTruth{ExpectedRootCause: "handler returns stale cache value after refresh", PrimaryFiles: []string{"handler.go"}}
+	report := &evidence.DiagnosisReportData{
+		ConclusionKind: evidence.ConclusionRootCause,
+		Summary:        "The handler returns a stale cache value after refresh.",
+		RootCause:      "The refresh path leaves the handler cache stale.",
+		Findings:       []evidence.Finding{{Title: "stale cache", Reasoning: "The refresh path leaves the cache stale.", Citations: []evidence.Citation{{EvidenceID: "ev_unknown", ValidationStatus: evidence.CitationInvalid, ValidationError: "EVIDENCE_NOT_FOUND"}}}},
+	}
+	if got := gradeRootCause(report, truth); got != "Correct" {
+		t.Fatalf("root cause grade = %s, want Correct despite invalid citation", got)
+	}
+	if unsupported := countUnsupportedClaims(report); unsupported != 1 {
+		t.Fatalf("unsupported claims = %d, want 1 for invalid-only finding", unsupported)
+	}
+}
+
+func TestRealBenchSeparatesCompletedE2EFromCitationGateFailure(t *testing.T) {
+	metrics := aggregateMetrics([]CaseStatus{{
+		CaseID: "REAL-001", Status: "RETRIEVAL_AND_E2E_COMPLETED", E2EStatus: e2eCompleted,
+		ExecutionStatus: e2eCompleted, ReportStatus: string(evidence.ReportDegraded), CitationIntegrityGate: "FAILED",
+		HitAt5: true, HitAt10: true, ReciprocalRank: 1,
+	}})
+	if metrics.CompletedCases != 1 || metrics.InfraErrors != 0 || metrics.ProductFailures != 0 || metrics.CitationGateFailures != 1 {
+		t.Fatalf("unexpected separated metrics: %+v", metrics)
+	}
+}
+
+func TestFailedE2EMetricsPreserveExternalClassification(t *testing.T) {
+	metrics := failedE2EMetrics(externalFailure("provider preflight", errors.New("429")))
+	if metrics.Status != e2eFailure || metrics.FailureClassification != string(failureExternalInfra) || metrics.ReportStatus != "NOT_AVAILABLE" || metrics.CitationIntegrityGate != "NOT_RUN" {
+		t.Fatalf("unexpected preflight failure metrics: %+v", metrics)
+	}
+}
+
+func TestRunnerRecordsProviderPreflightFailureAsExternalE2EFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"quota exhausted","code":1310}}`))
+	}))
+	defer server.Close()
+	t.Setenv("REPOLENS_REALBENCH_PROVIDER", "test-provider")
+	t.Setenv("REPOLENS_REALBENCH_BASE_URL", server.URL)
+	t.Setenv("REPOLENS_REALBENCH_MODEL", "test-model")
+	t.Setenv("REPOLENS_REALBENCH_API_KEY", "test-key")
+
+	datasetRoot := writeSyntheticDataset(t)
+	dataset, err := LoadInputs(datasetRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(dataset)
+	runner.Fetcher = syntheticFetcher{}
+	result, err := runner.Run(context.Background(), RunOptions{
+		CaseIDs:      []string{"REAL-999"},
+		CacheDir:     filepath.Join(t.TempDir(), "cache"),
+		ArtifactRoot: filepath.Join(t.TempDir(), "artifacts"),
+		RunE2E:       true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Metadata.E2EStatus != e2eFailure || result.Metrics.InfraErrors != 1 || result.Metrics.ProductFailures != 0 {
+		t.Fatalf("unexpected preflight failure result: metadata=%+v metrics=%+v", result.Metadata, result.Metrics)
+	}
+	if len(result.Cases) != 1 || result.Cases[0].ExecutionStatus != e2eFailure || result.Cases[0].ErrorClass != string(failureExternalInfra) || result.Cases[0].ReportStatus != "NOT_AVAILABLE" {
+		t.Fatalf("unexpected case status: %+v", result.Cases)
+	}
+	metricsData, err := os.ReadFile(filepath.Join(result.RunDir, "cases", "REAL-999", "e2e_metrics.json"))
+	if err != nil || !strings.Contains(string(metricsData), `"failure_classification": "EXTERNAL_INFRA"`) {
+		t.Fatalf("missing external E2E metrics: err=%v data=%s", err, metricsData)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -115,6 +116,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			}
 			result = executionResultFromCheckpoint(checkpoint)
 			if result.ReportDraft != nil && h.evidenceIssuer != nil {
+				result.ReportDraft = rebindCheckpointDraft(ctx, h.evidenceIssuer, result.ReportDraft, checkpoint.ID, run, attempt)
 				result.Report = resolveCheckpointDraft(ctx, h.evidenceIssuer, result.ReportDraft, run, attempt)
 			}
 			log.Info("resuming diagnosis from provider checkpoint", "checkpoint_attempt_id", checkpoint.ID)
@@ -305,6 +307,57 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	log.Info("diagnosis job completed successfully")
 	return nil
+}
+
+// rebindCheckpointDraft carries evidence handles from a provider checkpoint
+// into the new attempt that is performing finalization. Evidence handles are
+// intentionally attempt-scoped, so reusing the old opaque ID would make a
+// valid checkpoint look like a forged citation after a retry.
+func rebindCheckpointDraft(ctx context.Context, issuer evidence.EvidenceIssuer, draft *evidence.ReportDraft, sourceAttemptID string, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) *evidence.ReportDraft {
+	if draft == nil || issuer == nil || sourceAttemptID == "" || attempt == nil || sourceAttemptID == attempt.ID {
+		return draft
+	}
+
+	rebound := *draft
+	rebound.Findings = make([]evidence.FindingDraft, len(draft.Findings))
+	for findingIndex, finding := range draft.Findings {
+		rebound.Findings[findingIndex] = finding
+		rebound.Findings[findingIndex].Citations = append([]evidence.CitationRef(nil), finding.Citations...)
+		for citationIndex, citation := range rebound.Findings[findingIndex].Citations {
+			evidenceID := strings.TrimSpace(citation.EvidenceID)
+			if evidenceID == "" {
+				continue
+			}
+			item, err := issuer.Resolve(ctx, sourceAttemptID, evidenceID)
+			if err != nil || item == nil || item.DiagnosisRunID != run.ID || item.SnapshotID != run.SnapshotID || item.CodeIndexBuildID != run.CodeIndexBuildID {
+				continue
+			}
+			reissued, err := issuer.Issue(ctx, evidence.IssueRequest{
+				AttemptID:        attempt.ID,
+				DiagnosisRunID:   run.ID,
+				RepositoryID:     run.RepositoryID,
+				SnapshotID:       item.SnapshotID,
+				CodeIndexBuildID: item.CodeIndexBuildID,
+				SourceKind:       item.SourceKind,
+				SourceStepSeq:    valueOrZero(item.SourceStepSeq),
+				RetrievalChunkID: item.RetrievalChunkID,
+				FilePath:         item.FilePath,
+				StartLine:        item.StartLine,
+				EndLine:          item.EndLine,
+			})
+			if err == nil && reissued != nil {
+				rebound.Findings[findingIndex].Citations[citationIndex].EvidenceID = reissued.ID
+			}
+		}
+	}
+	return &rebound
+}
+
+func valueOrZero(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func resolveCheckpointDraft(ctx context.Context, issuer evidence.EvidenceIssuer, draft *evidence.ReportDraft, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) *evidence.DiagnosisReportData {

@@ -173,6 +173,27 @@ func (s *LocalSnapshotStore) safePath(repoID, snapshotID, relativePath string) (
 	if info.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("symlink access denied: %s", relativePath)
 	}
+	// Reject symlinked parent directories as well as a symlink at the final
+	// path. EvalSymlinks below prevents escape, but an in-root symlink is still
+	// not a canonical snapshot path and must not receive an Evidence ID.
+	relativeFromRoot, err := filepath.Rel(sourceRoot, fullPath)
+	if err != nil {
+		return "", fmt.Errorf("path resolution denied: %s", relativePath)
+	}
+	current := sourceRoot
+	for _, component := range strings.Split(relativeFromRoot, string(filepath.Separator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		componentInfo, componentErr := os.Lstat(current)
+		if componentErr != nil {
+			return "", fmt.Errorf("file not found: %s", relativePath)
+		}
+		if componentInfo.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("symlink access denied: %s", relativePath)
+		}
+	}
 	rootReal, err := filepath.EvalSymlinks(sourceRoot)
 	if err != nil {
 		return "", fmt.Errorf("snapshot root unavailable")

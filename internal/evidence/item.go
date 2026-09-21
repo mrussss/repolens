@@ -161,7 +161,7 @@ func (s *EvidenceIssuerService) Issue(ctx context.Context, req IssueRequest) (*A
 
 	fileRange, err := s.storeFS.ReadFileRange(ctx, req.RepositoryID, req.SnapshotID, req.FilePath, req.StartLine, req.EndLine, req.MaxBytes)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrEvidenceSourceUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", ErrEvidenceSourceUnavailable, err)
 	}
 	rawHash := sha256Hex(fileRange.Content)
 	if existing, findErr := s.store.FindCanonical(ctx, req.AttemptID, req.SnapshotID, fileRange.Path, fileRange.StartLine, fileRange.EndLine, rawHash); findErr != nil {
@@ -208,6 +208,16 @@ func (s *EvidenceIssuerService) Resolve(ctx context.Context, attemptID, evidence
 	}
 	item, err := s.store.GetByAttemptAndID(ctx, attemptID, evidenceID)
 	if err != nil {
+		if errors.Is(err, ErrEvidenceNotFound) {
+			if finder, ok := s.store.(interface {
+				FindByID(context.Context, string) (*AttemptEvidenceItem, error)
+			}); ok {
+				foreign, findErr := finder.FindByID(ctx, evidenceID)
+				if findErr == nil && foreign != nil && foreign.AttemptID != attemptID {
+					return nil, ErrEvidenceAttemptMismatch
+				}
+			}
+		}
 		return nil, err
 	}
 	return item, nil
@@ -251,7 +261,7 @@ func (s *EvidenceIssuerService) Verify(ctx context.Context, item *AttemptEvidenc
 	}
 	fileRange, err := s.storeFS.ReadFileRange(ctx, lineage.RepositoryID, item.SnapshotID, item.FilePath, item.StartLine, item.EndLine, 0)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrEvidenceSourceUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrEvidenceSourceUnavailable, err)
 	}
 	if sha256Hex(fileRange.Content) != item.RawContentHash || fileRange.StartLine != item.StartLine || fileRange.EndLine != item.EndLine {
 		return ErrEvidenceHashMismatch
