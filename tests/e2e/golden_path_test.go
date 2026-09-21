@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,6 +57,19 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 	snapshotBasePath := t.TempDir()
 	storeFS := snapshotstore.NewLocalSnapshotStore(snapshotBasePath)
 	artifactDir := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.Walk(snapshotBasePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil {
+				return nil
+			}
+			mode := os.FileMode(0700)
+			if !info.IsDir() {
+				mode = 0600
+			}
+			_ = os.Chmod(path, mode)
+			return nil
+		})
+	})
 
 	repository := &repo.Repository{
 		ID:         "repo-golden-path",
@@ -268,6 +282,16 @@ func (p *scriptedProvider) Generate(_ context.Context, request llm.GenerateReque
 		if json.Unmarshal([]byte(message.Content), &payload) == nil && payload.EvidenceID != "" {
 			evidenceID = payload.EvidenceID
 			break
+		}
+		if marker := "evidence_id="; strings.Contains(message.Content, marker) {
+			value := message.Content[strings.Index(message.Content, marker)+len(marker):]
+			if end := strings.IndexAny(value, " \t\r\n"); end >= 0 {
+				value = value[:end]
+			}
+			if value != "" {
+				evidenceID = value
+				break
+			}
 		}
 	}
 	content := fmt.Sprintf(`{"conclusion_kind":"ROOT_CAUSE","summary":"The fixture checkout path returns without applying the expected processing behavior.","root_cause":"ProcessCheckout is the source location captured for the checkout behavior.","findings":[{"title":"Checkout processing implementation","reasoning":"The deterministic fixture provider identified the checkout implementation and attached a source citation.","citations":[{"evidence_id":%q,"reason":"checkout implementation"}]}],"recommended_checks":["Add a regression test for checkout processing"],"confirmed_facts":["The checkout implementation is present in the prepared snapshot."],"limitations":[],"confidence":0.9}`, evidenceID)
