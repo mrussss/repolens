@@ -104,7 +104,7 @@ func run() error {
 		citationStore,
 		citationVal,
 		agentExecutor,
-	)
+	).WithEvidenceIssuer(evidenceIssuer)
 	snapshotJobHandler := indexing.NewSnapshotJobHandler(
 		repoStore,
 		snapshotStore,

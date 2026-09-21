@@ -21,7 +21,13 @@ type DiagnosisJobHandler struct {
 	reportStore    evidence.ReportStore
 	citationStore  evidence.CitationStore
 	citationVal    *evidence.CitationValidator
+	evidenceIssuer evidence.EvidenceIssuer
 	executor       DiagnosisExecutor
+}
+
+func (h *DiagnosisJobHandler) WithEvidenceIssuer(issuer evidence.EvidenceIssuer) *DiagnosisJobHandler {
+	h.evidenceIssuer = issuer
+	return h
 }
 
 // NewDiagnosisJobHandler constructs a new DiagnosisJobHandler.
@@ -108,6 +114,9 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				return versionErr
 			}
 			result = executionResultFromCheckpoint(checkpoint)
+			if result.ReportDraft != nil && h.evidenceIssuer != nil {
+				result.Report = resolveCheckpointDraft(ctx, h.evidenceIssuer, result.ReportDraft, run, attempt)
+			}
 			log.Info("resuming diagnosis from provider checkpoint", "checkpoint_attempt_id", checkpoint.ID)
 		}
 	}
@@ -296,6 +305,20 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	log.Info("diagnosis job completed successfully")
 	return nil
+}
+
+func resolveCheckpointDraft(ctx context.Context, issuer evidence.EvidenceIssuer, draft *evidence.ReportDraft, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) *evidence.DiagnosisReportData {
+	report, err := evidence.ResolveReportDraft(ctx, issuer, draft, evidence.DraftLineage{
+		AttemptID:        attempt.ID,
+		DiagnosisRunID:   run.ID,
+		RepositoryID:     run.RepositoryID,
+		SnapshotID:       run.SnapshotID,
+		CodeIndexBuildID: run.CodeIndexBuildID,
+	})
+	if err != nil || report == nil {
+		return &evidence.DiagnosisReportData{}
+	}
+	return report
 }
 
 func executionResultFromCheckpoint(checkpoint *diagnosis.DiagnosisAttempt) *ExecutionResult {
