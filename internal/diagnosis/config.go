@@ -50,3 +50,36 @@ func ComputeAgentConfigHashWithRuntimeAndToolLimit(maxSteps, maxToolCalls, maxSe
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
+
+// ComputeAgentConfigHashWithGenerationOptions extends the stable RealBench
+// configuration identity with provider generation compatibility parameters.
+// The existing helper remains unchanged for production callers. When the
+// options describe the current default request, this helper deliberately
+// returns the existing hash so an unset RealBench experiment is identical to
+// the current main behavior.
+func ComputeAgentConfigHashWithGenerationOptions(maxSteps, maxToolCalls, maxSearchCalls, maxRepeatCalls, maxEvidencePacketBytes, maxToolResultBytes, finalizationTurns, maxOutputTokens, providerTimeoutSeconds, providerRetryAttempts int, temperature float64, reasoningEffort, responseFormat string) string {
+	if reasoningEffort == "" && responseFormat == "json_object" {
+		return ComputeAgentConfigHashWithRuntimeAndToolLimit(maxSteps, maxToolCalls, maxSearchCalls, maxRepeatCalls, maxEvidencePacketBytes, maxToolResultBytes, finalizationTurns, maxOutputTokens, providerTimeoutSeconds, providerRetryAttempts, temperature)
+	}
+	payload := struct {
+		PromptVersion          string  `json:"prompt_version"`
+		AgentVersion           string  `json:"agent_version"`
+		MaxSteps               int     `json:"max_steps"`
+		MaxToolCalls           int     `json:"max_tool_calls"`
+		MaxSearchCalls         int     `json:"max_search_calls"`
+		MaxRepeatCalls         int     `json:"max_repeat_calls"`
+		MaxEvidencePacketBytes int     `json:"max_evidence_packet_bytes"`
+		MaxToolResultBytes     int     `json:"max_tool_result_bytes"`
+		FinalizationTurns      int     `json:"finalization_turns"`
+		MaxOutputTokens        int     `json:"max_output_tokens"`
+		ProviderTimeoutSeconds int     `json:"provider_timeout_seconds"`
+		ProviderRetryAttempts  int     `json:"provider_retry_attempts"`
+		ToolSetVersion         string  `json:"tool_set_version"`
+		Temperature            float64 `json:"temperature"`
+		ReasoningEffort        string  `json:"reasoning_effort"`
+		ResponseFormat         string  `json:"response_format"`
+	}{CurrentPromptVersion, CurrentAgentVersion, maxSteps, maxToolCalls, maxSearchCalls, maxRepeatCalls, maxEvidencePacketBytes, maxToolResultBytes, finalizationTurns, maxOutputTokens, providerTimeoutSeconds, providerRetryAttempts, "v2.2-readonly-tools-evidence", temperature, reasoningEffort, responseFormat}
+	b, _ := json.Marshal(payload)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}

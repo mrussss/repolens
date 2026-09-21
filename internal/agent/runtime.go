@@ -66,6 +66,7 @@ type AgentRuntimeExecutor struct {
 	guardCfg        GuardConfig
 	evidenceBytes   int
 	evidenceIssuer  evidence.EvidenceIssuer
+	generation      *GenerationOptions
 }
 
 type ProviderFactory interface {
@@ -104,6 +105,11 @@ func (e *AgentRuntimeExecutor) WithEvidencePacketLimit(maxBytes int) *AgentRunti
 
 func (e *AgentRuntimeExecutor) WithEvidenceIssuer(issuer evidence.EvidenceIssuer) *AgentRuntimeExecutor {
 	e.evidenceIssuer = issuer
+	return e
+}
+
+func (e *AgentRuntimeExecutor) WithGenerationOptions(options GenerationOptions) *AgentRuntimeExecutor {
+	e.generation = &options
 	return e
 }
 
@@ -172,6 +178,9 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		packetBytes = run.MaxEvidencePacketBytes
 	}
 	loop := NewAgentLoop(provider, registry, e.traceStore, guardCfg)
+	if e.generation != nil {
+		loop.WithGenerationOptions(*e.generation)
+	}
 	if e.retriever != nil {
 		query := retrieval.BuildQuery(run.IssueTitle, run.IssueDescription, run.ErrorLog)
 		results, searchErr := e.retriever.Search(ctx, retrieval.SearchRequest{

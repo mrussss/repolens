@@ -18,6 +18,18 @@ func (p loopResponseProvider) Generate(context.Context, llm.GenerateRequest) (ll
 	return p.response, nil
 }
 
+type generationOptionsProvider struct {
+	requests []llm.GenerateRequest
+}
+
+func (p *generationOptionsProvider) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
+	p.requests = append(p.requests, request)
+	return llm.GenerateResponse{
+		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[]}`},
+		FinishReason: "stop",
+	}, nil
+}
+
 func runLoopResponseTest(t *testing.T, response llm.GenerateResponse, maxOutputTokens int) (*LoopResult, error) {
 	t.Helper()
 	loop := NewAgentLoop(loopResponseProvider{response: response}, NewToolRegistry(), nil, GuardConfig{
@@ -81,6 +93,29 @@ func TestAgentLoopKeepsNormalStopAndInvalidJSONSeparateFromTruncation(t *testing
 	}, 2048)
 	if err != nil || invalid == nil || invalid.StructuredReport || invalid.ParseError == "MODEL_OUTPUT_TRUNCATED" {
 		t.Fatalf("invalid stop response took truncation path: result=%+v err=%v", invalid, err)
+	}
+}
+
+func TestAgentLoopGenerationOptionsReachProviderAndDefaultRemainsCompatible(t *testing.T) {
+	defaultProvider := &generationOptionsProvider{}
+	defaultLoop := NewAgentLoop(defaultProvider, NewToolRegistry(), nil, DefaultGuardConfig())
+	if _, err := defaultLoop.Run(context.Background(), &diagnosis.DiagnosisRun{IssueTitle: "issue"}, &diagnosis.DiagnosisAttempt{ID: "attempt-default-options"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(defaultProvider.requests) != 1 || defaultProvider.requests[0].ReasoningEffort != "" || defaultProvider.requests[0].ResponseFormat == nil || defaultProvider.requests[0].ResponseFormat.Type != "json_object" {
+		t.Fatalf("default generation request changed: %+v", defaultProvider.requests)
+	}
+
+	experimentProvider := &generationOptionsProvider{}
+	experimentLoop := NewAgentLoop(experimentProvider, NewToolRegistry(), nil, DefaultGuardConfig()).WithGenerationOptions(GenerationOptions{
+		ReasoningEffort: "low",
+		ResponseFormat:  nil,
+	})
+	if _, err := experimentLoop.Run(context.Background(), &diagnosis.DiagnosisRun{IssueTitle: "issue"}, &diagnosis.DiagnosisAttempt{ID: "attempt-experiment-options"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(experimentProvider.requests) != 1 || experimentProvider.requests[0].ReasoningEffort != "low" || experimentProvider.requests[0].ResponseFormat != nil {
+		t.Fatalf("experiment generation request was not propagated: %+v", experimentProvider.requests)
 	}
 }
 

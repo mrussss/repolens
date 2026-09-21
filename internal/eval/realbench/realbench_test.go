@@ -168,6 +168,47 @@ func TestConfiguredRealBenchMaxOutputTokens(t *testing.T) {
 	}
 }
 
+func TestConfiguredRealBenchGenerationOptions(t *testing.T) {
+	t.Setenv("REPOLENS_REALBENCH_REASONING_EFFORT", "")
+	t.Setenv("REPOLENS_REALBENCH_RESPONSE_FORMAT", "")
+	defaultOptions := configuredRealBenchGenerationOptions()
+	if defaultOptions.ReasoningEffort != "" || defaultOptions.ResponseFormat != "json_object" || defaultOptions.MetadataReasoningEffort() != "not_requested" {
+		t.Fatalf("unset generation options changed the default: %+v", defaultOptions)
+	}
+	if got := defaultOptions.AgentOptions(); got.ReasoningEffort != "" || got.ResponseFormat == nil || got.ResponseFormat.Type != "json_object" {
+		t.Fatalf("unset generation options changed the request: %+v", got)
+	}
+
+	t.Setenv("REPOLENS_REALBENCH_REASONING_EFFORT", "low")
+	t.Setenv("REPOLENS_REALBENCH_RESPONSE_FORMAT", "none")
+	experimentOptions := configuredRealBenchGenerationOptions()
+	if experimentOptions.ReasoningEffort != "low" || experimentOptions.ResponseFormat != "none" || experimentOptions.MetadataReasoningEffort() != "low" {
+		t.Fatalf("experiment options were not loaded: %+v", experimentOptions)
+	}
+	if got := experimentOptions.AgentOptions(); got.ReasoningEffort != "low" || got.ResponseFormat != nil {
+		t.Fatalf("response_format=none was not removed from the request: %+v", got)
+	}
+
+	t.Setenv("REPOLENS_REALBENCH_RESPONSE_FORMAT", "unsupported")
+	if got := configuredRealBenchGenerationOptions().ResponseFormat; got != "json_object" {
+		t.Fatalf("unsupported response format = %q, want json_object", got)
+	}
+}
+
+func TestRealBenchGenerationOptionsReachProviderRequest(t *testing.T) {
+	provider := &providerSpy{}
+	loop := agent.NewAgentLoop(provider, agent.NewToolRegistry(), nil, agent.DefaultGuardConfig()).WithGenerationOptions((realBenchGenerationOptions{
+		ReasoningEffort: "low",
+		ResponseFormat:  "none",
+	}).AgentOptions())
+	if _, err := loop.Run(context.Background(), &diagnosis.DiagnosisRun{IssueTitle: "issue"}, &diagnosis.DiagnosisAttempt{ID: "attempt-realbench-options"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.requests) != 1 || provider.requests[0].ReasoningEffort != "low" || provider.requests[0].ResponseFormat != nil {
+		t.Fatalf("RealBench generation options did not reach provider: %+v", provider.requests)
+	}
+}
+
 func TestRootCauseRubricUsesGroundTruthOnlyAfterExecution(t *testing.T) {
 	truth := GroundTruth{
 		ExpectedRootCause: "handler returns stale cache value after refresh",

@@ -260,6 +260,8 @@ type E2EMetrics struct {
 	TotalTokens             int         `json:"total_tokens"`
 	CachedTokens            interface{} `json:"cached_tokens"`
 	ReasoningTokens         interface{} `json:"reasoning_tokens"`
+	ReasoningEffort         string      `json:"reasoning_effort"`
+	ResponseFormat          string      `json:"response_format"`
 	FinishReason            string      `json:"finish_reason,omitempty"`
 	ErrorCode               string      `json:"error_code,omitempty"`
 	FailureClassification   string      `json:"failure_classification,omitempty"`
@@ -338,6 +340,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	if maxOutputTokens := configuredRealBenchMaxOutputTokens(); maxOutputTokens > 0 {
 		guardConfig.MaxOutputTokens = maxOutputTokens
 	}
+	generationOptions := configuredRealBenchGenerationOptions()
 	result := &RunResult{
 		RunDir: runDir,
 		Metadata: RunMetadata{
@@ -360,6 +363,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 			ProviderTimeoutSec:  providerTimeoutSeconds(),
 			MaxOutputTokens:     guardConfig.MaxOutputTokens,
 			Temperature:         0.1,
+			ReasoningEffort:     generationOptions.MetadataReasoningEffort(),
+			ResponseFormat:      generationOptions.ResponseFormat,
 		},
 	}
 	qualityRows := make([]analysisQualityRow, 0, len(caseInputs))
@@ -374,12 +379,10 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		result.Metadata.Model = providerConfig.Model
 		result.Metadata.BaseURLFingerprint = providerConfig.EndpointFingerprint
 		result.Metadata.AuthMode = providerConfig.AuthMode
-		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithRuntimeAndToolLimit(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxSearchCalls, guardConfig.MaxRepeatCalls, 32*1024, guardConfig.MaxToolResultBytes, 1, guardConfig.MaxOutputTokens, providerTimeoutSeconds(), 0, 0.1)
+		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithGenerationOptions(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxSearchCalls, guardConfig.MaxRepeatCalls, 32*1024, guardConfig.MaxToolResultBytes, 1, guardConfig.MaxOutputTokens, providerTimeoutSeconds(), 0, 0.1, generationOptions.ReasoningEffort, generationOptions.ResponseFormat)
 		result.Metadata.MaxToolCalls = guardConfig.MaxToolCalls
 		result.Metadata.ToolBudget = guardConfig.MaxToolCalls
-		result.Metadata.ResponseFormat = "prompt_json_contract"
-		result.Metadata.ReasoningEffort = "not_requested"
-		preflight, err := runProviderPreflight(ctx, providerConfig, guardConfig)
+		preflight, err := runProviderPreflight(ctx, providerConfig, guardConfig, generationOptions)
 		preflightErr = err
 		if preflightErr != nil {
 			result.Metadata.PreflightStatus = "FAIL"
@@ -448,8 +451,10 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 				caseE2EStatus = e2eFailure
 				e2eErr = preflightErr
 				e2eMetrics = failedE2EMetrics(preflightErr)
+				e2eMetrics.ReasoningEffort = generationOptions.MetadataReasoningEffort()
+				e2eMetrics.ResponseFormat = generationOptions.ResponseFormat
 			} else {
-				diagnosisResult, e2eMetrics, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir, guardConfig)
+				diagnosisResult, e2eMetrics, e2eErr = runE2E(ctx, inputCase.Input, workspace, providerConfig, caseDir, guardConfig, generationOptions)
 			}
 			status.E2ELatencyMs = time.Since(e2eStarted).Milliseconds()
 			if e2eErr != nil {
@@ -684,6 +689,40 @@ type providerConfig struct {
 	EndpointFingerprint string
 }
 
+type realBenchGenerationOptions struct {
+	ReasoningEffort string
+	ResponseFormat  string
+}
+
+func configuredRealBenchGenerationOptions() realBenchGenerationOptions {
+	responseFormat := strings.ToLower(strings.TrimSpace(os.Getenv("REPOLENS_REALBENCH_RESPONSE_FORMAT")))
+	if responseFormat != "none" && responseFormat != "json_object" {
+		responseFormat = "json_object"
+	}
+	return realBenchGenerationOptions{
+		ReasoningEffort: strings.TrimSpace(os.Getenv("REPOLENS_REALBENCH_REASONING_EFFORT")),
+		ResponseFormat:  responseFormat,
+	}
+}
+
+func (o realBenchGenerationOptions) MetadataReasoningEffort() string {
+	if o.ReasoningEffort == "" {
+		return "not_requested"
+	}
+	return o.ReasoningEffort
+}
+
+func (o realBenchGenerationOptions) AgentOptions() agent.GenerationOptions {
+	var responseFormat *llm.ResponseFormat
+	if o.ResponseFormat == "json_object" {
+		responseFormat = &llm.ResponseFormat{Type: "json_object"}
+	}
+	return agent.GenerationOptions{
+		ReasoningEffort: o.ReasoningEffort,
+		ResponseFormat:  responseFormat,
+	}
+}
+
 func loadProviderConfig() (providerConfig, bool) {
 	config := providerConfig{
 		Provider:       os.Getenv("REPOLENS_REALBENCH_PROVIDER"),
@@ -731,6 +770,8 @@ type providerPreflight struct {
 	Model                 string `json:"model"`
 	Configured            bool   `json:"is_configured"`
 	Demo                  bool   `json:"is_demo"`
+	ReasoningEffort       string `json:"reasoning_effort"`
+	ResponseFormat        string `json:"response_format"`
 	NormalCompletion      string `json:"normal_completion"`
 	ToolCalling           string `json:"tool_calling"`
 	AgentLoop             string `json:"agent_loop"`
@@ -746,12 +787,14 @@ type providerPreflight struct {
 	AgentFailureClass     string `json:"agent_failure_class,omitempty"`
 }
 
-func runProviderPreflight(ctx context.Context, config providerConfig, guardConfig agent.GuardConfig) (providerPreflight, error) {
+func runProviderPreflight(ctx context.Context, config providerConfig, guardConfig agent.GuardConfig, generationOptions realBenchGenerationOptions) (providerPreflight, error) {
 	result := providerPreflight{
-		Provider:   config.Provider,
-		Model:      config.Model,
-		Configured: true,
-		Demo:       config.IsDemo,
+		Provider:        config.Provider,
+		Model:           config.Model,
+		Configured:      true,
+		Demo:            config.IsDemo,
+		ReasoningEffort: generationOptions.MetadataReasoningEffort(),
+		ResponseFormat:  generationOptions.ResponseFormat,
 	}
 	if config.IsDemo {
 		return result, productFailure("provider preflight", errors.New("demo provider is not allowed for formal E2E"))
@@ -811,6 +854,7 @@ func runProviderPreflight(ctx context.Context, config providerConfig, guardConfi
 	result.ToolCalling = "PASS"
 
 	loop := agent.NewAgentLoop(classifiedProvider{Provider: client}, agent.NewToolRegistry(), nil, guardConfig)
+	loop.WithGenerationOptions(generationOptions.AgentOptions())
 	loopResult, err := loop.Run(ctx, &diagnosis.DiagnosisRun{
 		ID: "realbench-preflight", RepositoryID: "preflight", SnapshotID: "preflight",
 		IssueTitle: "preflight structured report", IssueDescription: "Return a concise diagnosis report.",
@@ -861,14 +905,14 @@ func (p classifiedProvider) Generate(ctx context.Context, request llm.GenerateRe
 	return response, nil
 }
 
-func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string, guardConfig agent.GuardConfig) (*agent.ExecutionResult, *E2EMetrics, error) {
+func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string, guardConfig agent.GuardConfig, generationOptions realBenchGenerationOptions) (*agent.ExecutionResult, *E2EMetrics, error) {
 	var lastResult *agent.ExecutionResult
 	var lastMetrics *E2EMetrics
 	var lastErr error
 	attempts := make([]e2eAttempt, 0, 3)
 	for attempt := 1; attempt <= 3; attempt++ {
 		started := time.Now()
-		result, metrics, err := runE2EOnce(ctx, input, workspace, config, caseDir, attempt, started, guardConfig)
+		result, metrics, err := runE2EOnce(ctx, input, workspace, config, caseDir, attempt, started, guardConfig, generationOptions)
 		if metrics == nil {
 			metrics = &E2EMetrics{Status: e2eFailure, RootCauseGrade: "Not Scorable", CostStatus: costStatus()}
 		}
@@ -891,7 +935,7 @@ func runE2E(ctx context.Context, input Input, workspace *productionWorkspace, co
 	return lastResult, lastMetrics, lastErr
 }
 
-func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string, attemptNo int, started time.Time, guardConfig agent.GuardConfig) (*agent.ExecutionResult, *E2EMetrics, error) {
+func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace, config providerConfig, caseDir string, attemptNo int, started time.Time, guardConfig agent.GuardConfig, generationOptions realBenchGenerationOptions) (*agent.ExecutionResult, *E2EMetrics, error) {
 	providerClient := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(
 		config.APIKey,
 		config.BaseURL,
@@ -908,6 +952,7 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 		collector,
 		agent.DefaultGuardConfig(),
 	)
+	executor.WithGenerationOptions(generationOptions.AgentOptions())
 	executor.WithCodeIntelStore(workspace.CodeIndexStore)
 	evidenceStore := evidence.NewEvidenceStore(workspace.db)
 	evidenceIssuer := evidence.NewEvidenceIssuerWithStore(workspace.SnapshotStore, evidenceStore)
@@ -918,6 +963,8 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 	if err != nil {
 		progress := executionProgress(err)
 		metrics := metricsFromExecution(progress, collector, time.Since(started).Milliseconds())
+		metrics.ReasoningEffort = generationOptions.MetadataReasoningEffort()
+		metrics.ResponseFormat = generationOptions.ResponseFormat
 		metrics.Status = e2eFailure
 		metrics.FailureClassification = errorClassFor(err)
 		metrics.ErrorCode = e2eErrorCode(err)
@@ -929,12 +976,16 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 	if result == nil {
 		err = productFailure("Agent runtime", errors.New("empty execution result"))
 		metrics := metricsFromExecution(nil, collector, time.Since(started).Milliseconds())
+		metrics.ReasoningEffort = generationOptions.MetadataReasoningEffort()
+		metrics.ResponseFormat = generationOptions.ResponseFormat
 		metrics.Status = e2eFailure
 		metrics.FailureClassification = errorClassFor(err)
 		metrics.CostStatus = costStatus()
 		return nil, metrics, err
 	}
 	metrics := metricsFromExecution(result, collector, time.Since(started).Milliseconds())
+	metrics.ReasoningEffort = generationOptions.MetadataReasoningEffort()
+	metrics.ResponseFormat = generationOptions.ResponseFormat
 	metrics.Status = e2eCompleted
 	metrics.CostStatus = costStatus()
 	metrics.EstimatedCostUSD = estimateCost(result)

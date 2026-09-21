@@ -88,6 +88,15 @@ type LoopResult struct {
 	FinalizationReason string
 }
 
+// GenerationOptions controls optional provider request fields. The default
+// AgentLoop behavior remains the production contract: no reasoning_effort and
+// a json_object response format. Callers such as RealBench may opt into a
+// compatibility experiment without changing that default.
+type GenerationOptions struct {
+	ReasoningEffort string
+	ResponseFormat  *llm.ResponseFormat
+}
+
 type AgentLoop struct {
 	provider        llm.Provider
 	registry        *ToolRegistry
@@ -95,11 +104,17 @@ type AgentLoop struct {
 	guardCfg        GuardConfig
 	initialEvidence string
 	initialQuery    string
+	generation      GenerationOptions
 }
 
 func (l *AgentLoop) WithInitialEvidence(query, packet string) *AgentLoop {
 	l.initialQuery = query
 	l.initialEvidence = packet
+	return l
+}
+
+func (l *AgentLoop) WithGenerationOptions(options GenerationOptions) *AgentLoop {
+	l.generation = options
 	return l
 }
 
@@ -114,6 +129,7 @@ func NewAgentLoop(
 		registry:   registry,
 		traceStore: traceStore,
 		guardCfg:   guardCfg,
+		generation: GenerationOptions{ResponseFormat: &llm.ResponseFormat{Type: "json_object"}},
 	}
 }
 
@@ -164,13 +180,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		providerCalls++
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "", "")
 		temperature := run.Temperature
-		resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
-			Messages:       messages,
-			Tools:          toolsDef,
-			Temperature:    &temperature,
-			MaxTokens:      l.guardCfg.MaxOutputTokens,
-			ResponseFormat: &llm.ResponseFormat{Type: "json_object"},
-		})
+		resp, err := l.provider.Generate(ctx, l.generateRequest(messages, toolsDef, &temperature))
 		latency := time.Since(startGen).Milliseconds()
 
 		if err != nil {
@@ -358,12 +368,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 	finalMessages = append(finalMessages, llm.Message{Role: llm.RoleUser, Content: "FINALIZE_ONLY: exploration budget is exhausted. Do not request tools. Return the best evidence-backed structured JSON now, clearly separating confirmed facts, likely explanation, uncertainty, and next checks."})
 	temperature := run.Temperature
 	start := time.Now()
-	resp, err := l.provider.Generate(ctx, llm.GenerateRequest{
-		Messages:       finalMessages,
-		Temperature:    &temperature,
-		MaxTokens:      l.guardCfg.MaxOutputTokens,
-		ResponseFormat: &llm.ResponseFormat{Type: "json_object"},
-	})
+	resp, err := l.provider.Generate(ctx, l.generateRequest(finalMessages, nil, &temperature))
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason, "")
@@ -412,6 +417,17 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 		SearchCalls: searchCalls, ProviderCalls: providerCalls, FinishReason: resp.FinishReason,
 		StructuredReport: parseErr == nil, ParseError: errorString(parseErr), FinalizationReason: reason,
 	}, nil
+}
+
+func (l *AgentLoop) generateRequest(messages []llm.Message, tools []llm.ToolDefinition, temperature *float64) llm.GenerateRequest {
+	return llm.GenerateRequest{
+		Messages:        messages,
+		Tools:           tools,
+		Temperature:     temperature,
+		MaxTokens:       l.guardCfg.MaxOutputTokens,
+		ReasoningEffort: l.generation.ReasoningEffort,
+		ResponseFormat:  l.generation.ResponseFormat,
+	}
 }
 
 func maxProviderAttempts(err error) int {
