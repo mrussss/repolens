@@ -6,10 +6,11 @@
 
 - Dataset: `realbench-v1`
 - Manifest hash: `5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf`
-- RepoLens commit: `0a2cbd2d17c6ed9e45444a0d269900addeca8c1d`
-- Run ID: `20260921T103622Z-b0f118ce`
-- Command: `go run ./cmd/realbench run --case REAL-001`; `go run ./cmd/realbench run --all`
-- Validation: `go run ./cmd/realbench validate` — PASS; single-case run — PASS
+- RepoLens commit: `7a9c27c866ff6cce2931e6249d6f3cd7225b3efa`
+- Run ID: `20260921T110046Z-1f87cfcc`
+- Single-case Run ID: `20260921T110040Z-b1d1b829`
+- Command: `go run ./cmd/realbench validate`; `go run ./cmd/realbench run --dataset v1 --case REAL-001`; `go run ./cmd/realbench run --dataset v1 --all`
+- Validation / single-case / full run: PASS / PASS / PASS
 - Retrieval: `symbol_bm25_structural` — current Pure Go BM25 + Structural Retrieval
 - Retrieval / index version: `v2.1.0` / `v2.1.0`; Agent / Prompt version: `v2.2.1` / `v2.2-evidence-1`
 - E2E: `NOT_REQUESTED`
@@ -35,8 +36,8 @@
 
 | Case | Repository | Top-10 primary-file rank | Hit@5 | Hit@10 | Latency |
 |---|---|---:|---:|---:|---:|
-| REAL-001 | go-chi/chi | 1 | yes | yes | 12 ms |
-| REAL-002 | spf13/cobra | 3 | yes | yes | 16 ms |
+| REAL-001 | go-chi/chi | 1 | yes | yes | 11 ms |
+| REAL-002 | spf13/cobra | 3 | yes | yes | 18 ms |
 | REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 3 ms |
 
 ## Code Intelligence quality
@@ -53,7 +54,7 @@ The raw per-case quality files and CSV summary are stored in the run artifact di
 
 ## Failure analysis
 
-本次在 clean HEAD `e24ac06` 重跑没有 Retrieval failure、Infra Error 或 Product Failure，因此没有隐藏失败 case。REAL-002 的 primary file 排名为 3，仍命中 Hit@5，但相较另外两个 case 需要更多候选排序空间；这个观察仅记录为 benchmark 证据，不在本任务中修改检索算法。
+本次在 clean HEAD `7a9c27c` 重跑没有 Retrieval failure、Infra Error 或 Product Failure，因此没有隐藏失败 case。REAL-002 的 primary file 排名为 3，仍命中 Hit@5，但相较另外两个 case 需要更多候选排序空间；这个观察仅记录为 benchmark 证据，不在本任务中修改检索算法。
 
 本次没有请求 E2E（`--e2e` 未传），因此没有生成真实 Agent diagnosis、Citation validity 或 Root Cause Correct/Partial/Incorrect 分数；FakeProvider 不作为公开 E2E 成绩。若请求 E2E 但未配置 provider，状态会单独记录为 `NOT_RUN_PROVIDER_NOT_CONFIGURED`。
 
