@@ -6,16 +6,16 @@
 
 - Dataset: `realbench-v1`
 - Manifest hash: `5b63f6e3ce1437c2d9e57dbb410530b54eca1f6a64590a29f4f639379768b9bf`
-- RepoLens commit: `e24ac0665e67fb943a64cd2901ec6f8a040ab5a2`
-- Run ID: `20260920T135140Z-55aeaee2`
-- Command: `go run ./cmd/realbench run --all`
-- Validation: `go run ./cmd/realbench validate`; single-case smoke test `go run ./cmd/realbench run --case REAL-001`
+- RepoLens commit: `3f7833c8baf6981b3f448f3db4c80928edc06ed0`
+- Run ID: `20260921T103105Z-4c1f5c42`
+- Command: `go run ./cmd/realbench run --case REAL-001`; `go run ./cmd/realbench run --all`
+- Validation: `go run ./cmd/realbench validate` — PASS; single-case run — PASS
 - Retrieval: `symbol_bm25_structural` — current Pure Go BM25 + Structural Retrieval
-- Retrieval / index version: `v2.1.0` / `v2.1.0`; Agent / Prompt version: `v2.2` / `v2.2`
+- Retrieval / index version: `v2.1.0` / `v2.1.0`; Agent / Prompt version: `v2.2.1` / `v2.2-evidence-1`
 - E2E: `NOT_REQUESTED`
 - Quality artifacts: per-case `analysis_quality.json` and run-level `analysis_quality_summary.csv`
 - Environment: `go1.22.12`, `linux/amd64`, provider timeout `60s`, temperature `0.1`
-- Working tree: clean; the user-requested root development MD is excluded locally through `.git/info/exclude` and is not part of the repository.
+- Working tree at baseline run: clean; the user-requested root development MD is excluded locally through `.git/info/exclude` and is not part of the repository.
 
 ## Summary
 
@@ -36,7 +36,7 @@
 | Case | Repository | Top-10 primary-file rank | Hit@5 | Hit@10 | Latency |
 |---|---|---:|---:|---:|---:|
 | REAL-001 | go-chi/chi | 1 | yes | yes | 12 ms |
-| REAL-002 | spf13/cobra | 3 | yes | yes | 17 ms |
+| REAL-002 | spf13/cobra | 3 | yes | yes | 16 ms |
 | REAL-003 | hashicorp/go-retryablehttp | 1 | yes | yes | 3 ms |
 
 ## Code Intelligence quality
