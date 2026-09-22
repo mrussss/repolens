@@ -7,6 +7,12 @@ import (
 	"strings"
 )
 
+const (
+	DefaultMaxOutputTokens        = 4096
+	DefaultReasoningEffort        = "low"
+	DefaultProviderTimeoutSeconds = 60
+)
+
 type Config struct {
 	Env                    string
 	HTTPPort               string
@@ -24,6 +30,8 @@ type Config struct {
 	ProviderAuthMode       string
 	ProviderTimeoutSeconds int
 	ProviderRetryAttempts  int
+	MaxOutputTokens        int
+	ReasoningEffort        string
 	ProviderSecretPath     string
 	RetrievalStrategy      string // "bm25", "symbol_bm25_structural"
 }
@@ -44,8 +52,10 @@ func Load() *Config {
 		ProviderBaseURL:        getEnv("REPOLENS_PROVIDER_BASE_URL", "https://api.openai.com/v1"),
 		ProviderModel:          getEnv("REPOLENS_PROVIDER_MODEL", "gpt-4o"),
 		ProviderAuthMode:       getEnv("REPOLENS_PROVIDER_AUTH_MODE", "bearer"),
-		ProviderTimeoutSeconds: getEnvPositiveInt("REPOLENS_PROVIDER_TIMEOUT_SECONDS", 60),
+		ProviderTimeoutSeconds: getEnvPositiveInt("REPOLENS_PROVIDER_TIMEOUT_SECONDS", DefaultProviderTimeoutSeconds),
 		ProviderRetryAttempts:  getEnvNonNegativeInt("REPOLENS_PROVIDER_RETRY_ATTEMPTS", 0),
+		MaxOutputTokens:        getEnvPositiveInt("REPOLENS_MAX_OUTPUT_TOKENS", DefaultMaxOutputTokens),
+		ReasoningEffort:        strings.TrimSpace(getEnv("REPOLENS_REASONING_EFFORT", DefaultReasoningEffort)),
 		ProviderSecretPath:     getEnv("PROVIDER_SECRET_PATH", defaultProviderSecretPath()),
 		RetrievalStrategy:      getEnv("RETRIEVAL_STRATEGY", "symbol_bm25_structural"),
 	}

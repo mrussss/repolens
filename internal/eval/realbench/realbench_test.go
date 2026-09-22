@@ -168,14 +168,27 @@ func TestConfiguredRealBenchMaxOutputTokens(t *testing.T) {
 	}
 }
 
+func TestRealBenchGuardConfigUsesProductionDefaultAndOverride(t *testing.T) {
+	t.Setenv("REPOLENS_MAX_OUTPUT_TOKENS", "")
+	t.Setenv("REPOLENS_REALBENCH_MAX_OUTPUT_TOKENS", "")
+	if got := realBenchGuardConfig().MaxOutputTokens; got != 4096 {
+		t.Fatalf("unset override max output tokens = %d, want 4096", got)
+	}
+	t.Setenv("REPOLENS_REALBENCH_MAX_OUTPUT_TOKENS", "2048")
+	if got := realBenchGuardConfig().MaxOutputTokens; got != 2048 {
+		t.Fatalf("override max output tokens = %d, want 2048", got)
+	}
+}
+
 func TestConfiguredRealBenchGenerationOptions(t *testing.T) {
 	t.Setenv("REPOLENS_REALBENCH_REASONING_EFFORT", "")
 	t.Setenv("REPOLENS_REALBENCH_RESPONSE_FORMAT", "")
+	t.Setenv("REPOLENS_REASONING_EFFORT", "")
 	defaultOptions := configuredRealBenchGenerationOptions()
-	if defaultOptions.ReasoningEffort != "" || defaultOptions.ResponseFormat != "json_object" || defaultOptions.MetadataReasoningEffort() != "not_requested" {
+	if defaultOptions.ReasoningEffort != "low" || defaultOptions.ResponseFormat != "json_object" || defaultOptions.MetadataReasoningEffort() != "low" {
 		t.Fatalf("unset generation options changed the default: %+v", defaultOptions)
 	}
-	if got := defaultOptions.AgentOptions(); got.ReasoningEffort != "" || got.ResponseFormat == nil || got.ResponseFormat.Type != "json_object" {
+	if got := defaultOptions.AgentOptions(); got.ReasoningEffort != "low" || got.ResponseFormat == nil || got.ResponseFormat.Type != "json_object" {
 		t.Fatalf("unset generation options changed the request: %+v", got)
 	}
 

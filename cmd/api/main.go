@@ -106,7 +106,7 @@ func run() error {
 			IsDemo:                 status.IsDemo,
 			PromptVersion:          diagnosis.CurrentPromptVersion,
 			AgentVersion:           diagnosis.CurrentAgentVersion,
-			AgentConfigHash:        diagnosis.ComputeAgentConfigHashWithRuntimeAndToolLimit(8, 12, 3, 2, 32*1024, 32*1024, 1, 2048, cfg.ProviderTimeoutSeconds, cfg.ProviderRetryAttempts, 0.1),
+			AgentConfigHash:        diagnosis.ComputeAgentConfigHashWithGenerationOptions(8, 12, 3, 2, 32*1024, 32*1024, 1, cfg.MaxOutputTokens, cfg.ProviderTimeoutSeconds, cfg.ProviderRetryAttempts, 0.1, cfg.ReasoningEffort, "json_object"),
 			Temperature:            0.1,
 			MaxAgentRounds:         8,
 			MaxToolCalls:           12,
@@ -115,7 +115,8 @@ func run() error {
 			MaxEvidencePacketBytes: 32 * 1024,
 			MaxToolResultBytes:     32 * 1024,
 			FinalizationTurns:      1,
-			MaxOutputTokens:        2048,
+			MaxOutputTokens:        cfg.MaxOutputTokens,
+			ReasoningEffort:        cfg.ReasoningEffort,
 			ProviderTimeoutSeconds: cfg.ProviderTimeoutSeconds,
 			ProviderRetryAttempts:  cfg.ProviderRetryAttempts,
 		}

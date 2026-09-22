@@ -88,10 +88,10 @@ type LoopResult struct {
 	FinalizationReason string
 }
 
-// GenerationOptions controls optional provider request fields. The default
-// AgentLoop behavior remains the production contract: no reasoning_effort and
-// a json_object response format. Callers such as RealBench may opt into a
-// compatibility experiment without changing that default.
+// GenerationOptions controls optional provider request fields. A standalone
+// AgentLoop defaults to a json_object response format and an empty
+// reasoning_effort; the production runtime supplies the frozen DiagnosisRun
+// value before executing the loop.
 type GenerationOptions struct {
 	ReasoningEffort string
 	ResponseFormat  *llm.ResponseFormat

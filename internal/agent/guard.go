@@ -22,7 +22,7 @@ func DefaultGuardConfig() GuardConfig {
 		MaxSearchCalls:     3,
 		MaxRepeatCalls:     2,
 		MaxToolResultBytes: 32 * 1024,
-		MaxOutputTokens:    2048,
+		MaxOutputTokens:    4096,
 	}
 }
 

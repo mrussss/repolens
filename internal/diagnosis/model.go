@@ -41,7 +41,8 @@ type DiagnosisRun struct {
 	MaxEvidencePacketBytes      int       `gorm:"not null;default:32768" json:"max_evidence_packet_bytes"`
 	MaxToolResultBytes          int       `gorm:"not null;default:32768" json:"max_tool_result_bytes"`
 	FinalizationTurns           int       `gorm:"not null;default:1" json:"finalization_turns"`
-	MaxOutputTokens             int       `gorm:"not null;default:2048" json:"max_output_tokens"`
+	MaxOutputTokens             int       `gorm:"not null;default:4096" json:"max_output_tokens"`
+	ReasoningEffort             string    `gorm:"size:32;not null;default:''" json:"reasoning_effort"`
 	ProviderTimeoutSeconds      int       `gorm:"not null;default:60" json:"provider_timeout_seconds"`
 	ProviderRetryAttempts       int       `gorm:"not null;default:0" json:"provider_retry_attempts"`
 	PipelineFingerprint         string    `gorm:"size:64;not null;default:''" json:"pipeline_fingerprint,omitempty"`

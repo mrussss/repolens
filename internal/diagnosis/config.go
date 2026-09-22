@@ -51,16 +51,9 @@ func ComputeAgentConfigHashWithRuntimeAndToolLimit(maxSteps, maxToolCalls, maxSe
 	return hex.EncodeToString(sum[:])
 }
 
-// ComputeAgentConfigHashWithGenerationOptions extends the stable RealBench
-// configuration identity with provider generation compatibility parameters.
-// The existing helper remains unchanged for production callers. When the
-// options describe the current default request, this helper deliberately
-// returns the existing hash so an unset RealBench experiment is identical to
-// the current main behavior.
+// ComputeAgentConfigHashWithGenerationOptions extends the stable configuration
+// identity with provider generation compatibility parameters.
 func ComputeAgentConfigHashWithGenerationOptions(maxSteps, maxToolCalls, maxSearchCalls, maxRepeatCalls, maxEvidencePacketBytes, maxToolResultBytes, finalizationTurns, maxOutputTokens, providerTimeoutSeconds, providerRetryAttempts int, temperature float64, reasoningEffort, responseFormat string) string {
-	if reasoningEffort == "" && responseFormat == "json_object" {
-		return ComputeAgentConfigHashWithRuntimeAndToolLimit(maxSteps, maxToolCalls, maxSearchCalls, maxRepeatCalls, maxEvidencePacketBytes, maxToolResultBytes, finalizationTurns, maxOutputTokens, providerTimeoutSeconds, providerRetryAttempts, temperature)
-	}
 	payload := struct {
 		PromptVersion          string  `json:"prompt_version"`
 		AgentVersion           string  `json:"agent_version"`

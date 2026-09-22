@@ -93,6 +93,9 @@ func TestOpenAICompatibleReasoningRoundTripAndUsage(t *testing.T) {
 	if assistant["reasoning_content"] != "internal reasoning state" || assistant["tool_calls"] == nil {
 		t.Fatalf("assistant message did not round-trip reasoning/tool calls: %v", assistant)
 	}
+	if _, present := requestBodies[1]["reasoning_effort"]; present {
+		t.Fatalf("empty reasoning_effort was sent: %v", requestBodies[1])
+	}
 	if requestBodies[0]["reasoning_effort"] != "medium" {
 		t.Fatalf("reasoning_effort was not sent: %v", requestBodies[0])
 	}

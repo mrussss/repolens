@@ -12,6 +12,7 @@ import (
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/jobs"
+	platformconfig "repolens/internal/platform/config"
 	"repolens/internal/platform/metrics"
 	"repolens/internal/repo"
 	"repolens/internal/revision"
@@ -86,6 +87,7 @@ type ProviderMetadata struct {
 	MaxToolResultBytes     int
 	FinalizationTurns      int
 	MaxOutputTokens        int
+	ReasoningEffort        string
 	ProviderTimeoutSeconds int
 	ProviderRetryAttempts  int
 }
@@ -292,13 +294,13 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		metadata.FinalizationTurns = 1
 	}
 	if metadata.MaxOutputTokens == 0 {
-		metadata.MaxOutputTokens = 2048
+		metadata.MaxOutputTokens = platformconfig.DefaultMaxOutputTokens
 	}
 	if metadata.ProviderTimeoutSeconds == 0 {
-		metadata.ProviderTimeoutSeconds = 60
+		metadata.ProviderTimeoutSeconds = platformconfig.DefaultProviderTimeoutSeconds
 	}
 	if metadata.AgentConfigHash == "" {
-		metadata.AgentConfigHash = ComputeAgentConfigHashWithRuntimeAndToolLimit(
+		metadata.AgentConfigHash = ComputeAgentConfigHashWithGenerationOptions(
 			metadata.MaxAgentRounds,
 			metadata.MaxToolCalls,
 			metadata.MaxSearchCalls,
@@ -310,6 +312,8 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 			metadata.ProviderTimeoutSeconds,
 			metadata.ProviderRetryAttempts,
 			metadata.Temperature,
+			metadata.ReasoningEffort,
+			"json_object",
 		)
 	}
 	run := &DiagnosisRun{
@@ -342,6 +346,7 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		MaxToolResultBytes:          metadata.MaxToolResultBytes,
 		FinalizationTurns:           metadata.FinalizationTurns,
 		MaxOutputTokens:             metadata.MaxOutputTokens,
+		ReasoningEffort:             metadata.ReasoningEffort,
 		ProviderTimeoutSeconds:      metadata.ProviderTimeoutSeconds,
 		ProviderRetryAttempts:       metadata.ProviderRetryAttempts,
 		Temperature:                 metadata.Temperature,

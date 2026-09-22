@@ -177,10 +177,16 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	if run.MaxEvidencePacketBytes > 0 {
 		packetBytes = run.MaxEvidencePacketBytes
 	}
-	loop := NewAgentLoop(provider, registry, e.traceStore, guardCfg)
-	if e.generation != nil {
-		loop.WithGenerationOptions(*e.generation)
+	generation := GenerationOptions{
+		ReasoningEffort: strings.TrimSpace(run.ReasoningEffort),
+		ResponseFormat:  &llm.ResponseFormat{Type: "json_object"},
 	}
+	if e.generation != nil {
+		// RealBench may override response_format, but reasoning_effort is
+		// always read from the immutable DiagnosisRun configuration snapshot.
+		generation.ResponseFormat = e.generation.ResponseFormat
+	}
+	loop := NewAgentLoop(provider, registry, e.traceStore, guardCfg).WithGenerationOptions(generation)
 	if e.retriever != nil {
 		query := retrieval.BuildQuery(run.IssueTitle, run.IssueDescription, run.ErrorLog)
 		results, searchErr := e.retriever.Search(ctx, retrieval.SearchRequest{

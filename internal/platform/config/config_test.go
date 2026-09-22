@@ -53,6 +53,27 @@ func TestProviderTimeoutSecondsUsesPositiveValueOrDefault(t *testing.T) {
 	}
 }
 
+func TestProductionAgentDefaults(t *testing.T) {
+	t.Setenv("REPOLENS_MAX_OUTPUT_TOKENS", "")
+	t.Setenv("REPOLENS_REASONING_EFFORT", "")
+	cfg := Load()
+	if DefaultMaxOutputTokens != 4096 || cfg.MaxOutputTokens != DefaultMaxOutputTokens {
+		t.Fatalf("max output tokens = %d, want 4096", cfg.MaxOutputTokens)
+	}
+	if DefaultReasoningEffort != "low" || cfg.ReasoningEffort != DefaultReasoningEffort {
+		t.Fatalf("reasoning effort = %q, want low", cfg.ReasoningEffort)
+	}
+}
+
+func TestProductionAgentConfigCanBeOverridden(t *testing.T) {
+	t.Setenv("REPOLENS_MAX_OUTPUT_TOKENS", "8192")
+	t.Setenv("REPOLENS_REASONING_EFFORT", "medium")
+	cfg := Load()
+	if cfg.MaxOutputTokens != 8192 || cfg.ReasoningEffort != "medium" {
+		t.Fatalf("production agent config = %+v", cfg)
+	}
+}
+
 func TestProviderRetryAttemptsAllowsZeroAndRejectsNegative(t *testing.T) {
 	tests := []struct {
 		value string

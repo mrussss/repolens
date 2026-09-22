@@ -28,6 +28,7 @@ import (
 	"repolens/internal/evidence"
 	"repolens/internal/indexing"
 	"repolens/internal/llm"
+	platformconfig "repolens/internal/platform/config"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/provider"
@@ -336,10 +337,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 	e2eStatus := e2eNotRequested
 	providerConfig, providerConfigured := loadProviderConfig()
 	e2eStatus = e2eStatusFor(opts.RunE2E, providerConfigured)
-	guardConfig := agent.DefaultGuardConfig()
-	if maxOutputTokens := configuredRealBenchMaxOutputTokens(); maxOutputTokens > 0 {
-		guardConfig.MaxOutputTokens = maxOutputTokens
-	}
+	guardConfig := realBenchGuardConfig()
 	generationOptions := configuredRealBenchGenerationOptions()
 	result := &RunResult{
 		RunDir: runDir,
@@ -699,8 +697,12 @@ func configuredRealBenchGenerationOptions() realBenchGenerationOptions {
 	if responseFormat != "none" && responseFormat != "json_object" {
 		responseFormat = "json_object"
 	}
+	reasoningEffort := strings.TrimSpace(os.Getenv("REPOLENS_REALBENCH_REASONING_EFFORT"))
+	if reasoningEffort == "" {
+		reasoningEffort = platformconfig.Load().ReasoningEffort
+	}
 	return realBenchGenerationOptions{
-		ReasoningEffort: strings.TrimSpace(os.Getenv("REPOLENS_REALBENCH_REASONING_EFFORT")),
+		ReasoningEffort: reasoningEffort,
 		ResponseFormat:  responseFormat,
 	}
 }
@@ -957,7 +959,7 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 	evidenceStore := evidence.NewEvidenceStore(workspace.db)
 	evidenceIssuer := evidence.NewEvidenceIssuerWithStore(workspace.SnapshotStore, evidenceStore)
 	executor.WithEvidenceIssuer(evidenceIssuer)
-	run := buildAgentRun(input, workspace, config.Model, guardConfig.MaxOutputTokens)
+	run := buildAgentRun(input, workspace, config.Model, guardConfig.MaxOutputTokens, generationOptions.ReasoningEffort)
 	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
 	result, err := executor.Execute(ctx, run, attempt)
 	if err != nil {
@@ -1331,13 +1333,14 @@ func searchInput(ctx context.Context, retriever retrieval.Retriever, input Input
 	return query, results, err
 }
 
-func buildAgentRun(input Input, workspace *productionWorkspace, model string, maxOutputTokens int) *diagnosis.DiagnosisRun {
+func buildAgentRun(input Input, workspace *productionWorkspace, model string, maxOutputTokens int, reasoningEffort string) *diagnosis.DiagnosisRun {
 	return &diagnosis.DiagnosisRun{
 		ID: uuid.New().String(), RepositoryID: input.CaseID, SnapshotID: input.CaseID,
 		CodeIndexBuildID: workspace.CodeIndexBuildID, RetrievalBuildID: workspace.RetrievalBuildID,
 		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
 		Temperature: 0.1, ModelName: model, PromptVersion: diagnosis.CurrentPromptVersion, AgentVersion: diagnosis.CurrentAgentVersion,
 		MaxOutputTokens: maxOutputTokens,
+		ReasoningEffort: strings.TrimSpace(reasoningEffort),
 	}
 }
 
@@ -1424,6 +1427,17 @@ func configuredRealBenchMaxOutputTokens() int {
 		return 0
 	}
 	return value
+}
+
+func realBenchGuardConfig() agent.GuardConfig {
+	guardConfig := agent.DefaultGuardConfig()
+	if productionMaxOutputTokens := platformconfig.Load().MaxOutputTokens; productionMaxOutputTokens > 0 {
+		guardConfig.MaxOutputTokens = productionMaxOutputTokens
+	}
+	if maxOutputTokens := configuredRealBenchMaxOutputTokens(); maxOutputTokens > 0 {
+		guardConfig.MaxOutputTokens = maxOutputTokens
+	}
+	return guardConfig
 }
 
 func retrievalMetrics(results []retrieval.SearchResult, relevantFiles []string) (bool, bool, float64) {
