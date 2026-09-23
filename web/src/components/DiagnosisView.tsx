@@ -21,11 +21,19 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
   const [cancelling, setCancelling] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pollEpoch, setPollEpoch] = useState(0);
 
   useEffect(() => {
     let stopped = false;
     let timer: number | undefined;
     let delay = 1000;
+
+    setRun(null);
+    setReport(null);
+    setSteps([]);
+    setAttempts([]);
+    setError(null);
+    setLoading(true);
 
     const fetchAll = async (): Promise<boolean> => {
       if (stopped) return false;
@@ -37,28 +45,35 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
         active = r.status === 'RUNNING' || r.status === 'QUEUED';
 
         try {
-          setAttempts(await api.getDiagnosisAttempts(diagnosisId));
+          const loadedAttempts = await api.getDiagnosisAttempts(diagnosisId);
+          if (stopped) return false;
+          setAttempts(loadedAttempts);
         } catch {}
 
-        if (r.status === 'SUCCEEDED') {
+        if (r.status === 'SUCCEEDED' || (r.status === 'FAILED' && !!r.final_attempt_id)) {
           try {
             const rep = await api.getDiagnosisReport(diagnosisId);
+            if (stopped) return false;
             setReport(rep);
           } catch {}
           try {
             const st = await api.getDiagnosisSteps(diagnosisId);
+            if (stopped) return false;
             setSteps(st || []);
           } catch {}
-        } else if (r.status === 'RUNNING' || r.status === 'QUEUED') {
+        }
+        if (r.status === 'RUNNING' || r.status === 'QUEUED' || (!!r.final_attempt_id && r.status !== 'SUCCEEDED')) {
           try {
             const st = await api.getDiagnosisSteps(diagnosisId);
+            if (stopped) return false;
             setSteps(st || []);
           } catch {}
         }
       } catch (err: any) {
+        if (stopped) return false;
         setError(err.message || '刷新诊断状态失败');
       } finally {
-        setLoading(false);
+        if (!stopped) setLoading(false);
       }
       return active;
     };
@@ -90,7 +105,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
       if (timer !== undefined) window.clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [diagnosisId]);
+  }, [diagnosisId, pollEpoch]);
 
   const handleCancel = async () => {
     setCancelling(true);
@@ -109,7 +124,12 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
     setRetrying(true);
     try {
       await api.retryDiagnosis(diagnosisId);
+      setReport(null);
+      setSteps([]);
+      setAttempts([]);
+      setError(null);
       setRun(await api.getDiagnosis(diagnosisId));
+      setPollEpoch((epoch) => epoch + 1);
     } catch (err: any) {
       setError(err.message || '重试诊断失败');
     } finally {
@@ -162,7 +182,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
             <StopCircle size={16} /> {cancelling ? '取消中…' : '取消任务'}
           </button>
         )}
-        {run?.status === 'FAILED' && (
+        {run?.status === 'FAILED' && run.retry_allowed && (
           <button className="btn" onClick={handleRetry} disabled={retrying}>
             <RefreshCw size={16} /> {retrying ? '重试中…' : '重试诊断'}
           </button>
@@ -194,7 +214,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
       )}
 
       {attempts.length > 0 && (() => {
-        const attempt = attempts[attempts.length - 1];
+        const attempt = attempts.find((candidate) => candidate.id === run?.final_attempt_id) || attempts[attempts.length - 1];
         return (
           <div className="card" style={{ marginBottom: '1.5rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
             执行详情：Attempt {attempt.attempt_no} · {attempt.status} · rounds {attempt.agent_rounds || 0} · tools {attempt.tool_calls || 0} · search {attempt.search_calls || 0} · provider calls {attempt.provider_calls || 0} · tokens {(attempt.prompt_tokens || 0) + (attempt.completion_tokens || 0)}
@@ -202,6 +222,16 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
           </div>
         );
       })()}
+
+      {run?.status === 'FAILED' && !report && run.final_attempt_id && (
+        <div className="card" style={{ marginBottom: '1.5rem', color: 'var(--text-muted)' }}>
+          本次执行未生成可展示的诊断报告。{run.retry_reason ? ` ${run.retry_reason}。` : ''}
+          {run.retry_error_code && <span> 错误代码：<code>{run.retry_error_code}</code></span>}
+        </div>
+      )}
+      {run?.status === 'FAILED' && !run.retry_allowed && run.retry_reason && !run.final_attempt_id && (
+        <div className="card" style={{ marginBottom: '1.5rem', color: 'var(--text-muted)' }}>{run.retry_reason}</div>
+      )}
 
       {/* Root Cause Card (if Succeeded) */}
       {report && (
@@ -226,6 +256,11 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
               {report.report_status === 'INSUFFICIENT_EVIDENCE'
                 ? '当前证据不足，不能将推断展示为已确认根因。'
                 : 'Provider 输出未通过结构校验，已保留原始输出供调试；当前不能展示为已确认根因。'}
+            </p>
+          )}
+          {isInvalidReport(report) && report.parse_error && (
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '0.5rem' }}>
+              结构校验类别：<code>{report.parse_error}</code>
             </p>
           )}
 

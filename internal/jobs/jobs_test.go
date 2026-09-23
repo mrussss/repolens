@@ -57,6 +57,29 @@ func setupTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+func TestDiagnosisRetryPolicyUsesExplicitProviderErrorAllowlist(t *testing.T) {
+	for code, want := range map[string]bool{
+		"PROVIDER_TIMEOUT": true, "PROVIDER_CONNECTION_FAILED": true,
+		"PROVIDER_UPSTREAM_ERROR": true, "PROVIDER_RATE_LIMITED": true,
+		"HTTP_5XX_SERVER_ERROR": true, "TRANSIENT_NETWORK_ERROR": true,
+		"INVALID_STRUCTURED_REPORT": false, "ATOMIC_FINALIZE_FAILED": false,
+		"UNKNOWN_RETRYABLE_ERROR": false, "PROVIDER_AUTH_FAILED": false,
+	} {
+		if got := jobs.IsRetryableDiagnosisProviderError(code); got != want {
+			t.Errorf("retry policy for %s = %t, want %t", code, got, want)
+		}
+	}
+	if jobs.IsRetryableDiagnosisProviderFailure(jobs.ErrorClassPermanent, "PROVIDER_TIMEOUT") {
+		t.Fatal("permanent provider error must not be retryable")
+	}
+	if !jobs.IsRetryableDiagnosisProviderFailure(jobs.ErrorClassPermanent, "PROVIDER_PROGRESS_ABORTED") {
+		t.Fatal("provider failure after Agent progress must permit only explicit retry")
+	}
+	if !jobs.IsRetryableDiagnosisProviderFailure(jobs.ErrorClassRetryable, "PROVIDER_TIMEOUT") {
+		t.Fatal("retryable provider timeout should be allowed")
+	}
+}
+
 func TestErrorClassification(t *testing.T) {
 	tests := []struct {
 		err           error
@@ -311,8 +334,8 @@ func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
 		`CREATE TABLE repository_snapshots (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
 		`CREATE TABLE code_index_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
 		`CREATE TABLE retrieval_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
-		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, version INTEGER NOT NULL)`,
-		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, status TEXT NOT NULL, finished_at DATETIME)`,
+		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, final_attempt_id TEXT, version INTEGER NOT NULL)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, created_at DATETIME)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)
@@ -331,7 +354,7 @@ func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
 	for _, tc := range cases {
 		if tc.typ == jobs.JobTypeRunDiagnosis {
 			_, _ = db.Exec(`INSERT INTO diagnosis_runs (id,status,version) VALUES (?, 'RUNNING', 1)`, tc.id)
-			_, _ = db.Exec(`INSERT INTO diagnosis_attempts (id,diagnosis_run_id,status) VALUES (?, ?, 'RUNNING')`, tc.id+"-attempt", tc.id)
+			_, _ = db.Exec(`INSERT INTO diagnosis_attempts (id,diagnosis_run_id,execution_generation,attempt_no,status) VALUES (?, ?, 1, 1, 'RUNNING')`, tc.id+"-attempt", tc.id)
 		} else {
 			_, _ = db.Exec(`INSERT INTO `+tc.table+` (id,status) VALUES (?, ?)`, tc.id, map[jobs.JobType]string{jobs.JobTypeMaterializeSnapshot: "MATERIALIZING", jobs.JobTypeBuildCodeIndex: "BUILDING", jobs.JobTypeBuildRetrieval: "BUILDING"}[tc.typ])
 		}
@@ -356,8 +379,12 @@ func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
 		}
 		var status string
 		if tc.typ == jobs.JobTypeRunDiagnosis {
-			if err := db.QueryRow(`SELECT status FROM diagnosis_runs WHERE id=?`, tc.id).Scan(&status); err != nil {
+			var finalAttemptID string
+			if err := db.QueryRow(`SELECT status, final_attempt_id FROM diagnosis_runs WHERE id=?`, tc.id).Scan(&status, &finalAttemptID); err != nil {
 				t.Fatal(err)
+			}
+			if finalAttemptID != tc.id+"-attempt" {
+				t.Errorf("final_attempt_id=%q, want %q", finalAttemptID, tc.id+"-attempt")
 			}
 			if status != "FAILED" {
 				t.Fatalf("diagnosis status=%s", status)

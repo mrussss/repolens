@@ -364,7 +364,30 @@ func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 }
 
 func (s *Service) Get(ctx context.Context, id, userID string) (*DiagnosisRun, error) {
-	return s.store.GetByIDAndUser(ctx, id, userID)
+	run, err := s.store.GetByIDAndUser(ctx, id, userID)
+	if err != nil {
+		return nil, err
+	}
+	if run.Status == StatusFailed {
+		run.RetryReason = "当前失败不属于可安全重试的 Provider 临时故障"
+	}
+	if s.jobStore != nil {
+		if job, jobErr := s.jobStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, id); jobErr == nil {
+			run.ExecutionGeneration = job.ExecutionGeneration
+			if run.Status == StatusFailed && job.Status == jobs.StatusFailed && job.LastErrorCode != nil {
+				run.RetryErrorCode = *job.LastErrorCode
+				class := jobs.ErrorClass("")
+				if job.LastErrorClass != nil {
+					class = jobs.ErrorClass(*job.LastErrorClass)
+				}
+				run.RetryAllowed = jobs.IsRetryableDiagnosisProviderFailure(class, *job.LastErrorCode)
+				if run.RetryAllowed {
+					run.RetryReason = ""
+				}
+			}
+		}
+	}
+	return run, nil
 }
 
 func (s *Service) List(ctx context.Context, userID string, page, pageSize int) ([]DiagnosisRun, int64, error) {

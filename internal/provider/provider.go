@@ -51,9 +51,13 @@ var (
 	ErrProviderConfigClearFailed     = errors.New("failed to clear provider configuration")
 	ErrProviderCapabilityUnsupported = errors.New("provider capability unsupported")
 	ErrProviderProbeTruncated        = errors.New("provider compatibility probe was truncated")
+	ErrProviderResponseFormatInvalid = errors.New("provider compatibility response format invalid")
 )
 
 const (
+	// providerConnectionTestTimeout is the overall budget shared by the basic
+	// connectivity request and the subsequent compatibility probe. Production
+	// Agent calls have their separate frozen per-request timeout.
 	providerConnectionTestTimeout    = 60 * time.Second
 	providerConnectionTestMaxTokens  = 256
 	providerConnectionBasicMaxTokens = 32
@@ -68,6 +72,7 @@ const (
 	ProviderTestCodeConnectionError       = "PROVIDER_CONNECTION_FAILED"
 	ProviderTestCodeCapabilityUnsupported = "PROVIDER_CAPABILITY_UNSUPPORTED"
 	ProviderTestCodeProbeTruncated        = "PROVIDER_PROBE_TRUNCATED"
+	ProviderTestCodeResponseFormatInvalid = "PROVIDER_RESPONSE_FORMAT_INVALID"
 )
 
 // CompatibilityProbeResult describes only the non-sensitive request shape
@@ -420,7 +425,8 @@ func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model
 // capabilities used by the production Agent request. The probe uses a small
 // output budget, but still requires the provider to accept reasoning_effort,
 // response_format, and tools. A returned probe tool call confirms tool
-// behavior; a successful response without one is reported as inconclusive.
+// behavior; CONFIRMED means only that the first target tool call was observed,
+// not that a complete multi-turn tool loop was exercised.
 func (m *Manager) TestConnectionCompatibilityWithAuthMode(ctx context.Context, baseURL, model, apiKey, authMode string) (time.Duration, CompatibilityProbeResult, error) {
 	normBase, err := NormalizeBaseURL(baseURL)
 	if err != nil {
@@ -461,8 +467,8 @@ func (m *Manager) TestConnectionCompatibilityWithAuthMode(ctx context.Context, b
 	// for unsupported capabilities merely because it was truncated.
 	response, err := provider.Generate(testCtx, llm.GenerateRequest{
 		Messages: []llm.Message{
-			{Role: llm.RoleSystem, Content: "You are a compatibility probe. Call the provided function exactly once."},
-			{Role: llm.RoleUser, Content: "Call repolens_compatibility_probe with an empty object."},
+			{Role: llm.RoleSystem, Content: "You are a compatibility probe. The response format is JSON. Call the provided function exactly once."},
+			{Role: llm.RoleUser, Content: "Call repolens_compatibility_probe with an empty JSON object."},
 		},
 		Tools: []llm.ToolDefinition{{
 			Type: "function",
@@ -493,7 +499,11 @@ func (m *Manager) TestConnectionCompatibilityWithAuthMode(ctx context.Context, b
 	}
 	if len(response.Message.ToolCalls) == 0 {
 		// A provider may accept tools but choose not to call one without an
-		// explicit tool_choice. This is inconclusive, not a capability failure.
+		// explicit tool_choice. It is inconclusive only if the JSON-mode response
+		// itself is one complete JSON object.
+		if !validJSONObject(response.Message.Content) {
+			return latency, probe, ErrProviderResponseFormatInvalid
+		}
 		return latency, probe, nil
 	}
 	if len(response.Message.ToolCalls) != 1 {
@@ -544,6 +554,16 @@ func validEmptyJSONObject(raw string) bool {
 	return decoder.Decode(&extra) == io.EOF
 }
 
+func validJSONObject(raw string) bool {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	var object map[string]json.RawMessage
+	if err := decoder.Decode(&object); err != nil || object == nil {
+		return false
+	}
+	var extra interface{}
+	return decoder.Decode(&extra) == io.EOF
+}
+
 // ClassifyTestConnectionError maps provider failures to stable, safe API
 // categories. The underlying error remains available for server logs only.
 func ClassifyTestConnectionError(err error) (code, message string, status int) {
@@ -555,6 +575,9 @@ func ClassifyTestConnectionError(err error) (code, message string, status int) {
 	}
 	if errors.Is(err, ErrProviderProbeTruncated) {
 		return ProviderTestCodeProbeTruncated, "Provider compatibility probe 未在有限输出预算内完成", http.StatusBadGateway
+	}
+	if errors.Is(err, ErrProviderResponseFormatInvalid) {
+		return ProviderTestCodeResponseFormatInvalid, "Provider 未按要求返回单一完整 JSON 对象", http.StatusBadGateway
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ProviderTestCodeTimeout, "Provider 请求超时（60 秒），上游可能仍在处理请求", http.StatusGatewayTimeout

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -221,6 +222,14 @@ func TestCompatibilityProbeUsesProductionGenerationShape(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
+		if _, compatibilityRequest := request["response_format"]; compatibilityRequest {
+			messages, _ := json.Marshal(request["messages"])
+			if !strings.Contains(strings.ToLower(string(messages)), "json") {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"JSON mode requires the word JSON in the prompt"}}`))
+				return
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"probe-1","type":"function","function":{"name":"repolens_compatibility_probe","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{}}`))
 	}))
@@ -245,36 +254,48 @@ func TestCompatibilityProbeUsesProductionGenerationShape(t *testing.T) {
 	if _, present := request["tool_choice"]; present {
 		t.Fatalf("probe sent tool_choice even though production requests omit it: %v", request["tool_choice"])
 	}
+	messages, ok := request["messages"].([]interface{})
+	if !ok || len(messages) != 2 {
+		t.Fatalf("probe messages = %v", request["messages"])
+	}
+	encodedMessages, _ := json.Marshal(messages)
+	if !strings.Contains(strings.ToLower(string(encodedMessages)), "json") {
+		t.Fatalf("json_object probe prompt must explicitly mention JSON: %s", encodedMessages)
+	}
 	if result.ProbeStatus != provider.CompatibilityProbeConfirmed {
 		t.Fatalf("probe status = %q, want %q", result.ProbeStatus, provider.CompatibilityProbeConfirmed)
 	}
 }
 
 func TestCompatibilityProbeRejectsUnsupportedGenerationOptions(t *testing.T) {
-	requests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer secret-token" {
-			t.Fatalf("authorization header was not sent")
-		}
-		requests++
-		w.Header().Set("Content-Type", "application/json")
-		if requests == 1 {
-			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{}}`))
-			return
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"message":"unsupported reasoning_effort; secret-token"}}`))
-	}))
-	defer server.Close()
+	for _, option := range []string{"reasoning_effort", "response_format", "tools"} {
+		t.Run(option, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer secret-token" {
+					t.Fatalf("authorization header was not sent")
+				}
+				requests++
+				w.Header().Set("Content-Type", "application/json")
+				if requests == 1 {
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{}}`))
+					return
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = fmt.Fprintf(w, `{"error":{"message":"unsupported %s; secret-token"}}`, option)
+			}))
+			defer server.Close()
 
-	mgr := provider.NewManager("", "", "", "", "")
-	_, _, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "secret-token", "bearer")
-	if !errors.Is(err, provider.ErrProviderCapabilityUnsupported) {
-		t.Fatalf("error = %v, want stable capability error", err)
-	}
-	code, message, status := provider.ClassifyTestConnectionError(err)
-	if code != provider.ProviderTestCodeCapabilityUnsupported || status != http.StatusBadGateway || strings.Contains(message, "secret-token") {
-		t.Fatalf("classification = %s/%q/%d", code, message, status)
+			mgr := provider.NewManager("", "", "", "", "")
+			_, _, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "secret-token", "bearer")
+			if !errors.Is(err, provider.ErrProviderCapabilityUnsupported) {
+				t.Fatalf("error = %v, want stable capability error", err)
+			}
+			code, message, status := provider.ClassifyTestConnectionError(err)
+			if code != provider.ProviderTestCodeCapabilityUnsupported || status != http.StatusBadGateway || strings.Contains(message, "secret-token") {
+				t.Fatalf("classification = %s/%q/%d", code, message, status)
+			}
+		})
 	}
 }
 
@@ -332,20 +353,37 @@ func TestCompatibilityProbeRejectsTruncationAndMalformedToolResponses(t *testing
 	}
 }
 
-func TestCompatibilityProbeMarksSuccessfulNonToolResponseUncertain(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{}}`))
-	}))
-	defer server.Close()
-
-	mgr := provider.NewManager("", "", "", "", "")
-	_, result, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "test-key", "bearer")
-	if err != nil {
-		t.Fatalf("error = %v, want inconclusive success", err)
-	}
-	if result.ToolCallObserved || result.ProbeStatus != provider.CompatibilityProbeUncertain {
-		t.Fatalf("probe result = %+v, want uncertain without a tool call", result)
+func TestCompatibilityProbeRequiresSingleJSONObjectWhenNoToolCall(t *testing.T) {
+	for _, tc := range []struct {
+		content string
+		valid   bool
+	}{
+		{content: `{}`, valid: true},
+		{content: `{"ok":true}`, valid: true},
+		{content: `OK`, valid: false},
+		{content: `{ } garbage`, valid: false},
+	} {
+		t.Run(tc.content, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.Header().Set("Content-Type", "application/json")
+				body, _ := json.Marshal(map[string]interface{}{"choices": []interface{}{map[string]interface{}{
+					"message": map[string]interface{}{"role": "assistant", "content": tc.content}, "finish_reason": "stop",
+				}}, "usage": map[string]interface{}{}})
+				_, _ = w.Write(body)
+			}))
+			defer server.Close()
+			mgr := provider.NewManager("", "", "", "", "")
+			_, result, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "test-key", "bearer")
+			if tc.valid {
+				if err != nil || result.ToolCallObserved || result.ProbeStatus != provider.CompatibilityProbeUncertain {
+					t.Fatalf("valid JSON response result=%+v err=%v", result, err)
+				}
+			} else if !errors.Is(err, provider.ErrProviderResponseFormatInvalid) {
+				t.Fatalf("invalid response format error = %v", err)
+			}
+		})
 	}
 }
 
@@ -365,6 +403,7 @@ func TestClassifyTestConnectionError(t *testing.T) {
 		{name: "model not found", err: &llm.HTTPError{StatusCode: http.StatusNotFound}, code: provider.ProviderTestCodeModelNotFound, message: "Provider 模型或接口不存在，请检查 Base URL 和模型名称", status: http.StatusNotFound},
 		{name: "upstream", err: &llm.HTTPError{StatusCode: http.StatusBadGateway}, code: provider.ProviderTestCodeUpstreamError, message: "Provider 上游服务暂时不可用", status: http.StatusBadGateway},
 		{name: "network", err: errors.New("dial tcp: connection refused"), code: provider.ProviderTestCodeConnectionError, message: "无法连接 Provider，请检查网络和 Base URL", status: http.StatusBadGateway},
+		{name: "invalid response format", err: provider.ErrProviderResponseFormatInvalid, code: provider.ProviderTestCodeResponseFormatInvalid, message: "Provider 未按要求返回单一完整 JSON 对象", status: http.StatusBadGateway},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

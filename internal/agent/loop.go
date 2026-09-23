@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
 	"strings"
 	"time"
 
@@ -149,7 +148,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 	}
 
 	messages := []llm.Message{
-		{Role: llm.RoleSystem, Content: SystemPrompt},
+		{Role: llm.RoleSystem, Content: SystemPrompt + "\n\nJSON response contract: because the response format is JSON mode, return exactly one complete JSON object and no prose, markdown, or trailing data."},
 		{Role: llm.RoleUser, Content: initialUserMsg},
 	}
 
@@ -481,47 +480,33 @@ func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, s
 	return l.traceStore.Create(ctx, step)
 }
 
-var jsonExtractorRegex = regexp.MustCompile(`(?s)\{.*\}`)
-var fencedJSONRegex = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
-
 func parseReportJSON(raw string) (*evidence.ReportDraft, error) {
-	clean := strings.TrimSpace(raw)
-	clean = strings.TrimPrefix(clean, "```json")
-	clean = strings.TrimPrefix(clean, "```")
-	clean = strings.TrimSuffix(clean, "```")
-	clean = strings.TrimSpace(clean)
-
-	var lastErr error
-	for _, match := range fencedJSONRegex.FindAllStringSubmatch(raw, -1) {
-		if len(match) < 2 {
-			continue
-		}
-		report, err := parseReportCandidate([]byte(match[1]))
-		if err == nil {
-			return &report, nil
-		}
-		lastErr = err
+	report, err := parseReportCandidate([]byte(strings.TrimSpace(raw)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidStructuredReport, safeReportParseError(err))
 	}
+	return &report, nil
+}
 
-	report, err := parseReportCandidate([]byte(clean))
+func safeReportParseError(err error) string {
 	if err == nil {
-		return &report, nil
+		return ""
 	}
-	lastErr = err
-
-	m := jsonExtractorRegex.FindString(raw)
-	if m != "" {
-		report, err := parseReportCandidate([]byte(m))
-		if err == nil {
-			return &report, nil
-		}
-		lastErr = err
+	if strings.Contains(err.Error(), "TRAILING_JSON") || strings.Contains(err.Error(), "one object") {
+		return "TRAILING_JSON"
 	}
-
-	if lastErr == nil {
-		lastErr = errors.New("cannot parse valid structured report JSON from LLM output")
+	var unknown *json.UnmarshalTypeError
+	if strings.Contains(strings.ToLower(err.Error()), "unknown field") {
+		return "UNKNOWN_FIELD"
 	}
-	return nil, fmt.Errorf("%w: %v", ErrInvalidStructuredReport, lastErr)
+	if errors.As(err, &unknown) {
+		return "INVALID_FIELD_TYPE"
+	}
+	var syntax *json.SyntaxError
+	if errors.As(err, &syntax) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return "MALFORMED_JSON"
+	}
+	return "INVALID_REPORT_STRUCTURE"
 }
 
 func parseReportCandidate(data []byte) (evidence.ReportDraft, error) {
@@ -544,9 +529,9 @@ func decodeReportJSON(data []byte, report *evidence.ReportDraft) error {
 	var extra interface{}
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return errors.New("report JSON must contain one object")
+			return errors.New("TRAILING_JSON")
 		}
-		return err
+		return errors.New("TRAILING_JSON")
 	}
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(data, &envelope); err != nil {

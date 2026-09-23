@@ -80,11 +80,9 @@ func ValidateReportDraftStructure(draft *ReportDraft) error {
 		for _, ref := range finding.Citations {
 			resolved.Citations = append(resolved.Citations, Citation{
 				EvidenceID: ref.EvidenceID,
-				FilePath:   ref.LegacyPath,
-				StartLine:  ref.LegacyStartLine,
-				EndLine:    ref.LegacyEndLine,
-				Excerpt:    ref.LegacyExcerpt,
-				Reason:     ref.Reason,
+				// Legacy location fields are decode-only and never canonical. Apply
+				// the canonical reason normalization before structural validation.
+				Reason: limitCitationReason(ref.Reason),
 			})
 		}
 		data.Findings = append(data.Findings, resolved)

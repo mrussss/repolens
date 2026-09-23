@@ -21,7 +21,7 @@ import (
 )
 
 func AutoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(
+	if err := db.AutoMigrate(
 		&repo.Repository{},
 		&snapshot.RepositorySnapshot{},
 		&codeintelmodel.CodeIndexBuild{},
@@ -38,7 +38,12 @@ func AutoMigrate(db *gorm.DB) error {
 		&evidence.AttemptEvidenceItem{},
 		&trace.AgentStep{},
 		&jobs.AnalysisJob{},
-	)
+	); err != nil {
+		return err
+	}
+	return db.Model(&diagnosis.DiagnosisAttempt{}).
+		Where("checkpoint_kind = ? AND (raw_output <> '' OR finish_reason <> '')", diagnosis.CheckpointKindNone).
+		Update("checkpoint_kind", diagnosis.CheckpointKindLegacyUntyped).Error
 }
 
 // ApplyMigrations is the production schema entry point. SQL files are the

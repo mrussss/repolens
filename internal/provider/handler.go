@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -308,6 +309,18 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 
 	// 4. Create deterministic Demo Report & Citations
 	attemptID := "attempt-demo-1"
+	if starter, ok := h.diagnosisStore.(interface {
+		StartAttempt(context.Context, string, *diagnosis.DiagnosisAttempt) error
+	}); ok {
+		attemptStartedAt := now
+		if err := starter.StartAttempt(ctx, demoRun.ID, &diagnosis.DiagnosisAttempt{
+			ID: attemptID, DiagnosisRunID: demoRun.ID, ExecutionGeneration: 1, AttemptNo: 1, WorkerID: "demo",
+			StartedAt: attemptStartedAt, HeartbeatAt: attemptStartedAt, DeadlineAt: attemptStartedAt.Add(time.Hour),
+		}); err != nil {
+			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
+			return
+		}
+	}
 	demoReport := &evidence.Report{
 		ID:             "report-demo-" + uuid.New().String()[:8],
 		DiagnosisRunID: demoRun.ID,

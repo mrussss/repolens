@@ -20,7 +20,10 @@ var (
 	ErrProviderNotConfigured = errors.New("provider is not configured")
 	ErrRunNotFound           = errors.New("diagnosis run not found")
 	ErrAttemptNotFound       = errors.New("diagnosis attempt not found")
+	ErrAttemptNotRunning     = errors.New("diagnosis attempt is not running")
+	ErrAttemptAlreadyExists  = errors.New("diagnosis attempt already exists")
 	ErrClaimConflict         = errors.New("run claim conflict: status is not in expected state or already claimed")
+	ErrRunTransitionConflict = errors.New("diagnosis run is not running")
 	ErrOptimisticLock        = errors.New("optimistic lock conflict")
 )
 
@@ -32,7 +35,7 @@ type Store interface {
 	ListByUser(ctx context.Context, userID string, page, pageSize int) ([]DiagnosisRun, int64, error)
 	ClaimRun(ctx context.Context, runID string, expectedStatuses []RunStatus, workerID string, attemptDeadline time.Duration) (*DiagnosisRun, *DiagnosisAttempt, error)
 	GetAttempt(ctx context.Context, attemptID string) (*DiagnosisAttempt, error)
-	GetLatestCheckpoint(ctx context.Context, runID string) (*DiagnosisAttempt, error)
+	GetLatestFinalCheckpoint(ctx context.Context, runID string, executionGeneration int) (*DiagnosisAttempt, error)
 	ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error)
 	UpdateAttemptHeartbeat(ctx context.Context, attemptID string, heartbeatAt time.Time) error
 	FinishAttempt(ctx context.Context, runID, attemptID string, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool) error
@@ -68,7 +71,9 @@ func (s *GormStore) StartAttempt(ctx context.Context, runID string, attempt *Dia
 		} else if run.Status != StatusRunning {
 			return fmt.Errorf("diagnosis %s cannot start from %s", runID, run.Status)
 		}
-		if err := tx.Where("id = ?", attempt.ID).First(&DiagnosisAttempt{}).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		var existing DiagnosisAttempt
+		err := tx.Where("id = ?", attempt.ID).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			if attempt.StartedAt.IsZero() {
 				attempt.StartedAt = time.Now().UTC()
 			}
@@ -78,11 +83,19 @@ func (s *GormStore) StartAttempt(ctx context.Context, runID string, attempt *Dia
 			if attempt.DeadlineAt.IsZero() {
 				attempt.DeadlineAt = attempt.StartedAt.Add(30 * time.Minute)
 			}
+			if attempt.ExecutionGeneration <= 0 {
+				attempt.ExecutionGeneration = 1
+			}
+			if attempt.CheckpointKind == "" {
+				attempt.CheckpointKind = CheckpointKindNone
+			}
 			attempt.Status = AttemptStatusRunning
 			return tx.Create(attempt).Error
-		} else {
+		}
+		if err != nil {
 			return err
 		}
+		return ErrAttemptAlreadyExists
 	})
 }
 
@@ -287,7 +300,7 @@ func (s *GormStore) FinalizeCancellation(ctx context.Context, jobID int64, worke
 			return jobs.ErrOwnershipLost
 		}
 		runResult := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ?", runID, StatusRunning).Updates(map[string]interface{}{
-			"status": StatusCancelled, "version": gorm.Expr("version + 1"),
+			"status": StatusCancelled, "final_attempt_id": attemptID, "version": gorm.Expr("version + 1"),
 		})
 		if runResult.Error != nil {
 			return runResult.Error
@@ -424,9 +437,19 @@ func (s *GormStore) ClaimRun(ctx context.Context, runID string, expectedStatuses
 			return fmt.Errorf("run %s has been requested for cancellation", runID)
 		}
 
-		// Count existing attempts for attempt_no
+		generation := 1
+		var job jobs.AnalysisJob
+		jobErr := tx.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, runID).First(&job).Error
+		if jobErr != nil && !errors.Is(jobErr, gorm.ErrRecordNotFound) {
+			return jobErr
+		}
+		if jobErr == nil && job.ExecutionGeneration > 0 {
+			generation = job.ExecutionGeneration
+		}
+
+		// Number attempts within the active execution generation.
 		var count int64
-		if err := tx.Model(&DiagnosisAttempt{}).Where("diagnosis_run_id = ?", runID).Count(&count).Error; err != nil {
+		if err := tx.Model(&DiagnosisAttempt{}).Where("diagnosis_run_id = ? AND execution_generation = ?", runID, generation).Count(&count).Error; err != nil {
 			return err
 		}
 
@@ -449,14 +472,15 @@ func (s *GormStore) ClaimRun(ctx context.Context, runID string, expectedStatuses
 
 		// Create DiagnosisAttempt
 		attempt = DiagnosisAttempt{
-			ID:             uuid.New().String(),
-			DiagnosisRunID: runID,
-			AttemptNo:      int(count) + 1,
-			WorkerID:       workerID,
-			Status:         AttemptStatusRunning,
-			StartedAt:      now,
-			HeartbeatAt:    now,
-			DeadlineAt:     deadline,
+			ID:                  uuid.New().String(),
+			DiagnosisRunID:      runID,
+			ExecutionGeneration: generation,
+			AttemptNo:           int(count) + 1,
+			WorkerID:            workerID,
+			Status:              AttemptStatusRunning,
+			StartedAt:           now,
+			HeartbeatAt:         now,
+			DeadlineAt:          deadline,
 		}
 		if err := tx.Create(&attempt).Error; err != nil {
 			return err
@@ -489,11 +513,11 @@ func (s *GormStore) GetAttempt(ctx context.Context, attemptID string) (*Diagnosi
 	return &att, nil
 }
 
-func (s *GormStore) GetLatestCheckpoint(ctx context.Context, runID string) (*DiagnosisAttempt, error) {
+func (s *GormStore) GetLatestFinalCheckpoint(ctx context.Context, runID string, executionGeneration int) (*DiagnosisAttempt, error) {
 	var attempt DiagnosisAttempt
 	err := s.db.WithContext(ctx).
-		Where("diagnosis_run_id = ? AND (raw_output <> '' OR finish_reason <> '')", runID).
-		Order("attempt_no DESC").
+		Where("diagnosis_run_id = ? AND execution_generation = ? AND checkpoint_kind IN ? AND provider_completed_at IS NOT NULL", runID, executionGeneration, []CheckpointKind{CheckpointKindFinalValid, CheckpointKindFinalInvalid}).
+		Order("attempt_no DESC, created_at DESC").
 		First(&attempt).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
@@ -505,35 +529,77 @@ func (s *GormStore) GetLatestCheckpoint(ctx context.Context, runID string) (*Dia
 }
 
 // UpdateAttemptCheckpoint persists provider output before citation validation
-// or the final business transaction. A later worker retry can inspect this
+// or the final business transaction. A later worker retry can inspect a final
 // checkpoint instead of calling the provider again.
-func (s *GormStore) UpdateAttemptCheckpoint(ctx context.Context, attemptID, rawOutput, parsedReport string, structured bool, promptTokens, completionTokens, cachedPromptTokens, reasoningTokens, toolCalls, agentRounds, searchCalls, providerCalls int, finalizationReason, finishReason string) error {
-	return s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).Updates(map[string]interface{}{
-		"raw_output": rawOutput, "parsed_report_json": parsedReport, "structured_output_valid": structured,
-		"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "cached_prompt_tokens": cachedPromptTokens,
-		"reasoning_tokens": reasoningTokens, "tool_calls": toolCalls, "agent_rounds": agentRounds,
-		"search_calls": searchCalls, "provider_calls": providerCalls, "finalization_reason": finalizationReason, "finish_reason": finishReason,
-		"provider_completed_at": time.Now().UTC(),
-	}).Error
+func (s *GormStore) UpdateAttemptCheckpoint(ctx context.Context, attemptID string, checkpoint AttemptCheckpoint) error {
+	return s.updateAttemptCheckpoint(ctx, attemptID, checkpoint, false)
 }
 
 // UpdateAttemptCheckpointWithDraft persists the parsed model draft alongside
 // the resolved compatibility report. A retry can therefore finish persistence
 // without calling the provider again.
-func (s *GormStore) UpdateAttemptCheckpointWithDraft(ctx context.Context, attemptID, rawOutput, parsedReport, parsedDraft, promptVersion, agentVersion string, structured bool, promptTokens, completionTokens, cachedPromptTokens, reasoningTokens, toolCalls, agentRounds, searchCalls, providerCalls int, finalizationReason, finishReason string) error {
-	return s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).Updates(map[string]interface{}{
-		"raw_output": rawOutput, "parsed_report_json": parsedReport, "parsed_report_draft_json": parsedDraft,
-		"checkpoint_prompt_version": promptVersion, "checkpoint_agent_version": agentVersion,
-		"structured_output_valid": structured,
-		"prompt_tokens":           promptTokens, "completion_tokens": completionTokens, "cached_prompt_tokens": cachedPromptTokens, "reasoning_tokens": reasoningTokens,
-		"tool_calls": toolCalls, "agent_rounds": agentRounds, "search_calls": searchCalls, "provider_calls": providerCalls,
-		"finalization_reason": finalizationReason, "finish_reason": finishReason, "provider_completed_at": time.Now().UTC(),
-	}).Error
+func (s *GormStore) UpdateAttemptCheckpointWithDraft(ctx context.Context, attemptID string, checkpoint AttemptCheckpoint) error {
+	return s.updateAttemptCheckpoint(ctx, attemptID, checkpoint, true)
+}
+
+func (s *GormStore) updateAttemptCheckpoint(ctx context.Context, attemptID string, checkpoint AttemptCheckpoint, withDraft bool) error {
+	if checkpoint.ExecutionGeneration <= 0 {
+		checkpoint.ExecutionGeneration = 1
+	}
+	if checkpoint.Kind == "" {
+		checkpoint.Kind = CheckpointKindNone
+	}
+	updates := map[string]interface{}{
+		"checkpoint_kind":           checkpoint.Kind,
+		"checkpoint_error_code":     checkpoint.ErrorCode,
+		"checkpoint_error_message":  truncateCheckpointMessage(checkpoint.ErrorMessage),
+		"raw_output":                checkpoint.RawOutput,
+		"parsed_report_json":        checkpoint.ParsedReportJSON,
+		"checkpoint_prompt_version": checkpoint.PromptVersion,
+		"checkpoint_agent_version":  checkpoint.AgentVersion,
+		"structured_output_valid":   checkpoint.Structured,
+		"prompt_tokens":             checkpoint.PromptTokens,
+		"completion_tokens":         checkpoint.CompletionTokens,
+		"cached_prompt_tokens":      checkpoint.CachedPromptTokens,
+		"reasoning_tokens":          checkpoint.ReasoningTokens,
+		"tool_calls":                checkpoint.ToolCalls,
+		"agent_rounds":              checkpoint.AgentRounds,
+		"search_calls":              checkpoint.SearchCalls,
+		"provider_calls":            checkpoint.ProviderCalls,
+		"finalization_reason":       checkpoint.FinalizationReason,
+		"finish_reason":             checkpoint.FinishReason,
+		"provider_completed_at":     nil,
+	}
+	if withDraft {
+		updates["parsed_report_draft_json"] = checkpoint.ParsedDraftJSON
+	}
+	if checkpoint.Kind == CheckpointKindFinalValid || checkpoint.Kind == CheckpointKindFinalInvalid {
+		updates["provider_completed_at"] = time.Now().UTC()
+	}
+	result := s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).
+		Where("id = ? AND execution_generation = ? AND status = ?", attemptID, checkpoint.ExecutionGeneration, AttemptStatusRunning).
+		Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrAttemptNotRunning
+	}
+	return nil
+}
+
+func truncateCheckpointMessage(message string) string {
+	runes := []rune(message)
+	if len(runes) > 255 {
+		return string(runes[:255])
+	}
+	return message
 }
 
 func (s *GormStore) ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error) {
 	var attempts []DiagnosisAttempt
-	err := s.db.WithContext(ctx).Where("diagnosis_run_id = ?", runID).Order("attempt_no ASC").Find(&attempts).Error
+	err := s.db.WithContext(ctx).Where("diagnosis_run_id = ?", runID).
+		Order("execution_generation ASC, attempt_no ASC, created_at ASC").Find(&attempts).Error
 	return attempts, err
 }
 
@@ -578,10 +644,13 @@ func (s *GormStore) FinishAttemptAndRun(ctx context.Context, runID, attemptID st
 			"retryable":         retryable,
 		}
 		resAtt := tx.Model(&DiagnosisAttempt{}).
-			Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).
+			Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).
 			Updates(attemptUpdates)
 		if resAtt.Error != nil {
 			return resAtt.Error
+		}
+		if resAtt.RowsAffected != 1 {
+			return ErrAttemptNotRunning
 		}
 
 		// Update run
@@ -590,11 +659,16 @@ func (s *GormStore) FinishAttemptAndRun(ctx context.Context, runID, attemptID st
 			"final_attempt_id": attemptID,
 			"version":          gorm.Expr("version + 1"),
 		}
-		resRun := tx.Model(&DiagnosisRun{}).
-			Where("id = ?", runID).
-			Updates(runUpdates)
+		runQuery := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ?", runID, StatusRunning)
+		if newRunStatus != StatusCancelled {
+			runQuery = runQuery.Where("cancel_requested = ?", false)
+		}
+		resRun := runQuery.Updates(runUpdates)
 		if resRun.Error != nil {
 			return resRun.Error
+		}
+		if resRun.RowsAffected != 1 {
+			return ErrRunTransitionConflict
 		}
 
 		return nil

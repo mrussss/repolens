@@ -55,7 +55,7 @@ describe('v2.2 API and UI contracts', () => {
     expect(isInvalidReport({ report_status: 'VALID' } as any)).toBe(false);
   });
 
-  it('shows confirmed provider tool calling as a green result', () => {
+  it('labels an observed first tool call without claiming a full round trip', () => {
     expect(getProviderTestAlert({
       success: true,
       latency_ms: 120,
@@ -71,11 +71,11 @@ describe('v2.2 API and UI contracts', () => {
       },
     })).toEqual({
       className: 'alert-success',
-      message: '✓ 连接及工具调用已确认，延迟 120ms',
+      message: '✓ 已观测到目标工具调用（未验证完整工具往返），延迟 120ms',
     });
   });
 
-  it('shows uncertain provider tool calling as a yellow result', () => {
+  it('keeps providers without an observed tool call uncertain', () => {
     expect(getProviderTestAlert({
       success: true,
       latency_ms: 240,

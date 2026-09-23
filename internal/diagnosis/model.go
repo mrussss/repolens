@@ -50,6 +50,10 @@ type DiagnosisRun struct {
 	IdempotencyKey              string    `gorm:"size:128;not null;index:idx_user_idemp,unique" json:"idempotency_key"`
 	IdempotencyRequestHash      string    `gorm:"size:64;not null" json:"idempotency_request_hash"`
 	FinalAttemptID              string    `gorm:"size:36" json:"final_attempt_id,omitempty"`
+	RetryAllowed                bool      `gorm:"-" json:"retry_allowed"`
+	RetryReason                 string    `gorm:"-" json:"retry_reason,omitempty"`
+	RetryErrorCode              string    `gorm:"-" json:"retry_error_code,omitempty"`
+	ExecutionGeneration         int       `gorm:"-" json:"execution_generation,omitempty"`
 	Version                     int       `gorm:"default:1;not null" json:"version"`
 	CreatedAt                   time.Time `json:"created_at"`
 	UpdatedAt                   time.Time `json:"updated_at"`

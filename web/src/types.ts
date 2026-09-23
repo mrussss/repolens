@@ -164,6 +164,11 @@ export interface DiagnosisRun {
   issue_description?: string;
   error_log?: string;
   status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED';
+  final_attempt_id?: string;
+  retry_allowed?: boolean;
+  retry_reason?: string;
+  retry_error_code?: string;
+  execution_generation?: number;
   execution_status?: string;
   attempt_count?: number;
   idempotency_key?: string;
@@ -174,8 +179,10 @@ export interface DiagnosisRun {
 export interface DiagnosisAttempt {
   id: string;
   diagnosis_run_id: string;
+  execution_generation: number;
   attempt_no: number;
   status: string;
+  checkpoint_kind?: 'NONE' | 'FINAL_VALID' | 'FINAL_INVALID' | 'PARTIAL_PROVIDER_FAILURE' | 'LEGACY_UNTYPED';
   error_code?: string;
   error_message?: string;
   prompt_tokens?: number;
@@ -209,6 +216,7 @@ export interface DiagnosisReport {
   root_cause: string;
   conclusion_kind?: 'ROOT_CAUSE' | 'INSUFFICIENT_EVIDENCE';
   report_status?: 'VALID' | 'DEGRADED' | 'INSUFFICIENT_EVIDENCE' | 'INVALID';
+  parse_error?: string;
   summary?: string;
   findings: Finding[];
   recommended_checks: string[];

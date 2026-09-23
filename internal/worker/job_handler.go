@@ -68,15 +68,25 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	if job.WorkerID != nil {
 		workerID = *job.WorkerID
 	}
+	executionGeneration := job.ExecutionGeneration
+	if executionGeneration <= 0 {
+		executionGeneration = 1
+	}
+	attemptNo := job.AttemptCount
+	if attemptNo <= 0 {
+		attemptNo = 1
+	}
+	now := time.Now().UTC()
 	attempt := &diagnosis.DiagnosisAttempt{
-		ID:             fmt.Sprintf("job-%d-%d", job.ID, job.AttemptCount),
-		DiagnosisRunID: run.ID,
-		AttemptNo:      job.AttemptCount,
-		WorkerID:       workerID,
-		Status:         diagnosis.AttemptStatusRunning,
-		StartedAt:      time.Now().UTC(),
-		HeartbeatAt:    time.Now().UTC(),
-		DeadlineAt:     time.Now().UTC().Add(30 * time.Minute),
+		ID:                  uuid.NewString(),
+		DiagnosisRunID:      run.ID,
+		ExecutionGeneration: executionGeneration,
+		AttemptNo:           attemptNo,
+		WorkerID:            workerID,
+		Status:              diagnosis.AttemptStatusRunning,
+		StartedAt:           now,
+		HeartbeatAt:         now,
+		DeadlineAt:          now.Add(30 * time.Minute),
 	}
 
 	if starter, ok := h.diagnosisStore.(interface {
@@ -99,9 +109,9 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	var result *ExecutionResult
 	var execErr error
 	if checkpointStore, ok := h.diagnosisStore.(interface {
-		GetLatestCheckpoint(context.Context, string) (*diagnosis.DiagnosisAttempt, error)
+		GetLatestFinalCheckpoint(context.Context, string, int) (*diagnosis.DiagnosisAttempt, error)
 	}); ok {
-		checkpoint, checkpointErr := checkpointStore.GetLatestCheckpoint(ctx, run.ID)
+		checkpoint, checkpointErr := checkpointStore.GetLatestFinalCheckpoint(ctx, run.ID, attempt.ExecutionGeneration)
 		if checkpointErr != nil {
 			return jobs.NewRetryableError("CHECKPOINT_LOAD_FAILED", "failed loading diagnosis checkpoint", checkpointErr)
 		}
@@ -116,6 +126,13 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				return versionErr
 			}
 			result = executionResultFromCheckpoint(checkpoint)
+			if checkpoint.CheckpointKind == diagnosis.CheckpointKindFinalInvalid {
+				message := result.ParseError
+				if message == "" {
+					message = "agent returned an invalid structured report"
+				}
+				execErr = fmt.Errorf("%w: %s", agent.ErrInvalidStructuredReport, message)
+			}
 			if result.ReportDraft != nil && h.evidenceIssuer != nil {
 				result.ReportDraft = rebindCheckpointDraft(ctx, h.evidenceIssuer, result.ReportDraft, checkpoint.ID, run, attempt)
 				result.Report = resolveCheckpointDraft(ctx, h.evidenceIssuer, result.ReportDraft, run, attempt)
@@ -142,14 +159,33 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			execErr = fmt.Errorf("%w: %v", agent.ErrInvalidStructuredReport, validationErr)
 		}
 	}
+	if result != nil {
+		checkpointKind := diagnosis.CheckpointKindPartialProviderFailure
+		switch {
+		case errors.Is(execErr, agent.ErrInvalidStructuredReport):
+			checkpointKind = diagnosis.CheckpointKindFinalInvalid
+		case execErr == nil:
+			checkpointKind = diagnosis.CheckpointKindFinalValid
+		}
+		if checkpointErr := h.saveAttemptCheckpoint(attempt, run, result, checkpointKind); checkpointErr != nil {
+			log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
+			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
+			finalizeErr := h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, result.PromptTokens, result.CompletionTokens, result.ToolCalls, "CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", false, 0)
+			cancelFinalize()
+			if finalizeErr != nil {
+				log.Error("failed to terminalize diagnosis after checkpoint failure", "error", finalizeErr)
+			}
+			return jobs.NewPermanentError("CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", checkpointErr)
+		}
+	}
 	if errors.Is(execErr, agent.ErrInvalidStructuredReport) {
 		promptTokens, completionTokens, toolCalls := 0, 0, 0
 		if result != nil {
 			promptTokens, completionTokens, toolCalls = result.PromptTokens, result.CompletionTokens, result.ToolCalls
 		}
-		message := execErr.Error()
+		message := "INVALID_STRUCTURED_REPORT: INVALID_REPORT_STRUCTURE"
 		if result != nil && result.ParseError != "" {
-			message = result.ParseError
+			message = safeStructuredParseMessage(result.ParseError)
 		}
 		rawOutput := ""
 		if result != nil {
@@ -184,6 +220,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				return h.cancelAttempt(ctx, job, run, attempt)
 			}
 			if finalizeErr != nil {
+				h.closeCheckpointAttempt(ctx, run, attempt, "ATOMIC_INVALID_FINALIZE_FAILED", finalizeErr)
 				return jobs.NewRetryableError("ATOMIC_INVALID_FINALIZE_FAILED", "failed to atomically finalize invalid structured report", finalizeErr)
 			}
 			return jobs.NewPermanentError(agent.ErrCodeInvalidStructuredReport, "agent returned an invalid structured report", execErr)
@@ -196,43 +233,6 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		}
 		_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, promptTokens, completionTokens, toolCalls, agent.ErrCodeInvalidStructuredReport, message, false, 0)
 		return jobs.NewPermanentError(agent.ErrCodeInvalidStructuredReport, "agent returned an invalid structured report", execErr)
-	}
-	if result != nil {
-		parsedReport, _ := json.Marshal(result.Report)
-		parsedDraft, _ := json.Marshal(result.ReportDraft)
-		if checkpointDraft, ok := h.diagnosisStore.(interface {
-			UpdateAttemptCheckpointWithDraft(context.Context, string, string, string, string, string, string, bool, int, int, int, int, int, int, int, int, string, string) error
-		}); ok {
-			checkpointCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			checkpointErr := checkpointDraft.UpdateAttemptCheckpointWithDraft(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), string(parsedDraft), run.PromptVersion, run.AgentVersion, result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason, result.FinishReason)
-			cancel()
-			if checkpointErr != nil {
-				log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
-				finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-				finalizeErr := h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, result.PromptTokens, result.CompletionTokens, result.ToolCalls, "CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", false, 0)
-				cancelFinalize()
-				if finalizeErr != nil {
-					log.Error("failed to terminalize diagnosis after checkpoint failure", "error", finalizeErr)
-				}
-				return jobs.NewPermanentError("CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", checkpointErr)
-			}
-		} else if checkpoint, ok := h.diagnosisStore.(interface {
-			UpdateAttemptCheckpoint(context.Context, string, string, string, bool, int, int, int, int, int, int, int, int, string, string) error
-		}); ok {
-			checkpointCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			checkpointErr := checkpoint.UpdateAttemptCheckpoint(checkpointCtx, attempt.ID, result.RawOutput, string(parsedReport), result.StructuredReport, result.PromptTokens, result.CompletionTokens, result.CachedPromptTokens, result.ReasoningTokens, result.ToolCalls, result.AgentRounds, result.SearchCalls, result.ProviderCalls, result.FinalizationReason, result.FinishReason)
-			cancel()
-			if checkpointErr != nil {
-				log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
-				finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-				finalizeErr := h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, result.PromptTokens, result.CompletionTokens, result.ToolCalls, "CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", false, 0)
-				cancelFinalize()
-				if finalizeErr != nil {
-					log.Error("failed to terminalize diagnosis after checkpoint failure", "error", finalizeErr)
-				}
-				return jobs.NewPermanentError("CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", checkpointErr)
-			}
-		}
 	}
 	if execErr != nil {
 		log.Error("agent execution failed", "error", execErr)
@@ -353,6 +353,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				if errors.Is(err, jobs.ErrCancellationRequested) {
 					return h.cancelAttempt(ctx, job, run, attempt)
 				}
+				h.closeCheckpointAttempt(ctx, run, attempt, "ATOMIC_FINALIZE_FAILED", err)
 				h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
 				return jobs.NewRetryableError("ATOMIC_FINALIZE_FAILED", err.Error(), err)
 			}
@@ -458,6 +459,60 @@ func resolveCheckpointDraft(ctx context.Context, issuer evidence.EvidenceIssuer,
 	return report
 }
 
+func (h *DiagnosisJobHandler) saveAttemptCheckpoint(attempt *diagnosis.DiagnosisAttempt, run *diagnosis.DiagnosisRun, result *ExecutionResult, kind diagnosis.CheckpointKind) error {
+	if attempt == nil || run == nil || result == nil {
+		return nil
+	}
+	parsedReport, _ := json.Marshal(result.Report)
+	parsedDraft, _ := json.Marshal(result.ReportDraft)
+	checkpoint := diagnosis.AttemptCheckpoint{
+		ExecutionGeneration: attempt.ExecutionGeneration,
+		Kind:                kind,
+		RawOutput:           result.RawOutput,
+		ParsedReportJSON:    string(parsedReport),
+		ParsedDraftJSON:     string(parsedDraft),
+		PromptVersion:       run.PromptVersion,
+		AgentVersion:        run.AgentVersion,
+		Structured:          result.StructuredReport,
+		PromptTokens:        result.PromptTokens,
+		CompletionTokens:    result.CompletionTokens,
+		CachedPromptTokens:  result.CachedPromptTokens,
+		ReasoningTokens:     result.ReasoningTokens,
+		ToolCalls:           result.ToolCalls,
+		AgentRounds:         result.AgentRounds,
+		SearchCalls:         result.SearchCalls,
+		ProviderCalls:       result.ProviderCalls,
+		FinalizationReason:  result.FinalizationReason,
+		FinishReason:        result.FinishReason,
+	}
+	if kind == diagnosis.CheckpointKindFinalInvalid {
+		checkpoint.ErrorCode = agent.ErrCodeInvalidStructuredReport
+		checkpoint.ErrorMessage = safeStructuredParseMessage(result.ParseError)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if store, ok := h.diagnosisStore.(interface {
+		UpdateAttemptCheckpointWithDraft(context.Context, string, diagnosis.AttemptCheckpoint) error
+	}); ok {
+		return store.UpdateAttemptCheckpointWithDraft(ctx, attempt.ID, checkpoint)
+	}
+	if store, ok := h.diagnosisStore.(interface {
+		UpdateAttemptCheckpoint(context.Context, string, diagnosis.AttemptCheckpoint) error
+	}); ok {
+		return store.UpdateAttemptCheckpoint(ctx, attempt.ID, checkpoint)
+	}
+	return nil
+}
+
+func safeStructuredParseMessage(message string) string {
+	for _, category := range []string{"UNKNOWN_FIELD", "TRAILING_JSON", "MALFORMED_JSON", "INVALID_FIELD_TYPE", "INVALID_REPORT_STRUCTURE"} {
+		if strings.Contains(message, category) {
+			return "INVALID_STRUCTURED_REPORT: " + category
+		}
+	}
+	return "INVALID_STRUCTURED_REPORT: INVALID_REPORT_STRUCTURE"
+}
+
 func executionResultFromCheckpoint(checkpoint *diagnosis.DiagnosisAttempt) *ExecutionResult {
 	result := &ExecutionResult{
 		RawOutput:          checkpoint.RawOutput,
@@ -472,6 +527,7 @@ func executionResultFromCheckpoint(checkpoint *diagnosis.DiagnosisAttempt) *Exec
 		FinishReason:       checkpoint.FinishReason,
 		StructuredReport:   checkpoint.StructuredOutputValid,
 		FinalizationReason: checkpoint.FinalizationReason,
+		ParseError:         checkpoint.CheckpointErrorMessage,
 	}
 	if checkpoint.ParsedReportJSON != "" {
 		var report evidence.DiagnosisReportData
@@ -522,4 +578,32 @@ func (h *DiagnosisJobHandler) cancelAttempt(ctx context.Context, job *jobs.Analy
 	}
 	_ = h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusCancelled, diagnosis.AttemptStatusCancelled, 0, 0, 0, "CANCELLED", "User requested cancellation", false, 0)
 	return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
+}
+
+// closeCheckpointAttempt prevents a durable provider result from leaving its
+// source attempt RUNNING if the atomic finalizer rolls back. The run remains
+// RUNNING while the generic worker schedules a same-generation retry, which
+// restores this checkpoint without another Provider call.
+func (h *DiagnosisJobHandler) closeCheckpointAttempt(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, code string, cause error) {
+	if run == nil || attempt == nil {
+		return
+	}
+	getter, ok := h.diagnosisStore.(interface {
+		GetAttempt(context.Context, string) (*diagnosis.DiagnosisAttempt, error)
+	})
+	if !ok {
+		return
+	}
+	finalizeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	saved, err := getter.GetAttempt(finalizeCtx, attempt.ID)
+	if err != nil || saved.ProviderCompletedAt == nil || (saved.CheckpointKind != diagnosis.CheckpointKindFinalValid && saved.CheckpointKind != diagnosis.CheckpointKindFinalInvalid) {
+		return
+	}
+	message := "final report checkpoint was saved but finalization failed"
+	if cause != nil {
+		message += ": " + cause.Error()
+	}
+	_ = h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusRunning, diagnosis.AttemptStatusFailedRetryable,
+		saved.PromptTokens, saved.CompletionTokens, saved.ToolCalls, code, message, true, 0)
 }

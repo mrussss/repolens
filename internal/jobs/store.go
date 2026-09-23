@@ -353,7 +353,8 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, reaped bool, errorCode, errorMessage string) error {
 	var jobType JobType
 	var resourceID string
-	if err := tx.QueryRowContext(ctx, `SELECT job_type, resource_id FROM analysis_jobs WHERE id = ?`, jobID).Scan(&jobType, &resourceID); err != nil {
+	var generation int
+	if err := tx.QueryRowContext(ctx, `SELECT job_type, resource_id, execution_generation FROM analysis_jobs WHERE id = ?`, jobID).Scan(&jobType, &resourceID, &generation); err != nil {
 		return err
 	}
 	code := "JOB_FAILED"
@@ -389,8 +390,19 @@ func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, rea
 		if reaped {
 			attemptStatus = "ABANDONED"
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts SET status = ?, finished_at = ? WHERE diagnosis_run_id = ? AND status = 'RUNNING'`, attemptStatus, time.Now().UTC(), resourceID); err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") {
-			return fmt.Errorf("failed terminal diagnosis attempt transition for %s: %w", resourceID, err)
+		now := time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts SET status = ?, finished_at = ? WHERE diagnosis_run_id = ? AND execution_generation = ? AND status = 'RUNNING'`, attemptStatus, now, resourceID, generation); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "no such column") && strings.Contains(strings.ToLower(err.Error()), "execution_generation") {
+				// Pre-v2.2 isolated job-store fixtures do not carry generation metadata.
+				if _, legacyErr := tx.ExecContext(ctx, `UPDATE diagnosis_attempts SET status = ?, finished_at = ? WHERE diagnosis_run_id = ? AND status = 'RUNNING'`, attemptStatus, now, resourceID); legacyErr != nil && !strings.Contains(strings.ToLower(legacyErr.Error()), "no such table") {
+					return fmt.Errorf("failed terminal diagnosis attempt transition for %s: %w", resourceID, legacyErr)
+				}
+			} else if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+				return fmt.Errorf("failed terminal diagnosis attempt transition for %s: %w", resourceID, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_runs SET final_attempt_id = (SELECT id FROM diagnosis_attempts WHERE diagnosis_run_id = ? AND execution_generation = ? ORDER BY attempt_no DESC, created_at DESC LIMIT 1) WHERE id = ? AND status = 'FAILED'`, resourceID, generation, resourceID); err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") && !(strings.Contains(strings.ToLower(err.Error()), "no such column") && strings.Contains(strings.ToLower(err.Error()), "execution_generation")) {
+			return fmt.Errorf("failed setting terminal diagnosis attempt for %s: %w", resourceID, err)
 		}
 	}
 	if err := s.failAnalysisRevisionTx(ctx, tx, jobType, resourceID, code, message); err != nil {
@@ -704,12 +716,12 @@ func (s *Store) RetryDiagnosis(ctx context.Context, resourceID string) error {
 		return err
 	}
 	defer tx.Rollback()
-	var lastCode sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT last_error_code FROM analysis_jobs WHERE job_type = ? AND resource_id = ? AND status = 'FAILED'`, JobTypeRunDiagnosis, resourceID).Scan(&lastCode); err != nil {
+	var lastClass, lastCode sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT last_error_class, last_error_code FROM analysis_jobs WHERE job_type = ? AND resource_id = ? AND status = 'FAILED'`, JobTypeRunDiagnosis, resourceID).Scan(&lastClass, &lastCode); err != nil {
 		return err
 	}
 	code := strings.ToUpper(lastCode.String)
-	if !strings.Contains(code, "PROVIDER") && !strings.Contains(code, "NETWORK") && !strings.Contains(code, "TIMEOUT") && !strings.Contains(code, "RATE") && !strings.Contains(code, "EXTERNAL") {
+	if !IsRetryableDiagnosisProviderFailure(ErrorClass(lastClass.String), code) {
 		return fmt.Errorf("diagnosis retry is only allowed after an external provider failure")
 	}
 	now := time.Now().UTC()
@@ -732,6 +744,32 @@ func (s *Store) RetryDiagnosis(ctx context.Context, resourceID string) error {
 		return fmt.Errorf("diagnosis job %s is not retryable", resourceID)
 	}
 	return tx.Commit()
+}
+
+// IsRetryableDiagnosisProviderError is the single retry policy used by both
+// the retry endpoint and the diagnosis status response. Unknown failures fail
+// closed: they may be worker bugs, malformed reports, or local persistence
+// errors rather than a transient upstream condition.
+func IsRetryableDiagnosisProviderError(code string) bool {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "PROVIDER_TIMEOUT", "PROVIDER_CONNECTION_FAILED", "PROVIDER_UPSTREAM_ERROR",
+		"PROVIDER_RATE_LIMITED", "PROVIDER_5XX", "PROVIDER_NETWORK_ERROR",
+		"HTTP_429_RATE_LIMITED", "HTTP_5XX_SERVER_ERROR", "TRANSIENT_NETWORK_ERROR":
+		return true
+	default:
+		return false
+	}
+}
+
+func IsRetryableDiagnosisProviderFailure(class ErrorClass, code string) bool {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	// A provider failure after useful Agent progress is deliberately PERMANENT
+	// for automatic retries (to avoid replaying billable partial work), while
+	// the user may explicitly start a fresh execution generation.
+	if class == ErrorClassPermanent && code == "PROVIDER_PROGRESS_ABORTED" {
+		return true
+	}
+	return class == ErrorClassRetryable && IsRetryableDiagnosisProviderError(code)
 }
 
 func businessTable(jobType JobType) string {

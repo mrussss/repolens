@@ -3,6 +3,7 @@ package diagnosis_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -151,6 +152,19 @@ func TestDiagnosisCreateRejectsMalformedTrailingAndUnknownJSON(t *testing.T) {
 	}
 }
 
+func TestDiagnosisCreateRejectsExplicitZeroOrNegativeBuildIDs(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	router := diagnosisHandlerRouter(svc)
+	for _, buildID := range []string{"0", "-1"} {
+		body := `{"analysis_revision_id":"rev","issue_title":"issue","code_index_build_id":` + buildID + `}`
+		response := performDiagnosisCreate(router, body)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "INPUT_INVALID") {
+			t.Fatalf("build id %s -> %d %s, want INPUT_INVALID", buildID, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestDiagnosisReportAPIExposesInvalidStructuredReport(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
 	ctx := context.Background()
@@ -160,8 +174,8 @@ func TestDiagnosisReportAPIExposesInvalidStructuredReport(t *testing.T) {
 	}
 	if err := evidence.NewReportStore(db).Create(ctx, &evidence.Report{
 		ID: "report-api-invalid", DiagnosisRunID: run.ID, AttemptID: "attempt-api-invalid", ReportStatus: evidence.ReportInvalid,
-		FindingsJSON: "[]", RecommendedChecksJSON: "[]", StructuredPayloadJSON: "{}", RawOutput: "not json",
-		ParseError: "INVALID_STRUCTURED_REPORT: malformed JSON",
+		FindingsJSON: "[]", RecommendedChecksJSON: "[]", StructuredPayloadJSON: "{}", RawOutput: `{"secret-test-marker-XYZ":"untrusted raw output"}`,
+		ParseError: "INVALID_STRUCTURED_REPORT: UNKNOWN_FIELD",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -172,9 +186,52 @@ func TestDiagnosisReportAPIExposesInvalidStructuredReport(t *testing.T) {
 	router.GET("/diagnoses/:id/report", handler.GetReport)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID+"/report", nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"report_status":"INVALID"`) || !strings.Contains(response.Body.String(), "INVALID_STRUCTURED_REPORT") {
+	var payload struct {
+		Report evidence.Report `json:"report"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || payload.Report.ReportStatus != evidence.ReportInvalid || !strings.Contains(payload.Report.ParseError, "INVALID_STRUCTURED_REPORT") || strings.Contains(payload.Report.ParseError, "secret-test-marker-XYZ") {
 		t.Fatalf("report response = %d %s", response.Code, response.Body.String())
 	}
+	if !strings.Contains(payload.Report.RawOutput, "secret-test-marker-XYZ") {
+		t.Fatal("separately stored raw output was not preserved for authorized diagnostics")
+	}
+}
+
+func TestDiagnosisStatusExposesExplicitProviderRetryPolicy(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	ctx := context.Background()
+	store := diagnosis.NewStore(db)
+	jobsStore := jobs.NewStoreWithDriver(mustSQLDB(t, db), "sqlite3")
+	run := &diagnosis.DiagnosisRun{ID: "retry-policy-api", UserID: "user", RepositoryID: "repo", SnapshotID: "snap", IssueTitle: "retry", IdempotencyKey: "retry-policy-key", IdempotencyRequestHash: "retry-policy-hash"}
+	if err := store.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Update("status", diagnosis.StatusFailed).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).Updates(map[string]interface{}{
+		"status": jobs.StatusFailed, "last_error_class": jobs.ErrorClassRetryable, "last_error_code": "PROVIDER_TIMEOUT",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	svc := diagnosis.NewService(store, repo.NewStore(db), snapshot.NewStore(db)).WithJobStore(jobsStore)
+	response := httptest.NewRecorder()
+	diagnosisHandlerRouter(svc).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID, nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"retry_allowed":true`) || !strings.Contains(response.Body.String(), `"retry_error_code":"PROVIDER_TIMEOUT"`) {
+		t.Fatalf("retry policy API response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func mustSQLDB(t *testing.T, db *gorm.DB) *sql.DB {
+	t.Helper()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sqlDB
 }
 
 func TestDiagnosisReportAPIExposesDegradedCitationReport(t *testing.T) {

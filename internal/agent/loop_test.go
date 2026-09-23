@@ -131,6 +131,9 @@ func TestAgentLoopGenerationOptionsReachProviderAndDefaultRemainsCompatible(t *t
 	if len(defaultProvider.requests) != 1 || defaultProvider.requests[0].ReasoningEffort != "" || defaultProvider.requests[0].ResponseFormat == nil || defaultProvider.requests[0].ResponseFormat.Type != "json_object" {
 		t.Fatalf("default generation request changed: %+v", defaultProvider.requests)
 	}
+	if !strings.Contains(defaultProvider.requests[0].Messages[0].Content, "JSON response contract") {
+		t.Fatalf("JSON-mode request lacks explicit JSON instruction: %+v", defaultProvider.requests[0].Messages[0])
+	}
 
 	experimentProvider := &generationOptionsProvider{}
 	experimentLoop := NewAgentLoop(experimentProvider, NewToolRegistry(), nil, DefaultGuardConfig()).WithGenerationOptions(GenerationOptions{
@@ -145,18 +148,37 @@ func TestAgentLoopGenerationOptionsReachProviderAndDefaultRemainsCompatible(t *t
 	}
 }
 
-func TestParseReportJSONSkipsProseBracesBeforeFencedJSON(t *testing.T) {
+func TestParseReportJSONRejectsProseAndFencedJSON(t *testing.T) {
 	raw := "Analysis note: if shouldRedirect { shouldRedirect = false }\n\n" +
 		"```json\n" +
 		`{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}` +
 		"\n```"
 
-	report, err := parseReportJSON(raw)
-	if err != nil {
-		t.Fatalf("parseReportJSON failed: %v", err)
+	_, err := parseReportJSON(raw)
+	if err == nil || !errors.Is(err, ErrInvalidStructuredReport) {
+		t.Fatalf("expected strict JSON-only response rejection, got %v", err)
 	}
-	if report.RootCause != "root cause" {
-		t.Fatalf("root cause = %q, want root cause", report.RootCause)
+}
+
+func TestParseReportJSONRejectsUnknownFieldNameLeak(t *testing.T) {
+	marker := "secret-test-marker"
+	raw := `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}],"` + marker + `":true}`
+	_, err := parseReportJSON(raw)
+	if err == nil || !strings.Contains(err.Error(), "UNKNOWN_FIELD") || strings.Contains(err.Error(), marker) {
+		t.Fatalf("parse error must be stable and not expose unknown field name: %v", err)
+	}
+}
+
+func TestParseReportJSONRequiresOneCompleteObject(t *testing.T) {
+	valid := `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`
+	for _, raw := range []string{valid, valid + `{}`, valid + ` garbage`} {
+		_, err := parseReportJSON(raw)
+		if raw == valid && err != nil {
+			t.Fatalf("valid object rejected: %v", err)
+		}
+		if raw != valid && (err == nil || !errors.Is(err, ErrInvalidStructuredReport)) {
+			t.Fatalf("non-single-object response accepted: %q", raw)
+		}
 	}
 }
 

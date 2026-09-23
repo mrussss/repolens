@@ -22,6 +22,6 @@ export function getProviderTestAlert(result: TestProviderConnectionResult): Prov
 
   return {
     className: 'alert-success',
-    message: `✓ 连接及工具调用已确认，延迟 ${result.latency_ms}ms`,
+      message: `✓ 已观测到目标工具调用（未验证完整工具往返），延迟 ${result.latency_ms}ms`,
   };
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -254,6 +255,55 @@ func TestFinalizeSuccessIsFencedAndAtomic(t *testing.T) {
 	}
 }
 
+func TestFinalizeSuccessRollsBackEveryWriteStage(t *testing.T) {
+	tests := []struct {
+		name    string
+		trigger string
+	}{
+		{name: "report insert", trigger: `CREATE TRIGGER inject_report_failure BEFORE INSERT ON reports BEGIN SELECT RAISE(ABORT, 'injected report failure'); END`},
+		{name: "citation insert", trigger: `CREATE TRIGGER inject_citation_failure BEFORE INSERT ON citations BEGIN SELECT RAISE(ABORT, 'injected citation failure'); END`},
+		{name: "attempt update", trigger: `CREATE TRIGGER inject_attempt_failure BEFORE UPDATE OF status ON diagnosis_attempts WHEN NEW.status = 'SUCCEEDED' BEGIN SELECT RAISE(ABORT, 'injected attempt failure'); END`},
+		{name: "run update", trigger: `CREATE TRIGGER inject_run_failure BEFORE UPDATE OF status ON diagnosis_runs WHEN NEW.status = 'SUCCEEDED' BEGIN SELECT RAISE(ABORT, 'injected run failure'); END`},
+		{name: "job update", trigger: `CREATE TRIGGER inject_job_failure BEFORE UPDATE OF status ON analysis_jobs WHEN NEW.status = 'SUCCEEDED' BEGIN SELECT RAISE(ABORT, 'injected job failure'); END`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db, store, run, job, attempt, workerID, claimToken := prepareInvalidFinalization(t)
+			defer func() { raw, _ := db.DB(); _ = raw.Close() }()
+			if err := db.Exec(tc.trigger).Error; err != nil {
+				t.Fatal(err)
+			}
+			report := &evidence.Report{ID: "success-stage-report", DiagnosisRunID: run.ID, AttemptID: attempt.ID, RootCause: "root", FindingsJSON: "[]", RecommendedChecksJSON: "[]", StructuredPayloadJSON: "{}", LimitationsJSON: "[]"}
+			citation := evidence.Citation{ID: "success-stage-citation", ReportID: report.ID, SnapshotID: run.SnapshotID, FilePath: "main.go", StartLine: 1, EndLine: 1}
+			if err := store.FinalizeSuccess(context.Background(), job.ID, workerID, claimToken, run.ID, attempt.ID, report, []evidence.Citation{citation}, 1, 1, 1); err == nil {
+				t.Fatal("injected finalizer stage failure was ignored")
+			}
+			var savedRun diagnosis.DiagnosisRun
+			var savedAttempt diagnosis.DiagnosisAttempt
+			var savedJob jobs.AnalysisJob
+			var reports, citations int64
+			if err := db.First(&savedRun, "id = ?", run.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.First(&savedAttempt, "id = ?", attempt.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.First(&savedJob, job.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&evidence.Report{}).Where("diagnosis_run_id = ?", run.ID).Count(&reports).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&evidence.Citation{}).Where("report_id = ?", report.ID).Count(&citations).Error; err != nil {
+				t.Fatal(err)
+			}
+			if reports != 0 || citations != 0 || savedRun.Status != diagnosis.StatusRunning || savedAttempt.Status != diagnosis.AttemptStatusRunning || savedJob.Status != jobs.StatusRunning {
+				t.Fatalf("%s failure was not fully rolled back: reports=%d citations=%d run=%s attempt=%s job=%s", tc.name, reports, citations, savedRun.Status, savedAttempt.Status, savedJob.Status)
+			}
+		})
+	}
+}
+
 func prepareInvalidFinalization(t *testing.T) (*gorm.DB, *diagnosis.GormStore, *diagnosis.DiagnosisRun, *jobs.AnalysisJob, *diagnosis.DiagnosisAttempt, string, string) {
 	t.Helper()
 	db := setupTestDB(t)
@@ -438,8 +488,8 @@ func TestCancellationQueuedRunningAndFinalizeRace(t *testing.T) {
 	if err := db.First(&queuedRun, "id = ?", queued.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if queuedRun.Status != diagnosis.StatusCancelled {
-		t.Fatalf("queued run status = %s", queuedRun.Status)
+	if queuedRun.Status != diagnosis.StatusCancelled || queuedRun.FinalAttemptID != "" {
+		t.Fatalf("queued run terminal state = %s final_attempt_id=%q; queued cancellation must not invent an attempt", queuedRun.Status, queuedRun.FinalAttemptID)
 	}
 
 	running := &diagnosis.DiagnosisRun{ID: "run-cancel-running", UserID: "user-cancel", RepositoryID: "repo", SnapshotID: "snap", IssueTitle: "running", IdempotencyKey: "cancel-running", IdempotencyRequestHash: "hash"}
@@ -482,13 +532,300 @@ func TestCancellationQueuedRunningAndFinalizeRace(t *testing.T) {
 	if err := db.First(&runningRun, "id = ?", running.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if runningRun.Status != diagnosis.StatusCancelled {
-		t.Fatalf("running run status = %s", runningRun.Status)
+	if runningRun.Status != diagnosis.StatusCancelled || runningRun.FinalAttemptID != attempt.ID {
+		t.Fatalf("running run terminal state = %s final_attempt_id=%q; want cancelled with attempt %s", runningRun.Status, runningRun.FinalAttemptID, attempt.ID)
 	}
 	if err := db.First(&flagJob, runningJob.ID).Error; err != nil {
 		t.Fatal(err)
 	}
 	if flagJob.Status != jobs.StatusCancelled {
 		t.Fatalf("running job status = %s", flagJob.Status)
+	}
+}
+
+func newRunningAttempt(t *testing.T, db *gorm.DB, store *diagnosis.GormStore, runID, attemptID string, generation, attemptNo int) *diagnosis.DiagnosisRun {
+	t.Helper()
+	ctx := context.Background()
+	run := &diagnosis.DiagnosisRun{
+		ID: runID, UserID: "user-" + runID, RepositoryID: "repo", SnapshotID: "snap",
+		IssueTitle: "attempt fencing", IdempotencyKey: "key-" + runID, IdempotencyRequestHash: "hash-" + runID,
+	}
+	var existing diagnosis.DiagnosisRun
+	if err := db.First(&existing, "id = ?", runID).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		if err := store.Create(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	attempt := &diagnosis.DiagnosisAttempt{
+		ID: attemptID, DiagnosisRunID: runID, ExecutionGeneration: generation, AttemptNo: attemptNo, WorkerID: "worker",
+	}
+	if err := store.StartAttempt(ctx, runID, attempt); err != nil {
+		t.Fatal(err)
+	}
+	return run
+}
+
+func TestCheckpointWritesAreTypedGenerationScopedAndFenced(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	store := diagnosis.NewStore(db)
+	newRunningAttempt(t, db, store, "run-checkpoint-generations", "gen1-final", 1, 1)
+	newRunningAttempt(t, db, store, "run-checkpoint-generations", "gen2-partial", 2, 1)
+	newRunningAttempt(t, db, store, "run-checkpoint-generations", "gen2-final", 2, 2)
+
+	final := diagnosis.AttemptCheckpoint{
+		ExecutionGeneration: 1, Kind: diagnosis.CheckpointKindFinalValid,
+		RawOutput: "final generation one", Structured: true,
+	}
+	if err := store.UpdateAttemptCheckpoint(ctx, "gen1-final", final); err != nil {
+		t.Fatal(err)
+	}
+	partial := diagnosis.AttemptCheckpoint{
+		ExecutionGeneration: 2, Kind: diagnosis.CheckpointKindPartialProviderFailure,
+		RawOutput: "partial generation two", FinishReason: "tool_calls",
+	}
+	if err := store.UpdateAttemptCheckpoint(ctx, "gen2-partial", partial); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint, err := store.GetLatestFinalCheckpoint(ctx, "run-checkpoint-generations", 2); err != nil || checkpoint != nil {
+		t.Fatalf("partial checkpoint became replayable: checkpoint=%+v err=%v", checkpoint, err)
+	}
+	final.ExecutionGeneration = 2
+	final.RawOutput = "final generation two"
+	if err := store.UpdateAttemptCheckpointWithDraft(ctx, "gen2-final", final); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := store.GetLatestFinalCheckpoint(ctx, "run-checkpoint-generations", 2)
+	if err != nil || checkpoint == nil || checkpoint.ID != "gen2-final" {
+		t.Fatalf("generation 2 checkpoint = %+v err=%v, want gen2-final", checkpoint, err)
+	}
+	if older, err := store.GetLatestFinalCheckpoint(ctx, "run-checkpoint-generations", 1); err != nil || older == nil || older.ID != "gen1-final" {
+		t.Fatalf("generation 1 checkpoint = %+v err=%v, want gen1-final", older, err)
+	}
+	var savedPartial, savedFinal diagnosis.DiagnosisAttempt
+	if err := db.First(&savedPartial, "id = ?", "gen2-partial").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&savedFinal, "id = ?", "gen2-final").Error; err != nil {
+		t.Fatal(err)
+	}
+	if savedPartial.ProviderCompletedAt != nil {
+		t.Fatal("partial checkpoint was marked provider-complete")
+	}
+	if savedFinal.ProviderCompletedAt == nil {
+		t.Fatal("final checkpoint is missing provider_completed_at")
+	}
+
+	if err := store.FinishAttempt(ctx, "run-checkpoint-generations", "gen2-final", diagnosis.AttemptStatusSucceeded, 0, 0, 0, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateAttemptCheckpointWithDraft(ctx, "gen2-final", final); !errors.Is(err, diagnosis.ErrAttemptNotRunning) {
+		t.Fatalf("checkpoint update after terminal transition = %v, want ErrAttemptNotRunning", err)
+	}
+	if err := store.UpdateAttemptCheckpoint(ctx, "missing-attempt", final); !errors.Is(err, diagnosis.ErrAttemptNotRunning) {
+		t.Fatalf("checkpoint update for missing attempt = %v, want ErrAttemptNotRunning", err)
+	}
+}
+
+func TestLegacyUntypedCheckpointIsNeverAutomaticallyReplayable(t *testing.T) {
+	db := setupTestDB(t)
+	store := diagnosis.NewStore(db)
+	newRunningAttempt(t, db, store, "run-legacy-checkpoint", "attempt-legacy-checkpoint", 1, 1)
+	completedAt := time.Now().UTC()
+	if err := db.Model(&diagnosis.DiagnosisAttempt{}).Where("id = ?", "attempt-legacy-checkpoint").Updates(map[string]interface{}{
+		"checkpoint_kind":       diagnosis.CheckpointKindLegacyUntyped,
+		"provider_completed_at": completedAt,
+		"raw_output":            `{"conclusion_kind":"ROOT_CAUSE","summary":"old","root_cause":"old","findings":[]}`,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := store.GetLatestFinalCheckpoint(context.Background(), "run-legacy-checkpoint", 1)
+	if err != nil || checkpoint != nil {
+		t.Fatalf("legacy checkpoint was automatically replayed: checkpoint=%+v err=%v", checkpoint, err)
+	}
+}
+
+func TestStartAttemptRejectsPreviouslyUsedID(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	store := diagnosis.NewStore(db)
+	run := newRunningAttempt(t, db, store, "run-attempt-id-reuse", "attempt-id-reuse", 1, 1)
+	if err := store.FinishAttempt(ctx, run.ID, "attempt-id-reuse", diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, "FAILED", "failed", false); err != nil {
+		t.Fatal(err)
+	}
+	reused := &diagnosis.DiagnosisAttempt{
+		ID: "attempt-id-reuse", DiagnosisRunID: run.ID, ExecutionGeneration: 2, AttemptNo: 1, WorkerID: "retry-worker",
+	}
+	if err := store.StartAttempt(ctx, run.ID, reused); !errors.Is(err, diagnosis.ErrAttemptAlreadyExists) {
+		t.Fatalf("StartAttempt with reused ID = %v, want ErrAttemptAlreadyExists", err)
+	}
+	var saved diagnosis.DiagnosisAttempt
+	if err := db.First(&saved, "id = ?", "attempt-id-reuse").Error; err != nil {
+		t.Fatal(err)
+	}
+	if saved.ExecutionGeneration != 1 || saved.AttemptNo != 1 || saved.Status != diagnosis.AttemptStatusFailedTerminal {
+		t.Fatalf("old attempt was modified by duplicate start: %+v", saved)
+	}
+}
+
+func TestFinishAttemptAndRunFencesAttemptAndRunTransitions(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*testing.T, *gorm.DB, *diagnosis.GormStore, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt)
+		attemptID string
+		wantErr   error
+	}{
+		{
+			name: "attempt already terminal",
+			mutate: func(t *testing.T, _ *gorm.DB, store *diagnosis.GormStore, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) {
+				t.Helper()
+				if err := store.FinishAttempt(context.Background(), run.ID, attempt.ID, diagnosis.AttemptStatusFailedRetryable, 0, 0, 0, "", "", true); err != nil {
+					t.Fatal(err)
+				}
+			},
+			attemptID: "attempt-terminal",
+			wantErr:   diagnosis.ErrAttemptNotRunning,
+		},
+		{
+			name: "run already terminal",
+			mutate: func(t *testing.T, db *gorm.DB, _ *diagnosis.GormStore, run *diagnosis.DiagnosisRun, _ *diagnosis.DiagnosisAttempt) {
+				t.Helper()
+				if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Update("status", diagnosis.StatusCancelled).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			attemptID: "attempt-run-terminal",
+			wantErr:   diagnosis.ErrRunTransitionConflict,
+		},
+		{
+			name:      "cancel requested run",
+			attemptID: "attempt-cancel-fenced",
+			mutate: func(t *testing.T, db *gorm.DB, _ *diagnosis.GormStore, run *diagnosis.DiagnosisRun, _ *diagnosis.DiagnosisAttempt) {
+				t.Helper()
+				if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Update("cancel_requested", true).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr: diagnosis.ErrRunTransitionConflict,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupTestDB(t)
+			store := diagnosis.NewStore(db)
+			runID := "run-" + strings.ReplaceAll(test.name, " ", "-")
+			attempt := &diagnosis.DiagnosisAttempt{ID: test.attemptID}
+			run := newRunningAttempt(t, db, store, runID, test.attemptID, 1, 1)
+			if err := db.First(attempt, "id = ?", test.attemptID).Error; err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, db, store, run, attempt)
+			err := store.FinishAttemptAndRun(context.Background(), run.ID, test.attemptID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, "FAILED", "failed", false, 0)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("FinishAttemptAndRun error = %v, want %v", err, test.wantErr)
+			}
+			var savedRun diagnosis.DiagnosisRun
+			var savedAttempt diagnosis.DiagnosisAttempt
+			if err := db.First(&savedRun, "id = ?", run.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.First(&savedAttempt, "id = ?", test.attemptID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if test.name == "attempt already terminal" {
+				if savedRun.Status != diagnosis.StatusRunning || savedAttempt.Status != diagnosis.AttemptStatusFailedRetryable || savedRun.FinalAttemptID != "" {
+					t.Fatalf("fenced terminal attempt mutated run: run=%+v attempt=%+v", savedRun, savedAttempt)
+				}
+			} else if test.name == "run already terminal" {
+				if savedRun.Status != diagnosis.StatusCancelled || savedAttempt.Status != diagnosis.AttemptStatusRunning {
+					t.Fatalf("run transition conflict was not rolled back: run=%+v attempt=%+v", savedRun, savedAttempt)
+				}
+			} else if savedRun.Status != diagnosis.StatusRunning || savedAttempt.Status != diagnosis.AttemptStatusRunning || savedRun.FinalAttemptID != "" {
+				t.Fatalf("cancel fence was not preserved: run=%+v attempt=%+v", savedRun, savedAttempt)
+			}
+		})
+	}
+
+	t.Run("wrong run", func(t *testing.T) {
+		db := setupTestDB(t)
+		store := diagnosis.NewStore(db)
+		first := newRunningAttempt(t, db, store, "run-wrong-first", "attempt-wrong-first", 1, 1)
+		newRunningAttempt(t, db, store, "run-wrong-second", "attempt-wrong-second", 1, 1)
+		err := store.FinishAttemptAndRun(context.Background(), first.ID, "attempt-wrong-second", diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, "FAILED", "failed", false, 0)
+		if !errors.Is(err, diagnosis.ErrAttemptNotRunning) {
+			t.Fatalf("wrong-run attempt transition error = %v, want ErrAttemptNotRunning", err)
+		}
+		var savedRun diagnosis.DiagnosisRun
+		var savedAttempt diagnosis.DiagnosisAttempt
+		if err := db.First(&savedRun, "id = ?", first.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.First(&savedAttempt, "id = ?", "attempt-wrong-second").Error; err != nil {
+			t.Fatal(err)
+		}
+		if savedRun.Status != diagnosis.StatusRunning || savedAttempt.Status != diagnosis.AttemptStatusRunning || savedRun.FinalAttemptID != "" {
+			t.Fatalf("wrong-run attempt mutated state: run=%+v attempt=%+v", savedRun, savedAttempt)
+		}
+	})
+
+	t.Run("missing attempt", func(t *testing.T) {
+		db := setupTestDB(t)
+		store := diagnosis.NewStore(db)
+		run := newRunningAttempt(t, db, store, "run-missing-attempt", "attempt-present", 1, 1)
+		err := store.FinishAttemptAndRun(context.Background(), run.ID, "attempt-missing", diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, "FAILED", "failed", false, 0)
+		if !errors.Is(err, diagnosis.ErrAttemptNotRunning) {
+			t.Fatalf("missing attempt transition error = %v, want ErrAttemptNotRunning", err)
+		}
+		var savedRun diagnosis.DiagnosisRun
+		var savedAttempt diagnosis.DiagnosisAttempt
+		if err := db.First(&savedRun, "id = ?", run.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.First(&savedAttempt, "id = ?", "attempt-present").Error; err != nil {
+			t.Fatal(err)
+		}
+		if savedRun.Status != diagnosis.StatusRunning || savedAttempt.Status != diagnosis.AttemptStatusRunning || savedRun.FinalAttemptID != "" {
+			t.Fatalf("missing attempt mutated state: run=%+v attempt=%+v", savedRun, savedAttempt)
+		}
+	})
+}
+
+func TestFinishAttemptAndRunConcurrentFinalizersCommitOnlyOnce(t *testing.T) {
+	db := setupTestDB(t)
+	store := diagnosis.NewStore(db)
+	run := newRunningAttempt(t, db, store, "run-concurrent-finalize", "attempt-concurrent-finalize", 1, 1)
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			errs <- store.FinishAttemptAndRun(context.Background(), run.ID, "attempt-concurrent-finalize", diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, "FAILED", "failed", false, 0)
+		}()
+	}
+	close(start)
+	first, second := <-errs, <-errs
+	successes := 0
+	if first == nil {
+		successes++
+	}
+	if second == nil {
+		successes++
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent finalizer success count=%d errors=(%v,%v)", successes, first, second)
+	}
+	var savedRun diagnosis.DiagnosisRun
+	var savedAttempt diagnosis.DiagnosisAttempt
+	if err := db.First(&savedRun, "id = ?", run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&savedAttempt, "id = ?", "attempt-concurrent-finalize").Error; err != nil {
+		t.Fatal(err)
+	}
+	if savedRun.Status != diagnosis.StatusFailed || savedRun.FinalAttemptID != savedAttempt.ID || savedAttempt.Status != diagnosis.AttemptStatusFailedTerminal {
+		t.Fatalf("concurrent finalization state = run=%+v attempt=%+v", savedRun, savedAttempt)
 	}
 }
