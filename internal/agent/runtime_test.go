@@ -15,7 +15,7 @@ type runtimeGenerationProvider struct {
 func (p *runtimeGenerationProvider) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
 	p.requests = append(p.requests, request)
 	return llm.GenerateResponse{
-		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[]}`},
+		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`},
 		FinishReason: "stop",
 	}, nil
 }

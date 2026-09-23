@@ -105,6 +105,40 @@ func TestOpenAICompatibleReasoningRoundTripAndUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleProductionGenerationShape(t *testing.T) {
+	var request map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{}}`))
+	}))
+	defer server.Close()
+
+	_, err := NewOpenAICompatibleProvider("key", server.URL, "model").Generate(context.Background(), GenerateRequest{
+		Messages:        []Message{{Role: RoleUser, Content: "inspect"}},
+		Tools:           []ToolDefinition{{Type: "function", Function: ToolFunction{Name: "probe", Description: "probe", Parameters: map[string]interface{}{"type": "object"}}}},
+		MaxTokens:       4096,
+		ReasoningEffort: "low",
+		ResponseFormat:  &ResponseFormat{Type: "json_object"},
+	})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	if request["max_tokens"] != float64(4096) || request["reasoning_effort"] != "low" {
+		t.Fatalf("generation limits were not sent: %v", request)
+	}
+	format, ok := request["response_format"].(map[string]interface{})
+	if !ok || format["type"] != "json_object" {
+		t.Fatalf("response format was not sent: %v", request)
+	}
+	tools, ok := request["tools"].([]interface{})
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools were not sent: %v", request)
+	}
+}
+
 func TestOpenAICompatibleTimeoutDefaultsWhenInvalid(t *testing.T) {
 	provider := NewOpenAICompatibleProviderWithAuthModeAndTimeout("key", "http://localhost", "model", "bearer", 0)
 	if provider.httpClient.Timeout != 60*time.Second {

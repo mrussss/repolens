@@ -85,20 +85,11 @@ func ClassifyReport(data *DiagnosisReportData, structured bool) (ReportQuality, 
 	if !structured || data == nil {
 		return ReportQuality{Status: ReportInvalid}, errors.New("structured report is invalid")
 	}
-	if data.ConclusionKind != ConclusionRootCause && data.ConclusionKind != ConclusionInsufficientEvidence {
-		return ReportQuality{Status: ReportInvalid}, errors.New("conclusion_kind is invalid")
-	}
-	if err := validateReportBounds(data); err != nil {
+	if err := ValidateReportStructure(data); err != nil {
 		return ReportQuality{Status: ReportInvalid}, err
 	}
 	if data.ConclusionKind == ConclusionInsufficientEvidence {
-		if len(data.ConfirmedFacts) == 0 || len(data.Limitations) == 0 || len(data.RecommendedChecks) == 0 {
-			return ReportQuality{Status: ReportInvalid}, errors.New("insufficient evidence report needs confirmed facts, limitations, and next checks")
-		}
 		return ReportQuality{Status: ReportInsufficientEvidence}, nil
-	}
-	if data.Summary == "" || data.RootCause == "" || len(data.Findings) == 0 {
-		return ReportQuality{Status: ReportInvalid}, fmt.Errorf("root cause report is missing required fields")
 	}
 	quality := ReportQuality{Status: ReportValid, FindingCount: len(data.Findings)}
 	for _, finding := range data.Findings {
@@ -132,7 +123,24 @@ func ClassifyReport(data *DiagnosisReportData, structured bool) (ReportQuality, 
 	return quality, nil
 }
 
-func validateReportBounds(data *DiagnosisReportData) error {
+// ValidateReportStructure applies the complete, shared structural contract for
+// a diagnosis report. It deliberately does not validate citation existence or
+// lineage; those are evidence-quality concerns and remain DEGRADED when they
+// fail after an otherwise valid report has been produced.
+func ValidateReportStructure(data *DiagnosisReportData) error {
+	if data == nil {
+		return errors.New("structured report is invalid")
+	}
+	if data.ConclusionKind != ConclusionRootCause && data.ConclusionKind != ConclusionInsufficientEvidence {
+		return errors.New("conclusion_kind is invalid")
+	}
+	if data.ConclusionKind == ConclusionInsufficientEvidence {
+		if len(data.ConfirmedFacts) == 0 || len(data.Limitations) == 0 || len(data.RecommendedChecks) == 0 {
+			return errors.New("insufficient evidence report needs confirmed facts, limitations, and next checks")
+		}
+	} else if strings.TrimSpace(data.Summary) == "" || strings.TrimSpace(data.RootCause) == "" || len(data.Findings) == 0 {
+		return fmt.Errorf("root cause report is missing required fields")
+	}
 	if data.ModelClaimedConfidence != nil && (*data.ModelClaimedConfidence < 0 || *data.ModelClaimedConfidence > 1) {
 		return errors.New("model_claimed_confidence must be between 0 and 1")
 	}

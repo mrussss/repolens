@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"repolens/internal/diagnosis"
 	"repolens/internal/jobs"
 	"repolens/internal/llm"
+	platformconfig "repolens/internal/platform/config"
 )
 
 // ProviderConfig represents stored provider credentials.
@@ -44,23 +46,46 @@ type PublicProviderStatus struct {
 }
 
 var (
-	ErrInvalidProviderConfig     = errors.New("invalid provider configuration")
-	ErrProviderConfigSaveFailed  = errors.New("failed to save provider configuration")
-	ErrProviderConfigClearFailed = errors.New("failed to clear provider configuration")
+	ErrInvalidProviderConfig         = errors.New("invalid provider configuration")
+	ErrProviderConfigSaveFailed      = errors.New("failed to save provider configuration")
+	ErrProviderConfigClearFailed     = errors.New("failed to clear provider configuration")
+	ErrProviderCapabilityUnsupported = errors.New("provider capability unsupported")
+	ErrProviderProbeTruncated        = errors.New("provider compatibility probe was truncated")
 )
 
 const (
-	providerConnectionTestTimeout   = 60 * time.Second
-	providerConnectionTestMaxTokens = 32
+	providerConnectionTestTimeout    = 60 * time.Second
+	providerConnectionTestMaxTokens  = 256
+	providerConnectionBasicMaxTokens = 32
 )
 
 const (
-	ProviderTestCodeAuthFailed      = "PROVIDER_AUTH_FAILED"
-	ProviderTestCodeRateLimited     = "PROVIDER_RATE_LIMITED"
-	ProviderTestCodeTimeout         = "PROVIDER_TIMEOUT"
-	ProviderTestCodeModelNotFound   = "PROVIDER_MODEL_NOT_FOUND"
-	ProviderTestCodeUpstreamError   = "PROVIDER_UPSTREAM_ERROR"
-	ProviderTestCodeConnectionError = "PROVIDER_CONNECTION_FAILED"
+	ProviderTestCodeAuthFailed            = "PROVIDER_AUTH_FAILED"
+	ProviderTestCodeRateLimited           = "PROVIDER_RATE_LIMITED"
+	ProviderTestCodeTimeout               = "PROVIDER_TIMEOUT"
+	ProviderTestCodeModelNotFound         = "PROVIDER_MODEL_NOT_FOUND"
+	ProviderTestCodeUpstreamError         = "PROVIDER_UPSTREAM_ERROR"
+	ProviderTestCodeConnectionError       = "PROVIDER_CONNECTION_FAILED"
+	ProviderTestCodeCapabilityUnsupported = "PROVIDER_CAPABILITY_UNSUPPORTED"
+	ProviderTestCodeProbeTruncated        = "PROVIDER_PROBE_TRUNCATED"
+)
+
+// CompatibilityProbeResult describes only the non-sensitive request shape
+// exercised by the provider probe. It deliberately excludes credentials and
+// response content.
+type CompatibilityProbeResult struct {
+	ProbeMaxOutputTokens      int    `json:"probe_max_output_tokens"`
+	ProductionMaxOutputTokens int    `json:"production_max_output_tokens"`
+	ReasoningEffort           string `json:"reasoning_effort"`
+	ResponseFormat            string `json:"response_format"`
+	Tools                     bool   `json:"tools"`
+	ProbeStatus               string `json:"probe_status"`
+	ToolCallObserved          bool   `json:"tool_call_observed"`
+}
+
+const (
+	CompatibilityProbeConfirmed = "CONFIRMED"
+	CompatibilityProbeUncertain = "UNCERTAIN"
 )
 
 // NormalizeBaseURL normalizes an OpenAI-compatible Base URL according to Master Spec rules:
@@ -387,9 +412,28 @@ func (m *Manager) TestConnection(ctx context.Context, baseURL, model, apiKey str
 }
 
 func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model, apiKey, authMode string) (time.Duration, error) {
+	latency, _, err := m.TestConnectionCompatibilityWithAuthMode(ctx, baseURL, model, apiKey, authMode)
+	return latency, err
+}
+
+// TestConnectionCompatibilityWithAuthMode probes the same optional generation
+// capabilities used by the production Agent request. The probe uses a small
+// output budget, but still requires the provider to accept reasoning_effort,
+// response_format, and tools. A returned probe tool call confirms tool
+// behavior; a successful response without one is reported as inconclusive.
+func (m *Manager) TestConnectionCompatibilityWithAuthMode(ctx context.Context, baseURL, model, apiKey, authMode string) (time.Duration, CompatibilityProbeResult, error) {
 	normBase, err := NormalizeBaseURL(baseURL)
 	if err != nil {
-		return 0, err
+		return 0, CompatibilityProbeResult{}, err
+	}
+	cfg := platformconfig.Load()
+	probe := CompatibilityProbeResult{
+		ProbeMaxOutputTokens:      providerConnectionTestMaxTokens,
+		ProductionMaxOutputTokens: cfg.MaxOutputTokens,
+		ReasoningEffort:           cfg.ReasoningEffort,
+		ResponseFormat:            "json_object",
+		Tools:                     true,
+		ProbeStatus:               CompatibilityProbeUncertain,
 	}
 
 	start := time.Now()
@@ -398,24 +442,106 @@ func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model
 	testCtx, cancel := context.WithTimeout(ctx, providerConnectionTestTimeout)
 	defer cancel()
 
-	// Perform a bounded dry-run completion. Reasoning models may spend a large
-	// budget even for "ping", so keep this probe cheap while allowing enough
-	// time for cold starts and provider-side reasoning.
+	// First establish ordinary connectivity/authentication/model validity without
+	// optional generation capabilities. This prevents an ordinary provider 400
+	// from being misreported as a capability failure.
 	temperature := 0.0
-	_, err = provider.Generate(testCtx, llm.GenerateRequest{
-		Messages: []llm.Message{
-			{Role: llm.RoleUser, Content: "Reply with exactly OK."},
-		},
+	if _, err := provider.Generate(testCtx, llm.GenerateRequest{
+		Messages:    []llm.Message{{Role: llm.RoleUser, Content: "Reply with OK."}},
 		Temperature: &temperature,
-		MaxTokens:   providerConnectionTestMaxTokens,
+		MaxTokens:   providerConnectionBasicMaxTokens,
+	}); err != nil {
+		return time.Since(start), probe, fmt.Errorf("connection test failed: %w", err)
+	}
+
+	// The second, bounded probe validates the optional generation shape used by
+	// the production Agent. It intentionally does not send tool_choice because
+	// production Agent requests do not send it either. The budget is deliberately
+	// larger than the old 32 token probe so a normal tool response is not mistaken
+	// for unsupported capabilities merely because it was truncated.
+	response, err := provider.Generate(testCtx, llm.GenerateRequest{
+		Messages: []llm.Message{
+			{Role: llm.RoleSystem, Content: "You are a compatibility probe. Call the provided function exactly once."},
+			{Role: llm.RoleUser, Content: "Call repolens_compatibility_probe with an empty object."},
+		},
+		Tools: []llm.ToolDefinition{{
+			Type: "function",
+			Function: llm.ToolFunction{
+				Name:        "repolens_compatibility_probe",
+				Description: "Confirms that the provider accepts RepoLens tool calls.",
+				Parameters:  map[string]interface{}{"type": "object", "additionalProperties": false},
+			},
+		}},
+		Temperature:     &temperature,
+		MaxTokens:       providerConnectionTestMaxTokens,
+		ReasoningEffort: cfg.ReasoningEffort,
+		ResponseFormat:  &llm.ResponseFormat{Type: "json_object"},
 	})
 	latency := time.Since(start)
 
 	if err != nil {
-		return latency, fmt.Errorf("connection test failed: %w", err)
+		if isExplicitCapabilityRejection(err) {
+			return latency, probe, fmt.Errorf("%w: provider rejected the production Agent generation options", ErrProviderCapabilityUnsupported)
+		}
+		if isProbeTruncated(err) {
+			return latency, probe, fmt.Errorf("%w: provider did not finish the bounded compatibility probe", ErrProviderProbeTruncated)
+		}
+		return latency, probe, fmt.Errorf("connection test failed: %w", err)
 	}
+	if strings.EqualFold(response.FinishReason, "length") {
+		return latency, probe, ErrProviderProbeTruncated
+	}
+	if len(response.Message.ToolCalls) == 0 {
+		// A provider may accept tools but choose not to call one without an
+		// explicit tool_choice. This is inconclusive, not a capability failure.
+		return latency, probe, nil
+	}
+	if len(response.Message.ToolCalls) != 1 {
+		return latency, probe, fmt.Errorf("%w: provider returned an invalid compatibility tool call", ErrProviderCapabilityUnsupported)
+	}
+	call := response.Message.ToolCalls[0]
+	if call.Type != "function" || call.Function.Name != "repolens_compatibility_probe" || !validEmptyJSONObject(call.Function.Arguments) {
+		return latency, probe, fmt.Errorf("%w: provider returned an invalid compatibility tool call", ErrProviderCapabilityUnsupported)
+	}
+	probe.ToolCallObserved = true
+	probe.ProbeStatus = CompatibilityProbeConfirmed
 
-	return latency, nil
+	return latency, probe, nil
+}
+
+func isExplicitCapabilityRejection(err error) bool {
+	var httpErr *llm.HTTPError
+	if !errors.As(err, &httpErr) || (httpErr.StatusCode != http.StatusBadRequest && httpErr.StatusCode != http.StatusUnprocessableEntity) {
+		return false
+	}
+	body := strings.ToLower(httpErr.Body)
+	for _, marker := range []string{"reasoning_effort", "response_format", "tools"} {
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return (strings.Contains(body, "unsupported") || strings.Contains(body, "unknown")) && strings.Contains(body, "parameter")
+}
+
+func isProbeTruncated(err error) bool {
+	var httpErr *llm.HTTPError
+	if errors.As(err, &httpErr) {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "finish_reason") && strings.Contains(strings.ToLower(err.Error()), "length")
+}
+
+func validEmptyJSONObject(raw string) bool {
+	if strings.TrimSpace(raw) == "" || !strings.HasPrefix(strings.TrimSpace(raw), "{") {
+		return false
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	var object map[string]json.RawMessage
+	if err := decoder.Decode(&object); err != nil || object == nil || len(object) != 0 {
+		return false
+	}
+	var extra interface{}
+	return decoder.Decode(&extra) == io.EOF
 }
 
 // ClassifyTestConnectionError maps provider failures to stable, safe API
@@ -423,6 +549,12 @@ func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model
 func ClassifyTestConnectionError(err error) (code, message string, status int) {
 	if err == nil {
 		return "", "", http.StatusOK
+	}
+	if errors.Is(err, ErrProviderCapabilityUnsupported) {
+		return ProviderTestCodeCapabilityUnsupported, "Provider 不支持 RepoLens production Agent 所需的 generation options", http.StatusBadGateway
+	}
+	if errors.Is(err, ErrProviderProbeTruncated) {
+		return ProviderTestCodeProbeTruncated, "Provider compatibility probe 未在有限输出预算内完成", http.StatusBadGateway
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ProviderTestCodeTimeout, "Provider 请求超时（60 秒），上游可能仍在处理请求", http.StatusGatewayTimeout

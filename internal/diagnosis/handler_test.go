@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"gorm.io/gorm"
 
 	"repolens/internal/diagnosis"
+	"repolens/internal/evidence"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
@@ -104,6 +106,106 @@ func TestDiagnosisCreateRejectsUnconfiguredProviderWithoutCreatingJob(t *testing
 	}
 	if runCount != 0 || jobCount != 0 {
 		t.Fatalf("unconfigured request created run/job: %d/%d", runCount, jobCount)
+	}
+}
+
+func TestDiagnosisCreateRejectsIncompleteBuildSelection(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	router := diagnosisHandlerRouter(svc)
+	for _, body := range []string{
+		`{"issue_title":"issue"}`,
+		`{"issue_title":"issue","code_index_build_id":1}`,
+		`{"issue_title":"issue","retrieval_build_id":2}`,
+	} {
+		response := performDiagnosisCreate(router, body)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "INVALID_BUILD_SELECTION") {
+			t.Fatalf("body %s -> %d %s, want INVALID_BUILD_SELECTION", body, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestDiagnosisCreateAcceptsRevisionSelectionAtHandlerBoundary(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	router := diagnosisHandlerRouter(svc)
+	response := performDiagnosisCreate(router, `{"issue_title":"issue","analysis_revision_id":"rev"}`)
+	if response.Code == http.StatusBadRequest && strings.Contains(response.Body.String(), "INVALID_BUILD_SELECTION") {
+		t.Fatalf("revision selection was rejected by handler: %s", response.Body.String())
+	}
+}
+
+func TestDiagnosisCreateRejectsMalformedTrailingAndUnknownJSON(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	router := diagnosisHandlerRouter(svc)
+	for _, body := range []string{
+		`{"issue_title":"issue","code_index_build_id":1,"retrieval_build_id":2`,
+		`{"issue_title":"issue","code_index_build_id":1,"retrieval_build_id":2}{}`,
+		`{"issue_title":"issue","code_index_build_id":1,"retrieval_build_id":2,"unknown":true}`,
+	} {
+		response := performDiagnosisCreate(router, body)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "INPUT_INVALID") {
+			t.Fatalf("body %s -> %d %s, want INPUT_INVALID", body, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestDiagnosisReportAPIExposesInvalidStructuredReport(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	ctx := context.Background()
+	run := &diagnosis.DiagnosisRun{ID: "run-api-invalid-report", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusFailed, IdempotencyKey: "api-invalid-report", IdempotencyRequestHash: "api-invalid-report"}
+	if err := db.Create(run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := evidence.NewReportStore(db).Create(ctx, &evidence.Report{
+		ID: "report-api-invalid", DiagnosisRunID: run.ID, AttemptID: "attempt-api-invalid", ReportStatus: evidence.ReportInvalid,
+		FindingsJSON: "[]", RecommendedChecksJSON: "[]", StructuredPayloadJSON: "{}", RawOutput: "not json",
+		ParseError: "INVALID_STRUCTURED_REPORT: malformed JSON",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	handler := diagnosis.NewHandler(svc, evidence.NewReportStore(db), evidence.NewCitationStore(db), nil)
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(string(logger.UserIDKey), "user"); c.Next() })
+	router.GET("/diagnoses/:id/report", handler.GetReport)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID+"/report", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"report_status":"INVALID"`) || !strings.Contains(response.Body.String(), "INVALID_STRUCTURED_REPORT") {
+		t.Fatalf("report response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestDiagnosisReportAPIExposesDegradedCitationReport(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	ctx := context.Background()
+	run := &diagnosis.DiagnosisRun{ID: "run-api-degraded-report", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusSucceeded, IdempotencyKey: "api-degraded-report", IdempotencyRequestHash: "api-degraded-report"}
+	if err := db.Create(run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := evidence.NewReportStore(db).Create(ctx, &evidence.Report{
+		ID: "report-api-degraded", DiagnosisRunID: run.ID, AttemptID: "attempt-api-degraded", ReportStatus: evidence.ReportDegraded,
+		FindingsJSON:          `[{"title":"finding","reasoning":"reasoning","citations":[{"evidence_id":"ev-missing","validation_status":"INVALID","validation_error":"EVIDENCE_NOT_FOUND"}]}]`,
+		RecommendedChecksJSON: "[]", StructuredPayloadJSON: "{}", InvalidCitationCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := evidence.NewCitationStore(db).CreateBatch(ctx, []evidence.Citation{{
+		ID: "citation-api-degraded", ReportID: "report-api-degraded", EvidenceID: "ev-missing",
+		SnapshotID: "snapshot", ValidationStatus: evidence.CitationInvalid, ValidationError: "EVIDENCE_NOT_FOUND",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	handler := diagnosis.NewHandler(svc, evidence.NewReportStore(db), evidence.NewCitationStore(db), nil)
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(string(logger.UserIDKey), "user"); c.Next() })
+	router.GET("/diagnoses/:id/report", handler.GetReport)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID+"/report", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"report_status":"DEGRADED"`) || !strings.Contains(response.Body.String(), `"validation_status":"INVALID"`) {
+		t.Fatalf("report response = %d %s", response.Code, response.Body.String())
 	}
 }
 
@@ -290,4 +392,12 @@ func diagnosisHandlerRouter(svc *diagnosis.Service) *gin.Engine {
 	router.GET("/diagnoses/:id/attempts", handler.ListAttempts)
 	router.GET("/diagnoses/:id/steps", handler.GetSteps)
 	return router
+}
+
+func performDiagnosisCreate(router *gin.Engine, body string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "/diagnoses", bytes.NewBufferString(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
 }

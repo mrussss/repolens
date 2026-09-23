@@ -360,12 +360,17 @@ func (e *FlakyRateLimitExecutor) Execute(ctx context.Context, run *diagnosis.Dia
 	}
 
 	report := &evidence.DiagnosisReportData{
-		Summary:   "Fixed after rate limit backoff",
-		RootCause: "Rate limit resolved",
-		Findings:  []evidence.Finding{},
+		ConclusionKind: evidence.ConclusionRootCause,
+		Summary:        "Fixed after rate limit backoff",
+		RootCause:      "Rate limit resolved",
+		Findings: []evidence.Finding{{
+			Title:     "Provider recovered after rate limit",
+			Reasoning: "The retry completed after the transient provider rate limit cleared.",
+		}},
 	}
 	return &agent.ExecutionResult{
 		Report:           report,
+		StructuredReport: true,
 		PromptTokens:     100,
 		CompletionTokens: 200,
 		ToolCalls:        1,

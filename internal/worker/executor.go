@@ -19,8 +19,9 @@ func NewFakeDiagnosisExecutor() *FakeDiagnosisExecutor {
 
 func (e *FakeDiagnosisExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
 	report := &evidence.DiagnosisReportData{
-		Summary:   "Root cause identified in repository repository based on logs and code structure",
-		RootCause: "Null pointer dereference in handler initialization logic",
+		ConclusionKind: evidence.ConclusionRootCause,
+		Summary:        "Root cause identified in repository repository based on logs and code structure",
+		RootCause:      "Null pointer dereference in handler initialization logic",
 		Findings: []evidence.Finding{
 			{
 				Title:     "Missing nil check during config loading",
@@ -46,6 +47,7 @@ func (e *FakeDiagnosisExecutor) Execute(ctx context.Context, run *diagnosis.Diag
 
 	return &ExecutionResult{
 		Report:           report,
+		StructuredReport: true,
 		PromptTokens:     150,
 		CompletionTokens: 300,
 		ToolCalls:        2,

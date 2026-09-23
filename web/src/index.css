@@ -196,4 +196,5 @@ code, pre {
 .alert { padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.85rem; display: flex; align-items: center; gap: 0.5rem; }
 .alert-danger { background: rgba(248,81,73,0.15); border: 1px solid rgba(248,81,73,0.3); color: var(--accent-danger); }
 .alert-success { background: rgba(63,185,80,0.15); border: 1px solid rgba(63,185,80,0.3); color: var(--accent-success); }
+.alert-warning { background: rgba(210, 153, 34, 0.15); border: 1px solid rgba(210, 153, 34, 0.3); color: var(--accent-warning); }
 select.input-field option { background: var(--bg-card); color: var(--text-bright); }

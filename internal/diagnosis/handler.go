@@ -50,13 +50,20 @@ func (h *Handler) Create(c *gin.Context) {
 	userID := c.GetString(string(logger.UserIDKey))
 	var req CreateDiagnosisRequest
 	if err := decodeCreateDiagnosisRequest(c, &req); err != nil {
+		if errors.Is(err, ErrInvalidBuildSelection) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":  "INVALID_BUILD_SELECTION",
+				"error": "provide analysis_revision_id or both positive build IDs",
+			})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INPUT_INVALID", "error": "invalid diagnosis request"})
 		return
 	}
-	if req.AnalysisRevisionID == "" && (req.CodeIndexBuildID <= 0 || req.RetrievalBuildID <= 0) {
+	if !validCreateDiagnosisSelection(req) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code":  "INVALID_BUILD_SELECTION",
-			"error": "code_index_build_id and retrieval_build_id must be positive",
+			"error": "provide analysis_revision_id or both positive build IDs",
 		})
 		return
 	}
@@ -133,6 +140,16 @@ func (h *Handler) Create(c *gin.Context) {
 	})
 }
 
+func validCreateDiagnosisSelection(req CreateDiagnosisRequest) bool {
+	hasRevision := strings.TrimSpace(req.AnalysisRevisionID) != ""
+	hasCodeBuild := req.CodeIndexBuildID > 0
+	hasRetrievalBuild := req.RetrievalBuildID > 0
+	if hasRevision {
+		return true
+	}
+	return strings.TrimSpace(req.RepositoryID) != "" && strings.TrimSpace(req.SnapshotID) != "" && hasCodeBuild && hasRetrievalBuild
+}
+
 func decodeCreateDiagnosisRequest(c *gin.Context, request *CreateDiagnosisRequest) error {
 	const maxBodyBytes = 512 * 1024
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBodyBytes+1))
@@ -151,7 +168,13 @@ func decodeCreateDiagnosisRequest(c *gin.Context, request *CreateDiagnosisReques
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return errors.New("request body must contain one JSON object")
 	}
-	return nil
+	// Keep the stable selection error for otherwise valid JSON. Syntax errors,
+	// trailing JSON, unknown fields, and other schema violations remain
+	// INPUT_INVALID at the HTTP boundary.
+	if request.IssueTitle != "" && !validCreateDiagnosisSelection(*request) {
+		return ErrInvalidBuildSelection
+	}
+	return validateDiagnosisCreateJSON(body)
 }
 
 func (h *Handler) Get(c *gin.Context) {

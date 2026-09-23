@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	"repolens/internal/agent"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
@@ -182,6 +185,56 @@ func TestWorkerJobHandler_InvalidEvidenceDegradesButSucceeds(t *testing.T) {
 	report, err := repStore.GetByRunID(ctx, run.ID)
 	if err != nil || report.ReportStatus != evidence.ReportDegraded || report.InvalidCitationCount != 1 {
 		t.Fatalf("report = %+v err=%v, want DEGRADED with one invalid citation", report, err)
+	}
+}
+
+type invalidStructuredReportExecutor struct{}
+
+func (invalidStructuredReportExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+	return &worker.ExecutionResult{
+		RawOutput:        "{\"conclusion_kind\":\"ROOT_CAUSE\"}",
+		ParseError:       "INVALID_STRUCTURED_REPORT: root cause report needs summary, root_cause, and at least one finding",
+		StructuredReport: false,
+	}, fmt.Errorf("%w: root cause report needs summary, root_cause, and at least one finding", agent.ErrInvalidStructuredReport)
+}
+
+func TestWorkerJobHandler_InvalidStructuredReportFailsTerminally(t *testing.T) {
+	db, jobsStore := setupTestEnvironment(t)
+	ctx := context.Background()
+	diagStore := diagnosis.NewStore(db)
+	repStore := evidence.NewReportStore(db)
+	citStore := evidence.NewCitationStore(db)
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-invalid-structured", UserID: "user-invalid-structured", RepositoryID: "repo-invalid-structured",
+		SnapshotID: "snap-invalid-structured", IssueTitle: "invalid structured", IdempotencyKey: "invalid-structured-key", IdempotencyRequestHash: "invalid-structured-hash",
+	}
+	if err := diagStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-invalid-structured", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("failed to claim invalid-structured job: err=%v jobs=%d", err, len(claimed))
+	}
+	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, nil, invalidStructuredReportExecutor{})
+	err = handler.Execute(ctx, claimed[0])
+	if err == nil || !strings.Contains(err.Error(), "INVALID_STRUCTURED_REPORT") {
+		t.Fatalf("expected terminal invalid structured error, got %v", err)
+	}
+	savedRun, err := diagStore.GetByID(ctx, run.ID)
+	if err != nil || savedRun.Status != diagnosis.StatusFailed {
+		t.Fatalf("run = %+v err=%v, want FAILED", savedRun, err)
+	}
+	attempts, err := diagStore.ListAttemptsByRun(ctx, run.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusFailedTerminal || attempts[0].ErrorCode != "INVALID_STRUCTURED_REPORT" {
+		t.Fatalf("attempts = %+v err=%v, want FAILED_TERMINAL with stable error code", attempts, err)
+	}
+	report, err := repStore.GetByRunID(ctx, run.ID)
+	if err != nil || report == nil || report.ReportStatus != evidence.ReportInvalid || report.RawOutput == "" || !strings.Contains(report.ParseError, "INVALID_STRUCTURED_REPORT") {
+		t.Fatalf("report = %+v err=%v, want INVALID report with raw output and parse error", report, err)
+	}
+	job, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil || job.Status != jobs.StatusFailed || job.TerminalReason == nil || *job.TerminalReason != jobs.TerminalReasonPermanent {
+		t.Fatalf("job = %+v err=%v, want FAILED/PERMANENT", job, err)
 	}
 }
 

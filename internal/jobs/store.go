@@ -267,7 +267,7 @@ func (s *Store) ConditionalFinalizeSuccessTx(ctx context.Context, tx *sql.Tx, jo
 	}
 	if rowsAffected == 0 {
 		var status JobStatus
-		if err := tx.QueryRowContext(ctx, `SELECT status FROM analysis_jobs WHERE id = ?`, jobID).Scan(&status); err == nil && status == StatusSucceeded {
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM analysis_jobs WHERE id = ?`, jobID).Scan(&status); err == nil && (status == StatusSucceeded || status == StatusFailed || status == StatusCancelled) {
 			return ErrAlreadyFinalized
 		}
 		return ErrOwnershipLost

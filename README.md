@@ -33,14 +33,14 @@ Compose 最终只运行 `mysql`、`api`、`worker`，默认仅绑定 loopback。
 5. 选择 READY AnalysisRevision，提交 CI/Test failure。
 6. 轮询 Diagnosis、Report、Evidence 和 Agent Trace。
 
-Diagnosis 会冻结 AnalysisRevision、Snapshot、两个 build、Provider endpoint/model、prompt/agent 版本和配置 hash。之后重新构建索引不会改变既有 Diagnosis；相同 endpoint 的 API Key rotation 可以继续使用，endpoint 或 model drift 会被拒绝。
+Diagnosis 会冻结 AnalysisRevision、Snapshot、两个 build、Provider endpoint/model、prompt/agent 版本、`MaxOutputTokens`、`ReasoningEffort`、`ResponseFormat`、Provider timeout 和配置 hash。当前 v2.2 RC production defaults 是 `MaxOutputTokens=4096`、`ReasoningEffort=low`、`ResponseFormat=json_object`、`ProviderTimeoutSeconds=60`、`ProviderRetryAttempts=0`；这些值会随 DiagnosisRun 快照冻结，运行中不会重新读取环境变量。之后重新构建索引不会改变既有 Diagnosis；相同 endpoint 的 API Key rotation 可以继续使用，endpoint 或 model drift 会被拒绝。
 
 ## API（节选）
 
 - `POST /api/v1/repositories/:id/revisions`：按 ref 解析并准备或复用 AnalysisRevision。
 - `GET /api/v1/repositories/:id/revisions`、`GET /api/v1/analysis-revisions/:id`：查询准备状态与冻结 lineage。
 - `POST /api/v1/analysis-revisions/:id/retry`：仅对 FAILED Revision 显式重试。
-- `POST /api/v1/diagnoses`：优先提交 `analysis_revision_id`，服务端冻结完整分析 lineage。
+- `POST /api/v1/diagnoses`：提交 `analysis_revision_id`（可带可选 lineage 字段），或同时提交正数 `code_index_build_id`、`retrieval_build_id` 及其 `repository_id`、`snapshot_id`；服务端冻结完整分析 lineage。请求约束见 [`contracts/v2.2/diagnosis-create.schema.json`](contracts/v2.2/diagnosis-create.schema.json)。
 
 主 API 前缀是 `/api/v1`：
 
@@ -79,6 +79,8 @@ docker compose build
 ```
 
 完整 release gate：`./scripts/release_gate.sh`。
+
+v2.2 RC 封板清单见 [`docs/v2.2-rc-release-checklist.md`](docs/v2.2-rc-release-checklist.md)。Provider 设置页的 Test Connection 会执行 production Agent 请求形状的兼容性探测（小型 `max_tokens`、`reasoning_effort`、`response_format=json_object` 和 tools），不会把 API Key 或 Provider 原始响应写入日志、trace 或 artifact。
 
 RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开仓库，Hit@5 `7/10`、Hit@10 `9/10`、MRR `0.724`。这是小规模 external benchmark，不是 production accuracy；完整方法、per-case rank 和 AnalysisQuality 见 [`docs/realbench/results/v2-baseline.md`](docs/realbench/results/v2-baseline.md)。真实 Provider Agent E2E 只记录选定 case 的证据和失败边界，见 [`docs/realbench/results/v2-agent-e2e.md`](docs/realbench/results/v2-agent-e2e.md)。
 

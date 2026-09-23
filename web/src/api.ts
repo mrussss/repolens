@@ -2,6 +2,26 @@ import { ProviderStatus, Repository, Snapshot, AnalysisRevision, DiagnosisRun, D
 
 const API_BASE = '/api/v1';
 
+export type ProviderProbeStatus = 'CONFIRMED' | 'UNCERTAIN';
+
+export interface ProviderCompatibility {
+  probe_max_output_tokens: number;
+  production_max_output_tokens: number;
+  reasoning_effort: string;
+  response_format: string;
+  tools: boolean;
+  probe_status: ProviderProbeStatus;
+  tool_call_observed: boolean;
+}
+
+export interface TestProviderConnectionResult {
+  success: boolean;
+  latency_ms: number;
+  message: string;
+  code?: string;
+  compatibility?: ProviderCompatibility;
+}
+
 export function buildDiagnosisRequest(data: {
   repository_id?: string;
   analysis_revision_id?: string;
@@ -53,7 +73,7 @@ export const api = {
     return handleResponse(res);
   },
 
-  async testProviderConnection(data: { base_url: string; model: string; api_key?: string; auth_mode: 'bearer' | 'none' }): Promise<{ success: boolean; latency_ms: number; message: string; code?: string }> {
+  async testProviderConnection(data: { base_url: string; model: string; api_key?: string; auth_mode: 'bearer' | 'none' }): Promise<TestProviderConnectionResult> {
     const res = await fetch(`${API_BASE}/settings/provider/test`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

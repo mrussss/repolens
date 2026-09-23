@@ -4,15 +4,24 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["issue_title"],
+  "oneOf": [
+    {
+      "required": ["analysis_revision_id"]
+    },
+    {
+      "required": ["repository_id", "snapshot_id", "code_index_build_id", "retrieval_build_id"],
+      "not": { "required": ["analysis_revision_id"] }
+    }
+  ],
   "properties": {
-    "repository_id": { "type": "string" },
-    "analysis_revision_id": { "type": "string" },
-    "snapshot_id": { "type": "string" },
+    "repository_id": { "type": "string", "minLength": 1 },
+    "analysis_revision_id": { "type": "string", "minLength": 1 },
+    "snapshot_id": { "type": "string", "minLength": 1 },
     "issue_title": { "type": "string", "minLength": 1, "maxLength": 255 },
     "issue_description": { "type": "string" },
     "error_log": { "type": "string" },
     "idempotency_key": { "type": "string", "maxLength": 128 },
-    "code_index_build_id": { "type": "integer", "minimum": 0 },
-    "retrieval_build_id": { "type": "integer", "minimum": 0 }
+    "code_index_build_id": { "type": "integer", "minimum": 1 },
+    "retrieval_build_id": { "type": "integer", "minimum": 1 }
   }
 }

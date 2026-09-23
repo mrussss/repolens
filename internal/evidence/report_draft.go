@@ -53,6 +53,45 @@ type EvidenceVerifier interface {
 	Verify(ctx context.Context, item *AttemptEvidenceItem, lineage DraftLineage) error
 }
 
+// ValidateReportDraftStructure applies the same structural rules used after
+// evidence resolution. Empty or unknown evidence IDs are intentionally not a
+// structural error: they become INVALID citations during resolution and keep
+// the report's existing DEGRADED semantics.
+func ValidateReportDraftStructure(draft *ReportDraft) error {
+	if draft == nil {
+		return errors.New("report draft is nil")
+	}
+	confidence := draft.ModelClaimedConfidence
+	if confidence == nil {
+		confidence = draft.LegacyConfidence
+	}
+	data := &DiagnosisReportData{
+		ConclusionKind:         draft.ConclusionKind,
+		Summary:                draft.Summary,
+		RootCause:              draft.RootCause,
+		RecommendedChecks:      append([]string(nil), draft.RecommendedChecks...),
+		ConfirmedFacts:         append([]string(nil), draft.ConfirmedFacts...),
+		Limitations:            append([]string(nil), draft.Limitations...),
+		ModelClaimedConfidence: confidence,
+		Findings:               make([]Finding, 0, len(draft.Findings)),
+	}
+	for _, finding := range draft.Findings {
+		resolved := Finding{Title: finding.Title, Reasoning: finding.Reasoning, Citations: make([]Citation, 0, len(finding.Citations))}
+		for _, ref := range finding.Citations {
+			resolved.Citations = append(resolved.Citations, Citation{
+				EvidenceID: ref.EvidenceID,
+				FilePath:   ref.LegacyPath,
+				StartLine:  ref.LegacyStartLine,
+				EndLine:    ref.LegacyEndLine,
+				Excerpt:    ref.LegacyExcerpt,
+				Reason:     ref.Reason,
+			})
+		}
+		data.Findings = append(data.Findings, resolved)
+	}
+	return ValidateReportStructure(data)
+}
+
 // ResolveReportDraft converts model-owned evidence references into canonical
 // Citation records. Unknown, cross-scope, or stale IDs remain visible as
 // INVALID citations so the report can be persisted as DEGRADED.
@@ -73,6 +112,9 @@ func ResolveReportDraft(ctx context.Context, issuer EvidenceIssuer, draft *Repor
 		Limitations:            append([]string(nil), draft.Limitations...),
 		ModelClaimedConfidence: confidence,
 		Findings:               make([]Finding, 0, len(draft.Findings)),
+	}
+	if err := ValidateReportDraftStructure(draft); err != nil {
+		return nil, err
 	}
 	for _, finding := range draft.Findings {
 		resolved := Finding{Title: finding.Title, Reasoning: finding.Reasoning, Citations: make([]Citation, 0, len(finding.Citations))}

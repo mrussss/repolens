@@ -81,6 +81,37 @@ func TestTestConnectionQuotaFailureHasPreciseHTTPError(t *testing.T) {
 	}
 }
 
+func TestTestConnectionCapabilityFailureHasStableSafeHTTPError(t *testing.T) {
+	requests := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],"usage":{}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"unsupported reasoning_effort; secret-token"}}`))
+	}))
+	defer mockServer.Close()
+
+	handler := provider.NewHandler(
+		provider.NewManager(filepath.Join(t.TempDir(), "provider.json"), "", "", "", ""),
+		nil, nil, nil, nil, nil, nil, nil,
+	)
+	router := gin.New()
+	router.POST("/settings/provider/test", handler.TestConnection)
+	response := performProviderRequestTo(router, http.MethodPost, "/settings/provider/test", `{"base_url":"`+mockServer.URL+`","model":"model","api_key":"secret-token"}`)
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502: %s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, provider.ProviderTestCodeCapabilityUnsupported) || strings.Contains(body, "secret-token") || strings.Contains(body, "unsupported reasoning_effort") {
+		t.Fatalf("unsafe capability response: %s", body)
+	}
+}
+
 func TestClearConfigFilesystemFailureHasSafeHTTPError(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "secrets", "provider.json")
 	if err := os.MkdirAll(target, 0700); err != nil {

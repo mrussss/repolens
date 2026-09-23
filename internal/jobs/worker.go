@@ -238,6 +238,9 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 		}
 		return
 	}
+	if errors.Is(err, ErrAlreadyFinalized) {
+		return
+	}
 
 	// Handle failure or cancellation
 	errClass, errCode := ClassifyError(err)

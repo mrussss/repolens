@@ -254,6 +254,167 @@ func TestFinalizeSuccessIsFencedAndAtomic(t *testing.T) {
 	}
 }
 
+func prepareInvalidFinalization(t *testing.T) (*gorm.DB, *diagnosis.GormStore, *diagnosis.DiagnosisRun, *jobs.AnalysisJob, *diagnosis.DiagnosisAttempt, string, string) {
+	t.Helper()
+	db := setupTestDB(t)
+	ctx := context.Background()
+	store := diagnosis.NewStore(db)
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-invalid-finalize", UserID: "user-invalid-finalize", RepositoryID: "repo-invalid-finalize", SnapshotID: "snap-invalid-finalize",
+		IssueTitle: "invalid", IdempotencyKey: "invalid-finalize-key", IdempotencyRequestHash: "invalid-finalize-hash",
+	}
+	if err := store.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	var job jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).First(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	workerID, claimToken := "worker-invalid-finalize", "claim-invalid-finalize"
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
+		"status": jobs.StatusRunning, "worker_id": workerID, "claim_token": claimToken,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempt := &diagnosis.DiagnosisAttempt{ID: "attempt-invalid-finalize", DiagnosisRunID: run.ID, AttemptNo: 1, WorkerID: workerID}
+	if err := store.StartAttempt(ctx, run.ID, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&job, job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	return db, store, run, &job, attempt, workerID, claimToken
+}
+
+func invalidReport(runID, attemptID string) *evidence.Report {
+	return &evidence.Report{
+		ID: runID + "-invalid-report", DiagnosisRunID: runID, AttemptID: attemptID,
+		ReportStatus: evidence.ReportInvalid, FindingsJSON: "[]", RecommendedChecksJSON: "[]",
+		StructuredPayloadJSON: "{}", LimitationsJSON: "[]", RawOutput: "not-json", ParseError: "malformed JSON",
+	}
+}
+
+func TestFinalizeInvalidStructuredReportIsAtomicAndFenced(t *testing.T) {
+	db, store, run, job, attempt, workerID, claimToken := prepareInvalidFinalization(t)
+	ctx := context.Background()
+	report := invalidReport(run.ID, attempt.ID)
+	err := store.FinalizeInvalidStructuredReport(ctx, job.ID, workerID, claimToken, run.ID, attempt.ID, report, 3, 4, 1, "INVALID_STRUCTURED_REPORT", report.ParseError)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var savedRun diagnosis.DiagnosisRun
+	var savedAttempt diagnosis.DiagnosisAttempt
+	var savedReport evidence.Report
+	var savedJob jobs.AnalysisJob
+	if err := db.First(&savedRun, "id = ?", run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&savedAttempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&savedReport, "id = ?", report.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&savedJob, job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if savedRun.Status != diagnosis.StatusFailed || savedAttempt.Status != diagnosis.AttemptStatusFailedTerminal || savedJob.Status != jobs.StatusFailed {
+		t.Fatalf("terminal states = run=%s attempt=%s job=%s", savedRun.Status, savedAttempt.Status, savedJob.Status)
+	}
+	if savedReport.ReportStatus != evidence.ReportInvalid || savedReport.RawOutput != report.RawOutput || savedReport.ParseError != report.ParseError || savedAttempt.RawOutput != report.RawOutput {
+		t.Fatalf("invalid report/debug data not preserved: report=%+v attempt=%+v", savedReport, savedAttempt)
+	}
+
+	if err := store.FinalizeInvalidStructuredReport(ctx, job.ID, workerID, "stale-token", run.ID, attempt.ID, invalidReport(run.ID, attempt.ID+"-stale"), 0, 0, 0, "INVALID_STRUCTURED_REPORT", "stale"); !errors.Is(err, jobs.ErrAlreadyFinalized) {
+		t.Fatalf("terminal duplicate = %v, want ErrAlreadyFinalized", err)
+	}
+}
+
+func TestFinalizeInvalidStructuredReportRollsBackOnReportFailure(t *testing.T) {
+	db, store, run, job, attempt, workerID, claimToken := prepareInvalidFinalization(t)
+	ctx := context.Background()
+	if err := db.Exec(`CREATE TRIGGER fail_invalid_report BEFORE INSERT ON reports BEGIN SELECT RAISE(ABORT, 'injected report failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec("DROP TRIGGER fail_invalid_report")
+	err := store.FinalizeInvalidStructuredReport(ctx, job.ID, workerID, claimToken, run.ID, attempt.ID, invalidReport(run.ID, attempt.ID), 0, 0, 0, "INVALID_STRUCTURED_REPORT", "parse error")
+	if err == nil {
+		t.Fatal("expected injected report failure")
+	}
+	assertInvalidFinalizationRolledBack(t, db, run.ID, attempt.ID, job.ID)
+}
+
+func TestFinalizeInvalidStructuredReportRollsBackOnAttemptFailure(t *testing.T) {
+	db, store, run, job, attempt, workerID, claimToken := prepareInvalidFinalization(t)
+	ctx := context.Background()
+	if err := db.Exec(`CREATE TRIGGER fail_invalid_attempt BEFORE UPDATE OF status ON diagnosis_attempts WHEN NEW.status = 'FAILED_TERMINAL' BEGIN SELECT RAISE(ABORT, 'injected attempt failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec("DROP TRIGGER fail_invalid_attempt")
+	err := store.FinalizeInvalidStructuredReport(ctx, job.ID, workerID, claimToken, run.ID, attempt.ID, invalidReport(run.ID, attempt.ID), 0, 0, 0, "INVALID_STRUCTURED_REPORT", "parse error")
+	if err == nil {
+		t.Fatal("expected injected attempt failure")
+	}
+	assertInvalidFinalizationRolledBack(t, db, run.ID, attempt.ID, job.ID)
+}
+
+func TestFinalizeInvalidStructuredReportRollsBackOnRunFailure(t *testing.T) {
+	db, store, run, job, attempt, workerID, claimToken := prepareInvalidFinalization(t)
+	ctx := context.Background()
+	if err := db.Exec(`CREATE TRIGGER fail_invalid_run BEFORE UPDATE OF status ON diagnosis_runs WHEN NEW.status = 'FAILED' BEGIN SELECT RAISE(ABORT, 'injected run failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec("DROP TRIGGER fail_invalid_run")
+	err := store.FinalizeInvalidStructuredReport(ctx, job.ID, workerID, claimToken, run.ID, attempt.ID, invalidReport(run.ID, attempt.ID), 0, 0, 0, "INVALID_STRUCTURED_REPORT", "parse error")
+	if err == nil {
+		t.Fatal("expected injected run failure")
+	}
+	assertInvalidFinalizationRolledBack(t, db, run.ID, attempt.ID, job.ID)
+}
+
+func TestFinalizeInvalidStructuredReportDoesNotOverwriteCancellationOrStaleClaim(t *testing.T) {
+	db, store, run, job, attempt, workerID, claimToken := prepareInvalidFinalization(t)
+	ctx := context.Background()
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Update("cancel_requested", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinalizeInvalidStructuredReport(ctx, job.ID, workerID, claimToken, run.ID, attempt.ID, invalidReport(run.ID, attempt.ID), 0, 0, 0, "INVALID_STRUCTURED_REPORT", "parse error"); !errors.Is(err, jobs.ErrCancellationRequested) {
+		t.Fatalf("cancelled job = %v, want ErrCancellationRequested", err)
+	}
+	assertInvalidFinalizationRolledBack(t, db, run.ID, attempt.ID, job.ID)
+
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Updates(map[string]interface{}{"cancel_requested": false, "claim_token": "new-token"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinalizeInvalidStructuredReport(ctx, job.ID, workerID, claimToken, run.ID, attempt.ID, invalidReport(run.ID, attempt.ID+"-stale"), 0, 0, 0, "INVALID_STRUCTURED_REPORT", "parse error"); !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("stale claim = %v, want ErrOwnershipLost", err)
+	}
+	assertInvalidFinalizationRolledBack(t, db, run.ID, attempt.ID, job.ID)
+}
+
+func assertInvalidFinalizationRolledBack(t *testing.T, db *gorm.DB, runID, attemptID string, jobID int64) {
+	t.Helper()
+	var run diagnosis.DiagnosisRun
+	var attempt diagnosis.DiagnosisAttempt
+	var job jobs.AnalysisJob
+	var reportCount int64
+	if err := db.First(&run, "id = ?", runID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&attempt, "id = ?", attemptID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&job, jobID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&evidence.Report{}).Where("diagnosis_run_id = ?", runID).Count(&reportCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if reportCount != 0 || run.Status != diagnosis.StatusRunning || attempt.Status != diagnosis.AttemptStatusRunning || job.Status != jobs.StatusRunning {
+		t.Fatalf("transaction was not rolled back: reports=%d run=%s attempt=%s job=%s", reportCount, run.Status, attempt.Status, job.Status)
+	}
+}
+
 func TestCancellationQueuedRunningAndFinalizeRace(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

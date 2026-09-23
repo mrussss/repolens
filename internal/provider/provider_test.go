@@ -2,11 +2,13 @@ package provider_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"repolens/internal/diagnosis"
@@ -195,7 +197,7 @@ func TestTestConnection(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
 			"id": "chatcmpl-test",
-			"choices": [{"message": {"role": "assistant", "content": "pong"}}],
+			"choices": [{"message": {"role": "assistant", "tool_calls": [{"id":"probe-1","type":"function","function":{"name":"repolens_compatibility_probe","arguments":"{}"}}]}, "finish_reason":"tool_calls"}],
 			"usage": {"prompt_tokens": 1, "completion_tokens": 1}
 		}`))
 	}))
@@ -208,6 +210,142 @@ func TestTestConnection(t *testing.T) {
 	}
 	if latency <= 0 {
 		t.Errorf("expected positive latency")
+	}
+}
+
+func TestCompatibilityProbeUsesProductionGenerationShape(t *testing.T) {
+	t.Setenv("REPOLENS_REASONING_EFFORT", "low")
+	t.Setenv("REPOLENS_MAX_OUTPUT_TOKENS", "4096")
+	var request map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"probe-1","type":"function","function":{"name":"repolens_compatibility_probe","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{}}`))
+	}))
+	defer server.Close()
+
+	mgr := provider.NewManager("", "", "", "", "")
+	_, result, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "test-key", "bearer")
+	if err != nil {
+		t.Fatalf("compatibility probe failed: %v", err)
+	}
+	if request["max_tokens"] != float64(256) || request["reasoning_effort"] != "low" {
+		t.Fatalf("probe generation options = %v", request)
+	}
+	format, ok := request["response_format"].(map[string]interface{})
+	if !ok || format["type"] != "json_object" {
+		t.Fatalf("probe response format = %v", request["response_format"])
+	}
+	tools, ok := request["tools"].([]interface{})
+	if !ok || len(tools) != 1 || !result.ToolCallObserved {
+		t.Fatalf("probe tools/result = %v/%+v", request["tools"], result)
+	}
+	if _, present := request["tool_choice"]; present {
+		t.Fatalf("probe sent tool_choice even though production requests omit it: %v", request["tool_choice"])
+	}
+	if result.ProbeStatus != provider.CompatibilityProbeConfirmed {
+		t.Fatalf("probe status = %q, want %q", result.ProbeStatus, provider.CompatibilityProbeConfirmed)
+	}
+}
+
+func TestCompatibilityProbeRejectsUnsupportedGenerationOptions(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret-token" {
+			t.Fatalf("authorization header was not sent")
+		}
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"unsupported reasoning_effort; secret-token"}}`))
+	}))
+	defer server.Close()
+
+	mgr := provider.NewManager("", "", "", "", "")
+	_, _, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "secret-token", "bearer")
+	if !errors.Is(err, provider.ErrProviderCapabilityUnsupported) {
+		t.Fatalf("error = %v, want stable capability error", err)
+	}
+	code, message, status := provider.ClassifyTestConnectionError(err)
+	if code != provider.ProviderTestCodeCapabilityUnsupported || status != http.StatusBadGateway || strings.Contains(message, "secret-token") {
+		t.Fatalf("classification = %s/%q/%d", code, message, status)
+	}
+}
+
+func TestCompatibilityProbeKeepsOrdinaryBadRequestAsConnectionFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"model request is invalid"}}`))
+	}))
+	defer server.Close()
+
+	mgr := provider.NewManager("", "", "", "", "")
+	_, _, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "test-key", "bearer")
+	if errors.Is(err, provider.ErrProviderCapabilityUnsupported) {
+		t.Fatalf("ordinary HTTP 400 was classified as capability unsupported: %v", err)
+	}
+	code, _, _ := provider.ClassifyTestConnectionError(err)
+	if code != provider.ProviderTestCodeConnectionError {
+		t.Fatalf("code = %s, want %s", code, provider.ProviderTestCodeConnectionError)
+	}
+}
+
+func TestCompatibilityProbeRejectsTruncationAndMalformedToolResponses(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "truncated", body: `{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}],"usage":{}}`},
+		{name: "wrong tool", body: `{"choices":[{"message":{"tool_calls":[{"type":"function","function":{"name":"other","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{}}`},
+		{name: "malformed args", body: `{"choices":[{"message":{"tool_calls":[{"type":"function","function":{"name":"repolens_compatibility_probe","arguments":"{}{}"}}]},"finish_reason":"tool_calls"}],"usage":{}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.Header().Set("Content-Type", "application/json")
+				if requests == 1 {
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],"usage":{}}`))
+					return
+				}
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			mgr := provider.NewManager("", "", "", "", "")
+			_, _, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "test-key", "bearer")
+			if tt.name == "truncated" {
+				if !errors.Is(err, provider.ErrProviderProbeTruncated) || errors.Is(err, provider.ErrProviderCapabilityUnsupported) {
+					t.Fatalf("error = %v, want probe truncation only", err)
+				}
+			} else if !errors.Is(err, provider.ErrProviderCapabilityUnsupported) {
+				t.Fatalf("error = %v, want capability unsupported", err)
+			}
+		})
+	}
+}
+
+func TestCompatibilityProbeMarksSuccessfulNonToolResponseUncertain(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{}}`))
+	}))
+	defer server.Close()
+
+	mgr := provider.NewManager("", "", "", "", "")
+	_, result, err := mgr.TestConnectionCompatibilityWithAuthMode(context.Background(), server.URL, "model", "test-key", "bearer")
+	if err != nil {
+		t.Fatalf("error = %v, want inconclusive success", err)
+	}
+	if result.ToolCallObserved || result.ProbeStatus != provider.CompatibilityProbeUncertain {
+		t.Fatalf("probe result = %+v, want uncertain without a tool call", result)
 	}
 }
 

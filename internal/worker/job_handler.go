@@ -126,6 +126,77 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	if result == nil {
 		result, execErr = h.executor.Execute(ctx, run, attempt)
 	}
+	// A result that claims to be structured must satisfy the same complete
+	// contract used by evidence classification. This guard also protects
+	// checkpoint/resume and custom executors from bypassing Agent parsing.
+	if execErr == nil && result != nil {
+		if !result.StructuredReport || result.Report == nil {
+			result.StructuredReport = false
+			if result.ParseError == "" {
+				result.ParseError = "structured report is missing or marked invalid"
+			}
+			execErr = fmt.Errorf("%w: %s", agent.ErrInvalidStructuredReport, result.ParseError)
+		} else if validationErr := evidence.ValidateReportStructure(result.Report); validationErr != nil {
+			result.StructuredReport = false
+			result.ParseError = validationErr.Error()
+			execErr = fmt.Errorf("%w: %v", agent.ErrInvalidStructuredReport, validationErr)
+		}
+	}
+	if errors.Is(execErr, agent.ErrInvalidStructuredReport) {
+		promptTokens, completionTokens, toolCalls := 0, 0, 0
+		if result != nil {
+			promptTokens, completionTokens, toolCalls = result.PromptTokens, result.CompletionTokens, result.ToolCalls
+		}
+		message := execErr.Error()
+		if result != nil && result.ParseError != "" {
+			message = result.ParseError
+		}
+		rawOutput := ""
+		if result != nil {
+			rawOutput = result.RawOutput
+		}
+		report := &evidence.Report{
+			ID:                    uuid.New().String(),
+			DiagnosisRunID:        run.ID,
+			AttemptID:             attempt.ID,
+			ReportStatus:          evidence.ReportInvalid,
+			FindingsJSON:          "[]",
+			RecommendedChecksJSON: "[]",
+			StructuredPayloadJSON: "{}",
+			RawOutput:             rawOutput,
+			ParseError:            message,
+			LimitationsJSON:       "[]",
+			CreatedAt:             time.Now().UTC(),
+		}
+		if finalizer, ok := h.diagnosisStore.(interface {
+			FinalizeInvalidStructuredReport(context.Context, int64, string, string, string, string, *evidence.Report, int, int, int, string, string) error
+		}); ok {
+			if job.WorkerID == nil || job.ClaimToken == nil {
+				return jobs.ErrOwnershipLost
+			}
+			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
+			finalizeErr := finalizer.FinalizeInvalidStructuredReport(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID, report, promptTokens, completionTokens, toolCalls, agent.ErrCodeInvalidStructuredReport, message)
+			cancelFinalize()
+			if errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
+				return jobs.ErrAlreadyFinalized
+			}
+			if errors.Is(finalizeErr, jobs.ErrCancellationRequested) {
+				return h.cancelAttempt(ctx, job, run, attempt)
+			}
+			if finalizeErr != nil {
+				return jobs.NewRetryableError("ATOMIC_INVALID_FINALIZE_FAILED", "failed to atomically finalize invalid structured report", finalizeErr)
+			}
+			return jobs.NewPermanentError(agent.ErrCodeInvalidStructuredReport, "agent returned an invalid structured report", execErr)
+		}
+		// Compatibility path for lightweight non-SQL stores.
+		if h.reportStore != nil {
+			if persistErr := h.reportStore.Create(ctx, report); persistErr != nil {
+				return jobs.NewRetryableError("REPORT_PERSIST_FAILED", persistErr.Error(), persistErr)
+			}
+		}
+		_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, promptTokens, completionTokens, toolCalls, agent.ErrCodeInvalidStructuredReport, message, false, 0)
+		return jobs.NewPermanentError(agent.ErrCodeInvalidStructuredReport, "agent returned an invalid structured report", execErr)
+	}
 	if result != nil {
 		parsedReport, _ := json.Marshal(result.Report)
 		parsedDraft, _ := json.Marshal(result.ReportDraft)

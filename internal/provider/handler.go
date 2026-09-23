@@ -167,10 +167,12 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		return
 	}
 
-	latency, err := h.mgr.TestConnectionWithAuthMode(c.Request.Context(), req.BaseURL, req.Model, req.APIKey, req.AuthMode)
+	latency, compatibility, err := h.mgr.TestConnectionCompatibilityWithAuthMode(c.Request.Context(), req.BaseURL, req.Model, req.APIKey, req.AuthMode)
 	if err != nil {
-		logger.L(c.Request.Context()).Error("provider connection test failed", "error", err)
 		code, message, status := ClassifyTestConnectionError(err)
+		// Do not log the wrapped provider error: it may contain upstream body
+		// text or request details. The stable code is sufficient for operations.
+		logger.L(c.Request.Context()).Error("provider connection test failed", "code", code)
 		c.JSON(status, gin.H{
 			"success":    false,
 			"code":       code,
@@ -181,9 +183,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"success":    true,
-		"latency_ms": latency.Milliseconds(),
-		"message":    fmt.Sprintf("Connection successful! Latency: %dms", latency.Milliseconds()),
+		"success":       true,
+		"latency_ms":    latency.Milliseconds(),
+		"message":       fmt.Sprintf("Connection successful! Latency: %dms", latency.Milliseconds()),
+		"compatibility": compatibility,
 	})
 }
 

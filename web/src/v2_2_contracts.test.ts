@@ -5,6 +5,7 @@ import { buildDiagnosisRequest } from './api';
 import { getStableDiagnosisIdempotencyKey } from './diagnosisSubmission';
 import { shouldContinueRevisionPolling } from './revisionPolling';
 import { isInvalidReport } from './reportStatus';
+import { getProviderTestAlert } from './providerCompatibility';
 
 function storage(initial: Record<string, string> = {}) {
   const values = new Map(Object.entries(initial));
@@ -52,5 +53,45 @@ describe('v2.2 API and UI contracts', () => {
   it('does not treat an INVALID report as a green conclusion', () => {
     expect(isInvalidReport({ report_status: 'INVALID' } as any)).toBe(true);
     expect(isInvalidReport({ report_status: 'VALID' } as any)).toBe(false);
+  });
+
+  it('shows confirmed provider tool calling as a green result', () => {
+    expect(getProviderTestAlert({
+      success: true,
+      latency_ms: 120,
+      message: 'ok',
+      compatibility: {
+        probe_max_output_tokens: 256,
+        production_max_output_tokens: 4096,
+        reasoning_effort: 'low',
+        response_format: 'json_object',
+        tools: true,
+        probe_status: 'CONFIRMED',
+        tool_call_observed: true,
+      },
+    })).toEqual({
+      className: 'alert-success',
+      message: '✓ 连接及工具调用已确认，延迟 120ms',
+    });
+  });
+
+  it('shows uncertain provider tool calling as a yellow result', () => {
+    expect(getProviderTestAlert({
+      success: true,
+      latency_ms: 240,
+      message: 'ok',
+      compatibility: {
+        probe_max_output_tokens: 256,
+        production_max_output_tokens: 4096,
+        reasoning_effort: 'low',
+        response_format: 'json_object',
+        tools: true,
+        probe_status: 'UNCERTAIN',
+        tool_call_observed: false,
+      },
+    })).toEqual({
+      className: 'alert-warning',
+      message: '✓ 连接成功，但工具调用能力尚未确认，延迟 240ms',
+    });
   });
 });

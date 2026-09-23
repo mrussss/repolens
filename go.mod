@@ -8,6 +8,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.17
 	github.com/prometheus/client_golang v1.19.0
 	github.com/prometheus/client_model v0.5.0
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/testcontainers/testcontainers-go v0.29.1
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.29.1
 	golang.org/x/mod v0.16.0

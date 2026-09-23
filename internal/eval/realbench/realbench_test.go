@@ -378,7 +378,7 @@ func (s *errorProviderSpy) Generate(_ context.Context, _ llm.GenerateRequest) (l
 func (s *providerSpy) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
 	s.requests = append(s.requests, request)
 	return llm.GenerateResponse{
-		Message: llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"ok","root_cause":"input-only","findings":[],"recommended_checks":[],"confidence":0.1}`},
+		Message: llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"ok","root_cause":"input-only","findings":[{"title":"input","reasoning":"input-only"}],"recommended_checks":[],"confidence":0.1}`},
 	}, nil
 }
 

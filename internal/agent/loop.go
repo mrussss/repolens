@@ -298,7 +298,21 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		structuredReport := err == nil
 		if err != nil {
 			logger.L(ctx).Warn("failed to parse structured report JSON from assistant output", "error", err)
-			reportData = &evidence.ReportDraft{}
+			return &LoopResult{
+				RawOutput:          finalText,
+				PromptTokens:       totalPromptTokens,
+				CompletionTokens:   totalCompletionTokens,
+				CachedPromptTokens: totalCachedPromptTokens,
+				ReasoningTokens:    totalReasoningTokens,
+				ToolCallsCount:     toolCallsCount,
+				ToolNames:          toolNames,
+				AgentRounds:        agentRounds,
+				SearchCalls:        searchCalls,
+				ProviderCalls:      providerCalls,
+				FinishReason:       resp.FinishReason,
+				StructuredReport:   false,
+				ParseError:         errorString(err),
+			}, err
 		}
 
 		return &LoopResult{
@@ -407,7 +421,14 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason, resp.FinishReason)
 	report, parseErr := parseReportJSON(finalText)
 	if parseErr != nil {
-		report = &evidence.ReportDraft{}
+		return &LoopResult{
+			RawOutput:    finalText,
+			PromptTokens: promptTokens + resp.PromptTokens, CompletionTokens: completionTokens + resp.CompletionTokens,
+			CachedPromptTokens: cachedTokens + resp.CachedPromptTokens, ReasoningTokens: reasoningTokens + resp.ReasoningTokens,
+			ToolCallsCount: toolCalls, ToolNames: toolNames, AgentRounds: rounds + 1,
+			SearchCalls: searchCalls, ProviderCalls: providerCalls, FinishReason: resp.FinishReason,
+			StructuredReport: false, ParseError: errorString(parseErr), FinalizationReason: reason,
+		}, parseErr
 	}
 	return &LoopResult{
 		Report: report, ReportDraft: report, RawOutput: finalText,
@@ -470,33 +491,48 @@ func parseReportJSON(raw string) (*evidence.ReportDraft, error) {
 	clean = strings.TrimSuffix(clean, "```")
 	clean = strings.TrimSpace(clean)
 
+	var lastErr error
 	for _, match := range fencedJSONRegex.FindAllStringSubmatch(raw, -1) {
 		if len(match) < 2 {
 			continue
 		}
-		var report evidence.ReportDraft
-		if err := decodeReportJSON([]byte(match[1]), &report); err == nil && reportIsStructurallyParseable(&report) {
+		report, err := parseReportCandidate([]byte(match[1]))
+		if err == nil {
 			return &report, nil
 		}
+		lastErr = err
 	}
 
-	var report evidence.ReportDraft
-	if err := decodeReportJSON([]byte(clean), &report); err == nil {
-		if reportIsStructurallyParseable(&report) {
-			return &report, nil
-		}
+	report, err := parseReportCandidate([]byte(clean))
+	if err == nil {
+		return &report, nil
 	}
+	lastErr = err
 
 	m := jsonExtractorRegex.FindString(raw)
 	if m != "" {
-		if err := decodeReportJSON([]byte(m), &report); err == nil {
-			if reportIsStructurallyParseable(&report) {
-				return &report, nil
-			}
+		report, err := parseReportCandidate([]byte(m))
+		if err == nil {
+			return &report, nil
 		}
+		lastErr = err
 	}
 
-	return nil, errors.New("cannot parse valid structured report JSON from LLM output")
+	if lastErr == nil {
+		lastErr = errors.New("cannot parse valid structured report JSON from LLM output")
+	}
+	return nil, fmt.Errorf("%w: %v", ErrInvalidStructuredReport, lastErr)
+}
+
+func parseReportCandidate(data []byte) (evidence.ReportDraft, error) {
+	var report evidence.ReportDraft
+	if err := decodeReportJSON(data, &report); err != nil {
+		return report, err
+	}
+	if err := evidence.ValidateReportDraftStructure(&report); err != nil {
+		return report, err
+	}
+	return report, nil
 }
 
 func decodeReportJSON(data []byte, report *evidence.ReportDraft) error {
@@ -528,14 +564,4 @@ func decodeReportJSON(data []byte, report *evidence.ReportDraft) error {
 		}
 	}
 	return nil
-}
-
-func reportIsStructurallyParseable(report *evidence.ReportDraft) bool {
-	if report == nil {
-		return false
-	}
-	if report.ConclusionKind == evidence.ConclusionInsufficientEvidence {
-		return true
-	}
-	return report.ConclusionKind == evidence.ConclusionRootCause && report.RootCause != ""
 }

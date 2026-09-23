@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -25,7 +26,7 @@ type generationOptionsProvider struct {
 func (p *generationOptionsProvider) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
 	p.requests = append(p.requests, request)
 	return llm.GenerateResponse{
-		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[]}`},
+		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`},
 		FinishReason: "stop",
 	}, nil
 }
@@ -75,7 +76,7 @@ func TestAgentLoopDetectsBudgetExhaustionWithoutFinishReason(t *testing.T) {
 
 func TestAgentLoopKeepsNormalStopAndInvalidJSONSeparateFromTruncation(t *testing.T) {
 	valid, err := runLoopResponseTest(t, llm.GenerateResponse{
-		Message:          llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[]}`},
+		Message:          llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`},
 		FinishReason:     "stop",
 		CompletionTokens: 100,
 	}, 2048)
@@ -91,8 +92,33 @@ func TestAgentLoopKeepsNormalStopAndInvalidJSONSeparateFromTruncation(t *testing
 		FinishReason:     "stop",
 		CompletionTokens: 100,
 	}, 2048)
-	if err != nil || invalid == nil || invalid.StructuredReport || invalid.ParseError == "MODEL_OUTPUT_TRUNCATED" {
-		t.Fatalf("invalid stop response took truncation path: result=%+v err=%v", invalid, err)
+	if err == nil || !errors.Is(err, ErrInvalidStructuredReport) || invalid == nil || invalid.StructuredReport || invalid.ParseError == ErrCodeModelOutputTruncated || invalid.RawOutput != "not json" {
+		t.Fatalf("invalid stop response did not take invalid structured path: result=%+v err=%v", invalid, err)
+	}
+}
+
+func TestParseReportJSONRejectsInvalidStructuredReports(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "malformed json", raw: "{not-json"},
+		{name: "unknown field", raw: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}],"unexpected":true}`},
+		{name: "trailing json", raw: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}{}`},
+		{name: "missing required fields", raw: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[]}`},
+		{name: "illegal conclusion kind", raw: `{"conclusion_kind":"MAYBE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`},
+		{name: "incomplete insufficient evidence", raw: `{"conclusion_kind":"INSUFFICIENT_EVIDENCE","confirmed_facts":[]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseReportJSON(tt.raw)
+			if !errors.Is(err, ErrInvalidStructuredReport) {
+				t.Fatalf("parse error = %v, want %s", err, ErrCodeInvalidStructuredReport)
+			}
+			if !strings.Contains(err.Error(), ErrCodeInvalidStructuredReport) {
+				t.Fatalf("parse error = %v, want stable error code", err)
+			}
+		})
 	}
 }
 
@@ -122,7 +148,7 @@ func TestAgentLoopGenerationOptionsReachProviderAndDefaultRemainsCompatible(t *t
 func TestParseReportJSONSkipsProseBracesBeforeFencedJSON(t *testing.T) {
 	raw := "Analysis note: if shouldRedirect { shouldRedirect = false }\n\n" +
 		"```json\n" +
-		`{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[]}` +
+		`{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}` +
 		"\n```"
 
 	report, err := parseReportJSON(raw)
