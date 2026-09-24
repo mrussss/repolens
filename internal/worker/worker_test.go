@@ -43,12 +43,26 @@ type successFinalizerFailingStore struct{ *diagnosis.GormStore }
 
 type invalidFinalizerFailingStore struct{ *diagnosis.GormStore }
 
+type ownershipLostFinalizerStore struct {
+	*diagnosis.GormStore
+	db *gorm.DB
+}
+
 func (s successFinalizerFailingStore) FinalizeSuccess(context.Context, int64, string, string, string, string, *evidence.Report, []evidence.Citation, int, int, int) error {
 	return errors.New("injected finalizer rollback")
 }
 
 func (s invalidFinalizerFailingStore) FinalizeInvalidStructuredReport(context.Context, int64, string, string, string, string, *evidence.Report, int, int, int, string, string) error {
 	return errors.New("injected invalid finalizer rollback")
+}
+
+func (s ownershipLostFinalizerStore) FinalizeSuccess(ctx context.Context, _ int64, _, _, runID, _ string, _ *evidence.Report, _ []evidence.Citation, _, _, _ int) error {
+	if err := s.db.WithContext(ctx).Model(&diagnosis.DiagnosisRun{}).Where("id = ?", runID).Updates(map[string]interface{}{
+		"status": diagnosis.StatusSucceeded, "final_attempt_id": "winning-worker-attempt",
+	}).Error; err != nil {
+		return err
+	}
+	return jobs.ErrOwnershipLost
 }
 
 type invalidReportExecutor struct{}
@@ -290,6 +304,39 @@ func TestFinalizerRollbackClosesDurableCheckpointAttempt(t *testing.T) {
 		if attempt.Status == diagnosis.AttemptStatusRunning {
 			t.Fatalf("historical RUNNING attempt remained: %+v", attempt)
 		}
+	}
+}
+
+func TestOwnershipLostFinalizerClosesStaleAttemptWithoutChangingWinningRun(t *testing.T) {
+	db, jobsStore := setupTestEnvironment(t)
+	ctx := context.Background()
+	baseStore := diagnosis.NewStore(db)
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-ownership-lost", UserID: "user-ownership-lost", RepositoryID: "repo-ownership-lost",
+		SnapshotID: "snap-ownership-lost", IssueTitle: "ownership lost", IdempotencyKey: "ownership-lost-key", IdempotencyRequestHash: "ownership-lost-hash",
+	}
+	if err := baseStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-stale-finalizer", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim failed: %v", err)
+	}
+	store := ownershipLostFinalizerStore{GormStore: baseStore, db: db}
+	handler := worker.NewDiagnosisJobHandler(store, evidence.NewReportStore(db), evidence.NewCitationStore(db), nil, invalidEvidenceExecutor{})
+	if err := handler.Execute(ctx, claimed[0]); err == nil {
+		t.Fatal("expected stale worker finalization to report ownership loss")
+	}
+	attempts, err := baseStore.ListAttemptsByRun(ctx, run.ID)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	if attempts[0].Status != diagnosis.AttemptStatusAbandoned || attempts[0].ErrorCode != "FINALIZATION_OWNERSHIP_LOST" {
+		t.Fatalf("stale Attempt = %+v; want ABANDONED after ownership loss", attempts[0])
+	}
+	savedRun, err := baseStore.GetByID(ctx, run.ID)
+	if err != nil || savedRun.Status != diagnosis.StatusSucceeded || savedRun.FinalAttemptID != "winning-worker-attempt" {
+		t.Fatalf("winning Run changed by stale worker cleanup: run=%+v err=%v", savedRun, err)
 	}
 }
 

@@ -22,6 +22,7 @@ var (
 	ErrAttemptNotFound       = errors.New("diagnosis attempt not found")
 	ErrAttemptNotRunning     = errors.New("diagnosis attempt is not running")
 	ErrAttemptAlreadyExists  = errors.New("diagnosis attempt already exists")
+	ErrAttemptLeaseActive    = errors.New("diagnosis attempt still has an active job lease")
 	ErrClaimConflict         = errors.New("run claim conflict: status is not in expected state or already claimed")
 	ErrRunTransitionConflict = errors.New("diagnosis run is not running")
 	ErrOptimisticLock        = errors.New("optimistic lock conflict")
@@ -38,6 +39,7 @@ type Store interface {
 	GetLatestFinalCheckpoint(ctx context.Context, runID string, executionGeneration int) (*DiagnosisAttempt, error)
 	ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error)
 	UpdateAttemptHeartbeat(ctx context.Context, attemptID string, heartbeatAt time.Time) error
+	CloseAttempt(ctx context.Context, runID, attemptID string, generation int, newStatus AttemptStatus, errCode, errMsg string, retryable bool) error
 	FinishAttempt(ctx context.Context, runID, attemptID string, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool) error
 	FinishAttemptAndRun(ctx context.Context, runID, attemptID string, newRunStatus RunStatus, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool, retryDelay time.Duration) error
 	RequestCancellation(ctx context.Context, runID, userID string) error
@@ -604,9 +606,16 @@ func (s *GormStore) ListAttemptsByRun(ctx context.Context, runID string) ([]Diag
 }
 
 func (s *GormStore) UpdateAttemptHeartbeat(ctx context.Context, attemptID string, heartbeatAt time.Time) error {
-	return s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).
+	result := s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).
 		Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).
-		Update("heartbeat_at", heartbeatAt).Error
+		Update("heartbeat_at", heartbeatAt)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrAttemptNotRunning
+	}
+	return nil
 }
 
 func (s *GormStore) FinishAttempt(ctx context.Context, runID, attemptID string, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool) error {
@@ -624,6 +633,31 @@ func (s *GormStore) FinishAttempt(ctx context.Context, runID, attemptID string, 
 	}
 	if result.RowsAffected != 1 {
 		return ErrAttemptNotFound
+	}
+	return nil
+}
+
+// CloseAttempt transitions one RUNNING Attempt without changing its Run. It is
+// used when a worker has lost finalization ownership: the stale Attempt still
+// needs a terminal status, but must never move a Run that another worker has
+// already finalized. The generation predicate and RowsAffected check make the
+// close operation safe to race with another finalizer or the recovery sweeper.
+func (s *GormStore) CloseAttempt(ctx context.Context, runID, attemptID string, generation int, newStatus AttemptStatus, errCode, errMsg string, retryable bool) error {
+	if newStatus != AttemptStatusFailedRetryable && newStatus != AttemptStatusFailedTerminal && newStatus != AttemptStatusCancelled && newStatus != AttemptStatusAbandoned {
+		return fmt.Errorf("invalid closed Attempt status %q", newStatus)
+	}
+	now := time.Now().UTC()
+	result := s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).
+		Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND status = ?", attemptID, runID, generation, AttemptStatusRunning).
+		Updates(map[string]interface{}{
+			"status": newStatus, "finished_at": &now, "error_code": errCode,
+			"error_message": errMsg, "retryable": retryable,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrAttemptNotRunning
 	}
 	return nil
 }
@@ -765,10 +799,29 @@ func (s *GormStore) FetchStaleAttempts(ctx context.Context, staleDuration time.D
 func (s *GormStore) RecoverStaleAttempt(ctx context.Context, attemptID, runID string, backoff time.Duration) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		now := time.Now()
+		var attempt DiagnosisAttempt
+		if err := tx.Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).First(&attempt).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+
+		// A stale Attempt heartbeat alone is not enough to prove the worker is
+		// dead. The jobs worker may still own a live lease, so only abandon it
+		// after the associated job lease has expired or the job has left RUNNING.
+		var job jobs.AnalysisJob
+		jobErr := tx.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, runID).First(&job).Error
+		if jobErr != nil && !errors.Is(jobErr, gorm.ErrRecordNotFound) {
+			return jobErr
+		}
+		if jobErr == nil && job.Status == jobs.StatusRunning && job.ExecutionGeneration == attempt.ExecutionGeneration && job.LeaseUntil != nil && job.LeaseUntil.After(now) {
+			return ErrAttemptLeaseActive
+		}
 
 		// Mark Attempt as ABANDONED
 		resAtt := tx.Model(&DiagnosisAttempt{}).
-			Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).
+			Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND status = ?", attemptID, runID, attempt.ExecutionGeneration, AttemptStatusRunning).
 			Updates(map[string]interface{}{
 				"status":        AttemptStatusAbandoned,
 				"finished_at":   &now,

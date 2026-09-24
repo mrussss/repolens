@@ -83,6 +83,54 @@ describe('DiagnosisView retry polling', () => {
     expect([...container.querySelectorAll('button')].some((button) => button.textContent?.includes('重试诊断'))).toBe(false);
   });
 
+  it('retries a transient diagnosis-status failure instead of stopping the poll loop', async () => {
+    let reads = 0;
+    vi.mocked(api.getDiagnosis).mockImplementation(async () => {
+      reads += 1;
+      if (reads === 1) throw new Error('temporary network failure');
+      return runningRun;
+    });
+
+    await act(async () => {
+      root.render(<DiagnosisView diagnosisId={failedRun.id} onBack={() => undefined} />);
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    });
+    expect(container.textContent).toContain('temporary network failure');
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+    expect(vi.mocked(api.getDiagnosis).mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(container.textContent).toContain('运行中');
+    expect(container.textContent).not.toContain('temporary network failure');
+  });
+
+  it('keeps retrying terminal report and steps reads after transient server errors', async () => {
+    const succeeded = { ...succeededGenerationTwo, status: 'SUCCEEDED' } as DiagnosisRun;
+    vi.mocked(api.getDiagnosis).mockResolvedValue(succeeded);
+    let reportReads = 0;
+    vi.mocked(api.getDiagnosisReport).mockImplementation(async () => {
+      reportReads += 1;
+      if (reportReads === 1) throw Object.assign(new Error('report temporarily unavailable'), { status: 503 });
+      return { report_status: 'VALID', summary: 'recovered terminal report', findings: [] } as any;
+    });
+    let stepReads = 0;
+    vi.mocked(api.getDiagnosisSteps).mockImplementation(async () => {
+      stepReads += 1;
+      if (stepReads === 1) throw Object.assign(new Error('trace temporarily unavailable'), { status: 503 });
+      return [];
+    });
+
+    await act(async () => {
+      root.render(<DiagnosisView diagnosisId={failedRun.id} onBack={() => undefined} />);
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    });
+    expect(container.textContent).toContain('trace temporarily unavailable');
+    expect(vi.mocked(api.getDiagnosisSteps)).toHaveBeenCalledOnce();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+    expect(reportReads).toBeGreaterThanOrEqual(2);
+    expect(stepReads).toBeGreaterThanOrEqual(2);
+    expect(container.textContent).toContain('recovered terminal report');
+    expect(container.textContent).not.toContain('temporarily unavailable');
+  });
+
   it('replaces the previous generation report with the terminal retry result', async () => {
     let queuedReads = 0;
     let runningReads = 0;

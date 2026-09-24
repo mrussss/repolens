@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"repolens/internal/diagnosis"
@@ -108,7 +109,9 @@ func (s *RecoverySweeper) SweepOnce(ctx context.Context) int {
 			"worker_id", att.WorkerID,
 			"last_heartbeat", att.HeartbeatAt,
 		)
-		if err := s.store.RecoverStaleAttempt(ctx, att.ID, att.DiagnosisRunID, s.retryBackoff); err != nil {
+		if err := s.store.RecoverStaleAttempt(ctx, att.ID, att.DiagnosisRunID, s.retryBackoff); errors.Is(err, diagnosis.ErrAttemptLeaseActive) {
+			continue
+		} else if err != nil {
 			logger.L(ctx).Error("failed to recover stale attempt", "attempt_id", att.ID, "error", err)
 		} else {
 			recovered++

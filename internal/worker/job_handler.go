@@ -101,6 +101,21 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			return jobs.NewRetryableError("START_ATTEMPT_FAILED", err.Error(), err)
 		}
 	}
+	// Keep Attempt liveness independent of Provider latency. RecoverySweeper
+	// uses these heartbeats, and its stale duration is longer than this interval.
+	heartbeat := NewHeartbeatEmitter(h.diagnosisStore, attempt.ID, 5*time.Second)
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		heartbeat.Start(heartbeatCtx)
+	}()
+	defer func() {
+		stopHeartbeat()
+		heartbeat.Stop()
+		<-heartbeatDone
+	}()
+
 	if run.CancelRequested || job.CancelRequested {
 		log.Info("diagnosis cancellation requested")
 		return h.cancelAttempt(ctx, job, run, attempt)
@@ -600,10 +615,22 @@ func (h *DiagnosisJobHandler) closeCheckpointAttempt(ctx context.Context, run *d
 	if err != nil || saved.ProviderCompletedAt == nil || (saved.CheckpointKind != diagnosis.CheckpointKindFinalValid && saved.CheckpointKind != diagnosis.CheckpointKindFinalInvalid) {
 		return
 	}
-	message := "final report checkpoint was saved but finalization failed"
-	if cause != nil {
-		message += ": " + cause.Error()
+	status := diagnosis.AttemptStatusFailedRetryable
+	errorCode := code
+	retryable := true
+	freshRun, runErr := h.diagnosisStore.GetByID(finalizeCtx, run.ID)
+	ownershipLost := errors.Is(cause, jobs.ErrOwnershipLost) || errors.Is(cause, jobs.ErrAlreadyFinalized)
+	terminalRun := runErr == nil && (freshRun.Status == diagnosis.StatusSucceeded || freshRun.Status == diagnosis.StatusFailed || freshRun.Status == diagnosis.StatusCancelled)
+	if ownershipLost || errors.Is(runErr, diagnosis.ErrRunNotFound) || terminalRun {
+		status = diagnosis.AttemptStatusAbandoned
+		errorCode = "FINALIZATION_OWNERSHIP_LOST"
+		retryable = false
 	}
-	_ = h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusRunning, diagnosis.AttemptStatusFailedRetryable,
-		saved.PromptTokens, saved.CompletionTokens, saved.ToolCalls, code, message, true, 0)
+	message := "final report checkpoint was saved, but this Attempt no longer owns Run finalization"
+	if status == diagnosis.AttemptStatusFailedRetryable {
+		message = "final report checkpoint was saved; automatic retry can resume without another Provider call"
+	}
+	if closeErr := h.diagnosisStore.CloseAttempt(finalizeCtx, run.ID, attempt.ID, saved.ExecutionGeneration, status, errorCode, message, retryable); closeErr != nil && !errors.Is(closeErr, diagnosis.ErrAttemptNotRunning) {
+		logger.L(finalizeCtx).Error("failed to close checkpoint Attempt without changing Run state", "attempt_id", attempt.ID, "error", closeErr)
+	}
 }

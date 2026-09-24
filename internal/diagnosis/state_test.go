@@ -829,3 +829,76 @@ func TestFinishAttemptAndRunConcurrentFinalizersCommitOnlyOnce(t *testing.T) {
 		t.Fatalf("concurrent finalization state = run=%+v attempt=%+v", savedRun, savedAttempt)
 	}
 }
+
+func TestCloseAttemptDoesNotRequireOrMutateRunningRun(t *testing.T) {
+	db := setupTestDB(t)
+	store := diagnosis.NewStore(db)
+	run := newRunningAttempt(t, db, store, "run-close-attempt-only", "attempt-close-only", 3, 1)
+	if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Updates(map[string]interface{}{
+		"status": diagnosis.StatusSucceeded, "final_attempt_id": "winning-attempt",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloseAttempt(context.Background(), run.ID, "attempt-close-only", 4, diagnosis.AttemptStatusAbandoned, "FINALIZATION_OWNERSHIP_LOST", "wrong generation", false); !errors.Is(err, diagnosis.ErrAttemptNotRunning) {
+		t.Fatalf("close with stale generation = %v, want ErrAttemptNotRunning", err)
+	}
+	var savedAttempt diagnosis.DiagnosisAttempt
+	if err := db.First(&savedAttempt, "id = ?", "attempt-close-only").Error; err != nil {
+		t.Fatal(err)
+	}
+	if savedAttempt.Status != diagnosis.AttemptStatusRunning {
+		t.Fatalf("generation mismatch changed Attempt status to %s", savedAttempt.Status)
+	}
+	if err := store.CloseAttempt(context.Background(), run.ID, "attempt-close-only", 3, diagnosis.AttemptStatusAbandoned, "FINALIZATION_OWNERSHIP_LOST", "superseded by the winning finalizer", false); err != nil {
+		t.Fatalf("close stale Attempt after Run terminalization: %v", err)
+	}
+	var savedRun diagnosis.DiagnosisRun
+	if err := db.First(&savedRun, "id = ?", run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&savedAttempt, "id = ?", "attempt-close-only").Error; err != nil {
+		t.Fatal(err)
+	}
+	if savedRun.Status != diagnosis.StatusSucceeded || savedRun.FinalAttemptID != "winning-attempt" {
+		t.Fatalf("closing stale Attempt changed the terminal Run: %+v", savedRun)
+	}
+	if savedAttempt.Status != diagnosis.AttemptStatusAbandoned || savedAttempt.FinishedAt == nil {
+		t.Fatalf("stale Attempt was not closed: %+v", savedAttempt)
+	}
+}
+
+func TestRecoverStaleAttemptRespectsLiveJobLease(t *testing.T) {
+	db := setupTestDB(t)
+	store := diagnosis.NewStore(db)
+	run := newRunningAttempt(t, db, store, "run-live-attempt-lease", "attempt-live-lease", 1, 1)
+	leaseUntil := time.Now().UTC().Add(time.Minute)
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).Updates(map[string]interface{}{
+		"status": jobs.StatusRunning, "execution_generation": 1, "lease_until": leaseUntil,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	err := store.RecoverStaleAttempt(context.Background(), "attempt-live-lease", run.ID, time.Second)
+	if !errors.Is(err, diagnosis.ErrAttemptLeaseActive) {
+		t.Fatalf("recovery with active lease = %v, want ErrAttemptLeaseActive", err)
+	}
+	var attempt diagnosis.DiagnosisAttempt
+	if err := db.First(&attempt, "id = ?", "attempt-live-lease").Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != diagnosis.AttemptStatusRunning {
+		t.Fatalf("live leased Attempt was changed to %s", attempt.Status)
+	}
+
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).Update("lease_until", time.Now().UTC().Add(-time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverStaleAttempt(context.Background(), "attempt-live-lease", run.ID, time.Second); err != nil {
+		t.Fatalf("recovery after lease expiry: %v", err)
+	}
+	if err := db.First(&attempt, "id = ?", "attempt-live-lease").Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != diagnosis.AttemptStatusAbandoned {
+		t.Fatalf("expired-lease Attempt status = %s, want ABANDONED", attempt.Status)
+	}
+}

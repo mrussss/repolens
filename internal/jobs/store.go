@@ -226,9 +226,10 @@ func (s *Store) RenewLease(ctx context.Context, jobID int64, workerID, claimToke
 		  AND status = 'RUNNING'
 		  AND worker_id = ?
 		  AND claim_token = ?
+		  AND lease_until > ?
 	`
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, query, newLeaseUntil, now, jobID, workerID, claimToken)
+	res, err := s.db.ExecContext(ctx, query, newLeaseUntil, now, jobID, workerID, claimToken, now)
 	if err != nil {
 		return fmt.Errorf("failed renewing lease for job %d: %w", jobID, err)
 	}

@@ -146,6 +146,8 @@ func run() error {
 	defer cancel()
 
 	jobsWorker.Start(ctx)
+	recoverySweeper := worker.NewRecoverySweeper(diagnosisStore, 45*time.Second, 10*time.Second, 2*time.Second)
+	go recoverySweeper.Start(ctx)
 	log.Info("analysis jobs worker started successfully with all 4 job handlers: RUN_DIAGNOSIS, MATERIALIZE_SNAPSHOT, BUILD_CODE_INDEX, BUILD_RETRIEVAL")
 
 	sigChan := make(chan os.Signal, 1)

@@ -11,6 +11,17 @@ interface Props {
   onBack: () => void;
 }
 
+type ReadRequestError = Error & { status?: number };
+
+function isTransientReadError(error: unknown): boolean {
+  const status = (error as ReadRequestError | undefined)?.status;
+  return status === undefined || status === 408 || status === 429 || status >= 500;
+}
+
+function readErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
 export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
   const [run, setRun] = useState<DiagnosisRun | null>(null);
   const [report, setReport] = useState<DiagnosisReport | null>(null);
@@ -27,6 +38,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
     let stopped = false;
     let timer: number | undefined;
     let delay = 1000;
+    const maxRetryDelay = 15000;
 
     setRun(null);
     setReport(null);
@@ -35,47 +47,63 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
     setError(null);
     setLoading(true);
 
-    const fetchAll = async (): Promise<boolean> => {
-      if (stopped) return false;
+    const fetchAll = async (): Promise<{ continuePolling: boolean; transientFailure: boolean }> => {
+      if (stopped) return { continuePolling: false, transientFailure: false };
       let active = false;
+      let transientFailure = false;
+      let requestError: string | null = null;
+      const noteError = (err: unknown, fallback: string) => {
+        requestError = readErrorMessage(err, fallback);
+        transientFailure ||= isTransientReadError(err);
+      };
       try {
         const r = await api.getDiagnosis(diagnosisId);
-        if (stopped) return false;
+        if (stopped) return { continuePolling: false, transientFailure: false };
         setRun(r);
         active = r.status === 'RUNNING' || r.status === 'QUEUED';
 
         try {
           const loadedAttempts = await api.getDiagnosisAttempts(diagnosisId);
-          if (stopped) return false;
+          if (stopped) return { continuePolling: false, transientFailure: false };
           setAttempts(loadedAttempts);
-        } catch {}
+        } catch (err) {
+          noteError(err, '无法读取诊断执行记录，正在重试…');
+        }
 
         if (r.status === 'SUCCEEDED' || (r.status === 'FAILED' && !!r.final_attempt_id)) {
           try {
             const rep = await api.getDiagnosisReport(diagnosisId);
-            if (stopped) return false;
+            if (stopped) return { continuePolling: false, transientFailure: false };
             setReport(rep);
-          } catch {}
-          try {
-            const st = await api.getDiagnosisSteps(diagnosisId);
-            if (stopped) return false;
-            setSteps(st || []);
-          } catch {}
+          } catch (err) {
+            // A failed diagnosis may legitimately have no report. Other errors
+            // remain visible, and transient errors keep the terminal view polling.
+            if (!(r.status === 'FAILED' && (err as ReadRequestError)?.status === 404)) {
+              noteError(err, '无法读取诊断报告，正在重试…');
+            } else {
+              setReport(null);
+            }
+          }
         }
-        if (r.status === 'RUNNING' || r.status === 'QUEUED' || (!!r.final_attempt_id && r.status !== 'SUCCEEDED')) {
+
+        const shouldLoadSteps = active || r.status === 'SUCCEEDED' || (r.status === 'FAILED' && !!r.final_attempt_id);
+        if (shouldLoadSteps) {
           try {
             const st = await api.getDiagnosisSteps(diagnosisId);
-            if (stopped) return false;
+            if (stopped) return { continuePolling: false, transientFailure: false };
             setSteps(st || []);
-          } catch {}
+          } catch (err) {
+            noteError(err, '无法读取诊断轨迹，正在重试…');
+          }
         }
       } catch (err: any) {
-        if (stopped) return false;
-        setError(err.message || '刷新诊断状态失败');
+        if (stopped) return { continuePolling: false, transientFailure: false };
+        noteError(err, '刷新诊断状态失败');
       } finally {
         if (!stopped) setLoading(false);
       }
-      return active;
+      if (!stopped) setError(requestError);
+      return { continuePolling: active || transientFailure, transientFailure };
     };
 
     const poll = async () => {
@@ -84,9 +112,9 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
         timer = window.setTimeout(poll, 5000);
         return;
       }
-      const active = await fetchAll();
-      if (stopped || !active) return;
-      delay = Math.min(5000, delay * 2);
+      const result = await fetchAll();
+      if (stopped || !result.continuePolling) return;
+      delay = result.transientFailure ? Math.min(maxRetryDelay, delay * 2) : Math.min(5000, delay * 2);
       timer = window.setTimeout(poll, delay);
     };
     const onVisibilityChange = () => {
@@ -191,7 +219,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
 
       {error && (
         <div style={{ padding: '0.75rem', background: 'rgba(248,81,73,0.15)', border: '1px solid rgba(248,81,73,0.3)', borderRadius: 6, color: 'var(--accent-danger)', marginBottom: '1rem', fontSize: '0.85rem' }}>
-          {error}
+          {error} <button className="btn" onClick={() => { setError(null); setPollEpoch((epoch) => epoch + 1); }}>重新加载</button>
         </div>
       )}
 

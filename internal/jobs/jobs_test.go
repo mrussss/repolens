@@ -236,6 +236,28 @@ func TestStore_LeaseRenewalAndStaleFinalize(t *testing.T) {
 	}
 }
 
+func TestStore_ExpiredLeaseCannotBeRenewed(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	ctx := context.Background()
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: "expired-lease"}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatalf("CreateJob failed: %v", err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "worker-A", 1, 5*time.Second)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("failed claiming job: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE analysis_jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?`, claimed[0].ID); err != nil {
+		t.Fatalf("expire job lease: %v", err)
+	}
+	if err := store.RenewLease(ctx, claimed[0].ID, "worker-A", *claimed[0].ClaimToken, time.Now().UTC().Add(time.Minute)); !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("expected expired lease renewal to lose ownership, got %v", err)
+	}
+}
+
 func TestStore_ReaperAndRetryExhaustion(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

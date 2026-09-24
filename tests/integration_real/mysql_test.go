@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -72,6 +73,125 @@ func setupRealMySQL(t *testing.T) (*gorm.DB, *jobs.Store, func()) {
 	}
 
 	return db, jobsStore, cleanup
+}
+
+func TestRealMySQL_Migration009ResumesAfterPartialDDL(t *testing.T) {
+	ctx := context.Background()
+	container, err := tcmysql.RunContainer(ctx,
+		tc.WithImage("mysql:8.0"),
+		tcmysql.WithDatabase("repolens_migration_test"),
+		tcmysql.WithUsername("testuser"),
+		tcmysql.WithPassword("testpass"),
+	)
+	if err != nil {
+		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
+			t.Fatalf("FAILED: real MySQL migration recovery test required but container failed to start: %v", err)
+		}
+		t.Skipf("Skipping real MySQL migration recovery test (Docker not available: %v)", err)
+	}
+	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
+
+	connStr, err := container.ConnectionString(ctx, "charset=utf8mb4&parseTime=True&loc=Local")
+	if err != nil {
+		t.Fatalf("get MySQL connection string: %v", err)
+	}
+	db, err := gorm.Open(gormmysql.Open(connStr), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		t.Fatalf("open MySQL: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get SQL connection: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	migrationDB := &mysql.DB{GormDB: db, SqlDB: sqlDB}
+
+	// Bring the database to the schema immediately before 009, then simulate a
+	// process dying after MySQL has committed some (but not all) ALTER TABLEs.
+	allMigrations := filepath.Join("..", "..", "migrations")
+	partialDir := t.TempDir()
+	entries, err := os.ReadDir(allMigrations)
+	if err != nil {
+		t.Fatalf("read migration directory: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= "009_v2_2_rc_recovery.sql" {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(allMigrations, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(partialDir, entry.Name()), contents, 0o600); err != nil {
+			t.Fatalf("copy %s: %v", entry.Name(), err)
+		}
+	}
+	if err := mysql.ApplyMigrations(migrationDB, partialDir); err != nil {
+		t.Fatalf("apply migrations 001-008: %v", err)
+	}
+
+	started := time.Now().UTC().Truncate(time.Millisecond)
+	for _, id := range []string{"partial-attempt-1", "partial-attempt-2"} {
+		if err := db.Exec(`INSERT INTO diagnosis_attempts
+			(id, diagnosis_run_id, attempt_no, worker_id, started_at, heartbeat_at, deadline_at, raw_output)
+			VALUES (?, 'partial-run', 1, 'legacy-worker', ?, ?, ?, 'legacy provider output')`,
+			id, started, started, started.Add(time.Minute)).Error; err != nil {
+			t.Fatalf("seed legacy attempt %s: %v", id, err)
+		}
+	}
+	if err := db.Exec(`ALTER TABLE diagnosis_attempts ADD COLUMN execution_generation INT NOT NULL DEFAULT 1 AFTER diagnosis_run_id`).Error; err != nil {
+		t.Fatalf("simulate first committed ALTER: %v", err)
+	}
+	if err := db.Exec(`ALTER TABLE diagnosis_attempts ADD COLUMN checkpoint_kind VARCHAR(32) NOT NULL DEFAULT 'NONE' AFTER parsed_report_draft_json`).Error; err != nil {
+		t.Fatalf("simulate second committed ALTER: %v", err)
+	}
+
+	// The duplicate legacy identities make the unique-index step fail after the
+	// remaining DDL and backfill have committed. The failed migration must not
+	// be recorded, and a later retry must resume without repeating ALTERs.
+	if err := mysql.ApplyMigrations(migrationDB, allMigrations); err == nil {
+		t.Fatal("expected duplicate legacy Attempt identities to prevent migration 009")
+	}
+	var attemptCount int
+	if err := db.Raw(`SELECT COUNT(*) FROM diagnosis_attempts WHERE diagnosis_run_id = 'partial-run'`).Scan(&attemptCount).Error; err != nil {
+		t.Fatalf("count legacy attempts after failed migration: %v", err)
+	}
+	if attemptCount != 2 {
+		t.Fatalf("failed migration modified legacy rows: got %d, want 2", attemptCount)
+	}
+	var checkpointKinds int
+	if err := db.Raw(`SELECT COUNT(*) FROM diagnosis_attempts WHERE diagnosis_run_id = 'partial-run' AND checkpoint_kind = 'LEGACY_UNTYPED'`).Scan(&checkpointKinds).Error; err != nil {
+		t.Fatalf("verify committed backfill: %v", err)
+	}
+	if checkpointKinds != 2 {
+		t.Fatalf("backfill before interrupted unique-index step: got %d, want 2", checkpointKinds)
+	}
+	var migrationRecorded int
+	if err := db.Raw(`SELECT COUNT(*) FROM schema_migrations WHERE version = '009_v2_2_rc_recovery.sql'`).Scan(&migrationRecorded).Error; err != nil {
+		t.Fatalf("check migration record after failure: %v", err)
+	}
+	if migrationRecorded != 0 {
+		t.Fatal("failed migration 009 was recorded as applied")
+	}
+	if err := db.Exec(`DELETE FROM diagnosis_attempts WHERE id = 'partial-attempt-2'`).Error; err != nil {
+		t.Fatalf("remove conflicting fixture row: %v", err)
+	}
+	if err := mysql.ApplyMigrations(migrationDB, allMigrations); err != nil {
+		t.Fatalf("resume partially committed migration 009: %v", err)
+	}
+	if err := db.Raw(`SELECT COUNT(*) FROM schema_migrations WHERE version = '009_v2_2_rc_recovery.sql'`).Scan(&migrationRecorded).Error; err != nil {
+		t.Fatalf("check completed migration record: %v", err)
+	}
+	if migrationRecorded != 1 {
+		t.Fatalf("migration 009 record count: got %d, want 1", migrationRecorded)
+	}
+	var uniqueIndexParts int
+	if err := db.Raw(`SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'diagnosis_attempts' AND INDEX_NAME = 'uq_attempt_run_generation_no' AND NON_UNIQUE = 0`).Scan(&uniqueIndexParts).Error; err != nil {
+		t.Fatalf("verify recovered unique index: %v", err)
+	}
+	if uniqueIndexParts != 3 {
+		t.Fatalf("recovered unique index columns: got %d, want 3", uniqueIndexParts)
+	}
 }
 
 func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
