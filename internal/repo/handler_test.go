@@ -90,6 +90,8 @@ func TestTriggerIndexRejectsInvalidJSONWithoutSideEffects(t *testing.T) {
 	}{
 		{name: "malformed JSON", body: `{"ref":`},
 		{name: "wrong field type", body: `{"ref":123}`},
+		{name: "null ref", body: `{"ref":null}`},
+		{name: "null strategy", body: `{"strategy":null}`},
 		{name: "trailing JSON document", body: `{} {}`},
 		{name: "unknown field", body: `{"branch":"main"}`},
 		{name: "case-mismatched field name", body: `{"REF":"feature/other"}`},

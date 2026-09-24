@@ -134,6 +134,10 @@ func validateTriggerIndexFieldNames(object []byte) error {
 		if err := decoder.Decode(&value); err != nil {
 			return err
 		}
+		value = bytes.TrimSpace(value)
+		if len(value) == 0 || value[0] != '"' {
+			return errors.New("expected string value")
+		}
 	}
 	if _, err := decoder.Token(); err != nil {
 		return err
