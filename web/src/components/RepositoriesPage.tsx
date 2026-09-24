@@ -1,11 +1,16 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
 import { AnalysisRevision, Repository } from '../types';
 import { GitBranch, Plus, RefreshCw, Database, Play } from 'lucide-react';
-import { shouldContinueRevisionPolling } from '../revisionPolling';
+import { mergeRevisionReads, RevisionPoller, shouldContinueRevisionPolling, startRevisionPolling } from '../revisionPolling';
 
 interface Props {
   onSelectRepoForDiagnosis: (repoId: string, revisionId: string) => void;
+}
+
+interface RepositoryPollValue {
+  repositories: Repository[];
+  revisions: Record<string, AnalysisRevision[]>;
 }
 
 export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) => {
@@ -18,57 +23,68 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
   const [error, setError] = useState<string | null>(null);
   const [preparingRepoId, setPreparingRepoId] = useState<string | null>(null);
   const [revisions, setRevisions] = useState<Record<string, AnalysisRevision[]>>({});
-  const [pollNonce, setPollNonce] = useState(0);
+  const revisionsRef = useRef<Record<string, AnalysisRevision[]>>({});
+  const pollerRef = useRef<RevisionPoller | null>(null);
 
   useEffect(() => {
-    let stopped = false;
-    let timer: number | undefined;
-    let delay = 1000;
+    let initialRequest = true;
+    const poller = startRevisionPolling<RepositoryPollValue>({
+      poll: async () => {
+        let list: Repository[];
+        try {
+          list = await api.listRepositories();
+        } catch {
+          throw new Error('加载仓库失败，请检查网络后重新加载。');
+        }
 
-    const poll = async () => {
-      if (stopped) return;
-      if (document.hidden) {
-        timer = window.setTimeout(poll, 5000);
-        return;
-      }
-      const hasPreparingRevision = await loadRepos();
-      delay = Math.min(5000, delay * 2);
-      if (!stopped && hasPreparingRevision) timer = window.setTimeout(poll, delay);
-    };
+        let revisionReadFailed = false;
+        const reads = await Promise.all(list.map(async (repository) => {
+          try {
+            return { repositoryId: repository.id, revisions: await api.listAnalysisRevisions(repository.id) } as const;
+          } catch {
+            revisionReadFailed = true;
+            return { repositoryId: repository.id, failed: true } as const;
+          }
+        }));
+        const nextRevisions = mergeRevisionReads(revisionsRef.current, reads);
+        return {
+          value: { repositories: list, revisions: nextRevisions },
+          error: revisionReadFailed ? '分析版本刷新失败，已保留上次状态；可稍后重试。' : undefined,
+        };
+      },
+      hasPreparing: (value) => Object.values(value.revisions).some(shouldContinueRevisionPolling),
+      onValue: (value) => {
+        revisionsRef.current = value.revisions;
+        setRepos(value.repositories);
+        setRevisions(value.revisions);
+      },
+      onError: setError,
+      onPollStart: () => {
+        if (initialRequest) setLoading(true);
+      },
+      onPollEnd: () => {
+        initialRequest = false;
+        setLoading(false);
+      },
+    });
+    pollerRef.current = poller;
     const onVisibilityChange = () => {
-      if (!document.hidden) {
-        delay = 1000;
-        void poll();
-      }
+      poller.refresh();
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
-    void poll();
+    poller.refresh();
     return () => {
-      stopped = true;
-      if (timer !== undefined) window.clearTimeout(timer);
+      poller.stop();
+      if (pollerRef.current === poller) pollerRef.current = null;
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [pollNonce]);
+  }, []);
 
-  const loadRepos = async (): Promise<boolean> => {
-    try {
-      setLoading(true);
-      const list = await api.listRepositories();
-      setRepos(list || []);
-      const revisionEntries = await Promise.all((list || []).map(async (repo) => {
-        try { return [repo.id, await api.listAnalysisRevisions(repo.id)] as const; }
-        catch { return [repo.id, []] as const; }
-      }));
-      const nextRevisions: Record<string, AnalysisRevision[]> = Object.fromEntries(revisionEntries);
-      setRevisions(nextRevisions);
-      return Object.values(nextRevisions).some(shouldContinueRevisionPolling);
-    } catch (err: any) {
-      setError(err.message || '加载仓库失败');
-      return false;
-    } finally {
-      setLoading(false);
-    }
+  const handleReload = () => {
+    setError(null);
+    setLoading(true);
+    pollerRef.current?.refresh();
   };
 
   const handleCreateRepo = async (e: React.FormEvent) => {
@@ -79,7 +95,7 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
       setShowAddModal(false);
       setName('');
       setGitURL('');
-      loadRepos();
+      pollerRef.current?.refresh();
     } catch (err: any) {
       setError(err.message || '添加仓库失败');
     }
@@ -95,8 +111,7 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
       } else {
         await api.createAnalysisRevision(repoId, ref);
       }
-      await loadRepos();
-      setPollNonce((value) => value + 1);
+      pollerRef.current?.refresh();
     } catch (err: any) {
       setError(err.message || '准备分析失败');
     } finally {
@@ -121,6 +136,9 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
       {error && (
         <div style={{ padding: '0.75rem', background: 'rgba(248,81,73,0.15)', border: '1px solid rgba(248,81,73,0.3)', borderRadius: 6, color: 'var(--accent-danger)', marginBottom: '1rem', fontSize: '0.85rem' }}>
           {error}
+          <button className="btn" style={{ marginLeft: '0.75rem' }} onClick={handleReload} disabled={loading}>
+            {loading ? '加载中…' : '重新加载'}
+          </button>
         </div>
       )}
 

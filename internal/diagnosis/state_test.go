@@ -873,7 +873,8 @@ func TestRecoverStaleAttemptRespectsLiveJobLease(t *testing.T) {
 	run := newRunningAttempt(t, db, store, "run-live-attempt-lease", "attempt-live-lease", 1, 1)
 	leaseUntil := time.Now().UTC().Add(time.Minute)
 	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).Updates(map[string]interface{}{
-		"status": jobs.StatusRunning, "execution_generation": 1, "lease_until": leaseUntil,
+		"status": jobs.StatusRunning, "execution_generation": 1, "attempt_count": 1,
+		"worker_id": "worker", "lease_until": leaseUntil,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -900,5 +901,28 @@ func TestRecoverStaleAttemptRespectsLiveJobLease(t *testing.T) {
 	}
 	if attempt.Status != diagnosis.AttemptStatusAbandoned {
 		t.Fatalf("expired-lease Attempt status = %s, want ABANDONED", attempt.Status)
+	}
+}
+
+func TestRecoverStaleAttemptDoesNotWaitForNewAttemptLease(t *testing.T) {
+	db := setupTestDB(t)
+	store := diagnosis.NewStore(db)
+	run := newRunningAttempt(t, db, store, "run-new-attempt-live-lease", "attempt-old-crashed", 1, 1)
+	leaseUntil := time.Now().UTC().Add(time.Minute)
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).Updates(map[string]interface{}{
+		"status": jobs.StatusRunning, "execution_generation": 1, "attempt_count": 2,
+		"worker_id": "retry-worker", "lease_until": leaseUntil,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverStaleAttempt(context.Background(), "attempt-old-crashed", run.ID, time.Second); err != nil {
+		t.Fatalf("recover previous same-generation Attempt while retry has a live lease: %v", err)
+	}
+	var attempt diagnosis.DiagnosisAttempt
+	if err := db.First(&attempt, "id = ?", "attempt-old-crashed").Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != diagnosis.AttemptStatusAbandoned {
+		t.Fatalf("old Attempt status = %s, want ABANDONED while newer attempt lease is live", attempt.Status)
 	}
 }

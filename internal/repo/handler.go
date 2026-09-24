@@ -1,7 +1,11 @@
 package repo
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -61,6 +65,46 @@ type RegisterRepoRequest struct {
 type TriggerIndexRequest struct {
 	Ref      string                      `json:"ref"`
 	Strategy repoindex.RetrievalStrategy `json:"strategy"`
+}
+
+func decodeTriggerIndexRequest(body io.Reader, req *TriggerIndexRequest) error {
+	decoder := json.NewDecoder(body)
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+
+	object := bytes.TrimSpace(raw)
+	if len(object) == 0 || object[0] != '{' {
+		return errors.New("expected JSON object")
+	}
+
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON documents")
+		}
+		return err
+	}
+
+	strictDecoder := json.NewDecoder(bytes.NewReader(object))
+	strictDecoder.DisallowUnknownFields()
+	if err := strictDecoder.Decode(req); err != nil {
+		return err
+	}
+	return nil
+}
+
+func applyTriggerIndexDefaults(req *TriggerIndexRequest, defaultRef string) {
+	if req.Ref == "" {
+		req.Ref = defaultRef
+	}
+	if req.Strategy == "" {
+		req.Strategy = repoindex.StrategyBM25
+	}
 }
 
 func (h *Handler) Register(c *gin.Context) {
@@ -125,16 +169,11 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 	}
 
 	var req TriggerIndexRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		req.Ref = r.DefaultRef
-		req.Strategy = repoindex.StrategyBM25
+	if err := decodeTriggerIndexRequest(c.Request.Body, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INPUT_INVALID", "error": "invalid index request"})
+		return
 	}
-	if req.Ref == "" {
-		req.Ref = r.DefaultRef
-	}
-	if req.Strategy == "" {
-		req.Strategy = repoindex.StrategyBM25
-	}
+	applyTriggerIndexDefaults(&req, r.DefaultRef)
 	if h.resolver == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "snapshot resolver is not configured"})
 		return

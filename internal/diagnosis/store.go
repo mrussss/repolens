@@ -808,14 +808,19 @@ func (s *GormStore) RecoverStaleAttempt(ctx context.Context, attemptID, runID st
 		}
 
 		// A stale Attempt heartbeat alone is not enough to prove the worker is
-		// dead. The jobs worker may still own a live lease, so only abandon it
-		// after the associated job lease has expired or the job has left RUNNING.
+		// dead. A live lease protects only the Attempt represented by the current
+		// job claim; a later automatic retry in the same generation must not keep
+		// an older crashed Attempt alive.
 		var job jobs.AnalysisJob
 		jobErr := tx.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, runID).First(&job).Error
 		if jobErr != nil && !errors.Is(jobErr, gorm.ErrRecordNotFound) {
 			return jobErr
 		}
-		if jobErr == nil && job.Status == jobs.StatusRunning && job.ExecutionGeneration == attempt.ExecutionGeneration && job.LeaseUntil != nil && job.LeaseUntil.After(now) {
+		jobOwnsAttempt := jobErr == nil && job.Status == jobs.StatusRunning &&
+			job.ExecutionGeneration == attempt.ExecutionGeneration && job.AttemptCount == attempt.AttemptNo &&
+			job.WorkerID != nil && *job.WorkerID == attempt.WorkerID &&
+			job.LeaseUntil != nil && job.LeaseUntil.After(now)
+		if jobOwnsAttempt {
 			return ErrAttemptLeaseActive
 		}
 

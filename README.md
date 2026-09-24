@@ -27,11 +27,11 @@ Compose 最终只运行 `mysql`、`api`、`worker`，默认仅绑定 loopback。
 ## 产品流程
 
 1. 注册公开 Git 仓库并选择 ref。
-2. 创建 Snapshot；Worker 解析 exact commit，完成文件 materialization 和 manifest hash 后才置为 READY。
-3. 创建 CodeIndexBuild，查看 Symbols、References、Related Tests 和 AnalysisQuality。
-4. 创建 RetrievalBuild。
-5. 选择 READY AnalysisRevision，提交 CI/Test failure。
-6. 轮询 Diagnosis、Report、Evidence 和 Agent Trace。
+2. 准备或复用该 ref 对应的 AnalysisRevision。
+3. 等待 AnalysisRevision 进入 READY。
+4. 选择 READY AnalysisRevision，提交 CI/Test 问题，并查看 Diagnosis、Report、Evidence 和 Agent Trace。
+
+Snapshot、CodeIndexBuild 和 RetrievalBuild 是 AnalysisRevision 内部固定的可复现 lineage：服务端解析 exact commit，物化不可变 Snapshot，再依序完成索引和检索构建。普通用户无需手工逐项创建这些底层资源；相关 Snapshot/Build API 仍可供兼容调用或高级工作流使用。
 
 Diagnosis 会冻结 AnalysisRevision、Snapshot、两个 build、Provider endpoint/model、prompt/agent 版本、`MaxOutputTokens`、`ReasoningEffort`、`ResponseFormat`、Provider timeout 和配置 hash。当前 v2.2 RC production defaults 是 `MaxOutputTokens=4096`、`ReasoningEffort=low`、`ResponseFormat=json_object`、`ProviderTimeoutSeconds=60`、`ProviderRetryAttempts=0`；这些值会随 DiagnosisRun 快照冻结，运行中不会重新读取环境变量。之后重新构建索引不会改变既有 Diagnosis；相同 endpoint 的 API Key rotation 可以继续使用，endpoint 或 model drift 会被拒绝。
 
