@@ -92,6 +92,9 @@ func TestTriggerIndexRejectsInvalidJSONWithoutSideEffects(t *testing.T) {
 		{name: "wrong field type", body: `{"ref":123}`},
 		{name: "trailing JSON document", body: `{} {}`},
 		{name: "unknown field", body: `{"branch":"main"}`},
+		{name: "case-mismatched field name", body: `{"REF":"feature/other"}`},
+		{name: "duplicate field", body: `{"ref":"main","ref":"other"}`},
+		{name: "invalid UTF-8", body: string([]byte{'{', '"', 'r', 'e', 'f', '"', ':', '"', 'x', 0xff, '"', '}'})},
 		{name: "non-object JSON", body: `null`},
 	}
 

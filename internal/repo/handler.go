@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -81,6 +82,9 @@ func decodeTriggerIndexRequest(body io.Reader, req *TriggerIndexRequest) error {
 	if len(object) == 0 || object[0] != '{' {
 		return errors.New("expected JSON object")
 	}
+	if !utf8.Valid(object) {
+		return errors.New("invalid UTF-8")
+	}
 
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
@@ -89,10 +93,49 @@ func decodeTriggerIndexRequest(body io.Reader, req *TriggerIndexRequest) error {
 		}
 		return err
 	}
+	if err := validateTriggerIndexFieldNames(object); err != nil {
+		return err
+	}
 
 	strictDecoder := json.NewDecoder(bytes.NewReader(object))
 	strictDecoder.DisallowUnknownFields()
 	if err := strictDecoder.Decode(req); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTriggerIndexFieldNames(object []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(object))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return errors.New("expected JSON object")
+	}
+
+	seen := make(map[string]struct{}, 2)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		field, ok := token.(string)
+		if !ok || (field != "ref" && field != "strategy") {
+			return errors.New("unknown field")
+		}
+		if _, exists := seen[field]; exists {
+			return errors.New("duplicate field")
+		}
+		seen[field] = struct{}{}
+
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
 		return err
 	}
 	return nil
