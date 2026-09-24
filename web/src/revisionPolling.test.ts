@@ -81,6 +81,36 @@ describe('AnalysisRevision polling', () => {
     expect(onValue).not.toHaveBeenCalled();
   });
 
+  it('does not restart hidden-page timers after a terminal result', async () => {
+    vi.useFakeTimers();
+    let hidden = false;
+    const poll = vi.fn().mockResolvedValue({ value: { status: 'READY' as const } });
+    const poller = startRevisionPolling({
+      poll,
+      hasPreparing: () => false,
+      onValue: vi.fn(),
+      onError: vi.fn(),
+      isHidden: () => hidden,
+      hiddenDelayMs: 5000,
+    });
+
+    poller.refresh();
+    await flushMicrotasks();
+    expect(poll).toHaveBeenCalledOnce();
+
+    hidden = true;
+    poller.visibilityChanged();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(poll).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+
+    hidden = false;
+    poller.visibilityChanged();
+    await flushMicrotasks();
+    expect(poll).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('uses a slower interval while hidden and refreshes when visible again', async () => {
     vi.useFakeTimers();
     let hidden = true;

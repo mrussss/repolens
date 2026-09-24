@@ -38,6 +38,7 @@ export interface RevisionPollingOptions<T> {
 
 export interface RevisionPoller {
   refresh: () => void;
+  visibilityChanged: () => void;
   stop: () => void;
 }
 
@@ -52,7 +53,10 @@ export function startRevisionPolling<T>(options: RevisionPollingOptions<T>): Rev
   let timer: ReturnType<typeof setTimeout> | undefined;
   let delayMs = baseDelayMs;
   let hasPreparing = false;
+  let hasSuccessfulPoll = false;
+  let terminal = false;
   let refreshPending = false;
+  let visibilityRefreshPending = false;
 
   const clearTimer = () => {
     if (timer !== undefined) {
@@ -62,7 +66,7 @@ export function startRevisionPolling<T>(options: RevisionPollingOptions<T>): Rev
   };
 
   const schedule = (delay: number) => {
-    if (stopped || timer !== undefined) return;
+    if (stopped || terminal || timer !== undefined) return;
     timer = setTimeout(() => {
       timer = undefined;
       void poll();
@@ -75,8 +79,8 @@ export function startRevisionPolling<T>(options: RevisionPollingOptions<T>): Rev
     schedule(isHidden() ? hiddenDelayMs : nextDelay);
   };
 
-  const poll = async () => {
-    if (stopped || inFlight) return;
+  const poll = async (force = false) => {
+    if (stopped || inFlight || (terminal && !force)) return;
     if (isHidden()) {
       schedule(hiddenDelayMs);
       return;
@@ -89,7 +93,9 @@ export function startRevisionPolling<T>(options: RevisionPollingOptions<T>): Rev
       if (stopped) return;
       options.onValue(result.value);
       options.onError(result.error ?? null);
+      hasSuccessfulPoll = true;
       hasPreparing = options.hasPreparing(result.value);
+      terminal = !hasPreparing;
       if (hasPreparing) scheduleNext();
     } catch (error) {
       if (stopped) return;
@@ -101,8 +107,15 @@ export function startRevisionPolling<T>(options: RevisionPollingOptions<T>): Rev
         options.onPollEnd?.();
         if (refreshPending) {
           refreshPending = false;
+          terminal = false;
           clearTimer();
-          void poll();
+          void poll(true);
+        } else if (visibilityRefreshPending) {
+          visibilityRefreshPending = false;
+          if (!terminal && (hasPreparing || !hasSuccessfulPoll)) {
+            clearTimer();
+            void poll();
+          }
         }
       }
     }
@@ -111,8 +124,18 @@ export function startRevisionPolling<T>(options: RevisionPollingOptions<T>): Rev
   return {
     refresh: () => {
       if (stopped) return;
+      terminal = false;
       if (inFlight) {
         refreshPending = true;
+        return;
+      }
+      clearTimer();
+      void poll(true);
+    },
+    visibilityChanged: () => {
+      if (stopped || terminal) return;
+      if (inFlight) {
+        visibilityRefreshPending = true;
         return;
       }
       clearTimer();

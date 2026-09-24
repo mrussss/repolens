@@ -69,7 +69,7 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
     });
     pollerRef.current = poller;
     const onVisibilityChange = () => {
-      poller.refresh();
+      poller.visibilityChanged();
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
