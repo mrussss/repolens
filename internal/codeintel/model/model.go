@@ -194,7 +194,7 @@ type SymbolRelation struct {
 	ResolutionKind      ResolutionKind `json:"resolution_kind" gorm:"size:32;not null"`
 	Confidence          float64        `json:"confidence" gorm:"not null;default:1.0"`
 	ReasonCode          string         `json:"reason_code" gorm:"size:64;not null"`
-	ReasonDetail        string         `json:"reason_detail,omitempty" gorm:"size:255"`
+	ReasonDetail        string         `json:"reason_detail,omitempty" gorm:"type:text"`
 	TargetName          string         `json:"target_name,omitempty" gorm:"size:128"`
 	TargetPackagePath   string         `json:"target_package_path,omitempty" gorm:"size:255"`
 	TargetQualifiedName string         `json:"target_qualified_name,omitempty" gorm:"size:255"`

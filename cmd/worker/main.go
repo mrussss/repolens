@@ -156,9 +156,13 @@ func run() error {
 	sig := <-sigChan
 	log.Info("received shutdown signal", "signal", sig.String())
 
-	cancel()
 	log.Info("shutting down worker daemon, draining in-flight jobs...")
 	jobsWorker.Stop()
+	// Stop first so the worker stops claiming new jobs and lets in-flight jobs
+	// finish. Cancelling the shared service context before draining would be
+	// observed by job handlers as context.Canceled and incorrectly finalize
+	// ordinary work as user-cancelled.
+	cancel()
 	log.Info("analysis jobs worker shut down cleanly")
 
 	return nil

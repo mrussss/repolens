@@ -517,7 +517,7 @@ func TestWorkerRuntime_ConcurrentExecution(t *testing.T) {
 	}
 }
 
-func TestWorkerRuntime_Cancellation(t *testing.T) {
+func TestWorkerRuntime_GracefulShutdownDrainsInFlightJob(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
@@ -530,12 +530,13 @@ func TestWorkerRuntime_Cancellation(t *testing.T) {
 	worker := jobs.NewWorker(store, cfg)
 
 	startedCh := make(chan struct{})
+	finishJobCh := make(chan struct{})
 	worker.RegisterHandler(jobs.JobTypeMaterializeSnapshot, jobs.HandlerFunc(func(ctx context.Context, job *jobs.AnalysisJob) error {
 		close(startedCh)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-finishJobCh:
 			return nil
 		}
 	}))
@@ -554,15 +555,81 @@ func TestWorkerRuntime_Cancellation(t *testing.T) {
 	// Wait for job handler to start
 	<-startedCh
 
-	// Request cancel
+	// cmd/worker's SIGTERM path must stop claiming and drain before cancelling
+	// the shared root context. Keep Stop blocked while the in-flight handler is
+	// active, then let the job complete as normal work.
+	stopped := make(chan struct{})
+	go func() {
+		worker.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("worker stopped before the in-flight job completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(finishJobCh)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not finish draining the in-flight job")
+	}
+	// Mirror cmd/worker: the process root is cancelled only after drain.
 	cancelWorker()
-	worker.Stop()
 
-	cancelledJob, err := store.GetJobByID(ctx, job.ID)
+	completedJob, err := store.GetJobByID(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("GetJobByID failed: %v", err)
 	}
-	if cancelledJob.Status != jobs.StatusCancelled {
-		t.Fatalf("expected CANCELLED status, got %s", cancelledJob.Status)
+	if completedJob.Status != jobs.StatusSucceeded {
+		t.Fatalf("expected graceful shutdown to preserve job completion, got %s", completedJob.Status)
 	}
+}
+
+func TestWorkerRuntime_UserCancellationStillCancelsJob(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	ctx := context.Background()
+
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.PollInterval = 20 * time.Millisecond
+
+	worker := jobs.NewWorker(store, cfg)
+	startedCh := make(chan struct{})
+	worker.RegisterHandler(jobs.JobTypeMaterializeSnapshot, jobs.HandlerFunc(func(ctx context.Context, job *jobs.AnalysisJob) error {
+		close(startedCh)
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: "snap-user-cancel-1"}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatalf("CreateJob failed: %v", err)
+	}
+	worker.Start(ctx)
+	defer worker.Stop()
+
+	select {
+	case <-startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("job handler did not start")
+	}
+	if err := store.RequestCancel(ctx, job.JobType, job.ResourceID); err != nil {
+		t.Fatalf("RequestCancel failed: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cancelledJob, err := store.GetJobByID(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("GetJobByID failed: %v", err)
+		}
+		if cancelledJob.Status == jobs.StatusCancelled {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("user cancellation did not finalize the job as CANCELLED")
 }
