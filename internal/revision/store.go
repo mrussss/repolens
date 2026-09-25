@@ -371,7 +371,7 @@ func ensureCodeIndexBuildTx(tx *gorm.DB, revisionID, snapshotID, modulePath stri
 
 func ensureRetrievalBuildTx(tx *gorm.DB, revisionID string, codeIndexBuildID int64, now time.Time) (*codeintelmodel.RetrievalBuild, error) {
 	const strategy = "BM25"
-	const configHash = "config-v2.1"
+	const configHash = "config-v2.2"
 	var build codeintelmodel.RetrievalBuild
 	err := tx.Where("code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?", codeIndexBuildID, strategy, codeintelmodel.CurrentRetrievalVersion, codeintelmodel.CurrentTokenizerVersion, configHash).First(&build).Error
 	if err == nil {

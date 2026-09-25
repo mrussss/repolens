@@ -139,6 +139,20 @@ func NewService(store Store, repoStore repo.Store, snapshotStore snapshot.Store)
 }
 
 func (s *Service) Create(ctx context.Context, input CreateDiagnosisInput) (*DiagnosisRun, bool, error) {
+	var run *DiagnosisRun
+	var reused bool
+	err := s.store.WithProviderConfigLock(ctx, func() error {
+		var createErr error
+		run, reused, createErr = s.create(ctx, input)
+		return createErr
+	})
+	return run, reused, err
+}
+
+// create runs while the store's provider-config identity lock is held, so the
+// pinned metadata snapshot and the QUEUED row become visible atomically with
+// respect to provider identity changes.
+func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*DiagnosisRun, bool, error) {
 	if input.IdempotencyKey == "" {
 		input.IdempotencyKey = uuid.New().String()
 	}
@@ -402,10 +416,25 @@ func (s *Service) Retry(ctx context.Context, id, userID string) error {
 	if s.jobStore == nil {
 		return errors.New("diagnosis retry is not configured")
 	}
-	if _, err := s.Get(ctx, id, userID); err != nil {
-		return err
-	}
-	return s.jobStore.RetryDiagnosis(ctx, id)
+	return s.store.WithProviderConfigLock(ctx, func() error {
+		run, err := s.Get(ctx, id, userID)
+		if err != nil {
+			return err
+		}
+		if s.providerMetadataSet || s.providerMetadataSource != nil {
+			metadata := s.providerMetadata
+			if s.providerMetadataSource != nil {
+				metadata = s.providerMetadataSource()
+			}
+			if !metadata.IsConfigured {
+				return ErrProviderNotConfigured
+			}
+			if run.ProviderConfigFingerprint == "" || run.ProviderConfigFingerprint != metadata.ConfigFingerprint {
+				return ErrProviderIdentityChanged
+			}
+		}
+		return s.jobStore.RetryDiagnosis(ctx, id)
+	})
 }
 
 func (s *Service) ListAttempts(ctx context.Context, runID, userID string) ([]DiagnosisAttempt, error) {

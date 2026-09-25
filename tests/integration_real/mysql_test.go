@@ -24,7 +24,7 @@ import (
 	"repolens/internal/snapshot"
 )
 
-func setupRealMySQL(t *testing.T) (*gorm.DB, *jobs.Store, func()) {
+func setupRealMySQL(t *testing.T, migrationDir ...string) (*gorm.DB, *jobs.Store, func()) {
 	ctx := context.Background()
 
 	mysqlContainer, err := tcmysql.RunContainer(ctx,
@@ -61,7 +61,11 @@ func setupRealMySQL(t *testing.T) (*gorm.DB, *jobs.Store, func()) {
 		t.Fatalf("failed getting sql.DB: %v", err)
 	}
 
-	if err := mysql.ApplyMigrations(&mysql.DB{GormDB: db, SqlDB: sqlDB}, filepath.Join("..", "..", "migrations")); err != nil {
+	migrationsPath := filepath.Join("..", "..", "migrations")
+	if len(migrationDir) > 0 {
+		migrationsPath = migrationDir[0]
+	}
+	if err := mysql.ApplyMigrations(&mysql.DB{GormDB: db, SqlDB: sqlDB}, migrationsPath); err != nil {
 		_ = mysqlContainer.Terminate(ctx)
 		t.Fatalf("failed to apply authoritative MySQL migrations: %v", err)
 	}
@@ -191,6 +195,117 @@ func TestRealMySQL_Migration009ResumesAfterPartialDDL(t *testing.T) {
 	}
 	if uniqueIndexParts != 3 {
 		t.Fatalf("recovered unique index columns: got %d, want 3", uniqueIndexParts)
+	}
+}
+
+func TestRealMySQL_Migration013ResumesAndScopesSnapshotIdentityByRevision(t *testing.T) {
+	ctx := context.Background()
+	container, err := tcmysql.RunContainer(ctx,
+		tc.WithImage("mysql:8.0"),
+		tcmysql.WithDatabase("repolens_snapshot_migration_test"),
+		tcmysql.WithUsername("testuser"),
+		tcmysql.WithPassword("testpass"),
+	)
+	if err != nil {
+		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
+			t.Fatalf("FAILED: real MySQL migration recovery test required but container failed to start: %v", err)
+		}
+		t.Skipf("Skipping real MySQL migration recovery test (Docker not available: %v)", err)
+	}
+	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
+
+	connStr, err := container.ConnectionString(ctx, "charset=utf8mb4&parseTime=True&loc=Local")
+	if err != nil {
+		t.Fatalf("get MySQL connection string: %v", err)
+	}
+	db, err := gorm.Open(gormmysql.Open(connStr), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		t.Fatalf("open MySQL: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get SQL connection: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	migrationDB := &mysql.DB{GormDB: db, SqlDB: sqlDB}
+
+	allMigrations := filepath.Join("..", "..", "migrations")
+	pre013Dir := t.TempDir()
+	entries, err := os.ReadDir(allMigrations)
+	if err != nil {
+		t.Fatalf("read migration directory: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= "013_v2_2_revision_snapshot_identity.sql" {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(allMigrations, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(pre013Dir, entry.Name()), contents, 0o600); err != nil {
+			t.Fatalf("copy %s: %v", entry.Name(), err)
+		}
+	}
+	if err := mysql.ApplyMigrations(migrationDB, pre013Dir); err != nil {
+		t.Fatalf("apply migrations 001-012: %v", err)
+	}
+	const repositoryID = "repo-snapshot-identity"
+	const commitSHA = "0123456789012345678901234567890123456789"
+	if err := db.Exec(`INSERT INTO repository_snapshots
+		(id, repository_id, analysis_revision_id, commit_sha, ref, materialized_path, content_hash, status)
+		VALUES ('legacy-ready-snapshot', ?, 'legacy-ready-revision', ?, 'main', '/tmp/legacy-source', 'legacy-hash', 'READY')`,
+		repositoryID, commitSHA).Error; err != nil {
+		t.Fatalf("seed legacy READY snapshot: %v", err)
+	}
+
+	// Simulate an interrupted migration after the restrictive legacy unique
+	// index has been removed but before the replacement index is created.
+	if err := db.Exec(`DROP INDEX uq_snapshot_repo_commit ON repository_snapshots`).Error; err != nil {
+		t.Fatalf("simulate partial migration 013: %v", err)
+	}
+	if err := mysql.ApplyMigrations(migrationDB, allMigrations); err != nil {
+		t.Fatalf("resume partial migration 013: %v", err)
+	}
+
+	var migrationRecorded int
+	if err := db.Raw(`SELECT COUNT(*) FROM schema_migrations WHERE version = '013_v2_2_revision_snapshot_identity.sql'`).Scan(&migrationRecorded).Error; err != nil {
+		t.Fatalf("check migration record: %v", err)
+	}
+	if migrationRecorded != 1 {
+		t.Fatalf("migration 013 record count = %d, want 1", migrationRecorded)
+	}
+	var existingCount int
+	if err := db.Raw(`SELECT COUNT(*) FROM repository_snapshots WHERE id = 'legacy-ready-snapshot' AND status = 'READY' AND analysis_revision_id = 'legacy-ready-revision'`).Scan(&existingCount).Error; err != nil {
+		t.Fatalf("verify legacy READY snapshot: %v", err)
+	}
+	if existingCount != 1 {
+		t.Fatal("migration did not preserve the historical READY snapshot")
+	}
+	if err := db.Exec(`INSERT INTO repository_snapshots
+		(id, repository_id, analysis_revision_id, commit_sha, ref, materialized_path, content_hash, status)
+		VALUES ('current-snapshot', ?, 'current-v22-revision', ?, 'main', '/tmp/current-source', 'current-hash', 'MATERIALIZING')`,
+		repositoryID, commitSHA).Error; err != nil {
+		t.Fatalf("insert new revision snapshot for same commit: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO repository_snapshots
+		(id, repository_id, analysis_revision_id, commit_sha, ref, materialized_path, content_hash, status)
+		VALUES ('duplicate-current-snapshot', ?, 'current-v22-revision', ?, 'main', '/tmp/duplicate-source', 'duplicate-hash', 'MATERIALIZING')`,
+		repositoryID, commitSHA).Error; err == nil {
+		t.Fatal("duplicate snapshot within one AnalysisRevision was accepted")
+	}
+	var oldIndexCount, newIndexParts int
+	if err := db.Raw(`SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'repository_snapshots' AND INDEX_NAME = 'uq_snapshot_repo_commit'`).Scan(&oldIndexCount).Error; err != nil {
+		t.Fatalf("verify legacy index removal: %v", err)
+	}
+	if oldIndexCount != 0 {
+		t.Fatal("legacy repository+commit unique index remains after migration")
+	}
+	if err := db.Raw(`SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'repository_snapshots' AND INDEX_NAME = 'uq_snapshot_repo_commit_revision' AND NON_UNIQUE = 0`).Scan(&newIndexParts).Error; err != nil {
+		t.Fatalf("verify revision-scoped index: %v", err)
+	}
+	if newIndexParts != 3 {
+		t.Fatalf("revision-scoped unique index columns = %d, want 3", newIndexParts)
 	}
 }
 

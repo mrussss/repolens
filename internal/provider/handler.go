@@ -26,6 +26,11 @@ import (
 	"gorm.io/gorm"
 )
 
+var (
+	errProviderConfigInUse       = errors.New("provider identity is pinned by an active diagnosis")
+	errProviderActiveCheckFailed = errors.New("failed checking active diagnoses")
+)
+
 // Handler handles system provider configuration and demo mode endpoints.
 type Handler struct {
 	mgr             *Manager
@@ -99,19 +104,31 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 		})
 		return
 	}
-	current := h.mgr.GetPublicStatus()
-	if h.diagnosisStore != nil && current.EndpointFingerprint != "" && ComputeEndpointFingerprint(newBase) != current.EndpointFingerprint {
-		userID := c.GetString("user_id")
-		if runs, _, listErr := h.diagnosisStore.ListByUser(c.Request.Context(), userID, 1, 100); listErr == nil {
-			for _, run := range runs {
-				if run.Status == diagnosis.StatusQueued || run.Status == diagnosis.StatusRunning {
-					c.JSON(http.StatusConflict, gin.H{"error": "PROVIDER_ENDPOINT_IN_USE"})
-					return
-				}
+	newConfigFingerprint := ComputeConfigFingerprint(newBase, req.Model, normalizeAuthMode(req.AuthMode))
+	err = h.withProviderConfigLock(c.Request.Context(), func() error {
+		current := h.mgr.GetPublicStatus()
+		identityChanged := current.ConfigFingerprint == "" || newConfigFingerprint != current.ConfigFingerprint
+		if h.diagnosisStore != nil && identityChanged {
+			hasActive, checkErr := h.diagnosisStore.HasActiveRuns(c.Request.Context())
+			if checkErr != nil {
+				return fmt.Errorf("%w: %v", errProviderActiveCheckFailed, checkErr)
+			}
+			if hasActive {
+				return errProviderConfigInUse
 			}
 		}
-	}
-	if err := h.mgr.SaveConfigWithAuthMode(newBase, req.Model, req.APIKey, req.AuthMode, false); err != nil {
+		return h.mgr.SaveConfigWithAuthMode(newBase, req.Model, req.APIKey, req.AuthMode, false)
+	})
+	if err != nil {
+		if errors.Is(err, errProviderConfigInUse) {
+			c.JSON(http.StatusConflict, gin.H{"code": "PROVIDER_CONFIG_IN_USE", "error": "provider identity is pinned by an active diagnosis"})
+			return
+		}
+		if errors.Is(err, errProviderActiveCheckFailed) {
+			logger.L(c.Request.Context()).Error("failed checking active diagnoses before provider identity change", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": "PROVIDER_ACTIVE_RUN_CHECK_FAILED", "error": "failed to verify active diagnoses"})
+			return
+		}
 		if errors.Is(err, ErrInvalidProviderConfig) {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"code":  "INVALID_PROVIDER_CONFIG",
@@ -134,7 +151,28 @@ func (h *Handler) SaveConfig(c *gin.Context) {
 }
 
 func (h *Handler) ClearConfig(c *gin.Context) {
-	if err := h.mgr.ClearConfig(); err != nil {
+	err := h.withProviderConfigLock(c.Request.Context(), func() error {
+		if h.diagnosisStore != nil {
+			hasActive, checkErr := h.diagnosisStore.HasActiveRuns(c.Request.Context())
+			if checkErr != nil {
+				return fmt.Errorf("%w: %v", errProviderActiveCheckFailed, checkErr)
+			}
+			if hasActive {
+				return errProviderConfigInUse
+			}
+		}
+		return h.mgr.ClearConfig()
+	})
+	if err != nil {
+		if errors.Is(err, errProviderConfigInUse) {
+			c.JSON(http.StatusConflict, gin.H{"code": "PROVIDER_CONFIG_IN_USE", "error": "provider identity is pinned by an active diagnosis"})
+			return
+		}
+		if errors.Is(err, errProviderActiveCheckFailed) {
+			logger.L(c.Request.Context()).Error("failed checking active diagnoses before clearing provider configuration", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": "PROVIDER_ACTIVE_RUN_CHECK_FAILED", "error": "failed to verify active diagnoses"})
+			return
+		}
 		logger.L(c.Request.Context()).Error("failed to clear provider configuration", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code":  "PROVIDER_CONFIG_CLEAR_FAILED",
@@ -143,6 +181,13 @@ func (h *Handler) ClearConfig(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "provider configuration cleared", "status": h.mgr.GetPublicStatus()})
+}
+
+func (h *Handler) withProviderConfigLock(ctx context.Context, fn func() error) error {
+	if h.diagnosisStore != nil {
+		return h.diagnosisStore.WithProviderConfigLock(ctx, fn)
+	}
+	return fn()
 }
 
 type TestConnectionRequest struct {

@@ -15,9 +15,9 @@ const (
 
 type RepositorySnapshot struct {
 	ID                 string         `gorm:"primaryKey;size:64" json:"id"`
-	RepositoryID       string         `gorm:"size:64;not null;uniqueIndex:uq_repo_commit,priority:1;index:ix_repo_snap" json:"repository_id"`
-	AnalysisRevisionID string         `gorm:"size:36;index" json:"analysis_revision_id,omitempty"`
-	CommitSHA          string         `gorm:"size:64;not null;uniqueIndex:uq_repo_commit,priority:2" json:"commit_sha"`
+	RepositoryID       string         `gorm:"size:64;not null;uniqueIndex:uq_repo_commit_revision,priority:1;index:ix_repo_snap" json:"repository_id"`
+	AnalysisRevisionID string         `gorm:"size:36;not null;default:'';uniqueIndex:uq_repo_commit_revision,priority:3;index" json:"analysis_revision_id,omitempty"`
+	CommitSHA          string         `gorm:"size:64;not null;uniqueIndex:uq_repo_commit_revision,priority:2" json:"commit_sha"`
 	Ref                string         `gorm:"size:128;not null" json:"ref"`
 	RequestedRef       string         `gorm:"size:128" json:"requested_ref,omitempty"`
 	MaterializedPath   string         `gorm:"size:512;not null" json:"materialized_path"`

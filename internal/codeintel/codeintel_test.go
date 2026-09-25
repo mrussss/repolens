@@ -2,8 +2,11 @@ package codeintel_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/snapshot"
+	"repolens/internal/tools"
 )
 
 func setupCodeIntelTestDB(t *testing.T) (*gorm.DB, *jobs.Store, codeintelstore.Store, snapshot.Store) {
@@ -39,6 +43,71 @@ func setupCodeIntelTestDB(t *testing.T) (*gorm.DB, *jobs.Store, codeintelstore.S
 	ciStore := codeintelstore.NewStore(db)
 	snapStore := snapshot.NewStore(db)
 	return db, jobsStore, ciStore, snapStore
+}
+
+func TestRelatedTestsPersistAndReachFindRelatedTestsTool(t *testing.T) {
+	_, _, ciStore, _ := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module example.com/related\n\ngo 1.22\n")
+	writeTestFile(t, filepath.Join(root, "orders.go"), `package related
+
+func ProcessOrder() {}
+`)
+	writeTestFile(t, filepath.Join(root, "orders_test.go"), `package related
+
+func TestProcessOrder() {
+	ProcessOrder()
+}
+`)
+
+	analysis, err := codeintel.NewAnalyzer().Analyze(ctx, root, codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatalf("analyze fixture: %v", err)
+	}
+	if len(analysis.RelatedTests) == 0 {
+		t.Fatal("analyzer did not discover related tests")
+	}
+
+	build, _, err := ciStore.GetOrCreateBuild(ctx, "snap-related-tests", analysis.ModulePath, analysis.BuildContext)
+	if err != nil {
+		t.Fatalf("create code index build: %v", err)
+	}
+	if err := ciStore.MarkBuildBuilding(ctx, build.ID); err != nil {
+		t.Fatalf("mark code index build building: %v", err)
+	}
+	if err := ciStore.SaveAnalysisResult(ctx, build.ID, analysis); err != nil {
+		t.Fatalf("save analysis result: %v", err)
+	}
+
+	discovery := analysis.RelatedTests[0]
+	relations, err := ciStore.ListRelatedTests(ctx, build.ID, discovery.TargetSymbolKeyHash)
+	if err != nil {
+		t.Fatalf("list related tests: %v", err)
+	}
+	if len(relations) != 1 {
+		t.Fatalf("stored related tests = %d, want 1: %+v", len(relations), relations)
+	}
+	got := relations[0]
+	if got.CodeIndexBuildID != build.ID || got.FromSymbolID == nil || got.ToSymbolID == nil ||
+		got.FromSymbolKeyHash != discovery.TargetSymbolKeyHash || got.ToSymbolKeyHash != discovery.TestSymbolKeyHash ||
+		got.RelationType != codeintelmodel.RelationTypeTestRelation || got.ResolutionKind != discovery.ResolutionKind ||
+		got.Confidence != discovery.Confidence || got.ReasonCode != string(discovery.ReasonCode) ||
+		got.ReasonDetail != discovery.Explanation || got.FilePath != discovery.TestFilePath || got.Line != discovery.TestLine || got.FileID == 0 {
+		t.Fatalf("persisted relation does not preserve discovery: discovery=%+v relation=%+v", discovery, got)
+	}
+
+	toolResult, err := tools.NewFindRelatedTestsTool(ciStore, build.ID).Execute(ctx, `{"symbol_name":"ProcessOrder"}`)
+	if err != nil {
+		t.Fatalf("find_related_tests tool: %v", err)
+	}
+	var toolRelations []codeintelmodel.SymbolRelation
+	if err := json.Unmarshal([]byte(toolResult), &toolRelations); err != nil {
+		t.Fatalf("decode find_related_tests output %q: %v", toolResult, err)
+	}
+	if len(toolRelations) != 1 || !strings.Contains(toolResult, discovery.TestSymbolKeyHash) || !strings.Contains(toolResult, discovery.TestFilePath) {
+		t.Fatalf("find_related_tests did not expose persisted relation: %s", toolResult)
+	}
 }
 
 func TestCodeIndexBuild_IdempotencyAndJobCreation(t *testing.T) {
@@ -79,6 +148,86 @@ func TestCodeIndexBuild_IdempotencyAndJobCreation(t *testing.T) {
 	}
 	if build2.ID != build1.ID {
 		t.Errorf("expected same build ID %d, got %d", build1.ID, build2.ID)
+	}
+}
+
+func TestQueuedCodeIndexJobRestoresPersistedBuildTags(t *testing.T) {
+	_, _, ciStore, snapStore := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	base := t.TempDir()
+	storeFS := snapshotstore.NewLocalSnapshotStore(base)
+	const repoID, snapshotID = "repo-build-tags", "snap-build-tags"
+	sourceDir, err := storeFS.EnsureDir(repoID, snapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(sourceDir, "go.mod"), "module example.com/buildtags\n\ngo 1.22\n")
+	writeTestFile(t, filepath.Join(sourceDir, "default.go"), "package buildtags\n\nfunc DefaultTarget() {}\n")
+	writeTestFile(t, filepath.Join(sourceDir, "custom.go"), "//go:build custom\n\npackage buildtags\n\nfunc CustomTarget() {}\n")
+	now := time.Now().UTC()
+	if err := snapStore.Create(ctx, &snapshot.RepositorySnapshot{
+		ID: snapshotID, RepositoryID: repoID, CommitSHA: "commit-build-tags", Ref: "main",
+		MaterializedPath: sourceDir, ContentHash: "build-tags-content", Status: snapshot.StatusReady, ReadyAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bc := codeintelmodel.BuildContext{GOOS: "linux", GOARCH: "amd64", BuildTags: []string{"custom"}}
+	build, created, err := ciStore.GetOrCreateBuild(ctx, snapshotID, "example.com/buildtags", bc)
+	if err != nil || !created {
+		t.Fatalf("create tagged build: created=%t err=%v", created, err)
+	}
+	if build.BuildTagsJSON != `["custom"]` {
+		t.Fatalf("persisted build tags = %q, want [\"custom\"]", build.BuildTagsJSON)
+	}
+	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, storeFS, codeintel.NewAnalyzer())
+	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: strconv.FormatInt(build.ID, 10), MaxAttempts: 3}); err != nil {
+		t.Fatalf("execute queued code-index job: %v", err)
+	}
+	ready, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.Status != codeintelmodel.BuildStatusReady || ready.BuildContextHash != bc.BuildContextHash() || ready.BuildTagsHash != bc.BuildTagsHash() {
+		t.Fatalf("ready build lost its requested context: %+v", ready)
+	}
+	symbols, err := ciStore.ListAllSymbols(ctx, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundCustom bool
+	for _, symbol := range symbols {
+		if symbol.Name == "CustomTarget" {
+			foundCustom = true
+		}
+	}
+	if !foundCustom {
+		t.Fatalf("worker omitted custom-tagged symbol; persisted build context was not restored: %+v", symbols)
+	}
+}
+
+func TestQueuedCodeIndexJobFailsClosedWhenLegacyTagNamesAreUnavailable(t *testing.T) {
+	db, _, ciStore, snapStore := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	bc := codeintelmodel.BuildContext{GOOS: "linux", GOARCH: "amd64", BuildTags: []string{"custom"}}
+	build, created, err := ciStore.GetOrCreateBuild(ctx, "snap-legacy-build-tags", "example.com/legacy", bc)
+	if err != nil || !created {
+		t.Fatalf("create custom-tag build: created=%t err=%v", created, err)
+	}
+	// Migration 012 backfills the absent legacy JSON as []; the persisted hash
+	// still proves that custom tag names were originally present but lost.
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Update("build_tags_json", "[]").Error; err != nil {
+		t.Fatal(err)
+	}
+	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()), codeintel.NewAnalyzer())
+	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: strconv.FormatInt(build.ID, 10), MaxAttempts: 3}); err == nil {
+		t.Fatal("legacy build with missing custom tag names unexpectedly executed")
+	}
+	retired, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired.Status != codeintelmodel.BuildStatusFailed || retired.ErrorCode != "BUILD_TAGS_UNAVAILABLE" {
+		t.Fatalf("legacy build was not failed closed: %+v", retired)
 	}
 }
 
@@ -239,5 +388,12 @@ func TestLineageInvariantValidation(t *testing.T) {
 	err = ciStore.ValidateLineage(ctx, repoA, snapA, buildA.ID+999, retBuildA.ID)
 	if err == nil {
 		t.Errorf("expected error on mismatched code index build ID")
+	}
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatalf("write fixture %s: %v", path, err)
 	}
 }

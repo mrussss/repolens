@@ -71,7 +71,7 @@ func (s *GormStore) GetLatestReady(ctx context.Context, repoID string) (*Reposit
 
 func (s *GormStore) GetByCommit(ctx context.Context, repoID, commitSHA string) (*RepositorySnapshot, error) {
 	var snap RepositorySnapshot
-	if err := s.db.WithContext(ctx).Where("repository_id = ? AND commit_sha = ?", repoID, commitSHA).First(&snap).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("repository_id = ? AND commit_sha = ?", repoID, commitSHA).Order("created_at DESC, id DESC").First(&snap).Error; err != nil {
 		return nil, err
 	}
 	return &snap, nil

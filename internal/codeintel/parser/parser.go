@@ -6,12 +6,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"go/ast"
-	"go/build/constraint"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/mod/modfile"
@@ -171,7 +172,7 @@ func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInf
 		}
 
 		// Check build constraints
-		included := matchesBuildContext(content, bctx)
+		included := matchesBuildContext(filepath.Dir(path), d.Name(), bctx)
 
 		codeFile := &model.CodeFile{
 			Path:                   relPath,
@@ -221,33 +222,68 @@ func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInf
 	return parsedFiles, warnings, nil
 }
 
-// matchesBuildContext evaluates //go:build and // +build constraint comments.
-func matchesBuildContext(content []byte, bctx model.BuildContext) bool {
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "package ") {
-			// Stop searching once package declaration is reached
-			break
-		}
-		if strings.HasPrefix(line, "//go:build ") || strings.HasPrefix(line, "// +build ") {
-			expr, err := constraint.Parse(line)
-			if err != nil {
-				continue
-			}
-			isTag := func(tag string) bool {
-				if tag == bctx.GOOS || tag == bctx.GOARCH {
-					return true
-				}
-				for _, t := range bctx.BuildTags {
-					if t == tag {
-						return true
-					}
-				}
-				return false
-			}
-			return expr.Eval(isTag)
+// matchesBuildContext delegates filename and source-comment semantics to the
+// standard Go build matcher. MatchFile only reads the file; it never executes
+// repository code.
+func matchesBuildContext(dir, name string, bctx model.BuildContext) bool {
+	ctx := build.Context{
+		GOOS:        bctx.GOOS,
+		GOARCH:      bctx.GOARCH,
+		Compiler:    "gc",
+		CgoEnabled:  false,
+		BuildTags:   normalizedBuildTags(bctx.BuildTags),
+		ReleaseTags: pinnedGoReleaseTags(),
+		ToolTags:    targetToolTags(bctx.GOARCH),
+	}
+	included, err := ctx.MatchFile(dir, name)
+	return err == nil && included
+}
+
+// pinnedGoReleaseTags makes parser inclusion independent of the Go toolchain
+// installed on a worker. v2.2 build identity is based on Go 1.22 semantics;
+// bump CurrentParserVersion whenever this supported release-tag set changes.
+func pinnedGoReleaseTags() []string {
+	tags := make([]string, 0, 22)
+	for minor := 1; minor <= 22; minor++ {
+		tags = append(tags, fmt.Sprintf("go1.%d", minor))
+	}
+	return tags
+}
+
+func normalizedBuildTags(tags []string) []string {
+	normalized := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if tag = strings.TrimSpace(tag); tag != "" {
+			normalized = append(normalized, tag)
 		}
 	}
-	return true
+	sort.Strings(normalized)
+	return normalized
+}
+
+// targetToolTags derives compiler and architecture tags from the requested
+// target, without inheriting host toolchain experiments or feature settings.
+// BuildContext currently represents the default target feature level for each
+// architecture.
+func targetToolTags(goarch string) []string {
+	tags := []string{"gc"}
+	switch goarch {
+	case "386":
+		tags = append(tags, "386.sse2")
+	case "amd64":
+		tags = append(tags, "amd64.v1")
+	case "arm":
+		// The Go 1.22 cross-compilation default is GOARM=7, which
+		// defines the compatible arm.5, arm.6, and arm.7 tags.
+		tags = append(tags, "arm.5", "arm.6", "arm.7")
+	case "mips", "mipsle":
+		tags = append(tags, goarch+".hardfloat")
+	case "mips64", "mips64le":
+		tags = append(tags, goarch+".hardfloat")
+	case "ppc64":
+		tags = append(tags, "ppc64.power8")
+	case "ppc64le":
+		tags = append(tags, "ppc64le.power8")
+	}
+	return tags
 }

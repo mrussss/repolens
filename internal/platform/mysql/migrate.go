@@ -24,6 +24,19 @@ import (
 )
 
 func AutoMigrate(db *gorm.DB) error {
+	// SQLite development databases can predate AnalysisRevision and contain
+	// NULL lineage IDs. Normalize those values before GORM rebuilds the table
+	// for the new NOT NULL composite identity; doing this afterward is too late
+	// because SQLite copies old rows during the rebuild.
+	if db.Dialector.Name() == "sqlite" &&
+		db.Migrator().HasTable(&snapshot.RepositorySnapshot{}) &&
+		db.Migrator().HasColumn(&snapshot.RepositorySnapshot{}, "analysis_revision_id") {
+		if err := db.Model(&snapshot.RepositorySnapshot{}).
+			Where("analysis_revision_id IS NULL").
+			Update("analysis_revision_id", "").Error; err != nil {
+			return fmt.Errorf("normalize legacy sqlite snapshot revision IDs: %w", err)
+		}
+	}
 	if err := db.AutoMigrate(
 		&repo.Repository{},
 		&snapshot.RepositorySnapshot{},
@@ -43,6 +56,15 @@ func AutoMigrate(db *gorm.DB) error {
 		&jobs.AnalysisJob{},
 	); err != nil {
 		return err
+	}
+	// Older sqlite development databases may still have the pre-revision
+	// repository+commit unique index. Drop it after AutoMigrate has created the
+	// revision-scoped replacement so the same commit can be prepared again when
+	// the analysis pipeline identity changes.
+	if db.Migrator().HasIndex(&snapshot.RepositorySnapshot{}, "uq_repo_commit") {
+		if err := db.Migrator().DropIndex(&snapshot.RepositorySnapshot{}, "uq_repo_commit"); err != nil {
+			return fmt.Errorf("drop legacy snapshot identity index: %w", err)
+		}
 	}
 	return db.Model(&diagnosis.DiagnosisAttempt{}).
 		Where("checkpoint_kind = ? AND (raw_output <> '' OR finish_reason <> '')", diagnosis.CheckpointKindNone).
@@ -115,6 +137,24 @@ func ApplyMigrations(db *DB, dir string) error {
 			}
 			continue
 		}
+		if version == "012_v2_2_code_index_build_tags.sql" {
+			if err := applyBuildTagsMigration012(ctx, conn); err != nil {
+				return fmt.Errorf("apply resumable migration %s: %w", version, err)
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, CURRENT_TIMESTAMP(3))`, version); err != nil {
+				return fmt.Errorf("record migration %s: %w", version, err)
+			}
+			continue
+		}
+		if version == "013_v2_2_revision_snapshot_identity.sql" {
+			if err := applyRevisionSnapshotIdentityMigration013(ctx, conn); err != nil {
+				return fmt.Errorf("apply resumable migration %s: %w", version, err)
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, CURRENT_TIMESTAMP(3))`, version); err != nil {
+				return fmt.Errorf("record migration %s: %w", version, err)
+			}
+			continue
+		}
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -142,6 +182,144 @@ func ApplyMigrations(db *DB, dir string) error {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func applyRevisionSnapshotIdentityMigration013(ctx context.Context, conn *sql.Conn) error {
+	var columnType, nullable string
+	var defaultValue sql.NullString
+	err := conn.QueryRowContext(ctx, `SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'repository_snapshots' AND COLUMN_NAME = 'analysis_revision_id'`).Scan(&columnType, &nullable, &defaultValue)
+	if err != nil {
+		return fmt.Errorf("inspect repository_snapshots.analysis_revision_id: %w", err)
+	}
+	if !strings.EqualFold(columnType, "varchar(36)") {
+		return fmt.Errorf("repository_snapshots.analysis_revision_id has incompatible type %s", columnType)
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE repository_snapshots SET analysis_revision_id = '' WHERE analysis_revision_id IS NULL`); err != nil {
+		return fmt.Errorf("normalize legacy empty snapshot revision identities: %w", err)
+	}
+	if !strings.EqualFold(nullable, "NO") || !defaultValue.Valid || strings.Trim(defaultValue.String, "'") != "" {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE repository_snapshots MODIFY COLUMN analysis_revision_id VARCHAR(36) NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("make snapshot revision identity non-null: %w", err)
+		}
+	}
+
+	if err := ensureMigration013Index(ctx, conn, "uq_snapshot_repo_commit_revision", true, []string{"repository_id", "commit_sha", "analysis_revision_id"}); err != nil {
+		return err
+	}
+	if err := dropMigration013LegacyIndex(ctx, conn); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureMigration013Index(ctx context.Context, conn *sql.Conn, name string, unique bool, wantColumns []string) error {
+	columns, nonUnique, exists, err := migration013Index(ctx, conn, name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if (nonUnique == 0) != unique || !sameStrings(columns, wantColumns) {
+			return fmt.Errorf("index %s has incompatible definition: unique=%t columns=%v", name, nonUnique == 0, columns)
+		}
+		return nil
+	}
+	if !unique {
+		return fmt.Errorf("cannot create unexpected non-unique migration index %s", name)
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE UNIQUE INDEX uq_snapshot_repo_commit_revision ON repository_snapshots (repository_id, commit_sha, analysis_revision_id)`); err != nil {
+		return fmt.Errorf("create revision-scoped snapshot identity index: %w", err)
+	}
+	columns, nonUnique, exists, err = migration013Index(ctx, conn, name)
+	if err != nil {
+		return err
+	}
+	if !exists || nonUnique != 0 || !sameStrings(columns, wantColumns) {
+		return fmt.Errorf("revision-scoped snapshot identity index verification failed")
+	}
+	return nil
+}
+
+func dropMigration013LegacyIndex(ctx context.Context, conn *sql.Conn) error {
+	const name = "uq_snapshot_repo_commit"
+	columns, nonUnique, exists, err := migration013Index(ctx, conn, name)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if nonUnique != 0 || !sameStrings(columns, []string{"repository_id", "commit_sha"}) {
+		return fmt.Errorf("legacy index %s has unexpected definition: unique=%t columns=%v", name, nonUnique == 0, columns)
+	}
+	if _, err := conn.ExecContext(ctx, `DROP INDEX uq_snapshot_repo_commit ON repository_snapshots`); err != nil {
+		return fmt.Errorf("drop legacy snapshot identity index: %w", err)
+	}
+	return nil
+}
+
+func migration013Index(ctx context.Context, conn *sql.Conn, name string) ([]string, int, bool, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT COLUMN_NAME, NON_UNIQUE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'repository_snapshots' AND INDEX_NAME = ? ORDER BY SEQ_IN_INDEX`, name)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("inspect repository_snapshots index %s: %w", name, err)
+	}
+	defer rows.Close()
+	var columns []string
+	nonUnique := -1
+	for rows.Next() {
+		var column string
+		var currentNonUnique int
+		if err := rows.Scan(&column, &currentNonUnique); err != nil {
+			return nil, 0, false, err
+		}
+		if nonUnique >= 0 && nonUnique != currentNonUnique {
+			return nil, 0, false, fmt.Errorf("index %s has inconsistent uniqueness metadata", name)
+		}
+		nonUnique = currentNonUnique
+		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, false, err
+	}
+	return columns, nonUnique, nonUnique >= 0, nil
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func applyBuildTagsMigration012(ctx context.Context, conn *sql.Conn) error {
+	var count int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'code_index_builds' AND COLUMN_NAME = 'build_tags_json'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect code_index_builds.build_tags_json: %w", err)
+	}
+	if count == 0 {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE code_index_builds ADD COLUMN build_tags_json TEXT NULL`); err != nil {
+			return fmt.Errorf("add code_index_builds.build_tags_json: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE code_index_builds SET build_tags_json = '[]' WHERE build_tags_json IS NULL OR build_tags_json = ''`); err != nil {
+		return fmt.Errorf("initialize code index build tags: %w", err)
+	}
+	// Historical pending builds persisted the tag hash but not the tag names.
+	// The hash is one-way, so fail those jobs closed. READY rows remain immutable
+	// historical artifacts; the v2.2 parser/pipeline identity prevents them from
+	// being reused for new preparations.
+	if _, err := conn.ExecContext(ctx, `UPDATE code_index_builds
+		SET status = 'FAILED', error_code = 'BUILD_TAGS_UNAVAILABLE'
+		WHERE status IN ('CREATED', 'BUILDING')
+		  AND (build_tags_hash IS NULL OR build_tags_hash <> 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+		  AND COALESCE(error_code, '') <> 'BUILD_TAGS_UNAVAILABLE'`); err != nil {
+		return fmt.Errorf("retire code index builds with unavailable legacy tags: %w", err)
 	}
 	return nil
 }

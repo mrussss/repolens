@@ -632,7 +632,7 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 		Strategy:         productionStrategy,
 		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion,
 		TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
-		ConfigHash:       "config-v2.1",
+		ConfigHash:       "config-v2.2",
 		Status:           codeintelmodel.BuildStatusCreated,
 		CreatedAt:        time.Now().UTC(),
 	}

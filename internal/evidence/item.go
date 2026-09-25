@@ -41,7 +41,7 @@ type AttemptEvidenceItem struct {
 	CodeIndexBuildID int64      `gorm:"not null;default:0;index" json:"code_index_build_id"`
 	SourceKind       SourceKind `gorm:"size:32;not null" json:"source_kind"`
 	SourceStepSeq    *int       `json:"source_step_seq,omitempty"`
-	RetrievalChunkID string     `gorm:"size:128" json:"retrieval_chunk_id,omitempty"`
+	RetrievalChunkID string     `gorm:"size:1024" json:"retrieval_chunk_id,omitempty"`
 	FilePath         string     `gorm:"size:512;not null;index:idx_snapshot_evidence;index:uq_attempt_evidence_identity,priority:3" json:"path"`
 	StartLine        int        `gorm:"not null;index:uq_attempt_evidence_identity,priority:4" json:"start_line"`
 	EndLine          int        `gorm:"not null;index:uq_attempt_evidence_identity,priority:5" json:"end_line"`

@@ -1,0 +1,1 @@
+ALTER TABLE citations MODIFY reason VARCHAR(2048) NULL;

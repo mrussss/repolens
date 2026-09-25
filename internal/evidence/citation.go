@@ -29,11 +29,11 @@ type Citation struct {
 	EvidenceID       string         `gorm:"size:64;index" json:"evidence_id,omitempty"`
 	SnapshotID       string         `gorm:"size:36;not null;index" json:"snapshot_id"`
 	CodeIndexBuildID int64          `gorm:"not null;default:0;index" json:"code_index_build_id"`
-	FilePath         string         `gorm:"size:255;not null" json:"file_path"`
+	FilePath         string         `gorm:"size:512;not null" json:"file_path"`
 	StartLine        int            `gorm:"not null" json:"start_line"`
 	EndLine          int            `gorm:"not null" json:"end_line"`
 	Excerpt          string         `gorm:"type:text" json:"excerpt,omitempty"`
-	Reason           string         `gorm:"size:255" json:"reason,omitempty"`
+	Reason           string         `gorm:"size:2048" json:"reason,omitempty"`
 	ContentHash      string         `gorm:"size:64" json:"content_hash,omitempty"`
 	ValidationStatus CitationStatus `gorm:"size:32;not null;default:'UNCHECKED'" json:"validation_status"`
 	ValidationError  string         `gorm:"size:255" json:"validation_error,omitempty"`

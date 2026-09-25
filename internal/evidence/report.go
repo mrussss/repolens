@@ -167,7 +167,7 @@ func ValidateReportStructure(data *DiagnosisReportData) error {
 			return errors.New("finding exceeds the configured limit")
 		}
 		for _, citation := range finding.Citations {
-			if len(citation.FilePath) > 255 || len(citation.Excerpt) > 32*1024 || len(citation.Reason) > 2*1024 {
+			if len(citation.FilePath) > 512 || len(citation.Excerpt) > 32*1024 || len(citation.Reason) > 2*1024 {
 				return errors.New("citation exceeds the configured limit")
 			}
 		}

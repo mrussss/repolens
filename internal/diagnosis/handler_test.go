@@ -225,6 +225,57 @@ func TestDiagnosisStatusExposesExplicitProviderRetryPolicy(t *testing.T) {
 	}
 }
 
+func TestDiagnosisRetryIsFencedByPinnedProviderIdentity(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	ctx := context.Background()
+	store := diagnosis.NewStore(db)
+	jobsStore := jobs.NewStoreWithDriver(mustSQLDB(t, db), "sqlite3")
+	run := &diagnosis.DiagnosisRun{
+		ID: "retry-provider-identity", UserID: "user", RepositoryID: "repo", SnapshotID: "snap",
+		IssueTitle: "retry", IdempotencyKey: "retry-provider-identity-key", IdempotencyRequestHash: "retry-provider-identity-hash",
+		Status: diagnosis.StatusFailed, ProviderConfigFingerprint: "pinned-endpoint-model-auth",
+	}
+	if err := store.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Update("status", diagnosis.StatusFailed).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).Updates(map[string]interface{}{
+		"status": jobs.StatusFailed, "last_error_class": jobs.ErrorClassRetryable, "last_error_code": "PROVIDER_TIMEOUT",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := diagnosis.ProviderMetadata{IsConfigured: true, ConfigFingerprint: "changed-endpoint-model-auth"}
+	svc := diagnosis.NewService(store, repo.NewStore(db), snapshot.NewStore(db)).WithJobStore(jobsStore).WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
+		return metadata
+	})
+	if err := svc.Retry(ctx, run.ID, "user"); !errors.Is(err, diagnosis.ErrProviderIdentityChanged) {
+		t.Fatalf("retry with changed provider identity error = %v, want ErrProviderIdentityChanged", err)
+	}
+	var job jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).First(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != jobs.StatusFailed {
+		t.Fatalf("mismatched-identity retry changed job status to %s", job.Status)
+	}
+
+	// The config fingerprint intentionally excludes the API key, so rotating
+	// only that secret leaves the run retryable under the same provider identity.
+	metadata.ConfigFingerprint = "pinned-endpoint-model-auth"
+	if err := svc.Retry(ctx, run.ID, "user"); err != nil {
+		t.Fatalf("retry after key-only rotation (same identity fingerprint): %v", err)
+	}
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).First(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != jobs.StatusPending {
+		t.Fatalf("same-identity retry job status = %s, want PENDING", job.Status)
+	}
+}
+
 func mustSQLDB(t *testing.T, db *gorm.DB) *sql.DB {
 	t.Helper()
 	sqlDB, err := db.DB()

@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+
+	codeintelmodel "repolens/internal/codeintel/model"
 )
 
 const PipelineVersion = "v2.2.0"
@@ -28,16 +30,16 @@ type pipelineFingerprintInput struct {
 func ComputePipelineFingerprint() string {
 	input := pipelineFingerprintInput{
 		PipelineVersion:      PipelineVersion,
-		ParserVersion:        "v2.1.0",
-		AnalyzerVersion:      "v2.1.0",
-		SymbolSchemaVersion:  "v2.1.0",
-		RetrievalVersion:     "v2.1.0",
-		TokenizerVersion:     "v2.1.0",
+		ParserVersion:        codeintelmodel.CurrentParserVersion,
+		AnalyzerVersion:      codeintelmodel.CurrentAnalyzerVersion,
+		SymbolSchemaVersion:  codeintelmodel.CurrentSymbolSchemaVersion,
+		RetrievalVersion:     codeintelmodel.CurrentRetrievalVersion,
+		TokenizerVersion:     codeintelmodel.CurrentTokenizerVersion,
 		RetrievalStrategy:    "symbol_bm25_structural",
 		BM25K1:               "1.2",
 		BM25B:                "0.75",
 		StructuralParameters: "symbol-expansion-v1",
-		FileFilterVersion:    "filter-v2.1",
+		FileFilterVersion:    "filter-v2.2",
 	}
 	raw, _ := json.Marshal(input)
 	hash := sha256.Sum256(raw)

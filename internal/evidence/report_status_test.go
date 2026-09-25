@@ -87,6 +87,12 @@ func TestValidateReportStructureUsesOneCompleteContract(t *testing.T) {
 		{name: "empty finding title", mutate: func(report *evidence.DiagnosisReportData) { report.Findings[0].Title = "   " }},
 		{name: "empty finding reasoning", mutate: func(report *evidence.DiagnosisReportData) { report.Findings[0].Reasoning = "" }},
 		{name: "long finding title", mutate: func(report *evidence.DiagnosisReportData) { report.Findings[0].Title = strings.Repeat("t", 2*1024+1) }},
+		{name: "long citation reason", mutate: func(report *evidence.DiagnosisReportData) {
+			report.Findings[0].Citations = []evidence.Citation{{Reason: strings.Repeat("r", 2*1024+1)}}
+		}},
+		{name: "citation path exceeds model column", mutate: func(report *evidence.DiagnosisReportData) {
+			report.Findings[0].Citations = []evidence.Citation{{FilePath: strings.Repeat("p", 513)}}
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -100,5 +106,10 @@ func TestValidateReportStructureUsesOneCompleteContract(t *testing.T) {
 				t.Fatalf("classification = %+v err=%v, want INVALID", quality, err)
 			}
 		})
+	}
+	longValidPath := base()
+	longValidPath.Findings[0].Citations = []evidence.Citation{{FilePath: strings.Repeat("p", 400)}}
+	if err := evidence.ValidateReportStructure(longValidPath); err != nil {
+		t.Fatalf("valid citation path within the 512-character storage limit was rejected: %v", err)
 	}
 }

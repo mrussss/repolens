@@ -3,8 +3,10 @@ package snapshotstore_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
@@ -100,5 +102,75 @@ func TestReadFileRangeKeepsUTF8LinesIntactWhenTruncated(t *testing.T) {
 	}
 	if !utf8.ValidString(rangeResult.Content) || rangeResult.Content != "第一行" || rangeResult.EndLine != 1 || !rangeResult.Truncated {
 		t.Fatalf("unexpected UTF-8 truncation result: %+v", rangeResult)
+	}
+}
+
+func TestReadFileRangeStreamsLargeUnselectedLineWithinBoundedRange(t *testing.T) {
+	store := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	root, err := store.EnsureDir("repo", "snap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := strings.Repeat("x", 8*1024*1024) + "\ntarget\n"
+	if err := os.WriteFile(filepath.Join(root, "large.go"), []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rangeResult, err := store.ReadFileRange(context.Background(), "repo", "snap", "large.go", 2, 2, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rangeResult.Content != "target" || rangeResult.StartLine != 2 || rangeResult.EndLine != 2 || rangeResult.TotalLines != 3 || rangeResult.Truncated {
+		t.Fatalf("large bounded range = %+v", rangeResult)
+	}
+}
+
+func TestReadFileRangeBoundedStopsAfterRequestedEnd(t *testing.T) {
+	store := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	root, err := store.EnsureDir("repo", "snap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := "package sample\nfunc Target() {}\n" + strings.Repeat("// irrelevant tail\n", 10000)
+	if err := os.WriteFile(filepath.Join(root, "sample.go"), []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rangeResult, err := store.ReadFileRangeBounded(context.Background(), "repo", "snap", "sample.go", 1, 2, 64*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rangeResult.Content != "package sample\nfunc Target() {}" || rangeResult.EndLine != 2 {
+		t.Fatalf("bounded range = %+v", rangeResult)
+	}
+	if rangeResult.TotalLines != 0 {
+		t.Fatalf("bounded range scanned past the requested end; TotalLines = %d, want unknown (0)", rangeResult.TotalLines)
+	}
+}
+
+func TestReadFileRangesBoundedExtractsManyRangesInOnePass(t *testing.T) {
+	store := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	root, err := store.EnsureDir("repo", "snap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := make([]string, 10000)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line-%d", i+1)
+	}
+	if err := os.WriteFile(filepath.Join(root, "many.go"), []byte(strings.Join(lines, "\n")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ranges := []snapshotstore.LineRange{{StartLine: 2, EndLine: 3}, {StartLine: 9999, EndLine: 10000}, {StartLine: 3, EndLine: 4}}
+	results, err := store.ReadFileRangesBounded(context.Background(), "repo", "snap", "many.go", ranges, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"line-2\nline-3", "line-9999\nline-10000", "line-3\nline-4"}
+	if len(results) != len(want) {
+		t.Fatalf("got %d range results, want %d", len(results), len(want))
+	}
+	for i := range want {
+		if results[i].Err != nil || results[i].Content != want[i] {
+			t.Errorf("range %d = %+v, want content %q", i, results[i], want[i])
+		}
 	}
 }

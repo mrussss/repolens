@@ -1,11 +1,15 @@
 package snapshotstore
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -18,6 +22,16 @@ type FileRange struct {
 	TotalLines int
 	Content    string
 	Truncated  bool
+}
+
+type LineRange struct {
+	StartLine int
+	EndLine   int
+}
+
+type BoundedLineRangeResult struct {
+	Content string
+	Err     error
 }
 
 type SnapshotStore interface {
@@ -58,6 +72,165 @@ func (s *LocalSnapshotStore) ReadFile(ctx context.Context, repoID, snapshotID, r
 }
 
 func (s *LocalSnapshotStore) ReadFileRange(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int) (FileRange, error) {
+	return s.readFileRange(ctx, repoID, snapshotID, relativePath, startLine, endLine, maxBytes, false)
+}
+
+// ReadFileRangeBounded reads only through endLine (or until maxBytes is
+// reached). TotalLines is zero when the scan stops before EOF because the
+// complete line count is then intentionally unknown.
+func (s *LocalSnapshotStore) ReadFileRangeBounded(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int) (FileRange, error) {
+	return s.readFileRange(ctx, repoID, snapshotID, relativePath, startLine, endLine, maxBytes, true)
+}
+
+// ReadFileRangesBounded extracts several line ranges from one file in a
+// single forward scan. Each range retains at most maxBytes of complete lines.
+func (s *LocalSnapshotStore) ReadFileRangesBounded(ctx context.Context, repoID, snapshotID, relativePath string, ranges []LineRange, maxBytes int) ([]BoundedLineRangeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("maxBytes must be positive")
+	}
+	for _, lineRange := range ranges {
+		if lineRange.StartLine < 1 || lineRange.EndLine < lineRange.StartLine {
+			return nil, fmt.Errorf("invalid source range %d-%d", lineRange.StartLine, lineRange.EndLine)
+		}
+	}
+	fullPath, err := s.safePath(repoID, snapshotID, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(fullPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+	defer file.Close()
+	return readBoundedRanges(ctx, bufio.NewReader(file), ranges, maxBytes)
+}
+
+type boundedRangeState struct {
+	content strings.Builder
+	bytes   int
+	hasLine bool
+	started bool
+	done    bool
+	err     error
+}
+
+func readBoundedRanges(ctx context.Context, reader *bufio.Reader, ranges []LineRange, maxBytes int) ([]BoundedLineRangeResult, error) {
+	results := make([]BoundedLineRangeResult, len(ranges))
+	if len(ranges) == 0 {
+		return results, nil
+	}
+	states := make([]boundedRangeState, len(ranges))
+	order := make([]int, len(ranges))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool { return ranges[order[i]].StartLine < ranges[order[j]].StartLine })
+
+	active := make([]int, 0, len(ranges))
+	next, completed, lineNo := 0, 0, 1
+	var line bytes.Buffer
+	lineTooLong := false
+	finish := func(index int, err error) {
+		state := &states[index]
+		if state.done {
+			return
+		}
+		state.done = true
+		state.err = err
+		completed++
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for next < len(order) && ranges[order[next]].StartLine <= lineNo {
+			index := order[next]
+			states[index].started = true
+			active = append(active, index)
+			next++
+		}
+		kept := active[:0]
+		for _, index := range active {
+			if !states[index].done && ranges[index].EndLine >= lineNo {
+				kept = append(kept, index)
+			}
+		}
+		active = kept
+
+		fragment, readErr := reader.ReadSlice('\n')
+		lineComplete := readErr == nil || readErr == io.EOF
+		part := fragment
+		if readErr == nil && len(part) > 0 {
+			part = part[:len(part)-1]
+		}
+		if len(active) > 0 && !lineTooLong {
+			if line.Len()+len(part) > maxBytes {
+				lineTooLong = true
+				line.Reset()
+			} else {
+				_, _ = line.Write(part)
+			}
+		}
+		if lineComplete {
+			for _, index := range active {
+				state := &states[index]
+				if lineTooLong {
+					if state.bytes == 0 {
+						finish(index, ErrLineTooLong)
+					} else {
+						finish(index, nil)
+					}
+					continue
+				}
+				separatorBytes := 0
+				if state.hasLine {
+					separatorBytes = 1
+				}
+				if state.bytes+separatorBytes+line.Len() > maxBytes {
+					if state.bytes == 0 {
+						finish(index, ErrLineTooLong)
+					} else {
+						finish(index, nil)
+					}
+					continue
+				}
+				if state.hasLine {
+					state.content.WriteByte('\n')
+				}
+				state.content.Write(line.Bytes())
+				state.bytes += separatorBytes + line.Len()
+				state.hasLine = true
+				if ranges[index].EndLine <= lineNo {
+					finish(index, nil)
+				}
+			}
+			line.Reset()
+			lineTooLong = false
+			if readErr == io.EOF {
+				break
+			}
+			lineNo++
+			if completed == len(ranges) {
+				break
+			}
+		} else if readErr != bufio.ErrBufferFull {
+			return nil, readErr
+		}
+	}
+
+	for i := range states {
+		if !states[i].started {
+			states[i].err = fmt.Errorf("invalid line range: %d to %d (total lines %d)", ranges[i].StartLine, ranges[i].EndLine, lineNo)
+		}
+		results[i] = BoundedLineRangeResult{Content: states[i].content.String(), Err: states[i].err}
+	}
+	return results, nil
+}
+
+func (s *LocalSnapshotStore) readFileRange(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int, stopAtEnd bool) (FileRange, error) {
 	if err := ctx.Err(); err != nil {
 		return FileRange{}, err
 	}
@@ -66,58 +239,111 @@ func (s *LocalSnapshotStore) ReadFileRange(ctx context.Context, repoID, snapshot
 		return FileRange{}, err
 	}
 
-	data, err := os.ReadFile(fullPath)
+	file, err := os.Open(fullPath)
 	if err != nil {
 		return FileRange{}, fmt.Errorf("failed to read file: %w", err)
 	}
-
-	lines := strings.Split(string(data), "\n")
-	totalLines := len(lines)
+	defer file.Close()
 
 	if startLine <= 0 {
 		startLine = 1
 	}
-	if endLine <= 0 || endLine > totalLines {
-		endLine = totalLines
-	}
-	if startLine > endLine {
-		return FileRange{}, fmt.Errorf("invalid line range: %d to %d (total lines %d)", startLine, endLine, totalLines)
+	if endLine > 0 && startLine > endLine {
+		return FileRange{}, fmt.Errorf("invalid line range: %d to %d", startLine, endLine)
 	}
 
-	selected := lines[startLine-1 : endLine]
-	content := strings.Join(selected, "\n")
+	content, actualEndLine, totalLines, truncated, totalKnown, err := readBoundedLines(ctx, bufio.NewReader(file), startLine, endLine, maxBytes, stopAtEnd)
+	if err != nil {
+		return FileRange{}, err
+	}
+	if totalKnown && startLine > totalLines {
+		return FileRange{}, fmt.Errorf("invalid line range: %d to %d (total lines %d)", startLine, endLine, totalLines)
+	}
 	result := FileRange{
 		Path:       filepath.ToSlash(filepath.Clean(relativePath)),
 		StartLine:  startLine,
-		EndLine:    endLine,
+		EndLine:    actualEndLine,
 		TotalLines: totalLines,
 		Content:    content,
+		Truncated:  truncated,
 	}
-	if maxBytes > 0 && len(content) > maxBytes {
-		var kept []string
-		used := 0
-		for _, line := range selected {
-			extra := len(line)
-			if len(kept) > 0 {
-				extra++
-			}
-			if used+extra > maxBytes {
-				if len(kept) == 0 {
-					return FileRange{}, ErrLineTooLong
-				}
-				break
-			}
-			kept = append(kept, line)
-			used += extra
-		}
-		result.Content = strings.Join(kept, "\n")
-		result.EndLine = startLine + len(kept) - 1
-		result.Truncated = result.EndLine < endLine
+	if !totalKnown {
+		result.TotalLines = 0
 	}
 	if err := ctx.Err(); err != nil {
 		return FileRange{}, err
 	}
 	return result, nil
+}
+
+// readBoundedLines counts the whole file for FileRange.TotalLines but only
+// retains selected lines up to maxBytes. A non-positive limit preserves the
+// historical unbounded API for callers that explicitly require exact content.
+func readBoundedLines(ctx context.Context, reader *bufio.Reader, startLine, requestedEnd, maxBytes int, stopAtEnd bool) (string, int, int, bool, bool, error) {
+	var content strings.Builder
+	lineNo, totalLines := 1, 1
+	selectedLines := 0
+	var currentLine []byte
+	currentLineTooLong := false
+	truncated := false
+	actualEndLine := startLine - 1
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", 0, 0, false, false, err
+		}
+		fragment, readErr := reader.ReadSlice('\n')
+		lineComplete := readErr == nil || readErr == io.EOF
+		part := fragment
+		if readErr == nil && len(part) > 0 {
+			part = part[:len(part)-1]
+		}
+		selected := lineNo >= startLine && (requestedEnd <= 0 || lineNo <= requestedEnd) && !truncated
+		if selected && !currentLineTooLong {
+			if maxBytes > 0 && len(currentLine)+len(part) > maxBytes {
+				currentLineTooLong = true
+				currentLine = nil
+			} else {
+				currentLine = append(currentLine, part...)
+			}
+		}
+
+		if lineComplete {
+			if selected {
+				separatorBytes := 0
+				if selectedLines > 0 {
+					separatorBytes = 1
+				}
+				if currentLineTooLong || (maxBytes > 0 && content.Len()+separatorBytes+len(currentLine) > maxBytes) {
+					if selectedLines == 0 {
+						return "", 0, 0, false, false, ErrLineTooLong
+					}
+					truncated = true
+				} else {
+					if selectedLines > 0 {
+						content.WriteByte('\n')
+					}
+					content.Write(currentLine)
+					selectedLines++
+					actualEndLine = lineNo
+				}
+			}
+			currentLine = nil
+			currentLineTooLong = false
+			if readErr == io.EOF {
+				break
+			}
+			lineNo++
+			totalLines++
+			if stopAtEnd && ((requestedEnd > 0 && lineNo > requestedEnd) || truncated) {
+				return content.String(), actualEndLine, totalLines, truncated, false, nil
+			}
+		} else if readErr != bufio.ErrBufferFull {
+			return "", 0, 0, false, false, readErr
+		}
+	}
+
+	return content.String(), actualEndLine, totalLines, truncated, true, nil
 }
 
 func (s *LocalSnapshotStore) FileExists(repoID, snapshotID, relativePath string) bool {

@@ -14,12 +14,13 @@ const (
 	BuildStatusFailed   BuildStatus = "FAILED"
 )
 
-// Version constants frozen for v2.1
+// Build identities change when persisted parser, analyzer, schema, or retrieval
+// semantics change. Keep historical benchmark fixtures pinned separately.
 const (
-	CurrentParserVersion       = "v2.1.0"
-	CurrentAnalyzerVersion     = "v2.1.0"
+	CurrentParserVersion       = "v2.2.0"
+	CurrentAnalyzerVersion     = "v2.2.0"
 	CurrentSymbolSchemaVersion = "v2.1.0"
-	CurrentRetrievalVersion    = "v2.1.0"
+	CurrentRetrievalVersion    = "v2.2.0"
 	CurrentTokenizerVersion    = "v2.1.0"
 )
 
@@ -36,6 +37,7 @@ type CodeIndexBuild struct {
 	GOOS                string      `json:"goos" gorm:"size:32;not null;default:'linux'"`
 	GOARCH              string      `json:"goarch" gorm:"size:32;not null;default:'amd64'"`
 	BuildTagsHash       string      `json:"build_tags_hash" gorm:"size:64;not null"`
+	BuildTagsJSON       string      `json:"-" gorm:"type:text"`
 	Status              BuildStatus `json:"status" gorm:"size:32;not null;default:'CREATED';index:ix_cib_status"`
 
 	// Completeness & Quality metrics

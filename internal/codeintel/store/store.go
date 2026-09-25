@@ -30,6 +30,7 @@ type Store interface {
 	FailBuild(ctx context.Context, buildID int64, errorCode string) error
 	MarkBuildBuilding(ctx context.Context, buildID int64) error
 	ListSymbols(ctx context.Context, buildID int64, query string, limit int) ([]*model.Symbol, error)
+	ListAllSymbols(ctx context.Context, buildID int64) ([]*model.Symbol, error)
 	GetSymbolByHash(ctx context.Context, buildID int64, symbolKeyHash string) (*model.Symbol, error)
 	ListRelationsForSymbol(ctx context.Context, buildID int64, symbolID int64) ([]*model.SymbolRelation, error)
 	ListRelatedTests(ctx context.Context, buildID int64, symbolKeyHash string) ([]*model.SymbolRelation, error)
@@ -57,9 +58,14 @@ func NewStore(db *gorm.DB) *GormStore {
 
 func (s *GormStore) GetOrCreateBuild(ctx context.Context, snapshotID, modulePath string, bc model.BuildContext) (*model.CodeIndexBuild, bool, error) {
 	ctxHash := bc.BuildContextHash()
+	buildTags := append([]string{}, bc.BuildTags...)
+	tagsJSON, err := json.Marshal(buildTags)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode code index build tags: %w", err)
+	}
 	var existing model.CodeIndexBuild
 
-	err := s.db.WithContext(ctx).Where(
+	err = s.db.WithContext(ctx).Where(
 		"snapshot_id = ? AND parser_version = ? AND analyzer_version = ? AND symbol_schema_version = ? AND build_context_hash = ?",
 		snapshotID, model.CurrentParserVersion, model.CurrentAnalyzerVersion, model.CurrentSymbolSchemaVersion, ctxHash,
 	).First(&existing).Error
@@ -82,6 +88,7 @@ func (s *GormStore) GetOrCreateBuild(ctx context.Context, snapshotID, modulePath
 		GOOS:                bc.GOOS,
 		GOARCH:              bc.GOARCH,
 		BuildTagsHash:       bc.BuildTagsHash(),
+		BuildTagsJSON:       string(tagsJSON),
 		Status:              model.BuildStatusCreated,
 		CreatedAt:           time.Now().UTC(),
 	}
@@ -173,6 +180,7 @@ func (s *GormStore) saveAnalysisResultTx(tx *gorm.DB, buildID int64, res *model.
 	}
 
 	// 3. Batch insert SymbolRelations
+	testRelationKeys := make(map[string]struct{})
 	for _, rel := range res.Relations {
 		rel.CodeIndexBuildID = buildID
 		if rel.FromSymbolKeyHash != "" {
@@ -191,6 +199,46 @@ func (s *GormStore) saveAnalysisResultTx(tx *gorm.DB, buildID int64, res *model.
 		if err := tx.Create(rel).Error; err != nil {
 			return fmt.Errorf("failed saving symbol relation: %w", err)
 		}
+		if rel.RelationType == model.RelationTypeTestRelation {
+			testRelationKeys[relatedTestKey(rel.FromSymbolKeyHash, rel.ToSymbolKeyHash)] = struct{}{}
+		}
+	}
+
+	// Persist test discovery in the same transaction as files, symbols, and
+	// ordinary relations so a CodeIndexBuild cannot become READY with only a
+	// partial test relation graph.
+	for _, discovery := range res.RelatedTests {
+		key := relatedTestKey(discovery.TargetSymbolKeyHash, discovery.TestSymbolKeyHash)
+		if _, exists := testRelationKeys[key]; exists {
+			continue
+		}
+		fromID, fromOK := symbolMap[discovery.TargetSymbolKeyHash]
+		toID, toOK := symbolMap[discovery.TestSymbolKeyHash]
+		fileID, fileOK := fileMap[discovery.TestFilePath]
+		if !fromOK || !toOK || !fileOK {
+			return fmt.Errorf("related test discovery references missing target, test, or file: target=%s test=%s file=%s", discovery.TargetSymbolKeyHash, discovery.TestSymbolKeyHash, discovery.TestFilePath)
+		}
+		relation := &model.SymbolRelation{
+			CodeIndexBuildID:  buildID,
+			FromSymbolID:      &fromID,
+			FromSymbolKeyHash: discovery.TargetSymbolKeyHash,
+			ToSymbolID:        &toID,
+			ToSymbolKeyHash:   discovery.TestSymbolKeyHash,
+			RelationType:      model.RelationTypeTestRelation,
+			ResolutionKind:    discovery.ResolutionKind,
+			Confidence:        discovery.Confidence,
+			ReasonCode:        string(discovery.ReasonCode),
+			ReasonDetail:      discovery.Explanation,
+			TargetName:        discovery.TestSymbolName,
+			FilePath:          discovery.TestFilePath,
+			FileID:            fileID,
+			Line:              discovery.TestLine,
+			Column:            1,
+		}
+		if err := tx.Create(relation).Error; err != nil {
+			return fmt.Errorf("failed saving related test %s for symbol %s: %w", discovery.TestSymbolName, discovery.TargetSymbolName, err)
+		}
+		testRelationKeys[key] = struct{}{}
 	}
 
 	// 4. Update CodeIndexBuild with metrics and READY status
@@ -221,6 +269,10 @@ func (s *GormStore) saveAnalysisResultTx(tx *gorm.DB, buildID int64, res *model.
 		return fmt.Errorf("code index build %d finalize conflict", buildID)
 	}
 	return nil
+}
+
+func relatedTestKey(targetHash, testHash string) string {
+	return targetHash + "\x00" + testHash
 }
 
 func (s *GormStore) FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, res *model.AnalysisResult) error {
@@ -265,7 +317,7 @@ func (s *GormStore) FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jo
 				Strategy:           "BM25",
 				RetrievalVersion:   model.CurrentRetrievalVersion,
 				TokenizerVersion:   model.CurrentTokenizerVersion,
-				ConfigHash:         "config-v2.1",
+				ConfigHash:         "config-v2.2",
 				Status:             model.BuildStatusCreated,
 				CreatedAt:          now,
 			}
@@ -370,6 +422,19 @@ func (s *GormStore) ListSymbols(ctx context.Context, buildID int64, query string
 	return symbols, nil
 }
 
+// ListAllSymbols returns every symbol in deterministic insertion order for
+// internal consumers that must process a complete CodeIndexBuild.
+func (s *GormStore) ListAllSymbols(ctx context.Context, buildID int64) ([]*model.Symbol, error) {
+	var symbols []*model.Symbol
+	if err := s.db.WithContext(ctx).
+		Where("code_index_build_id = ?", buildID).
+		Order("id ASC").
+		Find(&symbols).Error; err != nil {
+		return nil, err
+	}
+	return symbols, nil
+}
+
 func (s *GormStore) GetSymbolByHash(ctx context.Context, buildID int64, symbolKeyHash string) (*model.Symbol, error) {
 	var sym model.Symbol
 	err := s.db.WithContext(ctx).
@@ -405,7 +470,7 @@ func (s *GormStore) ListRelatedTests(ctx context.Context, buildID int64, symbolK
 
 // RetrievalBuild implementation
 func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuildID int64, strategy string) (*model.RetrievalBuild, bool, error) {
-	configHash := "config-v2.1"
+	configHash := "config-v2.2"
 	var existing model.RetrievalBuild
 
 	err := s.db.WithContext(ctx).Where(

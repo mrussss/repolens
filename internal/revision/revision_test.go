@@ -81,6 +81,52 @@ func TestPrepareCreatesOneProductRevisionAndLineage(t *testing.T) {
 	}
 }
 
+func TestPrepareCreatesNewSnapshotForExistingCommitAfterPipelineChange(t *testing.T) {
+	db := newRevisionDB(t)
+	ctx := context.Background()
+	repoStore := repo.NewStore(db)
+	repository := &repo.Repository{ID: "repo-pipeline-upgrade", UserID: "local-user", Name: "fixture", GitURL: "https://github.com/example/pipeline-upgrade", DefaultRef: "main"}
+	if err := repoStore.Create(ctx, repository); err != nil {
+		t.Fatal(err)
+	}
+	const commitSHA = "0123456789012345678901234567890123456789"
+	oldRevision := &revision.AnalysisRevision{
+		ID: "legacy-v21-revision", RepositoryID: repository.ID, SourceRef: "main", CommitSHA: commitSHA,
+		PipelineVersion: "v2.1.0", PipelineFingerprint: "legacy-v2.1-fingerprint",
+		Status: revision.StatusReady, Stage: revision.StageReady,
+	}
+	if err := db.Create(oldRevision).Error; err != nil {
+		t.Fatalf("seed historical READY revision: %v", err)
+	}
+	oldSnapshot := &snapshot.RepositorySnapshot{
+		ID: "legacy-v21-snapshot", RepositoryID: repository.ID, AnalysisRevisionID: oldRevision.ID,
+		CommitSHA: commitSHA, Ref: "main", MaterializedPath: filepath.Join(t.TempDir(), "legacy-source"),
+		ContentHash: "legacy-content-hash", Status: snapshot.StatusReady,
+	}
+	if err := db.Create(oldSnapshot).Error; err != nil {
+		t.Fatalf("seed historical READY snapshot: %v", err)
+	}
+
+	service := revision.NewService(revision.NewStore(db), repoStore, fixedResolver{sha: commitSHA}, t.TempDir())
+	current, created, err := service.Prepare(ctx, "local-user", repository.ID, "main")
+	if err != nil || !created {
+		t.Fatalf("prepare after pipeline change = created=%v err=%v", created, err)
+	}
+	if current.ID == oldRevision.ID || current.SnapshotID == oldSnapshot.ID || current.PipelineFingerprint == oldRevision.PipelineFingerprint {
+		t.Fatalf("new pipeline reused historical revision identity: current=%+v old=%+v", current, oldRevision)
+	}
+	var snapshots []snapshot.RepositorySnapshot
+	if err := db.Where("repository_id = ? AND commit_sha = ?", repository.ID, commitSHA).Find(&snapshots).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 2 {
+		t.Fatalf("snapshot count for same commit across revisions = %d, want 2", len(snapshots))
+	}
+	if snapshots[0].AnalysisRevisionID == snapshots[1].AnalysisRevisionID {
+		t.Fatalf("revision-scoped snapshots have duplicate lineage IDs: %+v", snapshots)
+	}
+}
+
 func TestRevisionTransitionsToReadyAndRetryIsExplicit(t *testing.T) {
 	db := newRevisionDB(t)
 	ctx := context.Background()
@@ -120,7 +166,7 @@ func TestRevisionTransitionsToReadyAndRetryIsExplicit(t *testing.T) {
 	retrievalBuild := &codeintelmodel.RetrievalBuild{
 		CodeIndexBuildID: codeBuild.ID, AnalysisRevisionID: value.ID, Strategy: "BM25",
 		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion, TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
-		ConfigHash: "config-v2.1", Status: codeintelmodel.BuildStatusReady,
+		ConfigHash: "config-v2.2", Status: codeintelmodel.BuildStatusReady,
 	}
 	if err := db.Create(retrievalBuild).Error; err != nil {
 		t.Fatal(err)

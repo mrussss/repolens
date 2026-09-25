@@ -2,8 +2,10 @@ package diagnosis
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,18 +16,19 @@ import (
 )
 
 var (
-	ErrIdempotencyConflict   = errors.New("idempotency conflict: request payload differs from existing record")
-	ErrInvalidBuildSelection = errors.New("code index and retrieval build IDs must be positive")
-	ErrBuildNotReady         = errors.New("diagnosis build is not ready")
-	ErrProviderNotConfigured = errors.New("provider is not configured")
-	ErrRunNotFound           = errors.New("diagnosis run not found")
-	ErrAttemptNotFound       = errors.New("diagnosis attempt not found")
-	ErrAttemptNotRunning     = errors.New("diagnosis attempt is not running")
-	ErrAttemptAlreadyExists  = errors.New("diagnosis attempt already exists")
-	ErrAttemptLeaseActive    = errors.New("diagnosis attempt still has an active job lease")
-	ErrClaimConflict         = errors.New("run claim conflict: status is not in expected state or already claimed")
-	ErrRunTransitionConflict = errors.New("diagnosis run is not running")
-	ErrOptimisticLock        = errors.New("optimistic lock conflict")
+	ErrIdempotencyConflict     = errors.New("idempotency conflict: request payload differs from existing record")
+	ErrInvalidBuildSelection   = errors.New("code index and retrieval build IDs must be positive")
+	ErrBuildNotReady           = errors.New("diagnosis build is not ready")
+	ErrProviderNotConfigured   = errors.New("provider is not configured")
+	ErrProviderIdentityChanged = errors.New("provider identity changed since diagnosis was created")
+	ErrRunNotFound             = errors.New("diagnosis run not found")
+	ErrAttemptNotFound         = errors.New("diagnosis attempt not found")
+	ErrAttemptNotRunning       = errors.New("diagnosis attempt is not running")
+	ErrAttemptAlreadyExists    = errors.New("diagnosis attempt already exists")
+	ErrAttemptLeaseActive      = errors.New("diagnosis attempt still has an active job lease")
+	ErrClaimConflict           = errors.New("run claim conflict: status is not in expected state or already claimed")
+	ErrRunTransitionConflict   = errors.New("diagnosis run is not running")
+	ErrOptimisticLock          = errors.New("optimistic lock conflict")
 )
 
 type Store interface {
@@ -34,6 +37,8 @@ type Store interface {
 	GetByIDAndUser(ctx context.Context, id, userID string) (*DiagnosisRun, error)
 	GetByIdempotencyKey(ctx context.Context, userID, key string) (*DiagnosisRun, error)
 	ListByUser(ctx context.Context, userID string, page, pageSize int) ([]DiagnosisRun, int64, error)
+	HasActiveRuns(ctx context.Context) (bool, error)
+	WithProviderConfigLock(ctx context.Context, fn func() error) error
 	ClaimRun(ctx context.Context, runID string, expectedStatuses []RunStatus, workerID string, attemptDeadline time.Duration) (*DiagnosisRun, *DiagnosisAttempt, error)
 	GetAttempt(ctx context.Context, attemptID string) (*DiagnosisAttempt, error)
 	GetLatestFinalCheckpoint(ctx context.Context, runID string, executionGeneration int) (*DiagnosisAttempt, error)
@@ -49,7 +54,8 @@ type Store interface {
 }
 
 type GormStore struct {
-	db *gorm.DB
+	db               *gorm.DB
+	providerConfigMu sync.Mutex
 }
 
 // StartAttempt records the business transition and attempt row before an
@@ -410,6 +416,53 @@ func (s *GormStore) ListByUser(ctx context.Context, userID string, page, pageSiz
 		return nil, 0, err
 	}
 	return runs, total, nil
+}
+
+// HasActiveRuns reports whether any user has a queued or running diagnosis.
+// The EXISTS query is independent of pagination and does not load run data.
+func (s *GormStore) HasActiveRuns(ctx context.Context) (bool, error) {
+	var active bool
+	err := s.db.WithContext(ctx).Raw(
+		"SELECT EXISTS (SELECT 1 FROM diagnosis_runs WHERE status IN (?, ?))",
+		StatusQueued, StatusRunning,
+	).Scan(&active).Error
+	return active, err
+}
+
+// WithProviderConfigLock serializes provider-identity changes with diagnosis
+// creation. MySQL's named lock coordinates API processes; SQLite and other
+// local test/development stores use the shared GormStore instance mutex.
+func (s *GormStore) WithProviderConfigLock(ctx context.Context, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	if s.db.Dialector.Name() != "mysql" {
+		s.providerConfigMu.Lock()
+		defer s.providerConfigMu.Unlock()
+		return fn()
+	}
+
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return err
+	}
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var acquired sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", "repolens:provider_config_identity", 30).Scan(&acquired); err != nil {
+		return fmt.Errorf("acquire provider identity lock: %w", err)
+	}
+	if !acquired.Valid || acquired.Int64 != 1 {
+		return errors.New("timed out acquiring provider identity lock")
+	}
+	defer func() {
+		var released sql.NullInt64
+		_ = conn.QueryRowContext(context.Background(), "SELECT RELEASE_LOCK(?)", "repolens:provider_config_identity").Scan(&released)
+	}()
+	return fn()
 }
 
 func (s *GormStore) ClaimRun(ctx context.Context, runID string, expectedStatuses []RunStatus, workerID string, attemptDeadline time.Duration) (*DiagnosisRun, *DiagnosisAttempt, error) {
