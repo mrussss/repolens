@@ -24,6 +24,16 @@ type ownedRunningJob struct {
 	cancelRequested     bool
 }
 
+type expiredJob struct {
+	id                  int64
+	jobType             JobType
+	resourceID          string
+	executionGeneration int
+	attemptCount        int
+	maxAttempts         int
+	cancelRequested     bool
+}
+
 // NewStore creates a new Store instance defaulting to MySQL.
 func NewStore(db *sql.DB) *Store {
 	return &Store{db: db, driver: "mysql"}
@@ -608,7 +618,9 @@ func (s *Store) IsCancelRequested(ctx context.Context, jobID int64, workerID, cl
 	return requested, err
 }
 
-// ReapExpiredJobs scans for RUNNING jobs with expired leases and moves them to RETRY_WAIT or terminal FAILED.
+// ReapExpiredJobs scans for RUNNING jobs with expired leases and moves them to
+// RETRY_WAIT or terminal FAILED. An accepted Diagnosis cancellation takes
+// precedence over both retry scheduling and retry exhaustion.
 func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -617,7 +629,8 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 	defer tx.Rollback()
 
 	selectQuery := `
-		SELECT id, attempt_count, max_attempts
+		SELECT id, job_type, resource_id, execution_generation,
+		       attempt_count, max_attempts, cancel_requested
 		FROM analysis_jobs
 		WHERE status = 'RUNNING'
 		  AND lease_until < ?
@@ -633,15 +646,11 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 	}
 	defer rows.Close()
 
-	type expiredJob struct {
-		id           int64
-		attemptCount int
-		maxAttempts  int
-	}
 	var expired []expiredJob
 	for rows.Next() {
 		var ej expiredJob
-		if err := rows.Scan(&ej.id, &ej.attemptCount, &ej.maxAttempts); err != nil {
+		if err := rows.Scan(&ej.id, &ej.jobType, &ej.resourceID, &ej.executionGeneration,
+			&ej.attemptCount, &ej.maxAttempts, &ej.cancelRequested); err != nil {
 			return 0, err
 		}
 		expired = append(expired, ej)
@@ -650,6 +659,13 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 
 	reapedCount := 0
 	for _, ej := range expired {
+		if ej.jobType == JobTypeRunDiagnosis && ej.cancelRequested {
+			if err := s.cancelExpiredDiagnosisTx(ctx, tx, ej, now); err != nil {
+				return 0, err
+			}
+			reapedCount++
+			continue
+		}
 		if ej.attemptCount < ej.maxAttempts {
 			// Schedule retry
 			backoff := CalculateBackoff(ej.attemptCount, time.Second, time.Minute)
@@ -696,6 +712,55 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 		return 0, err
 	}
 	return reapedCount, nil
+}
+
+func (s *Store) cancelExpiredDiagnosisTx(ctx context.Context, tx *sql.Tx, expired expiredJob, now time.Time) error {
+	jobResult, err := tx.ExecContext(ctx, `UPDATE analysis_jobs
+		SET status = 'CANCELLED', terminal_reason = 'CANCELLED', finished_at = ?, updated_at = ?
+		WHERE id = ? AND status = 'RUNNING' AND cancel_requested = TRUE AND lease_until < ?`,
+		now, now, expired.id, now)
+	if err != nil {
+		return fmt.Errorf("failed cancelling expired diagnosis job %d: %w", expired.id, err)
+	}
+	if affected, err := jobResult.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return fmt.Errorf("expired diagnosis job %d changed before cancellation recovery", expired.id)
+	}
+
+	// A worker whose lease expired no longer owns the running attempt. Preserve
+	// the reaper's existing ABANDONED semantics, but scope the transition to the
+	// expired job's execution generation so an older attempt cannot be touched.
+	if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts
+		SET status = 'ABANDONED', finished_at = ?
+		WHERE diagnosis_run_id = ? AND execution_generation = ? AND status = 'RUNNING'`,
+		now, expired.resourceID, expired.executionGeneration); err != nil {
+		return fmt.Errorf("failed abandoning expired diagnosis attempts for %s: %w", expired.resourceID, err)
+	}
+
+	runResult, err := tx.ExecContext(ctx, `UPDATE diagnosis_runs
+		SET status = 'CANCELLED', cancel_requested = TRUE,
+		    final_attempt_id = (SELECT id FROM diagnosis_attempts
+		        WHERE diagnosis_run_id = ? AND execution_generation = ?
+		        ORDER BY attempt_no DESC, created_at DESC LIMIT 1),
+		    version = version + 1
+		WHERE id = ? AND status IN ('QUEUED', 'RUNNING')`,
+		expired.resourceID, expired.executionGeneration, expired.resourceID)
+	if err != nil {
+		return fmt.Errorf("failed cancelling expired diagnosis run %s: %w", expired.resourceID, err)
+	}
+	if affected, err := runResult.RowsAffected(); err != nil {
+		return err
+	} else if affected == 0 {
+		var status string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM diagnosis_runs WHERE id = ?`, expired.resourceID).Scan(&status); err != nil {
+			return fmt.Errorf("failed verifying expired diagnosis run %s cancellation: %w", expired.resourceID, err)
+		}
+		if status != "CANCELLED" {
+			return fmt.Errorf("expired diagnosis run %s cannot be cancelled from status %s", expired.resourceID, status)
+		}
+	}
+	return nil
 }
 
 func (s *Store) failBusinessForReapedJob(ctx context.Context, tx *sql.Tx, jobID int64) error {

@@ -497,3 +497,108 @@ func TestRealMySQL_LeaseRenewalAndReaping(t *testing.T) {
 		t.Errorf("expected job in RETRY_WAIT after reaping on MySQL, got %s", reapedJob.Status)
 	}
 }
+
+func TestRealMySQL_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *testing.T) {
+	db, jobsStore, cleanup := setupRealMySQL(t)
+	if db == nil {
+		return
+	}
+	defer cleanup()
+
+	ctx := context.Background()
+	diagStore := diagnosis.NewStore(db)
+	type reapCase struct {
+		name            string
+		cancelRequested bool
+		maxAttempts     int
+		wantJob         jobs.JobStatus
+		wantRun         diagnosis.RunStatus
+		wantAttempt     diagnosis.AttemptStatus
+		wantReason      *jobs.TerminalReason
+	}
+	cancelledReason := jobs.TerminalReasonCancelled
+	exhaustedReason := jobs.TerminalReasonRetryableExhausted
+	cases := []reapCase{
+		{name: "cancellation before exhausted lease", cancelRequested: true, maxAttempts: 1, wantJob: jobs.StatusCancelled, wantRun: diagnosis.StatusCancelled, wantAttempt: diagnosis.AttemptStatusAbandoned, wantReason: &cancelledReason},
+		{name: "cancellation before retryable lease", cancelRequested: true, maxAttempts: 3, wantJob: jobs.StatusCancelled, wantRun: diagnosis.StatusCancelled, wantAttempt: diagnosis.AttemptStatusAbandoned, wantReason: &cancelledReason},
+		{name: "exhausted lease without cancellation", cancelRequested: false, maxAttempts: 1, wantJob: jobs.StatusFailed, wantRun: diagnosis.StatusFailed, wantAttempt: diagnosis.AttemptStatusAbandoned, wantReason: &exhaustedReason},
+		{name: "retryable lease without cancellation", cancelRequested: false, maxAttempts: 3, wantJob: jobs.StatusRetryWait, wantRun: diagnosis.StatusRunning, wantAttempt: diagnosis.AttemptStatusRunning},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := fmt.Sprintf("diag-reap-cancel-%d", i)
+			run := &diagnosis.DiagnosisRun{
+				ID: runID, UserID: "user-" + runID, RepositoryID: "repo-reaper",
+				SnapshotID: "snapshot-reaper", IssueTitle: "reaper cancellation priority",
+				IdempotencyKey: "key-" + runID, IdempotencyRequestHash: "hash-" + runID,
+			}
+			if err := diagStore.Create(ctx, run); err != nil {
+				t.Fatalf("create diagnosis: %v", err)
+			}
+			claimed, err := jobsStore.ClaimJobs(ctx, "worker-reaper-cancel", 1, time.Minute)
+			if err != nil || len(claimed) != 1 || claimed[0].ResourceID != runID {
+				t.Fatalf("claim diagnosis job: claimed=%+v err=%v", claimed, err)
+			}
+			attempt := &diagnosis.DiagnosisAttempt{
+				ID: runID + "-attempt", DiagnosisRunID: runID, ExecutionGeneration: claimed[0].ExecutionGeneration,
+				AttemptNo: claimed[0].AttemptCount, WorkerID: "worker-reaper-cancel",
+			}
+			if err := diagStore.StartAttempt(ctx, runID, attempt); err != nil {
+				t.Fatalf("start DiagnosisAttempt: %v", err)
+			}
+			sqlDB, err := db.DB()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqlDB.ExecContext(ctx, `UPDATE analysis_jobs SET max_attempts = ? WHERE id = ?`, tc.maxAttempts, claimed[0].ID); err != nil {
+				t.Fatalf("set attempt limit: %v", err)
+			}
+			if tc.cancelRequested {
+				if err := diagStore.RequestCancellation(ctx, runID, run.UserID); err != nil {
+					t.Fatalf("accept user cancellation: %v", err)
+				}
+			}
+			if _, err := sqlDB.ExecContext(ctx, `UPDATE analysis_jobs SET lease_until = ? WHERE id = ?`, time.Now().UTC().Add(-time.Second), claimed[0].ID); err != nil {
+				t.Fatalf("expire job lease: %v", err)
+			}
+
+			reaped, err := jobsStore.ReapExpiredJobs(ctx, 10)
+			if err != nil || reaped != 1 {
+				t.Fatalf("ReapExpiredJobs = %d, err=%v; want 1", reaped, err)
+			}
+			savedJob, err := jobsStore.GetJobByID(ctx, claimed[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if savedJob.Status != tc.wantJob {
+				t.Fatalf("Job status = %s, want %s", savedJob.Status, tc.wantJob)
+			}
+			if tc.wantReason == nil {
+				if savedJob.TerminalReason != nil {
+					t.Fatalf("Job terminal reason = %v, want nil", *savedJob.TerminalReason)
+				}
+			} else if savedJob.TerminalReason == nil || *savedJob.TerminalReason != *tc.wantReason {
+				t.Fatalf("Job terminal reason = %v, want %s", savedJob.TerminalReason, *tc.wantReason)
+			}
+
+			savedRun, err := diagStore.GetByID(ctx, runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if savedRun.Status != tc.wantRun {
+				t.Fatalf("DiagnosisRun status = %s, want %s", savedRun.Status, tc.wantRun)
+			}
+			attempts, err := diagStore.ListAttemptsByRun(ctx, runID)
+			if err != nil || len(attempts) != 1 {
+				t.Fatalf("list DiagnosisAttempts: count=%d err=%v", len(attempts), err)
+			}
+			if attempts[0].Status != tc.wantAttempt {
+				t.Fatalf("DiagnosisAttempt status = %s, want %s", attempts[0].Status, tc.wantAttempt)
+			}
+			if tc.wantAttempt == diagnosis.AttemptStatusAbandoned && savedRun.FinalAttemptID != attempt.ID {
+				t.Fatalf("final_attempt_id = %q, want %q", savedRun.FinalAttemptID, attempt.ID)
+			}
+		})
+	}
+}

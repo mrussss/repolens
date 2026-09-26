@@ -428,6 +428,103 @@ func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
 	}
 }
 
+func TestStore_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	for _, ddl := range []string{
+		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, cancel_requested BOOLEAN NOT NULL DEFAULT 0, final_attempt_id TEXT, version INTEGER NOT NULL)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, created_at DATETIME)`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type reapCase struct {
+		name            string
+		cancelRequested bool
+		attemptCount    int
+		maxAttempts     int
+		wantJob         jobs.JobStatus
+		wantRun         string
+		wantAttempt     string
+		wantReason      *jobs.TerminalReason
+	}
+	cancelledReason := jobs.TerminalReasonCancelled
+	retryExhaustedReason := jobs.TerminalReasonRetryableExhausted
+	cases := []reapCase{
+		{name: "cancelled and exhausted", cancelRequested: true, attemptCount: 1, maxAttempts: 1, wantJob: jobs.StatusCancelled, wantRun: "CANCELLED", wantAttempt: "ABANDONED", wantReason: &cancelledReason},
+		{name: "cancelled with attempts remaining", cancelRequested: true, attemptCount: 1, maxAttempts: 3, wantJob: jobs.StatusCancelled, wantRun: "CANCELLED", wantAttempt: "ABANDONED", wantReason: &cancelledReason},
+		{name: "not cancelled and exhausted", cancelRequested: false, attemptCount: 1, maxAttempts: 1, wantJob: jobs.StatusFailed, wantRun: "FAILED", wantAttempt: "ABANDONED", wantReason: &retryExhaustedReason},
+		{name: "not cancelled with attempts remaining", cancelRequested: false, attemptCount: 1, maxAttempts: 3, wantJob: jobs.StatusRetryWait, wantRun: "RUNNING", wantAttempt: "RUNNING"},
+	}
+
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := fmt.Sprintf("diag-reap-cancel-%d", i)
+			attemptID := runID + "-attempt"
+			if _, err := db.Exec(`INSERT INTO diagnosis_runs (id, status, cancel_requested, version) VALUES (?, 'RUNNING', ?, 1)`, runID, tc.cancelRequested); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO diagnosis_attempts (id, diagnosis_run_id, execution_generation, attempt_no, status) VALUES (?, ?, 1, 1, 'RUNNING')`, attemptID, runID); err != nil {
+				t.Fatal(err)
+			}
+			job := &jobs.AnalysisJob{
+				JobType: jobs.JobTypeRunDiagnosis, ResourceID: runID,
+				AttemptCount: tc.attemptCount, MaxAttempts: tc.maxAttempts,
+			}
+			if err := store.CreateJob(ctx, job); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE analysis_jobs
+				SET status='RUNNING', worker_id='dead-worker', claim_token='dead-token',
+				    lease_until=datetime('now','-1 second'), cancel_requested=?
+				WHERE id=?`, tc.cancelRequested, job.ID); err != nil {
+				t.Fatal(err)
+			}
+
+			reaped, err := store.ReapExpiredJobs(ctx, 10)
+			if err != nil || reaped != 1 {
+				t.Fatalf("ReapExpiredJobs = %d, err=%v; want 1 reaped job", reaped, err)
+			}
+			savedJob, err := store.GetJobByID(ctx, job.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if savedJob.Status != tc.wantJob {
+				t.Fatalf("job status = %s, want %s", savedJob.Status, tc.wantJob)
+			}
+			if tc.wantReason == nil {
+				if savedJob.TerminalReason != nil {
+					t.Fatalf("terminal reason = %v, want nil", *savedJob.TerminalReason)
+				}
+			} else if savedJob.TerminalReason == nil || *savedJob.TerminalReason != *tc.wantReason {
+				t.Fatalf("terminal reason = %v, want %s", savedJob.TerminalReason, *tc.wantReason)
+			}
+
+			var runStatus, attemptStatus string
+			var finalAttemptID sql.NullString
+			if err := db.QueryRow(`SELECT status, final_attempt_id FROM diagnosis_runs WHERE id=?`, runID).Scan(&runStatus, &finalAttemptID); err != nil {
+				t.Fatal(err)
+			}
+			if runStatus != tc.wantRun {
+				t.Fatalf("diagnosis status = %s, want %s", runStatus, tc.wantRun)
+			}
+			if err := db.QueryRow(`SELECT status FROM diagnosis_attempts WHERE id=?`, attemptID).Scan(&attemptStatus); err != nil {
+				t.Fatal(err)
+			}
+			if attemptStatus != tc.wantAttempt {
+				t.Fatalf("attempt status = %s, want %s", attemptStatus, tc.wantAttempt)
+			}
+			if tc.wantAttempt == "ABANDONED" && (!finalAttemptID.Valid || finalAttemptID.String != attemptID) {
+				t.Fatalf("final_attempt_id = %v, want %s", finalAttemptID, attemptID)
+			}
+		})
+	}
+}
+
 func TestStore_TerminalStageFailureSynchronizesAnalysisRevision(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
