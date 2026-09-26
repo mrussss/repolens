@@ -80,6 +80,14 @@ func (f *FileFilter) ShouldIgnoreDir(dirName string) bool {
 }
 
 func (f *FileFilter) ShouldIgnoreFile(relPath string, sizeBytes int64) bool {
+	return f.IsExplicitlyIgnoredFile(relPath) || f.IsOversized(sizeBytes)
+}
+
+// IsExplicitlyIgnoredFile reports files excluded by path/name/type policy,
+// independently of their size. Snapshot materialization uses this before the
+// hard source-file size limit so large images, secrets, and files under ignored
+// directories cannot fail a build for content that will never be indexed.
+func (f *FileFilter) IsExplicitlyIgnoredFile(relPath string) bool {
 	base := filepath.Base(relPath)
 	lowerBase := strings.ToLower(base)
 	ext := strings.ToLower(filepath.Ext(relPath))
@@ -91,9 +99,6 @@ func (f *FileFilter) ShouldIgnoreFile(relPath string, sizeBytes int64) bool {
 		return true
 	}
 	if ignoredExtensions[ext] {
-		return true
-	}
-	if sizeBytes > f.maxFileSizeKB*1024 {
 		return true
 	}
 

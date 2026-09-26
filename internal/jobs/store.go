@@ -17,6 +17,13 @@ type Store struct {
 	driver string
 }
 
+type ownedRunningJob struct {
+	jobType             JobType
+	resourceID          string
+	executionGeneration int
+	cancelRequested     bool
+}
+
 // NewStore creates a new Store instance defaulting to MySQL.
 func NewStore(db *sql.DB) *Store {
 	return &Store{db: db, driver: "mysql"}
@@ -292,10 +299,20 @@ func (s *Store) ConditionalFinalizeSuccess(ctx context.Context, jobID int64, wor
 
 // ConditionalFinalizeFailureTx records failure details (either RETRY_WAIT or terminal FAILED) with claim verification.
 func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jobID int64, workerID, claimToken string, errClass ErrorClass, errCode, errMsg string, terminalReason *TerminalReason, isTerminal bool, nextRunAt time.Time) error {
+	owned, err := s.loadOwnedRunningJobTx(ctx, tx, jobID, workerID, claimToken)
+	if err != nil {
+		return err
+	}
+	if owned.jobType == JobTypeRunDiagnosis && owned.cancelRequested {
+		// A user cancellation accepted while the handler was returning a
+		// retryable error wins over retry scheduling and terminalizes both state
+		// machines in the same transaction.
+		return s.ConditionalFinalizeCancelTx(ctx, tx, jobID, workerID, claimToken)
+	}
+
 	now := time.Now().UTC()
 	var query string
-	var err error
-	var res sql.Result
+	var args []interface{}
 
 	if isTerminal {
 		query = `
@@ -312,7 +329,7 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 			  AND worker_id = ?
 			  AND claim_token = ?
 		`
-		res, err = tx.ExecContext(ctx, query, terminalReason, string(errClass), errCode, errMsg, now, now, jobID, workerID, claimToken)
+		args = []interface{}{terminalReason, string(errClass), errCode, errMsg, now, now, jobID, workerID, claimToken}
 	} else {
 		query = `
 			UPDATE analysis_jobs
@@ -327,8 +344,12 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 			  AND worker_id = ?
 			  AND claim_token = ?
 		`
-		res, err = tx.ExecContext(ctx, query, nextRunAt, string(errClass), errCode, errMsg, now, jobID, workerID, claimToken)
+		args = []interface{}{nextRunAt, string(errClass), errCode, errMsg, now, jobID, workerID, claimToken}
 	}
+	if owned.jobType == JobTypeRunDiagnosis {
+		query += " AND cancel_requested = FALSE"
+	}
+	res, err := tx.ExecContext(ctx, query, args...)
 
 	if err != nil {
 		return fmt.Errorf("failed finalizing failure for job %d: %w", jobID, err)
@@ -338,6 +359,12 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 		return err
 	}
 	if rowsAffected == 0 {
+		if owned.jobType == JobTypeRunDiagnosis {
+			current, currentErr := s.loadOwnedRunningJobTx(ctx, tx, jobID, workerID, claimToken)
+			if currentErr == nil && current.cancelRequested {
+				return s.ConditionalFinalizeCancelTx(ctx, tx, jobID, workerID, claimToken)
+			}
+		}
 		return ErrOwnershipLost
 	}
 	if isTerminal {
@@ -346,6 +373,25 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 		}
 	}
 	return nil
+}
+
+func (s *Store) loadOwnedRunningJobTx(ctx context.Context, tx *sql.Tx, jobID int64, workerID, claimToken string) (ownedRunningJob, error) {
+	query := `SELECT job_type, resource_id, execution_generation, cancel_requested
+		FROM analysis_jobs
+		WHERE id = ? AND status = 'RUNNING' AND worker_id = ? AND claim_token = ?`
+	if s.driver != "sqlite" && s.driver != "sqlite3" {
+		query += " FOR UPDATE"
+	}
+	var job ownedRunningJob
+	if err := tx.QueryRowContext(ctx, query, jobID, workerID, claimToken).Scan(
+		&job.jobType, &job.resourceID, &job.executionGeneration, &job.cancelRequested,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ownedRunningJob{}, ErrOwnershipLost
+		}
+		return ownedRunningJob{}, err
+	}
+	return job, nil
 }
 
 // failBusinessTx keeps terminal execution failure and business failure in one
@@ -458,6 +504,10 @@ func (s *Store) ConditionalFinalizeFailure(ctx context.Context, jobID int64, wor
 
 // ConditionalFinalizeCancelTx marks a job CANCELLED in the provided transaction.
 func (s *Store) ConditionalFinalizeCancelTx(ctx context.Context, tx *sql.Tx, jobID int64, workerID, claimToken string) error {
+	owned, err := s.loadOwnedRunningJobTx(ctx, tx, jobID, workerID, claimToken)
+	if err != nil {
+		return err
+	}
 	query := `
 		UPDATE analysis_jobs
 		SET status = 'CANCELLED',
@@ -481,6 +531,40 @@ func (s *Store) ConditionalFinalizeCancelTx(ctx context.Context, tx *sql.Tx, job
 	}
 	if rowsAffected == 0 {
 		return ErrOwnershipLost
+	}
+	if owned.jobType == JobTypeRunDiagnosis {
+		if err := s.cancelDiagnosisRunTx(ctx, tx, owned.resourceID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) cancelDiagnosisRunTx(ctx context.Context, tx *sql.Tx, runID string) error {
+	res, err := tx.ExecContext(ctx, `UPDATE diagnosis_runs
+		SET status = 'CANCELLED', cancel_requested = TRUE, version = version + 1
+		WHERE id = ? AND status IN ('QUEUED', 'RUNNING')`, runID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return nil
+		}
+		return fmt.Errorf("failed to cancel diagnosis run %s with its job: %w", runID, err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		var status string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM diagnosis_runs WHERE id = ?`, runID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) || strings.Contains(strings.ToLower(err.Error()), "no such table") {
+				return nil
+			}
+			return err
+		}
+		if status != "CANCELLED" {
+			return fmt.Errorf("diagnosis %s cannot be cancelled from status %s", runID, status)
+		}
 	}
 	return nil
 }

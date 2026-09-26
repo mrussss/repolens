@@ -1,6 +1,7 @@
 package indexing_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -323,6 +324,84 @@ func TestSnapshotJobHandler_DoesNotMarkReadyOnWalkFailure(t *testing.T) {
 	if !recorder.failed || recorder.snap.Status != snapshot.StatusFailed {
 		t.Fatalf("retry exhaustion must fail snapshot: failed=%v status=%s", recorder.failed, recorder.snap.Status)
 	}
+}
+
+func TestSnapshotJobHandler_IgnoresOversizedExcludedFilesButRejectsOversizedSource(t *testing.T) {
+	newFixture := func(t *testing.T, files map[string][]byte) (*indexing.SnapshotJobHandler, *materializationRecorder) {
+		t.Helper()
+		root := t.TempDir()
+		t.Cleanup(func() {
+			_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if info.IsDir() {
+					return os.Chmod(path, 0755)
+				}
+				return os.Chmod(path, 0644)
+			})
+		})
+		storeFS := snapshotstore.NewLocalSnapshotStore(root)
+		snap := &snapshot.RepositorySnapshot{
+			ID: "snap-filter-order", RepositoryID: "repo-filter-order", Ref: "main",
+			CommitSHA: "0123456789abcdef0123456789abcdef01234567", Status: snapshot.StatusMaterializing,
+		}
+		sourceDir, err := storeFS.EnsureDir(snap.RepositoryID, snap.ID)
+		if err != nil {
+			t.Fatalf("ensure source dir: %v", err)
+		}
+		for name, content := range files {
+			if err := os.WriteFile(filepath.Join(sourceDir, name), content, 0o644); err != nil {
+				t.Fatalf("write fixture %s: %v", name, err)
+			}
+		}
+		recorder := &materializationRecorder{snap: snap}
+		handler := indexing.NewSnapshotJobHandler(
+			&mockRepoStore{}, recorder, nil, storeFS,
+			&fixtureCloner{commitSHA: snap.CommitSHA}, indexing.NewFileFilter(512), indexing.NewCodeChunker(5, 2), nil,
+		)
+		return handler, recorder
+	}
+
+	t.Run("oversized png and ordinary ignored files do not block snapshot", func(t *testing.T) {
+		handler, recorder := newFixture(t, map[string][]byte{
+			"main.go":   []byte("package main\nfunc Hello() {}\n"),
+			"large.png": bytes.Repeat([]byte{0x89}, 513*1024),
+			"small.png": []byte("ignored image"),
+			".env":      []byte("SECRET=not-indexed"),
+		})
+		err := handler.Execute(context.Background(), &jobs.AnalysisJob{
+			ID: 31, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3,
+		})
+		if err != nil {
+			t.Fatalf("snapshot should ignore excluded files regardless of size: %v", err)
+		}
+		if !recorder.finalized || recorder.snap.Status != snapshot.StatusReady {
+			t.Fatalf("snapshot did not become READY: finalized=%v status=%s", recorder.finalized, recorder.snap.Status)
+		}
+		if recorder.fileCount != 1 {
+			t.Fatalf("indexed file count = %d, want only main.go (ordinary ignored files must remain excluded)", recorder.fileCount)
+		}
+	})
+
+	t.Run("oversized source still fails", func(t *testing.T) {
+		handler, recorder := newFixture(t, map[string][]byte{
+			"main.go": bytes.Repeat([]byte{'x'}, 513*1024),
+		})
+		err := handler.Execute(context.Background(), &jobs.AnalysisJob{
+			ID: 32, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3,
+		})
+		if err == nil {
+			t.Fatal("oversized source should fail materialization")
+		}
+		class, code := jobs.ClassifyError(err)
+		if class != jobs.ErrorClassPermanent || code != "FILE_TOO_LARGE" {
+			t.Fatalf("oversized source error = %s/%s, want PERMANENT/FILE_TOO_LARGE (%v)", class, code, err)
+		}
+		if recorder.finalized || recorder.snap.Status == snapshot.StatusReady {
+			t.Fatal("oversized source must not publish a READY snapshot")
+		}
+	})
 }
 
 type failingIndexWriter struct {

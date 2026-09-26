@@ -122,15 +122,51 @@ func (w *Worker) claimLoop(ctx context.Context) {
 		default:
 		}
 
-		// Claim batch
-		jobs, err := w.store.ClaimJobs(ctx, w.cfg.WorkerID, w.cfg.BatchSize, w.cfg.LeaseDuration)
+		// Reserve execution capacity before claiming. ClaimJobs starts each
+		// lease immediately, so a job must never wait for a semaphore after it
+		// has become RUNNING. BatchSize remains an upper bound, while free
+		// concurrency slots determine the actual claim size.
+		reserved := 0
+	reserveSlots:
+		for reserved < w.cfg.BatchSize {
+			select {
+			case sem <- struct{}{}:
+				reserved++
+			default:
+				break reserveSlots
+			}
+		}
+		if reserved == 0 {
+			select {
+			case <-w.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			case <-time.After(w.cfg.PollInterval):
+				continue
+			}
+		}
+
+		jobs, err := w.store.ClaimJobs(ctx, w.cfg.WorkerID, reserved, w.cfg.LeaseDuration)
 		if err != nil {
+			for i := 0; i < reserved; i++ {
+				<-sem
+			}
 			log := logger.L(ctx)
 			log.Error("error claiming jobs", "worker_id", w.cfg.WorkerID, "error", err)
-			time.Sleep(w.cfg.PollInterval)
+			select {
+			case <-w.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			case <-time.After(w.cfg.PollInterval):
+			}
 			continue
 		}
 
+		for i := len(jobs); i < reserved; i++ {
+			<-sem
+		}
 		if len(jobs) == 0 {
 			select {
 			case <-w.stopCh:
@@ -143,7 +179,6 @@ func (w *Worker) claimLoop(ctx context.Context) {
 		}
 
 		for _, job := range jobs {
-			sem <- struct{}{}
 			w.wg.Add(1)
 			go func(j *AnalysisJob) {
 				defer func() {

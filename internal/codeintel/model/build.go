@@ -17,7 +17,7 @@ const (
 // Build identities change when persisted parser, analyzer, schema, or retrieval
 // semantics change. Keep historical benchmark fixtures pinned separately.
 const (
-	CurrentParserVersion       = "v2.2.0"
+	CurrentParserVersion       = "v2.2.1"
 	CurrentAnalyzerVersion     = "v2.2.0"
 	CurrentSymbolSchemaVersion = "v2.1.0"
 	CurrentRetrievalVersion    = "v2.2.0"

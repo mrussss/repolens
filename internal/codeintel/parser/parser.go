@@ -218,8 +218,35 @@ func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInf
 	if err != nil {
 		return nil, warnings, fmt.Errorf("failed walking repository: %w", err)
 	}
+	applyExternalTestPackagePaths(parsedFiles)
 
 	return parsedFiles, warnings, nil
+}
+
+// applyExternalTestPackagePaths gives a Go external test package its own
+// package identity. A package p_test file in a directory containing package p
+// is compiled as a separate package that imports p; retaining the directory's
+// base import path would merge its symbols and type-check files with package p.
+func applyExternalTestPackagePaths(files []*ParsedFile) {
+	productionPackageNames := make(map[string]string)
+	for _, file := range files {
+		if file == nil || file.CodeFile == nil || file.CodeFile.IsTest || file.AST == nil || file.CodeFile.ParseStatus != "OK" {
+			continue
+		}
+		if _, exists := productionPackageNames[file.CodeFile.PackagePath]; !exists {
+			productionPackageNames[file.CodeFile.PackagePath] = file.CodeFile.PackageName
+		}
+	}
+
+	for _, file := range files {
+		if file == nil || file.CodeFile == nil || !file.CodeFile.IsTest || file.AST == nil || file.CodeFile.ParseStatus != "OK" {
+			continue
+		}
+		productionName, exists := productionPackageNames[file.CodeFile.PackagePath]
+		if exists && file.CodeFile.PackageName == productionName+"_test" {
+			file.CodeFile.PackagePath += "_test"
+		}
+	}
 }
 
 // matchesBuildContext delegates filename and source-comment semantics to the

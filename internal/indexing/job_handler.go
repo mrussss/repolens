@@ -179,11 +179,11 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			}
 			return nil
 		}
+		if h.filter.IsExplicitlyIgnoredFile(relPath) {
+			return nil
+		}
 		if h.filter.IsOversized(info.Size()) {
 			return jobs.NewPermanentError("FILE_TOO_LARGE", fmt.Sprintf("file %s exceeds maximum size", relPath), nil)
-		}
-		if h.filter.ShouldIgnoreFile(relPath, info.Size()) {
-			return nil
 		}
 		if h.maxFileCount > 0 && fileCount >= h.maxFileCount {
 			return jobs.NewPermanentError("TOO_MANY_FILES", fmt.Sprintf("repository exceeds maximum file count %d", h.maxFileCount), nil)

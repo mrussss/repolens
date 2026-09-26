@@ -517,6 +517,117 @@ func TestWorkerRuntime_ConcurrentExecution(t *testing.T) {
 	}
 }
 
+func TestWorkerRuntime_DoesNotLeaseJobsBeforeExecutionCapacity(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	ctx := context.Background()
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.WorkerID = "worker-capacity-lease"
+	cfg.Concurrency = 1
+	cfg.BatchSize = 2
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LeaseDuration = 180 * time.Millisecond
+	cfg.ReapInterval = 10 * time.Millisecond
+	worker := jobs.NewWorker(store, cfg)
+
+	first := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "capacity-first", MaxAttempts: 3}
+	second := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "capacity-second", MaxAttempts: 3}
+	for _, job := range []*jobs.AnalysisJob{first, second} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ResourceID, err)
+		}
+	}
+
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	var active int32
+	var maxActive int32
+	worker.RegisterHandler(jobs.JobTypeRunDiagnosis, jobs.HandlerFunc(func(ctx context.Context, job *jobs.AnalysisJob) error {
+		current := atomic.AddInt32(&active, 1)
+		for previous := atomic.LoadInt32(&maxActive); current > previous; previous = atomic.LoadInt32(&maxActive) {
+			if atomic.CompareAndSwapInt32(&maxActive, previous, current) {
+				break
+			}
+		}
+		defer atomic.AddInt32(&active, -1)
+
+		if job.ResourceID == first.ResourceID {
+			close(firstStarted)
+			select {
+			case <-releaseFirst:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		secondStarted <- struct{}{}
+		return nil
+	}))
+	worker.Start(ctx)
+	defer func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+		worker.Stop()
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first job did not acquire execution capacity")
+	}
+
+	// Keep the first handler beyond multiple lease periods while the only
+	// execution slot is occupied. The second job must remain unclaimed rather
+	// than aging a lease while waiting outside execution capacity.
+	time.Sleep(3 * cfg.LeaseDuration)
+	queued, err := store.GetJobByID(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID(second): %v", err)
+	}
+	if queued.Status != jobs.StatusPending || queued.AttemptCount != 0 {
+		t.Fatalf("waiting job state = %s with attempt_count=%d, want PENDING with no consumed attempt", queued.Status, queued.AttemptCount)
+	}
+	running, err := store.GetJobByID(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID(first): %v", err)
+	}
+	if running.Status != jobs.StatusRunning || running.AttemptCount != 1 {
+		t.Fatalf("active job state = %s with attempt_count=%d, want RUNNING/1", running.Status, running.AttemptCount)
+	}
+
+	close(releaseFirst)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		completedFirst, firstErr := store.GetJobByID(ctx, first.ID)
+		completedSecond, secondErr := store.GetJobByID(ctx, second.ID)
+		if firstErr != nil || secondErr != nil {
+			t.Fatalf("read completed jobs: first=%v second=%v", firstErr, secondErr)
+		}
+		if completedFirst.Status == jobs.StatusSucceeded && completedSecond.Status == jobs.StatusSucceeded {
+			if completedFirst.AttemptCount != 1 || completedSecond.AttemptCount != 1 {
+				t.Fatalf("attempt counts = first %d / second %d, want 1 / 1", completedFirst.AttemptCount, completedSecond.AttemptCount)
+			}
+			if got := atomic.LoadInt32(&maxActive); got > 1 {
+				t.Fatalf("max concurrent handlers = %d, want <= 1", got)
+			}
+			select {
+			case <-secondStarted:
+			default:
+				t.Fatal("second job reached SUCCEEDED without executing")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("both jobs did not complete after execution capacity became available")
+}
+
 func TestWorkerRuntime_GracefulShutdownDrainsInFlightJob(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

@@ -543,6 +543,174 @@ func TestCancellationQueuedRunningAndFinalizeRace(t *testing.T) {
 	}
 }
 
+func TestDiagnosisCancellationAndRetryConvergeAcrossJobStates(t *testing.T) {
+	ctx := context.Background()
+	newRun := func(t *testing.T, store *diagnosis.GormStore, id string) *diagnosis.DiagnosisRun {
+		t.Helper()
+		run := &diagnosis.DiagnosisRun{
+			ID: id, UserID: "user-" + id, RepositoryID: "repo", SnapshotID: "snap",
+			IssueTitle: "retry cancellation", IdempotencyKey: "key-" + id, IdempotencyRequestHash: "hash-" + id,
+		}
+		if err := store.Create(ctx, run); err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return run
+	}
+	getFinalStates := func(t *testing.T, db *gorm.DB, runID string) (diagnosis.RunStatus, jobs.JobStatus) {
+		t.Helper()
+		var run diagnosis.DiagnosisRun
+		if err := db.First(&run, "id = ?", runID).Error; err != nil {
+			t.Fatal(err)
+		}
+		var job jobs.AnalysisJob
+		if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, runID).First(&job).Error; err != nil {
+			t.Fatal(err)
+		}
+		return run.Status, job.Status
+	}
+
+	t.Run("RUNNING run and RETRY_WAIT job cancel together", func(t *testing.T) {
+		db := setupTestDB(t)
+		store := diagnosis.NewStore(db)
+		run := newRun(t, store, "run-cancel-retry-wait")
+		if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Update("status", diagnosis.StatusRunning).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Model(&jobs.AnalysisJob{}).
+			Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).
+			Updates(map[string]interface{}{"status": jobs.StatusRetryWait, "next_run_at": time.Now().UTC().Add(-time.Second)}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RequestCancellation(ctx, run.ID, run.UserID); err != nil {
+			t.Fatalf("cancel RUNNING/RETRY_WAIT diagnosis: %v", err)
+		}
+		gotRun, gotJob := getFinalStates(t, db, run.ID)
+		if gotRun != diagnosis.StatusCancelled || gotJob != jobs.StatusCancelled {
+			t.Fatalf("cancellation terminal state = Run %s / Job %s, want both CANCELLED", gotRun, gotJob)
+		}
+	})
+
+	t.Run("cancel racing retry failure finalization wins", func(t *testing.T) {
+		db := setupTestDB(t)
+		store := diagnosis.NewStore(db)
+		run := newRun(t, store, "run-cancel-retry-finalize-race")
+		sqlDB, err := db.DB()
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+		claimed, err := jobStore.ClaimJobs(ctx, "worker-retry-race", 1, time.Minute)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claim initial diagnosis job: claimed=%d err=%v", len(claimed), err)
+		}
+		attempt := &diagnosis.DiagnosisAttempt{ID: "attempt-retry-race", DiagnosisRunID: run.ID, AttemptNo: 1, WorkerID: "worker-retry-race"}
+		if err := store.StartAttempt(ctx, run.ID, attempt); err != nil {
+			t.Fatalf("start attempt: %v", err)
+		}
+		if err := store.FinishAttempt(ctx, run.ID, attempt.ID, diagnosis.AttemptStatusFailedRetryable, 0, 0, 0, "PROVIDER_TIMEOUT", "temporary provider error", true); err != nil {
+			t.Fatalf("finish retryable attempt: %v", err)
+		}
+
+		// This is the critical ordering: handler has returned its retryable error,
+		// cancellation is accepted while Job is still RUNNING, then generic Job
+		// failure finalization attempts to schedule RETRY_WAIT.
+		if err := store.RequestCancellation(ctx, run.ID, run.UserID); err != nil {
+			t.Fatalf("request cancellation before retry finalize: %v", err)
+		}
+		if err := jobStore.ConditionalFinalizeFailure(ctx, claimed[0].ID, *claimed[0].WorkerID, *claimed[0].ClaimToken,
+			jobs.ErrorClassRetryable, "PROVIDER_TIMEOUT", "temporary provider error", nil, false, time.Now().UTC().Add(time.Second)); err != nil {
+			t.Fatalf("finalize retryable failure after accepted cancellation: %v", err)
+		}
+		gotRun, gotJob := getFinalStates(t, db, run.ID)
+		if gotRun != diagnosis.StatusCancelled || gotJob != jobs.StatusCancelled {
+			t.Fatalf("race terminal state = Run %s / Job %s, want both CANCELLED", gotRun, gotJob)
+		}
+	})
+
+	t.Run("cancel flag already set before next claim is finalized atomically", func(t *testing.T) {
+		db := setupTestDB(t)
+		store := diagnosis.NewStore(db)
+		run := newRun(t, store, "run-cancel-before-next-claim")
+		if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Updates(map[string]interface{}{
+			"status": diagnosis.StatusRunning, "cancel_requested": true,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Model(&jobs.AnalysisJob{}).
+			Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).
+			Updates(map[string]interface{}{"status": jobs.StatusRetryWait, "cancel_requested": true, "next_run_at": time.Now().UTC().Add(-time.Second)}).Error; err != nil {
+			t.Fatal(err)
+		}
+		sqlDB, err := db.DB()
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+		cfg := jobs.DefaultWorkerConfig()
+		cfg.WorkerID = "worker-cancel-before-claim"
+		cfg.PollInterval = 10 * time.Millisecond
+		cfg.ReapInterval = time.Hour
+		runtime := jobs.NewWorker(jobStore, cfg)
+		handlerCalled := make(chan struct{}, 1)
+		runtime.RegisterHandler(jobs.JobTypeRunDiagnosis, jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error {
+			handlerCalled <- struct{}{}
+			return nil
+		}))
+		runtime.Start(ctx)
+		defer runtime.Stop()
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			gotRun, gotJob := getFinalStates(t, db, run.ID)
+			if gotRun == diagnosis.StatusCancelled && gotJob == jobs.StatusCancelled {
+				select {
+				case <-handlerCalled:
+					t.Fatal("handler executed despite cancellation already being set before claim")
+				default:
+				}
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		gotRun, gotJob := getFinalStates(t, db, run.ID)
+		t.Fatalf("pre-claim cancellation did not converge: Run %s / Job %s", gotRun, gotJob)
+	})
+
+	t.Run("ordinary retry remains available without cancellation", func(t *testing.T) {
+		db := setupTestDB(t)
+		store := diagnosis.NewStore(db)
+		run := newRun(t, store, "run-ordinary-retry")
+		sqlDB, err := db.DB()
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+		claimed, err := jobStore.ClaimJobs(ctx, "worker-ordinary-retry", 1, time.Minute)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claim initial diagnosis job: claimed=%d err=%v", len(claimed), err)
+		}
+		attempt := &diagnosis.DiagnosisAttempt{ID: "attempt-ordinary-retry", DiagnosisRunID: run.ID, AttemptNo: 1, WorkerID: "worker-ordinary-retry"}
+		if err := store.StartAttempt(ctx, run.ID, attempt); err != nil {
+			t.Fatalf("start attempt: %v", err)
+		}
+		if err := store.FinishAttempt(ctx, run.ID, attempt.ID, diagnosis.AttemptStatusFailedRetryable, 0, 0, 0, "PROVIDER_TIMEOUT", "temporary provider error", true); err != nil {
+			t.Fatalf("finish retryable attempt: %v", err)
+		}
+		if err := jobStore.ConditionalFinalizeFailure(ctx, claimed[0].ID, *claimed[0].WorkerID, *claimed[0].ClaimToken,
+			jobs.ErrorClassRetryable, "PROVIDER_TIMEOUT", "temporary provider error", nil, false, time.Now().UTC().Add(-time.Second)); err != nil {
+			t.Fatalf("finalize ordinary retry: %v", err)
+		}
+		gotRun, gotJob := getFinalStates(t, db, run.ID)
+		if gotRun != diagnosis.StatusRunning || gotJob != jobs.StatusRetryWait {
+			t.Fatalf("ordinary retry state = Run %s / Job %s, want RUNNING / RETRY_WAIT", gotRun, gotJob)
+		}
+		retry, err := jobStore.ClaimJobs(ctx, "worker-ordinary-retry-2", 1, time.Minute)
+		if err != nil || len(retry) != 1 || retry[0].AttemptCount != 2 || retry[0].ExecutionGeneration != 1 {
+			t.Fatalf("ordinary retry claim = %+v err=%v, want attempt 2 in generation 1", retry, err)
+		}
+	})
+}
+
 func newRunningAttempt(t *testing.T, db *gorm.DB, store *diagnosis.GormStore, runID, attemptID string, generation, attemptNo int) *diagnosis.DiagnosisRun {
 	t.Helper()
 	ctx := context.Background()

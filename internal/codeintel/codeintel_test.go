@@ -110,6 +110,139 @@ func TestProcessOrder() {
 	}
 }
 
+func TestAnalyzerSeparatesExternalTestPackageIdentityAndPersistsRelations(t *testing.T) {
+	_, _, ciStore, _ := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	modulePath := "example.com/symbolidentity"
+	writeTestFile(t, filepath.Join(root, "go.mod"), "module "+modulePath+"\n\ngo 1.22\n")
+	writeTestFile(t, filepath.Join(root, "foo.go"), `package p
+
+func Helper() {}
+
+func Invoke() { Helper() }
+`)
+	writeTestFile(t, filepath.Join(root, "foo_test.go"), `package p_test
+
+import (
+	"testing"
+	p "example.com/symbolidentity"
+)
+
+func Helper() {}
+
+func TestExternal(t *testing.T) { p.Helper() }
+`)
+	writeTestFile(t, filepath.Join(root, "foo_internal_test.go"), `package p
+
+import "testing"
+
+func TestInternal(t *testing.T) { Helper() }
+`)
+
+	analysis, err := codeintel.NewAnalyzer().Analyze(ctx, root, codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatalf("analyze package identity fixture: %v", err)
+	}
+	var productionHelper, externalHelper, externalTest, internalTest *codeintelmodel.Symbol
+	for _, symbol := range analysis.Symbols {
+		switch {
+		case symbol.Name == "Helper" && symbol.FilePath == "foo.go":
+			productionHelper = symbol
+		case symbol.Name == "Helper" && symbol.FilePath == "foo_test.go":
+			externalHelper = symbol
+		case symbol.Name == "TestExternal":
+			externalTest = symbol
+		case symbol.Name == "TestInternal":
+			internalTest = symbol
+		}
+	}
+	if productionHelper == nil || externalHelper == nil || externalTest == nil || internalTest == nil {
+		t.Fatalf("fixture symbols missing: production=%v external=%v externalTest=%v internalTest=%v", productionHelper, externalHelper, externalTest, internalTest)
+	}
+	if productionHelper.PackagePath != modulePath || externalHelper.PackagePath != modulePath+"_test" {
+		t.Fatalf("package identities = production %q, external test %q; want %q and %q",
+			productionHelper.PackagePath, externalHelper.PackagePath, modulePath, modulePath+"_test")
+	}
+	if productionHelper.SymbolKeyHash == externalHelper.SymbolKeyHash || productionHelper.SymbolKeyRaw == externalHelper.SymbolKeyRaw {
+		t.Fatalf("production and external-test Helper share identity: production=%+v external=%+v", productionHelper, externalHelper)
+	}
+	if analysis.Quality.PackagesTotal != 2 || analysis.Quality.PackagesTypechecked != 2 {
+		t.Fatalf("package type-check grouping = total %d, checked %d; want two distinct checked packages",
+			analysis.Quality.PackagesTotal, analysis.Quality.PackagesTypechecked)
+	}
+
+	var externalCallResolvedToProduction, internalCallResolvedToProduction bool
+	for _, relation := range analysis.Relations {
+		if relation.RelationType != codeintelmodel.RelationTypeCallCandidate || relation.ToSymbolKeyHash != productionHelper.SymbolKeyHash {
+			continue
+		}
+		if relation.FromSymbolKeyHash == externalTest.SymbolKeyHash {
+			externalCallResolvedToProduction = true
+		}
+		if relation.FromSymbolKeyHash == internalTest.SymbolKeyHash {
+			internalCallResolvedToProduction = true
+		}
+	}
+	if !externalCallResolvedToProduction {
+		t.Fatal("external-test p.Helper() relation did not resolve to the production Helper symbol")
+	}
+	if !internalCallResolvedToProduction {
+		t.Fatal("same-package test Helper() relation did not resolve to the production Helper symbol")
+	}
+
+	build, _, err := ciStore.GetOrCreateBuild(ctx, "snap-symbol-identity", analysis.ModulePath, analysis.BuildContext)
+	if err != nil {
+		t.Fatalf("create CodeIndexBuild: %v", err)
+	}
+	if err := ciStore.MarkBuildBuilding(ctx, build.ID); err != nil {
+		t.Fatalf("mark CodeIndexBuild building: %v", err)
+	}
+	if err := ciStore.SaveAnalysisResult(ctx, build.ID, analysis); err != nil {
+		t.Fatalf("persist CodeIndex analysis: %v", err)
+	}
+	ready, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil || ready.Status != codeintelmodel.BuildStatusReady {
+		t.Fatalf("CodeIndexBuild status = %v, err=%v; want READY", ready, err)
+	}
+
+	persistedSymbols, err := ciStore.ListAllSymbols(ctx, build.ID)
+	if err != nil {
+		t.Fatalf("list persisted symbols: %v", err)
+	}
+	var persistedProductionHelper, persistedExternalHelper *codeintelmodel.Symbol
+	for _, symbol := range persistedSymbols {
+		if symbol.Name != "Helper" {
+			continue
+		}
+		switch symbol.FilePath {
+		case "foo.go":
+			persistedProductionHelper = symbol
+		case "foo_test.go":
+			persistedExternalHelper = symbol
+		}
+	}
+	if persistedProductionHelper == nil || persistedExternalHelper == nil ||
+		persistedProductionHelper.SymbolKeyHash == persistedExternalHelper.SymbolKeyHash {
+		t.Fatalf("both distinct Helper symbols were not persisted: production=%+v external=%+v", persistedProductionHelper, persistedExternalHelper)
+	}
+
+	persistedRelations, err := ciStore.ListRelationsForSymbol(ctx, build.ID, persistedProductionHelper.ID)
+	if err != nil {
+		t.Fatalf("list relations for production Helper: %v", err)
+	}
+	var persistedExternalRelation bool
+	for _, relation := range persistedRelations {
+		if relation.FromSymbolKeyHash == externalTest.SymbolKeyHash && relation.ToSymbolKeyHash == persistedProductionHelper.SymbolKeyHash &&
+			relation.ToSymbolID != nil && *relation.ToSymbolID == persistedProductionHelper.ID {
+			persistedExternalRelation = true
+		}
+	}
+	if !persistedExternalRelation {
+		t.Fatal("persisted external-test relation does not point to production Helper")
+	}
+}
+
 func TestCodeIndexBuild_IdempotencyAndJobCreation(t *testing.T) {
 	_, jobsStore, ciStore, _ := setupCodeIntelTestDB(t)
 	ctx := context.Background()

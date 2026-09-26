@@ -237,7 +237,5 @@ func isNameMatch(testName string, prodSym *model.Symbol) bool {
 }
 
 func isSamePackage(testPkgPath, prodPkgPath string) bool {
-	cleanTest := strings.TrimSuffix(testPkgPath, "_test")
-	cleanProd := strings.TrimSuffix(prodPkgPath, "_test")
-	return cleanTest == cleanProd
+	return testPkgPath == prodPkgPath
 }

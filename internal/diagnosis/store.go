@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
@@ -112,7 +113,8 @@ func (s *GormStore) StartAttempt(ctx context.Context, runID string, attempt *Dia
 func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, citations []evidence.Citation, promptTokens, completionTokens, toolCalls int) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job jobs.AnalysisJob
-		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return jobs.ErrOwnershipLost
 			}
@@ -192,7 +194,8 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 func (s *GormStore) FinalizeInvalidStructuredReport(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, promptTokens, completionTokens, toolCalls int, errorCode, errorMessage string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job jobs.AnalysisJob
-		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				var current jobs.AnalysisJob
 				if lookupErr := tx.Select("status").First(&current, jobID).Error; lookupErr == nil && (current.Status == jobs.StatusFailed || current.Status == jobs.StatusSucceeded || current.Status == jobs.StatusCancelled) {
@@ -292,7 +295,8 @@ func (s *GormStore) FinalizeInvalidStructuredReport(ctx context.Context, jobID i
 func (s *GormStore) FinalizeCancellation(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job jobs.AnalysisJob
-		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return jobs.ErrOwnershipLost
 			}
@@ -764,8 +768,20 @@ func (s *GormStore) FinishAttemptAndRun(ctx context.Context, runID, attemptID st
 
 func (s *GormStore) RequestCancellation(ctx context.Context, runID, userID string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Lock Job before Run to match all claim-fenced diagnosis finalizers. A
+		// retry finalizer and cancellation therefore serialize on the Job row:
+		// cancellation either flags a RUNNING owner, or observes RETRY_WAIT and
+		// terminalizes both state machines in this transaction.
+		var job jobs.AnalysisJob
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, runID).First(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("diagnosis job %s not found", runID)
+			}
+			return err
+		}
 		var run DiagnosisRun
-		if err := tx.First(&run, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&run, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrRunNotFound
 			}
@@ -777,40 +793,65 @@ func (s *GormStore) RequestCancellation(ctx context.Context, runID, userID strin
 		}
 
 		nextStatus := run.Status
-		if run.Status == StatusQueued {
-			// A queued diagnosis and its pending/retry job are cancelled together,
-			// before another claimant can observe them as runnable.
-			jobRes := tx.Model(&jobs.AnalysisJob{}).
-				Where("job_type = ? AND resource_id = ? AND status IN (?, ?)", jobs.JobTypeRunDiagnosis, runID, jobs.StatusPending, jobs.StatusRetryWait).
-				Updates(map[string]interface{}{"status": jobs.StatusCancelled, "terminal_reason": jobs.TerminalReasonCancelled, "cancel_requested": true, "finished_at": time.Now().UTC()})
-			if jobRes.Error != nil {
-				return jobRes.Error
+		jobUpdates := map[string]interface{}{"cancel_requested": true, "updated_at": time.Now().UTC()}
+		jobTerminal := false
+		switch run.Status {
+		case StatusQueued:
+			if job.Status == jobs.StatusPending || job.Status == jobs.StatusRetryWait {
+				nextStatus = StatusCancelled
+				jobTerminal = true
+			} else if job.Status == jobs.StatusRunning {
+				// A worker may have claimed the Job but not yet started its
+				// DiagnosisAttempt. Let the claim owner observe cancellation.
+			} else if job.Status == jobs.StatusCancelled {
+				nextStatus = StatusCancelled
+				jobTerminal = true
+			} else {
+				return fmt.Errorf("cannot cancel queued diagnosis with job status %s", job.Status)
 			}
-			if jobRes.RowsAffected != 1 {
-				return fmt.Errorf("diagnosis job %s is no longer queued", runID)
+		case StatusRunning:
+			switch job.Status {
+			case jobs.StatusRunning:
+				// The active owner will stop through the existing cancellation
+				// poll and atomically finalize its Attempt, Run, and Job.
+			case jobs.StatusRetryWait, jobs.StatusCancelled:
+				// RETRY_WAIT has no active owner. Do not leave a RUNNING Run for
+				// the generic pre-execution cancellation path to strand.
+				nextStatus = StatusCancelled
+				jobTerminal = true
+			default:
+				return fmt.Errorf("cannot cancel running diagnosis with job status %s", job.Status)
 			}
-			nextStatus = StatusCancelled
-		} else if run.Status != StatusRunning {
+		default:
 			return fmt.Errorf("cannot cancel run in status %s", run.Status)
-		} else {
-			jobRes := tx.Model(&jobs.AnalysisJob{}).
-				Where("job_type = ? AND resource_id = ? AND status = ?", jobs.JobTypeRunDiagnosis, runID, jobs.StatusRunning).
-				Updates(map[string]interface{}{"cancel_requested": true})
-			if jobRes.Error != nil {
-				return jobRes.Error
-			}
-			if jobRes.RowsAffected != 1 {
-				return fmt.Errorf("diagnosis job %s is not running", runID)
-			}
+		}
+		if jobTerminal {
+			jobUpdates["status"] = jobs.StatusCancelled
+			jobUpdates["terminal_reason"] = jobs.TerminalReasonCancelled
+			jobUpdates["finished_at"] = time.Now().UTC()
+		}
+		jobRes := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ?", job.ID, job.Status).Updates(jobUpdates)
+		if jobRes.Error != nil {
+			return jobRes.Error
+		}
+		if jobRes.RowsAffected != 1 {
+			return fmt.Errorf("diagnosis job %s changed during cancellation", runID)
 		}
 
-		return tx.Model(&DiagnosisRun{}).
-			Where("id = ?", runID).
+		runRes := tx.Model(&DiagnosisRun{}).
+			Where("id = ? AND user_id = ? AND status = ?", runID, userID, run.Status).
 			Updates(map[string]interface{}{
 				"cancel_requested": true,
 				"status":           nextStatus,
 				"version":          gorm.Expr("version + 1"),
-			}).Error
+			})
+		if runRes.Error != nil {
+			return runRes.Error
+		}
+		if runRes.RowsAffected != 1 {
+			return fmt.Errorf("diagnosis run %s changed during cancellation", runID)
+		}
+		return nil
 	})
 }
 
