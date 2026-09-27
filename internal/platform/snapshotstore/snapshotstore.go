@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"repolens/internal/snapshotpolicy"
 )
 
 var ErrLineTooLong = errors.New("snapshot file line exceeds the configured range limit")
@@ -127,7 +129,7 @@ func (s *LocalSnapshotStore) ReadFileAt(ctx context.Context, sourceRoot, relativ
 }
 
 func (s *LocalSnapshotStore) ReadFileRange(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int) (FileRange, error) {
-	return s.readFileRangeAt(ctx, s.GetSourcePath(repoID, snapshotID), relativePath, startLine, endLine, maxBytes, false)
+	return s.readFileRange(ctx, repoID, snapshotID, relativePath, startLine, endLine, maxBytes, false)
 }
 
 func (s *LocalSnapshotStore) ReadFileRangeAt(ctx context.Context, sourceRoot, relativePath string, startLine, endLine, maxBytes int) (FileRange, error) {
@@ -290,7 +292,12 @@ func readBoundedRanges(ctx context.Context, reader *bufio.Reader, ranges []LineR
 }
 
 func (s *LocalSnapshotStore) readFileRange(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int, stopAtEnd bool) (FileRange, error) {
-	return s.readFileRangeAt(ctx, s.GetSourcePath(repoID, snapshotID), relativePath, startLine, endLine, maxBytes, stopAtEnd)
+	sourceRoot := s.GetSourcePath(repoID, snapshotID)
+	decision := snapshotpolicy.CanReadFromSnapshot(sourceRoot, relativePath)
+	if !decision.Allowed {
+		return FileRange{}, fmt.Errorf("snapshot file access denied: %s (%s)", relativePath, decision.Reason)
+	}
+	return s.readFileRangeAt(ctx, sourceRoot, relativePath, startLine, endLine, maxBytes, stopAtEnd)
 }
 
 func (s *LocalSnapshotStore) readFileRangeAt(ctx context.Context, sourceRoot, relativePath string, startLine, endLine, maxBytes int, stopAtEnd bool) (FileRange, error) {
@@ -366,6 +373,12 @@ func readBoundedLines(ctx context.Context, reader *bufio.Reader, startLine, requ
 			if maxBytes > 0 && len(currentLine)+len(part) > maxBytes {
 				currentLineTooLong = true
 				currentLine = nil
+				if stopAtEnd {
+					if selectedLines == 0 {
+						return "", 0, 0, false, false, ErrLineTooLong
+					}
+					return content.String(), actualEndLine, 0, true, false, nil
+				}
 			} else {
 				currentLine = append(currentLine, part...)
 			}
@@ -543,10 +556,18 @@ func isSnapshotHex(value string) bool {
 }
 
 func (s *LocalSnapshotStore) safePath(repoID, snapshotID, relativePath string) (string, error) {
-	return safePathAt(s.GetSourcePath(repoID, snapshotID), relativePath)
+	sourceRoot := s.GetSourcePath(repoID, snapshotID)
+	decision := snapshotpolicy.CanReadFromSnapshot(sourceRoot, relativePath)
+	if !decision.Allowed {
+		return "", fmt.Errorf("snapshot file access denied: %s (%s)", relativePath, decision.Reason)
+	}
+	return safePathAt(sourceRoot, relativePath)
 }
 
 func safePathAt(sourceRoot, relativePath string) (string, error) {
+	if !snapshotpolicy.CanReadByAgent(relativePath, 0).Allowed {
+		return "", fmt.Errorf("snapshot file access denied: %s", relativePath)
+	}
 	cleaned := filepath.Clean(relativePath)
 	if cleaned == "." || filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) || cleaned == ".." {
 		return "", fmt.Errorf("path traversal denied: %s", relativePath)

@@ -19,6 +19,7 @@ import (
 	"repolens/internal/repoindex"
 	"repolens/internal/revision"
 	"repolens/internal/snapshot"
+	"repolens/internal/snapshotpolicy"
 )
 
 // SnapshotJobHandler handles MATERIALIZE_SNAPSHOT jobs.
@@ -185,6 +186,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	fileCount := 0
 	var totalBytes int64
 	manifest := make([]string, 0)
+	manifestFiles := make([]snapshotpolicy.FileEntry, 0)
 
 	walkFiles := h.storeFS.WalkFiles
 	readFile := h.storeFS.ReadFile
@@ -226,6 +228,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 
 		chunks := h.chunker.ChunkFile(snap.ID, relPath, content)
 		allChunks = append(allChunks, chunks...)
+		manifestFiles = append(manifestFiles, snapshotpolicy.FileEntryFor(relPath, []byte(content)))
 		docCount++
 		fileCount++
 		totalBytes += info.Size()
@@ -248,6 +251,11 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		_, _ = hasher.Write([]byte(entry))
 	}
 	contentHash := fmt.Sprintf("%x", hasher.Sum(nil))
+	fileManifest := snapshotpolicy.NewManifest(snap.ID, commitSHA, contentHash, manifestFiles)
+	if err := snapshotpolicy.WriteManifest(targetDir, fileManifest); err != nil {
+		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_MANIFEST_WRITE_FAILED")
+		return jobs.NewRetryableError("SNAPSHOT_MANIFEST_WRITE_FAILED", err.Error(), err)
+	}
 
 	if h.indexWriter != nil && len(allChunks) > 0 {
 		if err := h.indexWriter.IndexChunks(ctx, snap.ID, allChunks); err != nil {
@@ -259,6 +267,10 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 
 	now := time.Now().UTC()
 	if err := sealSnapshot(targetDir); err != nil {
+		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_SEAL_FAILED")
+		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
+	}
+	if err := os.Chmod(snapshotpolicy.ManifestPath(targetDir), 0444); err != nil {
 		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_SEAL_FAILED")
 		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
 	}
