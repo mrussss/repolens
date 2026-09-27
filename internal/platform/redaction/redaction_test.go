@@ -5,36 +5,44 @@ import (
 	"testing"
 )
 
-func TestRedactJSONCredentialValues(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-	}{
-		{name: "password compact", input: `{"password":"supersecret123"}`},
-		{name: "password whitespace", input: `{"password" :  "supersecret123"}`},
-		{name: "case insensitive", input: `{"PASSWORD":"supersecret123"}`},
-		{name: "passwd", input: `{"passwd":"supersecret123"}`},
-		{name: "pwd", input: `{"pwd":"supersecret123"}`},
-		{name: "token", input: `{"token":"supersecret123"}`},
-		{name: "access token", input: `{"access_token":"supersecret123"}`},
-		{name: "refresh token", input: `{"refresh_token":"supersecret123"}`},
-		{name: "api key", input: `{"api_key":"supersecret123"}`},
-		{name: "apikey", input: `{"apikey":"supersecret123"}`},
-		{name: "secret", input: `{"secret":"supersecret123"}`},
-		{name: "client secret", input: `{"client_secret":"supersecret123"}`},
-		{name: "escaped string value", input: `{"token":"secret\\\"value"}`},
-		{name: "authorization", input: `{"authorization":"supersecret123"}`},
+func TestRedactRawAndEscapedJSONCredentialPairs(t *testing.T) {
+	keys := []string{
+		"password", "passwd", "pwd", "token", "access_token", "refresh_token",
+		"api_key", "apikey", "secret", "client_secret", "authorization",
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := RedactSecrets(test.input)
-			if strings.Contains(got, "supersecret123") || strings.Contains(got, "secret\\\"value") {
-				t.Fatalf("credential remained visible: %s", got)
+	for _, key := range keys {
+		for _, escaped := range []bool{false, true} {
+			name := key + "/raw"
+			input := `{"` + key + `" : "credential-value"}`
+			if escaped {
+				name = key + "/escaped"
+				input = strings.ReplaceAll(input, `"`, `\"`)
 			}
-			if !strings.Contains(got, `"[REDACTED_SECRET]"`) {
-				t.Fatalf("redacted JSON value was not preserved as a string: %s", got)
-			}
-		})
+			t.Run(name, func(t *testing.T) {
+				got := RedactSecrets("context=kept " + input)
+				if strings.Contains(got, "credential-value") {
+					t.Fatalf("credential remained visible: %s", got)
+				}
+				if !strings.Contains(got, "context=kept") || !strings.Contains(got, "[REDACTED_SECRET]") {
+					t.Fatalf("ordinary context or redaction marker missing: %s", got)
+				}
+			})
+		}
+	}
+}
+
+func TestRedactEmbeddedJSONLogWithMultipleCredentials(t *testing.T) {
+	input := `request_body="{\"password\":\"password-secret\",\"access_token\": \"access-secret\"}" response="{\"client_secret\":\"client-secret\"}" note=kept`
+	got := RedactSecrets(input)
+	for _, secret := range []string{"password-secret", "access-secret", "client-secret"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("embedded credential %q remained visible: %s", secret, got)
+		}
+	}
+	for _, context := range []string{"request_body=", "response=", "note=kept", "[REDACTED_SECRET]"} {
+		if !strings.Contains(got, context) {
+			t.Errorf("redaction removed useful context %q: %s", context, got)
+		}
 	}
 }
 

@@ -12,7 +12,7 @@ var (
 	envSecretRegex   = regexp.MustCompile(`(?i)\b(password|secret|api_key|access_token|private_key)\s*=\s*['"]?([^'"\s\n]{8,})['"]?`)
 	authHeaderRegex  = regexp.MustCompile(`(?im)(\bauthorization[\t ]*:[\t ]*)([a-z][a-z0-9_-]*)([\t ]+)([^\s\r\n]+)`)
 	authJSONRegex    = regexp.MustCompile(`(?i)(["']authorization["'][\t ]*:[\t ]*["'])([^"'\r\n]+)`)
-	jsonSecretRegex  = regexp.MustCompile(`(?i)("(?:password|passwd|pwd|token|access_token|refresh_token|api_key|apikey|secret|client_secret)"[\t\r\n ]*:[\t\r\n ]*")((?:\\.|[^"\\])*)(")`)
+	jsonSecretRegex  = regexp.MustCompile(`(?i)(\\?")(password|passwd|pwd|token|access_token|refresh_token|api_key|apikey|secret|client_secret|authorization)(\\?"[\t\r\n ]*:[\t\r\n ]*\\?")((?:\\.|[^"\\])*)(\\?")`)
 )
 
 // RedactSecrets replaces obvious API keys, tokens, and credentials before
@@ -23,7 +23,19 @@ func RedactSecrets(text string) string {
 	}
 
 	text = privateKeyRegex.ReplaceAllString(text, "[REDACTED_PRIVATE_KEY]")
-	text = jsonSecretRegex.ReplaceAllString(text, "${1}[REDACTED_SECRET]${3}")
+	text = jsonSecretRegex.ReplaceAllStringFunc(text, func(pair string) string {
+		parts := jsonSecretRegex.FindStringSubmatch(pair)
+		if len(parts) != 6 {
+			return pair
+		}
+		value := "[REDACTED_SECRET]"
+		if strings.EqualFold(parts[2], "authorization") {
+			if fields := strings.Fields(parts[4]); len(fields) >= 2 {
+				value = fields[0] + " [REDACTED_SECRET]"
+			}
+		}
+		return parts[1] + parts[2] + parts[3] + value + parts[5]
+	})
 	text = authHeaderRegex.ReplaceAllString(text, "${1}${2} [REDACTED_SECRET]")
 	text = authJSONRegex.ReplaceAllStringFunc(text, func(header string) string {
 		parts := authJSONRegex.FindStringSubmatch(header)

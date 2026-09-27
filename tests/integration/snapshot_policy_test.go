@@ -76,17 +76,18 @@ func TestSnapshotVisibilityMatchesManifestCodeIndexReadFileAndEvidence(t *testin
 		t.Fatal(err)
 	}
 	files := map[string]string{
-		"go.mod":          "module example.com/policy\n\ngo 1.22\n",
-		"src/main.go":     "package src\nfunc Visible() {}\n",
-		".env":            "TOKEN=secret\n",
-		".env.staging":    "TOKEN=staging-secret\n",
-		".ENV.PRODUCTION": "TOKEN=production-secret\n",
-		"secret.pem":      "private key\n",
-		"foo.key":         "private key\n",
-		"secrets.json":    `{"password":"snapshot-supersecret"}`,
-		"dist/main.go":    "package dist\nfunc HiddenDist() {}\n",
-		"build/main.go":   "package build\nfunc HiddenBuild() {}\n",
-		"README.md":       "visible documentation\n",
+		"go.mod":           "module example.com/policy\n\ngo 1.22\n",
+		"src/main.go":      "package src\nfunc Visible() {}\n",
+		".env":             "TOKEN=secret\n",
+		".env.staging":     "TOKEN=staging-secret\n",
+		".ENV.PRODUCTION":  "TOKEN=production-secret\n",
+		"secret.pem":       "private key\n",
+		"foo.key":          "private key\n",
+		"secrets.json":     `{"password":"snapshot-supersecret"}`,
+		"logs/request.log": `request_body="{\"password\":\"snapshot-supersecret\"}"`,
+		"dist/main.go":     "package dist\nfunc HiddenDist() {}\n",
+		"build/main.go":    "package build\nfunc HiddenBuild() {}\n",
+		"README.md":        "visible documentation\n",
 	}
 	for relativePath, content := range files {
 		fullPath := filepath.Join(sourceRoot, filepath.FromSlash(relativePath))
@@ -163,6 +164,7 @@ func TestSnapshotVisibilityMatchesManifestCodeIndexReadFileAndEvidence(t *testin
 		{path: "secrets.json", allowed: false},
 		{path: "dist/main.go", allowed: false},
 		{path: "build/main.go", allowed: false},
+		{path: "logs/request.log", allowed: true},
 		{path: "src/main.go", allowed: true},
 	}
 	for _, test := range tests {
@@ -187,10 +189,24 @@ func TestSnapshotVisibilityMatchesManifestCodeIndexReadFileAndEvidence(t *testin
 			}
 		})
 	}
+	logEvidence, err := evidenceIssuer.Issue(ctx, evidence.IssueRequest{
+		AttemptID: "attempt-policy-escaped-log", DiagnosisRunID: "run-policy-escaped-log", RepositoryID: repoID,
+		SnapshotID: snapshotID, CodeIndexBuildID: 1, SourceKind: evidence.SourceReadFile,
+		FilePath: "logs/request.log", StartLine: 1, EndLine: 1, MaxBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("issue escaped-log evidence: %v", err)
+	}
+	if strings.Contains(logEvidence.DisplayExcerpt, "snapshot-supersecret") || !strings.Contains(logEvidence.DisplayExcerpt, "request_body") || !strings.Contains(logEvidence.DisplayExcerpt, "[REDACTED_SECRET]") {
+		t.Fatalf("escaped-log Evidence content=%q; want retained context and redacted credential", logEvidence.DisplayExcerpt)
+	}
 
 	provider := &snapshotPolicyCaptureProvider{}
 	registry := agent.NewToolRegistry()
-	registry.Register(readTool)
+	providerReadTool := tools.NewReadFileTool(storeFS, repoID, snapshotID).WithEvidenceIssuer(
+		evidenceIssuer, "attempt-policy-provider", "run-policy-provider", 1, 1024,
+	)
+	registry.Register(providerReadTool)
 	loop := agent.NewAgentLoop(provider, registry, nil, agent.DefaultGuardConfig())
 	_, err = loop.Run(ctx, &diagnosis.DiagnosisRun{
 		ID: "run-policy-provider", RepositoryID: repoID, SnapshotID: snapshotID,
@@ -199,15 +215,22 @@ func TestSnapshotVisibilityMatchesManifestCodeIndexReadFileAndEvidence(t *testin
 	if err != nil {
 		t.Fatalf("run provider boundary check: %v", err)
 	}
-	if len(provider.requests) != 2 {
-		t.Fatalf("provider calls=%d, want initial call and post-tool call", len(provider.requests))
+	if len(provider.requests) != 3 {
+		t.Fatalf("provider calls=%d, want initial call, two tool attempts, and final response", len(provider.requests))
 	}
+	redactedLogReachedProvider := false
 	for callIndex, request := range provider.requests {
 		for _, message := range request.Messages {
 			if strings.Contains(message.Content, "snapshot-supersecret") {
 				t.Fatalf("provider call %d received excluded file content: %+v", callIndex+1, message)
 			}
+			if strings.Contains(message.Content, "request_body") && strings.Contains(message.Content, "[REDACTED_SECRET]") {
+				redactedLogReachedProvider = true
+			}
 		}
+	}
+	if !redactedLogReachedProvider {
+		t.Fatal("provider did not receive the ordinary log context with its credential redacted")
 	}
 }
 
@@ -228,6 +251,17 @@ func (p *snapshotPolicyCaptureProvider) Generate(_ context.Context, request llm.
 		call.Type = "function"
 		call.Function.Name = "read_file"
 		call.Function.Arguments = `{"path":"secrets.json","start_line":1,"end_line":1}`
+		return llm.GenerateResponse{
+			Message:      llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{call}},
+			FinishReason: "tool_calls",
+		}, nil
+	}
+	if len(p.requests) == 2 {
+		var call llm.ToolCall
+		call.ID = "read-embedded-log"
+		call.Type = "function"
+		call.Function.Name = "read_file"
+		call.Function.Arguments = `{"path":"logs/request.log","start_line":1,"end_line":1}`
 		return llm.GenerateResponse{
 			Message:      llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{call}},
 			FinishReason: "tool_calls",

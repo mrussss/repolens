@@ -146,7 +146,7 @@ func TestDiagnosisJSONCredentialIsRedactedBeforeProviderInput(t *testing.T) {
 	run, created, err := diagService.Create(ctx, diagnosis.CreateDiagnosisInput{
 		UserID: "user-json-redaction", RepositoryID: "repo-json-redaction", SnapshotID: "snapshot-json-redaction",
 		IssueTitle: "credential leak", IssueDescription: `{"password":"supersecret123"}`,
-		ErrorLog: `{"password": "supersecret123"}`, IdempotencyKey: "json-redaction-test",
+		ErrorLog: `request_body="{\"password\":\"supersecret123\"}"`, IdempotencyKey: "json-redaction-test",
 		CodeIndexBuildID: 1, RetrievalBuildID: 1,
 	})
 	if err != nil || !created {
@@ -159,6 +159,9 @@ func TestDiagnosisJSONCredentialIsRedactedBeforeProviderInput(t *testing.T) {
 	if strings.Contains(persisted.IssueDescription, "supersecret123") || strings.Contains(persisted.ErrorLog, "supersecret123") {
 		t.Fatalf("persisted input contains original credential: description=%q error_log=%q", persisted.IssueDescription, persisted.ErrorLog)
 	}
+	if !strings.Contains(persisted.ErrorLog, "request_body") || !strings.Contains(persisted.ErrorLog, "[REDACTED_SECRET]") {
+		t.Fatalf("redaction did not preserve escaped JSON context: %q", persisted.ErrorLog)
+	}
 	provider := &diagnosisPromptCaptureProvider{}
 	loop := agent.NewAgentLoop(provider, agent.NewToolRegistry(), nil, agent.DefaultGuardConfig())
 	if _, err := loop.Run(ctx, persisted, &diagnosis.DiagnosisAttempt{ID: "attempt-json-redaction"}); err != nil {
@@ -167,10 +170,17 @@ func TestDiagnosisJSONCredentialIsRedactedBeforeProviderInput(t *testing.T) {
 	if len(provider.requests) != 1 {
 		t.Fatalf("provider calls=%d, want one", len(provider.requests))
 	}
+	providerLogContext := false
 	for _, message := range provider.requests[0].Messages {
 		if strings.Contains(message.Content, "supersecret123") {
 			t.Fatalf("provider-visible message contains original credential: %s", message.Content)
 		}
+		if strings.Contains(message.Content, "request_body") && strings.Contains(message.Content, "[REDACTED_SECRET]") {
+			providerLogContext = true
+		}
+	}
+	if !providerLogContext {
+		t.Fatal("provider-visible prompt lost the redacted request_body context")
 	}
 }
 
