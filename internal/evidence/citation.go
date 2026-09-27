@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/snapshotpolicy"
 )
 
 type CitationStatus string
@@ -112,6 +113,12 @@ func (v *CitationValidator) Validate(ctx context.Context, repoID, snapshotID str
 		c.ValidationError = fmt.Sprintf("invalid line range: %d to %d", c.StartLine, c.EndLine)
 		return
 	}
+	decision := snapshotpolicy.CanIssueEvidenceFromSnapshot(v.store.GetSourcePath(repoID, snapshotID), c.FilePath)
+	if !decision.Allowed {
+		c.ValidationStatus = CitationInvalid
+		c.ValidationError = fmt.Sprintf("file %s is excluded by snapshot policy", c.FilePath)
+		return
+	}
 
 	if !v.store.FileExists(repoID, snapshotID, c.FilePath) {
 		c.ValidationStatus = CitationInvalid
@@ -119,7 +126,16 @@ func (v *CitationValidator) Validate(ctx context.Context, repoID, snapshotID str
 		return
 	}
 
-	actualContent, err := v.store.ReadFile(ctx, repoID, snapshotID, c.FilePath, c.StartLine, c.EndLine)
+	var actualContent string
+	var err error
+	if bounded, ok := v.store.(interface {
+		ReadFileRangeBounded(context.Context, string, string, string, int, int, int) (snapshotstore.FileRange, error)
+	}); ok {
+		fileRange, rangeErr := bounded.ReadFileRangeBounded(ctx, repoID, snapshotID, c.FilePath, c.StartLine, c.EndLine, 0)
+		actualContent, err = fileRange.Content, rangeErr
+	} else {
+		actualContent, err = v.store.ReadFile(ctx, repoID, snapshotID, c.FilePath, c.StartLine, c.EndLine)
+	}
 	if err != nil {
 		c.ValidationStatus = CitationInvalid
 		c.ValidationError = fmt.Sprintf("failed to read file lines: %v", err)

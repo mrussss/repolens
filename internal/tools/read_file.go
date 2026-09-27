@@ -10,36 +10,7 @@ import (
 	"repolens/internal/evidence"
 	"repolens/internal/llm"
 	"repolens/internal/platform/snapshotstore"
-)
-
-var (
-	blockedFilenames = map[string]bool{
-		".env":                 true,
-		".env.local":           true,
-		".env.production":      true,
-		"id_rsa":               true,
-		"id_dsa":               true,
-		"id_ed25519":           true,
-		"credentials.json":     true,
-		"service-account.json": true,
-		".git/config":          true,
-		".git/HEAD":            true,
-	}
-
-	blockedExtensions = map[string]bool{
-		".pem": true,
-		".key": true,
-		".exe": true,
-		".dll": true,
-		".bin": true,
-		".so":  true,
-		".zip": true,
-		".tar": true,
-		".gz":  true,
-		".png": true,
-		".jpg": true,
-		".pdf": true,
-	}
+	"repolens/internal/snapshotpolicy"
 )
 
 type ReadFileArgs struct {
@@ -127,14 +98,9 @@ func (t *ReadFileTool) Execute(ctx context.Context, argsJSON string) (string, er
 		return "", fmt.Errorf("path traversal denied: %s", args.Path)
 	}
 
-	base := filepath.Base(cleanPath)
-	ext := strings.ToLower(filepath.Ext(cleanPath))
-
-	if blockedFilenames[strings.ToLower(base)] || blockedFilenames[filepath.ToSlash(cleanPath)] {
-		return "", fmt.Errorf("access to sensitive file denied: %s", cleanPath)
-	}
-	if blockedExtensions[ext] {
-		return "", fmt.Errorf("access to binary/secret file type denied: %s", cleanPath)
+	decision := snapshotpolicy.CanReadFromSnapshot(t.storeFS.GetSourcePath(t.repoID, t.snapshotID), cleanPath)
+	if !decision.Allowed {
+		return "", fmt.Errorf("file access denied: %s (%s)", cleanPath, decision.Reason)
 	}
 
 	if !t.storeFS.FileExists(t.repoID, t.snapshotID, cleanPath) {
@@ -167,7 +133,15 @@ func (t *ReadFileTool) Execute(ctx context.Context, argsJSON string) (string, er
 	// Keep the legacy no-issuer path bounded at complete lines as well. The
 	// evidence-enabled path above is canonical; neither path should slice a
 	// source string after reading it.
-	contentRange, err := t.storeFS.ReadFileRange(ctx, t.repoID, t.snapshotID, cleanPath, args.StartLine, args.EndLine, 64*1024)
+	var contentRange snapshotstore.FileRange
+	var err error
+	if bounded, ok := t.storeFS.(interface {
+		ReadFileRangeBounded(context.Context, string, string, string, int, int, int) (snapshotstore.FileRange, error)
+	}); ok {
+		contentRange, err = bounded.ReadFileRangeBounded(ctx, t.repoID, t.snapshotID, cleanPath, args.StartLine, args.EndLine, 64*1024)
+	} else {
+		contentRange, err = t.storeFS.ReadFileRange(ctx, t.repoID, t.snapshotID, cleanPath, args.StartLine, args.EndLine, 64*1024)
+	}
 	if err != nil {
 		return "", err
 	}
