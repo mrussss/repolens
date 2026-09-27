@@ -32,7 +32,9 @@ var ignoredExtensions = map[string]struct{}{
 
 var sensitiveNames = map[string]struct{}{
 	".env": {}, "id_rsa": {}, "id_dsa": {}, "id_ed25519": {},
-	"credentials.json": {}, "service-account.json": {},
+	"secret.json": {}, "secrets.json": {},
+	"credential.json": {}, "credentials.json": {},
+	"service-account.json": {}, "service_account.json": {},
 }
 
 func CanMaterialize(path string, size int64) Decision   { return evaluate(path, size) }

@@ -32,6 +32,27 @@ func (p *generationOptionsProvider) Generate(_ context.Context, request llm.Gene
 	}, nil
 }
 
+func TestProviderPromptContainsOnlyRedactedPersistedDiagnosisInput(t *testing.T) {
+	provider := &generationOptionsProvider{}
+	loop := NewAgentLoop(provider, NewToolRegistry(), nil, DefaultGuardConfig())
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-redacted-prompt", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "issue", IssueDescription: `{"password":"supersecret123"}`,
+		ErrorLog: `{"password": "supersecret123"}`,
+	}
+	if _, err := loop.Run(context.Background(), run, &diagnosis.DiagnosisAttempt{ID: "attempt-redacted-prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider calls = %d, want one", len(provider.requests))
+	}
+	for _, message := range provider.requests[0].Messages {
+		if strings.Contains(message.Content, "supersecret123") {
+			t.Fatalf("provider-visible prompt contains original credential: %s", message.Content)
+		}
+	}
+}
+
 func runLoopResponseTest(t *testing.T, response llm.GenerateResponse, maxOutputTokens int) (*LoopResult, error) {
 	t.Helper()
 	loop := NewAgentLoop(loopResponseProvider{response: response}, NewToolRegistry(), nil, GuardConfig{

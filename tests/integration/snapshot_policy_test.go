@@ -8,16 +8,20 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	"repolens/internal/agent"
 	"repolens/internal/codeintel"
 	codeintelmodel "repolens/internal/codeintel/model"
+	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/indexing"
 	"repolens/internal/jobs"
+	"repolens/internal/llm"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
@@ -79,6 +83,7 @@ func TestSnapshotVisibilityMatchesManifestCodeIndexReadFileAndEvidence(t *testin
 		".ENV.PRODUCTION": "TOKEN=production-secret\n",
 		"secret.pem":      "private key\n",
 		"foo.key":         "private key\n",
+		"secrets.json":    `{"password":"snapshot-supersecret"}`,
 		"dist/main.go":    "package dist\nfunc HiddenDist() {}\n",
 		"build/main.go":   "package build\nfunc HiddenBuild() {}\n",
 		"README.md":       "visible documentation\n",
@@ -155,6 +160,7 @@ func TestSnapshotVisibilityMatchesManifestCodeIndexReadFileAndEvidence(t *testin
 		{path: ".ENV.PRODUCTION", allowed: false},
 		{path: "secret.pem", allowed: false},
 		{path: "foo.key", allowed: false},
+		{path: "secrets.json", allowed: false},
 		{path: "dist/main.go", allowed: false},
 		{path: "build/main.go", allowed: false},
 		{path: "src/main.go", allowed: true},
@@ -181,6 +187,56 @@ func TestSnapshotVisibilityMatchesManifestCodeIndexReadFileAndEvidence(t *testin
 			}
 		})
 	}
+
+	provider := &snapshotPolicyCaptureProvider{}
+	registry := agent.NewToolRegistry()
+	registry.Register(readTool)
+	loop := agent.NewAgentLoop(provider, registry, nil, agent.DefaultGuardConfig())
+	_, err = loop.Run(ctx, &diagnosis.DiagnosisRun{
+		ID: "run-policy-provider", RepositoryID: repoID, SnapshotID: snapshotID,
+		IssueTitle: "inspect credentials file",
+	}, &diagnosis.DiagnosisAttempt{ID: "attempt-policy-provider"})
+	if err != nil {
+		t.Fatalf("run provider boundary check: %v", err)
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider calls=%d, want initial call and post-tool call", len(provider.requests))
+	}
+	for callIndex, request := range provider.requests {
+		for _, message := range request.Messages {
+			if strings.Contains(message.Content, "snapshot-supersecret") {
+				t.Fatalf("provider call %d received excluded file content: %+v", callIndex+1, message)
+			}
+		}
+	}
+}
+
+type snapshotPolicyCaptureProvider struct {
+	requests []llm.GenerateRequest
+}
+
+func (p *snapshotPolicyCaptureProvider) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
+	copyRequest := request
+	copyRequest.Messages = append([]llm.Message(nil), request.Messages...)
+	for i := range copyRequest.Messages {
+		copyRequest.Messages[i].ToolCalls = append([]llm.ToolCall(nil), request.Messages[i].ToolCalls...)
+	}
+	p.requests = append(p.requests, copyRequest)
+	if len(p.requests) == 1 {
+		var call llm.ToolCall
+		call.ID = "read-secrets-file"
+		call.Type = "function"
+		call.Function.Name = "read_file"
+		call.Function.Arguments = `{"path":"secrets.json","start_line":1,"end_line":1}`
+		return llm.GenerateResponse{
+			Message:      llm.Message{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{call}},
+			FinishReason: "tool_calls",
+		}, nil
+	}
+	return llm.GenerateResponse{
+		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`},
+		FinishReason: "stop",
+	}, nil
 }
 
 type policyCloner struct{ commitSHA string }
