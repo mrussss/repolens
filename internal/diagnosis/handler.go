@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/evidence"
@@ -305,11 +306,21 @@ func (h *Handler) GetReport(c *gin.Context) {
 	}
 	report, err := h.reportStore.GetByRunID(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "report not found"})
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"code": "REPORT_NOT_FOUND", "error": "report not found"})
+			return
+		}
+		logger.L(c.Request.Context()).Error("failed to load diagnosis report", "diagnosis_id", id, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
 		return
 	}
 
-	citations, _ := h.citationStore.ListByReportID(c.Request.Context(), report.ID)
+	citations, err := h.citationStore.ListByReportID(c.Request.Context(), report.ID)
+	if err != nil {
+		logger.L(c.Request.Context()).Error("failed to load diagnosis report citations", "diagnosis_id", id, "report_id", report.ID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"report":    report,
