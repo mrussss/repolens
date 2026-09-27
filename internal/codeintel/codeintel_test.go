@@ -377,28 +377,73 @@ func TestQueuedCodeIndexJobRestoresPersistedBuildTags(t *testing.T) {
 }
 
 func TestQueuedCodeIndexJobFailsClosedWhenLegacyTagNamesAreUnavailable(t *testing.T) {
-	db, _, ciStore, snapStore := setupCodeIntelTestDB(t)
+	db, jobsStore, ciStore, snapStore := setupCodeIntelTestDB(t)
 	ctx := context.Background()
+	const revisionID = "revision-missing-build-tags"
+	if err := db.Create(&revision.AnalysisRevision{
+		ID: revisionID, RepositoryID: "repo-build-tags", SourceRef: "main",
+		CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2",
+		PipelineFingerprint: "fingerprint-missing-build-tags", Status: revision.StatusPreparing,
+		Stage: revision.StageBuildingCode, ExecutionGeneration: 1, Version: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	bc := codeintelmodel.BuildContext{GOOS: "linux", GOARCH: "amd64", BuildTags: []string{"custom"}}
 	build, created, err := ciStore.GetOrCreateBuild(ctx, "snap-legacy-build-tags", "example.com/legacy", bc)
 	if err != nil || !created {
 		t.Fatalf("create custom-tag build: created=%t err=%v", created, err)
+	}
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Update("analysis_revision_id", revisionID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", revisionID).Update("code_index_build_id", build.ID).Error; err != nil {
+		t.Fatal(err)
 	}
 	// Migration 012 backfills the absent legacy JSON as []; the persisted hash
 	// still proves that custom tag names were originally present but lost.
 	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Update("build_tags_json", "[]").Error; err != nil {
 		t.Fatal(err)
 	}
+	if _, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(build.ID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-build-tags", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim build job: jobs=%d err=%v", len(claimed), err)
+	}
 	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()), codeintel.NewAnalyzer())
-	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: strconv.FormatInt(build.ID, 10), MaxAttempts: 3}); err == nil {
+	handlerErr := handler.Execute(ctx, claimed[0])
+	if handlerErr == nil {
 		t.Fatal("legacy build with missing custom tag names unexpectedly executed")
 	}
-	retired, err := ciStore.GetByID(ctx, build.ID)
+	class, code := jobs.ClassifyError(handlerErr)
+	if class != jobs.ErrorClassPermanent || code != "BUILD_TAGS_UNAVAILABLE" {
+		t.Fatalf("build tags error classification = %s/%s, want PERMANENT/BUILD_TAGS_UNAVAILABLE", class, code)
+	}
+	unchanged, err := ciStore.GetByID(ctx, build.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retired.Status != codeintelmodel.BuildStatusFailed || retired.ErrorCode != "BUILD_TAGS_UNAVAILABLE" {
-		t.Fatalf("legacy build was not failed closed: %+v", retired)
+	if unchanged.Status != codeintelmodel.BuildStatusCreated {
+		t.Fatalf("handler changed build before claim-fenced terminalization: %+v", unchanged)
+	}
+	terminalReason := jobs.TerminalReasonPermanent
+	if err := jobsStore.ConditionalFinalizeFailure(ctx, claimed[0].ID, "worker-build-tags", *claimed[0].ClaimToken, class, code, handlerErr.Error(), &terminalReason, true, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	failedBuild, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failedBuild.Status != codeintelmodel.BuildStatusFailed || failedBuild.ErrorCode != "BUILD_TAGS_UNAVAILABLE" {
+		t.Fatalf("claim-fenced terminalizer did not fail the build: %+v", failedBuild)
+	}
+	failedRevision := &revision.AnalysisRevision{}
+	if err := db.First(failedRevision, "id = ?", revisionID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if failedRevision.Status != revision.StatusFailed || failedRevision.ErrorCode != "BUILD_TAGS_UNAVAILABLE" {
+		t.Fatalf("claim-fenced terminalizer did not fail the revision: %+v", failedRevision)
 	}
 }
 

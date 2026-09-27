@@ -76,15 +76,12 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	var buildTags []string
 	if cib.BuildTagsJSON != "" {
 		if err := json.Unmarshal([]byte(cib.BuildTagsJSON), &buildTags); err != nil {
-			return fmt.Errorf("invalid persisted build tags for build %d: %w", cib.ID, err)
+			return jobs.NewPermanentError("BUILD_TAGS_UNAVAILABLE", fmt.Sprintf("invalid persisted build tags for build %d", cib.ID), err)
 		}
 	}
 	bc := model.BuildContext{GOOS: cib.GOOS, GOARCH: cib.GOARCH, BuildTags: buildTags}
 	if bc.BuildTagsHash() != cib.BuildTagsHash {
-		if err := h.store.FailBuild(ctx, cib.ID, "BUILD_TAGS_UNAVAILABLE"); err != nil {
-			return fmt.Errorf("persisted build tags do not match build %d identity; fail build: %w", cib.ID, err)
-		}
-		return fmt.Errorf("persisted build tags do not match build %d identity; legacy tag names may be unavailable", cib.ID)
+		return jobs.NewPermanentError("BUILD_TAGS_UNAVAILABLE", fmt.Sprintf("persisted build tags do not match build %d identity; legacy tag names may be unavailable", cib.ID), nil)
 	}
 	if bc.BuildContextHash() != cib.BuildContextHash {
 		return fmt.Errorf("persisted build context does not match build %d identity", cib.ID)

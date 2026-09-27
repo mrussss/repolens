@@ -37,8 +37,14 @@ type ModuleInfo struct {
 	NestedMods []string
 }
 
+type walkDirFunc func(string, fs.WalkDirFunc) error
+
 // DiscoverModule locates the root go.mod and any nested go.mod files.
 func DiscoverModule(rootPath string) (*ModuleInfo, error) {
+	return discoverModuleWithWalkDir(rootPath, filepath.WalkDir)
+}
+
+func discoverModuleWithWalkDir(rootPath string, walkDir walkDirFunc) (*ModuleInfo, error) {
 	rootPath, err := filepath.Abs(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path: %w", err)
@@ -72,9 +78,9 @@ func DiscoverModule(rootPath string) (*ModuleInfo, error) {
 	}
 
 	// Walk to discover nested go.mod
-	err = filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	err = walkDir(rootPath, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
 		if d.IsDir() {
 			if snapshotpolicy.ShouldSkipDirectory(d.Name()) {
@@ -104,6 +110,10 @@ func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInf
 // when allowedFiles is non-nil. A nil list retains the shared policy walk used
 // for legacy snapshots that predate manifests.
 func ParseRepositoryWithAllowedFiles(fset *token.FileSet, rootPath string, moduleInfo *ModuleInfo, bctx model.BuildContext, allowedFiles []string) ([]*ParsedFile, []string, error) {
+	return parseRepositoryWithWalkDir(fset, rootPath, moduleInfo, bctx, allowedFiles, filepath.WalkDir)
+}
+
+func parseRepositoryWithWalkDir(fset *token.FileSet, rootPath string, moduleInfo *ModuleInfo, bctx model.BuildContext, allowedFiles []string, walkDir walkDirFunc) ([]*ParsedFile, []string, error) {
 	var warnings []string
 	if len(moduleInfo.NestedMods) > 0 {
 		warnings = append(warnings, fmt.Sprintf("found %d nested go.mod files (%s); nested modules excluded from root module semantic analysis",
@@ -124,9 +134,9 @@ func ParseRepositoryWithAllowedFiles(fset *token.FileSet, rootPath string, modul
 		}
 	}
 
-	err := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, walkErr error) error {
+	err := walkDir(rootPath, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return nil
+			return walkErr
 		}
 
 		if d.IsDir() {

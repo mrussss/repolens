@@ -1,7 +1,9 @@
 package parser
 
 import (
+	"errors"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,26 @@ import (
 
 	"repolens/internal/codeintel/model"
 )
+
+func TestRepositoryWalkErrorsPropagate(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/walk-errors\ngo 1.22\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	walkErr := errors.New("injected directory read failure")
+	walker := walkDirFunc(func(root string, fn fs.WalkDirFunc) error {
+		return fn(filepath.Join(root, "unreadable"), nil, walkErr)
+	})
+
+	if _, err := discoverModuleWithWalkDir(root, walker); !errors.Is(err, walkErr) {
+		t.Fatalf("DiscoverModule walk error = %v, want %v", err, walkErr)
+	}
+
+	moduleInfo := &ModuleInfo{RootPath: root}
+	if _, _, err := parseRepositoryWithWalkDir(token.NewFileSet(), root, moduleInfo, model.DefaultBuildContext(), nil, walker); !errors.Is(err, walkErr) {
+		t.Fatalf("ParseRepository walk error = %v, want %v", err, walkErr)
+	}
+}
 
 func TestParseRepositorySkipsSymlinkAndRecordsWarning(t *testing.T) {
 	root := t.TempDir()
