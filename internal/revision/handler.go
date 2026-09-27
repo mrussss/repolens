@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"repolens/internal/platform/logger"
+	"repolens/internal/repo"
 )
 
 type Handler struct{ service *Service }
@@ -52,6 +53,8 @@ func (h *Handler) Create(c *gin.Context) {
 	value, created, err := h.service.Prepare(c.Request.Context(), userID, c.Param("id"), request.Ref)
 	if err != nil {
 		switch {
+		case errors.Is(err, repo.ErrRefTooLong):
+			c.JSON(http.StatusBadRequest, gin.H{"code": "REF_TOO_LONG", "error": "git ref must not exceed 255 characters"})
 		case errors.Is(err, ErrFailedRevision):
 			c.JSON(http.StatusConflict, gin.H{"code": "REVISION_PREPARE_FAILED", "error": "analysis revision failed; retry explicitly", "analysis_revision": publicRevision(value)})
 		case errors.Is(err, ErrNotFound):

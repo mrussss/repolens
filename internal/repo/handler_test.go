@@ -141,6 +141,33 @@ func TestTriggerIndexRejectsInvalidJSONWithoutSideEffects(t *testing.T) {
 	}
 }
 
+func TestTriggerIndexRejectsOverlongRefBeforeResolving(t *testing.T) {
+	router, db, resolver := newTriggerIndexTestHandler(t)
+	request := httptest.NewRequest(http.MethodPost, "/repositories/repo-1/index", strings.NewReader(`{"ref":"`+strings.Repeat("r", 256)+`"}`))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["code"] != "REF_TOO_LONG" || resolver.calls != 0 {
+		t.Fatalf("response=%v resolver calls=%d, want REF_TOO_LONG and no resolution", payload, resolver.calls)
+	}
+	var snapshots, jobsCount int64
+	if err := db.Model(&snapshot.RepositorySnapshot{}).Count(&snapshots).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Count(&jobsCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 || jobsCount != 0 {
+		t.Fatalf("overlong ref side effects: snapshots=%d jobs=%d", snapshots, jobsCount)
+	}
+}
+
 func TestTriggerIndexDefaultsValidEmptyRequests(t *testing.T) {
 	tests := []struct {
 		name string
@@ -180,6 +207,45 @@ func TestTriggerIndexDefaultsValidEmptyRequests(t *testing.T) {
 				t.Fatalf("job count = %d, want 1", jobCount)
 			}
 		})
+	}
+}
+
+func TestLegacyTriggerIndexDoesNotReuseOrRequeueRevisionSnapshot(t *testing.T) {
+	router, db, resolver := newTriggerIndexTestHandler(t)
+	revisionSnapshot := &snapshot.RepositorySnapshot{
+		ID: "revision-aware-snapshot", RepositoryID: "repo-1", AnalysisRevisionID: "revision-1",
+		CommitSHA: "0123456789abcdef0123456789abcdef01234567", Ref: "release/2.x",
+		MaterializedPath: "/tmp/revision-snapshot", ContentHash: "content", Status: snapshot.StatusFailed,
+	}
+	if err := db.Create(revisionSnapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldJob := &jobs.AnalysisJob{
+		JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: revisionSnapshot.ID, Status: jobs.StatusFailed,
+		AttemptCount: 1, MaxAttempts: 3,
+	}
+	if err := db.Create(oldJob).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/repositories/repo-1/index", strings.NewReader(`{}`)))
+	if response.Code != http.StatusAccepted || resolver.calls != 1 {
+		t.Fatalf("response=%d %s resolver calls=%d, want new legacy snapshot", response.Code, response.Body.String(), resolver.calls)
+	}
+	var legacySnapshots []snapshot.RepositorySnapshot
+	if err := db.Where("repository_id = ? AND commit_sha = ? AND analysis_revision_id = ''", "repo-1", revisionSnapshot.CommitSHA).Find(&legacySnapshots).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(legacySnapshots) != 1 || legacySnapshots[0].ID == revisionSnapshot.ID {
+		t.Fatalf("legacy snapshots=%+v; revision-aware row was reused", legacySnapshots)
+	}
+	var stillFailed jobs.AnalysisJob
+	if err := db.First(&stillFailed, oldJob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stillFailed.Status != jobs.StatusFailed {
+		t.Fatalf("revision-aware job status=%s, want unchanged FAILED", stillFailed.Status)
 	}
 }
 

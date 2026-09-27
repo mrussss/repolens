@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -202,7 +203,23 @@ func TestRevisionHandlerSeparatesRefFailureFromStoreFailure(t *testing.T) {
 	router.POST("/repositories/:id/revisions", handler.Create)
 
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"missing"}`))
+	request := httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"`+strings.Repeat("r", 256)+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte(`"REF_TOO_LONG"`)) {
+		t.Fatalf("overlong ref response = %d %s, want REF_TOO_LONG", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"`+strings.Repeat("r", 255)+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || bytes.Contains(response.Body.Bytes(), []byte(`"REF_TOO_LONG"`)) {
+		t.Fatalf("255-character ref response = %d %s, want resolver-level REF_NOT_FOUND", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"missing"}`))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte(`"REF_NOT_FOUND"`)) {

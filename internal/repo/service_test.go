@@ -2,6 +2,8 @@ package repo
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -95,5 +97,18 @@ func TestServiceRegisterDefaultRef(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestServiceRegisterRefLengthBoundaries(t *testing.T) {
+	for _, length := range []int{128, 129, 255} {
+		ref := strings.Repeat("r", length)
+		registered, err := NewService(&fakeStore{}).Register(context.Background(), "user", "repo", "https://example.com/repo.git", ref)
+		if err != nil || registered.DefaultRef != ref {
+			t.Errorf("Register ref length %d = (%v, %v), want accepted ref", length, registered, err)
+		}
+	}
+	if _, err := NewService(&fakeStore{}).Register(context.Background(), "user", "repo", "https://example.com/repo.git", strings.Repeat("r", 256)); !errors.Is(err, ErrRefTooLong) {
+		t.Fatalf("Register ref length 256 error = %v, want ErrRefTooLong", err)
 	}
 }

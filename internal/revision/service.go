@@ -32,8 +32,8 @@ func (s *Service) Prepare(ctx context.Context, userID, repositoryID, requestedRe
 		}
 		requestedRef = r.DefaultRef
 	}
-	if len(requestedRef) > 255 {
-		return nil, false, fmt.Errorf("ref exceeds maximum length")
+	if err := repo.ValidateRefLength(requestedRef); err != nil {
+		return nil, false, err
 	}
 	repository, err := s.repoStore.GetByIDAndUser(ctx, repositoryID, userID)
 	if err != nil {

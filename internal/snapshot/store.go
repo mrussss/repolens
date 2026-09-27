@@ -19,6 +19,7 @@ type Store interface {
 	GetByID(ctx context.Context, id string) (*RepositorySnapshot, error)
 	GetLatestReady(ctx context.Context, repoID string) (*RepositorySnapshot, error)
 	GetByCommit(ctx context.Context, repoID, commitSHA string) (*RepositorySnapshot, error)
+	GetLegacyByCommit(ctx context.Context, repoID, commitSHA string) (*RepositorySnapshot, error)
 	UpdateStatus(ctx context.Context, id string, expectedOldStatus, newStatus SnapshotStatus, readyAt *time.Time) error
 }
 
@@ -72,6 +73,14 @@ func (s *GormStore) GetLatestReady(ctx context.Context, repoID string) (*Reposit
 func (s *GormStore) GetByCommit(ctx context.Context, repoID, commitSHA string) (*RepositorySnapshot, error) {
 	var snap RepositorySnapshot
 	if err := s.db.WithContext(ctx).Where("repository_id = ? AND commit_sha = ?", repoID, commitSHA).Order("created_at DESC, id DESC").First(&snap).Error; err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+func (s *GormStore) GetLegacyByCommit(ctx context.Context, repoID, commitSHA string) (*RepositorySnapshot, error) {
+	var snap RepositorySnapshot
+	if err := s.db.WithContext(ctx).Where("repository_id = ? AND commit_sha = ? AND analysis_revision_id = ''", repoID, commitSHA).Order("created_at DESC, id DESC").First(&snap).Error; err != nil {
 		return nil, err
 	}
 	return &snap, nil
