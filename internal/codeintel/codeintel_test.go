@@ -19,6 +19,7 @@ import (
 	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 	"repolens/internal/tools"
 )
@@ -361,6 +362,81 @@ func TestQueuedCodeIndexJobFailsClosedWhenLegacyTagNamesAreUnavailable(t *testin
 	}
 	if retired.Status != codeintelmodel.BuildStatusFailed || retired.ErrorCode != "BUILD_TAGS_UNAVAILABLE" {
 		t.Fatalf("legacy build was not failed closed: %+v", retired)
+	}
+}
+
+type codeIndexRevisionFailureRecorder struct{ calls int }
+
+func (r *codeIndexRevisionFailureRecorder) MarkCodeIndexReady(context.Context, string, int64) error {
+	return nil
+}
+
+func (r *codeIndexRevisionFailureRecorder) MarkFailed(context.Context, string, revision.Stage, string, string) error {
+	r.calls++
+	return nil
+}
+
+func TestStaleCodeIndexHandlerDoesNotFailRevision(t *testing.T) {
+	db, jobsStore, ciStore, snapStore := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	revisionID := "revision-stale-code-index"
+	if err := db.Create(&revision.AnalysisRevision{
+		ID: revisionID, RepositoryID: "repo-stale-code-index", SourceRef: "main",
+		CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2",
+		PipelineFingerprint: "fingerprint-stale-code-index", Status: revision.StatusPreparing,
+		Stage: revision.StageBuildingCode, ExecutionGeneration: 1, Version: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	buildContext := codeintelmodel.BuildContext{GOOS: "linux", GOARCH: "amd64", BuildTags: []string{"custom"}}
+	build, _, err := ciStore.GetOrCreateBuild(ctx, "snap-missing-stale-code-index", "example.com/stale", buildContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Updates(map[string]interface{}{
+		"analysis_revision_id": revisionID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, strconv.FormatInt(build.ID, 10)).Update("max_attempts", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldClaim, err := jobsStore.ClaimJobs(ctx, "old-code-index-worker", 1, time.Minute)
+	if err != nil || len(oldClaim) != 1 {
+		t.Fatalf("old CodeIndex claim = %d jobs, err=%v", len(oldClaim), err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
+		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
+		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", revisionID).Updates(map[string]interface{}{
+		"execution_generation": 2, "stage": revision.StageBuildingCode,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	newClaim, err := jobsStore.ClaimJobs(ctx, "new-code-index-worker", 1, time.Minute)
+	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
+		t.Fatalf("new CodeIndex claim = %+v, err=%v", newClaim, err)
+	}
+	revisionFailures := &codeIndexRevisionFailureRecorder{}
+	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()), codeintel.NewAnalyzer()).
+		WithRevisionStore(revisionFailures)
+	err = handler.Execute(ctx, oldClaim[0])
+	if err == nil {
+		t.Fatal("CodeIndex handler unexpectedly succeeded with a missing source snapshot")
+	}
+	if revisionFailures.calls != 0 {
+		t.Fatalf("stale CodeIndex handler wrote revision failure %d times without a claim", revisionFailures.calls)
+	}
+	currentRevision, err := revision.NewStore(db).GetByID(ctx, revisionID)
+	if err != nil || currentRevision.Status != revision.StatusPreparing || currentRevision.ExecutionGeneration != 2 {
+		t.Fatalf("new revision after stale CodeIndex error = %+v err=%v", currentRevision, err)
+	}
+	currentJob, err := jobsStore.GetJobByID(ctx, newClaim[0].ID)
+	if err != nil || currentJob.Status != jobs.StatusRunning || currentJob.ClaimToken == nil || *currentJob.ClaimToken != *newClaim[0].ClaimToken {
+		t.Fatalf("new CodeIndex claim changed by stale handler: job=%+v err=%v", currentJob, err)
 	}
 }
 

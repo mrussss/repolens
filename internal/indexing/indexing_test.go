@@ -10,10 +10,15 @@ import (
 	"testing"
 	"time"
 
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+
 	"repolens/internal/indexing"
 	"repolens/internal/jobs"
+	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
 
@@ -249,6 +254,93 @@ type failingWalkStore struct{ snapshotstore.SnapshotStore }
 
 func (f failingWalkStore) WalkFiles(string, string, func(string, os.FileInfo) error) error {
 	return errors.New("simulated walk failure")
+}
+
+type snapshotRevisionFailureRecorder struct{ calls int }
+
+func (r *snapshotRevisionFailureRecorder) MarkSnapshotReady(context.Context, string, string) error {
+	return nil
+}
+
+func (r *snapshotRevisionFailureRecorder) MarkFailed(context.Context, string, revision.Stage, string, string) error {
+	r.calls++
+	return nil
+}
+
+func TestStaleSnapshotHandlerDoesNotFailRevision(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "stale_snapshot.db")), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mysql.AutoMigrate(db); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const revisionID = "revision-stale-snapshot"
+	const snapshotID = "snap-stale-revision"
+	const repositoryID = "repo-stale-revision"
+	if err := db.Create(&revision.AnalysisRevision{
+		ID: revisionID, RepositoryID: repositoryID, SourceRef: "main",
+		CommitSHA: "0123456789abcdef0123456789abcdef01234567", PipelineVersion: "v2.2",
+		PipelineFingerprint: "fingerprint-stale-snapshot", SnapshotID: snapshotID,
+		Status: revision.StatusPreparing, Stage: revision.StageMaterializing, ExecutionGeneration: 1, Version: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshotStore := snapshot.NewStore(db)
+	if err := snapshotStore.Create(ctx, &snapshot.RepositorySnapshot{
+		ID: snapshotID, AnalysisRevisionID: revisionID, RepositoryID: repositoryID, Ref: "main",
+		CommitSHA: "0123456789abcdef0123456789abcdef01234567", Status: snapshot.StatusMaterializing,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: snapshotID, MaxAttempts: 1}
+	if err := jobsStore.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	oldClaim, err := jobsStore.ClaimJobs(ctx, "old-snapshot-worker", 1, time.Minute)
+	if err != nil || len(oldClaim) != 1 {
+		t.Fatalf("old Snapshot claim = %d jobs, err=%v", len(oldClaim), err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
+		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
+		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", revisionID).Update("execution_generation", 2).Error; err != nil {
+		t.Fatal(err)
+	}
+	newClaim, err := jobsStore.ClaimJobs(ctx, "new-snapshot-worker", 1, time.Minute)
+	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
+		t.Fatalf("new Snapshot claim = %+v, err=%v", newClaim, err)
+	}
+	revisionFailures := &snapshotRevisionFailureRecorder{}
+	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	handler := indexing.NewSnapshotJobHandler(
+		&mockRepoStore{}, snapshotStore, nil, failingWalkStore{SnapshotStore: storeFS},
+		&fixtureCloner{commitSHA: "0123456789abcdef0123456789abcdef01234567"}, indexing.NewFileFilter(512), indexing.NewCodeChunker(5, 2), nil,
+	).WithRevisionStore(revisionFailures)
+	err = handler.Execute(ctx, oldClaim[0])
+	if err == nil {
+		t.Fatal("snapshot walk failure unexpectedly succeeded")
+	}
+	if revisionFailures.calls != 0 {
+		t.Fatalf("stale Snapshot handler wrote revision failure %d times without a claim", revisionFailures.calls)
+	}
+	currentRevision, err := revision.NewStore(db).GetByID(ctx, revisionID)
+	if err != nil || currentRevision.Status != revision.StatusPreparing || currentRevision.ExecutionGeneration != 2 {
+		t.Fatalf("new revision after stale Snapshot error = %+v err=%v", currentRevision, err)
+	}
+	currentJob, err := jobsStore.GetJobByID(ctx, newClaim[0].ID)
+	if err != nil || currentJob.Status != jobs.StatusRunning || currentJob.ClaimToken == nil || *currentJob.ClaimToken != *newClaim[0].ClaimToken {
+		t.Fatalf("new Snapshot claim changed by stale handler: job=%+v err=%v", currentJob, err)
+	}
 }
 
 func TestSnapshotJobHandler_FinalizesOnlyAfterMaterialization(t *testing.T) {

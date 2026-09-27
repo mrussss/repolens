@@ -24,7 +24,6 @@ type CodeIndexJobHandler struct {
 	analyzer      *Analyzer
 	revisionStore interface {
 		MarkCodeIndexReady(context.Context, string, int64) error
-		MarkFailed(context.Context, string, revision.Stage, string, string) error
 	}
 }
 
@@ -48,27 +47,18 @@ func NewCodeIndexJobHandler(
 
 func (h *CodeIndexJobHandler) WithRevisionStore(store interface {
 	MarkCodeIndexReady(context.Context, string, int64) error
-	MarkFailed(context.Context, string, revision.Stage, string, string) error
 }) *CodeIndexJobHandler {
 	h.revisionStore = store
 	return h
 }
 
 // Execute performs full code intelligence extraction for a code_index_build.
-func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) (executeErr error) {
+func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
 	log := logger.L(ctx)
 	buildID, err := strconv.ParseInt(job.ResourceID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid build resource ID %s: %w", job.ResourceID, err)
 	}
-	defer func() {
-		if executeErr != nil && h.revisionStore != nil && job.AttemptCount >= job.MaxAttempts {
-			if build, buildErr := h.store.GetByID(context.Background(), buildID); buildErr == nil && build.AnalysisRevisionID != "" {
-				_ = h.revisionStore.MarkFailed(context.Background(), build.AnalysisRevisionID, revision.StageBuildingCode, "CODE_INDEX_BUILD_FAILED", executeErr.Error())
-			}
-		}
-	}()
-
 	cib, err := h.store.GetByID(ctx, buildID)
 	if err != nil {
 		return fmt.Errorf("failed fetching code index build %d: %w", buildID, err)

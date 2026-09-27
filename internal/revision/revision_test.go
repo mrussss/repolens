@@ -181,9 +181,6 @@ func TestRevisionTransitionsToReadyAndRetryIsExplicit(t *testing.T) {
 	if err != nil || ready.Status != revision.StatusReady || ready.Stage != revision.StageReady {
 		t.Fatalf("ready revision = %+v err=%v", ready, err)
 	}
-	if err := store.MarkFailed(ctx, value.ID, revision.StageFailed, "TEST", "failure"); err == nil {
-		t.Fatal("READY revision was allowed to fail")
-	}
 }
 
 func TestRevisionHandlerSeparatesRefFailureFromStoreFailure(t *testing.T) {

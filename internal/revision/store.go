@@ -43,7 +43,6 @@ type Store interface {
 	MarkSnapshotReady(ctx context.Context, id, snapshotID string) error
 	MarkCodeIndexReady(ctx context.Context, id string, buildID int64) error
 	MarkRetrievalReady(ctx context.Context, id string, buildID int64) error
-	MarkFailed(ctx context.Context, id string, stage Stage, code, message string) error
 }
 
 type GormStore struct{ db *gorm.DB }
@@ -470,17 +469,6 @@ func (s *GormStore) MarkRetrievalReady(ctx context.Context, id string, buildID i
 	}
 	if result.RowsAffected != 1 {
 		return ErrLineage
-	}
-	return nil
-}
-
-func (s *GormStore) MarkFailed(ctx context.Context, id string, stage Stage, code, message string) error {
-	result := s.db.WithContext(ctx).Model(&AnalysisRevision{}).Where("id = ? AND status = ?", id, StatusPreparing).Updates(map[string]interface{}{"status": StatusFailed, "stage": stage, "error_code": code, "error_message": message, "version": gorm.Expr("version + 1"), "updated_at": time.Now().UTC()})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected != 1 {
-		return ErrInvalidState
 	}
 	return nil
 }

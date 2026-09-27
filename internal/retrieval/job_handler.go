@@ -27,7 +27,6 @@ type RetrievalJobHandler struct {
 	storeFS       snapshotstore.SnapshotStore
 	revisionStore interface {
 		MarkRetrievalReady(context.Context, string, int64) error
-		MarkFailed(context.Context, string, revision.Stage, string, string) error
 	}
 }
 
@@ -49,27 +48,18 @@ func NewRetrievalJobHandler(ciStore codeintelstore.Store, baseStorageDir string)
 
 func (h *RetrievalJobHandler) WithRevisionStore(store interface {
 	MarkRetrievalReady(context.Context, string, int64) error
-	MarkFailed(context.Context, string, revision.Stage, string, string) error
 }) *RetrievalJobHandler {
 	h.revisionStore = store
 	return h
 }
 
 // Execute builds and atomically publishes the BM25 retrieval index for a RetrievalBuild.
-func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) (executeErr error) {
+func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
 	log := logger.L(ctx)
 	rbID, err := strconv.ParseInt(job.ResourceID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid retrieval build resource ID %s: %w", job.ResourceID, err)
 	}
-	defer func() {
-		if executeErr != nil && h.revisionStore != nil && job.AttemptCount >= job.MaxAttempts {
-			if build, buildErr := h.ciStore.GetRetrievalBuildByID(context.Background(), rbID); buildErr == nil && build.AnalysisRevisionID != "" {
-				_ = h.revisionStore.MarkFailed(context.Background(), build.AnalysisRevisionID, revision.StageBuildingSearch, "RETRIEVAL_BUILD_FAILED", executeErr.Error())
-			}
-		}
-	}()
-
 	rb, err := h.ciStore.GetRetrievalBuildByID(ctx, rbID)
 	if err != nil {
 		return fmt.Errorf("failed fetching retrieval build %d: %w", rbID, err)

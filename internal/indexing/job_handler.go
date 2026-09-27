@@ -36,7 +36,6 @@ type SnapshotJobHandler struct {
 	maxFileCount   int
 	revisionStore  interface {
 		MarkSnapshotReady(context.Context, string, string) error
-		MarkFailed(context.Context, string, revision.Stage, string, string) error
 	}
 }
 
@@ -88,14 +87,13 @@ func (h *SnapshotJobHandler) WithCodeIntelStore(cis codeintelstore.Store) *Snaps
 // existing snapshot job while keeping the DB-backed job pipeline unchanged.
 func (h *SnapshotJobHandler) WithRevisionStore(store interface {
 	MarkSnapshotReady(context.Context, string, string) error
-	MarkFailed(context.Context, string, revision.Stage, string, string) error
 }) *SnapshotJobHandler {
 	h.revisionStore = store
 	return h
 }
 
 // Execute processes a MATERIALIZE_SNAPSHOT job.
-func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) (executeErr error) {
+func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
 	snapID := job.ResourceID
 	log := logger.L(ctx).With("snapshot_id", snapID, "job_id", job.ID)
 
@@ -103,12 +101,6 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	if err != nil {
 		return jobs.NewPermanentError("SNAPSHOT_NOT_FOUND", fmt.Sprintf("snapshot %s not found: %v", snapID, err), err)
 	}
-	defer func() {
-		if executeErr != nil && h.revisionStore != nil && snap.AnalysisRevisionID != "" && job.AttemptCount >= job.MaxAttempts {
-			_ = h.revisionStore.MarkFailed(context.Background(), snap.AnalysisRevisionID, revision.StageMaterializing, "SNAPSHOT_MATERIALIZATION_FAILED", executeErr.Error())
-		}
-	}()
-
 	if snap.Status == snapshot.StatusReady {
 		log.Info("snapshot already READY")
 		if h.revisionStore != nil && snap.AnalysisRevisionID != "" {
