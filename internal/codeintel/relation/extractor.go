@@ -137,31 +137,40 @@ func extractCallRelation(ectx *ExtractionContext, call *ast.CallExpr, funcDecl *
 						Column:              pos.Column,
 					}
 				}
+				if isFunctionValue(targetObj) {
+					return indirectCallRelation(ectx, callerHash, targetObj.Name(), filePath, pos.Line, pos.Column)
+				}
 			}
 
 			if usesObj, ok := typeInfo.Uses[sel.Sel]; ok {
-				targetPkgPath := ""
-				if usesObj.Pkg() != nil {
-					targetPkgPath = usesObj.Pkg().Path()
-				}
-				targetName := usesObj.Name()
-				// Package-level function call
-				rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, "", model.SymbolKindFunction, targetName)
-				if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
-					return &model.SymbolRelation{
-						FromSymbolKeyHash:   callerHash,
-						ToSymbolKeyHash:     targetSym.SymbolKeyHash,
-						RelationType:        model.RelationTypeCallCandidate,
-						ResolutionKind:      model.ResolutionKindSemantic,
-						Confidence:          1.0,
-						ReasonCode:          "SEMANTIC_PACKAGE_FUNC_CALL",
-						ReasonDetail:        fmt.Sprintf("Call to func %s in pkg %s resolved via go/types", targetName, targetPkgPath),
-						TargetName:          targetName,
-						TargetPackagePath:   targetPkgPath,
-						TargetQualifiedName: targetSym.QualifiedName,
-						FilePath:            filePath,
-						Line:                pos.Line,
-						Column:              pos.Column,
+				if _, isFunction := usesObj.(*types.Func); !isFunction {
+					if isFunctionValue(usesObj) {
+						return indirectCallRelation(ectx, callerHash, usesObj.Name(), filePath, pos.Line, pos.Column)
+					}
+				} else {
+					targetPkgPath := ""
+					if usesObj.Pkg() != nil {
+						targetPkgPath = usesObj.Pkg().Path()
+					}
+					targetName := usesObj.Name()
+					// Package-level function call
+					rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, "", model.SymbolKindFunction, targetName)
+					if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
+						return &model.SymbolRelation{
+							FromSymbolKeyHash:   callerHash,
+							ToSymbolKeyHash:     targetSym.SymbolKeyHash,
+							RelationType:        model.RelationTypeCallCandidate,
+							ResolutionKind:      model.ResolutionKindSemantic,
+							Confidence:          1.0,
+							ReasonCode:          "SEMANTIC_PACKAGE_FUNC_CALL",
+							ReasonDetail:        fmt.Sprintf("Call to func %s in pkg %s resolved via go/types", targetName, targetPkgPath),
+							TargetName:          targetName,
+							TargetPackagePath:   targetPkgPath,
+							TargetQualifiedName: targetSym.QualifiedName,
+							FilePath:            filePath,
+							Line:                pos.Line,
+							Column:              pos.Column,
+						}
 					}
 				}
 			}
@@ -169,27 +178,33 @@ func extractCallRelation(ectx *ExtractionContext, call *ast.CallExpr, funcDecl *
 
 		if ident, ok := call.Fun.(*ast.Ident); ok {
 			if usesObj, ok := typeInfo.Uses[ident]; ok {
-				targetPkgPath := ""
-				if usesObj.Pkg() != nil {
-					targetPkgPath = usesObj.Pkg().Path()
-				}
-				targetName := usesObj.Name()
-				rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, "", model.SymbolKindFunction, targetName)
-				if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
-					return &model.SymbolRelation{
-						FromSymbolKeyHash:   callerHash,
-						ToSymbolKeyHash:     targetSym.SymbolKeyHash,
-						RelationType:        model.RelationTypeCallCandidate,
-						ResolutionKind:      model.ResolutionKindSemantic,
-						Confidence:          1.0,
-						ReasonCode:          "SEMANTIC_DIRECT_FUNC_CALL",
-						ReasonDetail:        fmt.Sprintf("Direct call to local func %s resolved via go/types", targetName),
-						TargetName:          targetName,
-						TargetPackagePath:   targetPkgPath,
-						TargetQualifiedName: targetSym.QualifiedName,
-						FilePath:            filePath,
-						Line:                pos.Line,
-						Column:              pos.Column,
+				if _, isFunction := usesObj.(*types.Func); !isFunction {
+					if isFunctionValue(usesObj) {
+						return indirectCallRelation(ectx, callerHash, usesObj.Name(), filePath, pos.Line, pos.Column)
+					}
+				} else {
+					targetPkgPath := ""
+					if usesObj.Pkg() != nil {
+						targetPkgPath = usesObj.Pkg().Path()
+					}
+					targetName := usesObj.Name()
+					rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, "", model.SymbolKindFunction, targetName)
+					if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
+						return &model.SymbolRelation{
+							FromSymbolKeyHash:   callerHash,
+							ToSymbolKeyHash:     targetSym.SymbolKeyHash,
+							RelationType:        model.RelationTypeCallCandidate,
+							ResolutionKind:      model.ResolutionKindSemantic,
+							Confidence:          1.0,
+							ReasonCode:          "SEMANTIC_DIRECT_FUNC_CALL",
+							ReasonDetail:        fmt.Sprintf("Direct call to local func %s resolved via go/types", targetName),
+							TargetName:          targetName,
+							TargetPackagePath:   targetPkgPath,
+							TargetQualifiedName: targetSym.QualifiedName,
+							FilePath:            filePath,
+							Line:                pos.Line,
+							Column:              pos.Column,
+						}
 					}
 				}
 			}
@@ -290,6 +305,30 @@ func extractCallRelation(ectx *ExtractionContext, call *ast.CallExpr, funcDecl *
 	return nil
 }
 
+func isFunctionValue(object types.Object) bool {
+	variable, ok := object.(*types.Var)
+	if !ok || variable.Type() == nil {
+		return false
+	}
+	_, ok = types.Unalias(variable.Type()).Underlying().(*types.Signature)
+	return ok
+}
+
+func indirectCallRelation(ectx *ExtractionContext, callerHash, targetName, filePath string, line, column int) *model.SymbolRelation {
+	return &model.SymbolRelation{
+		FromSymbolKeyHash: callerHash,
+		RelationType:      model.RelationTypeCallCandidate,
+		ResolutionKind:    model.ResolutionKindUnresolved,
+		Confidence:        0,
+		ReasonCode:        "INDIRECT_CALL",
+		ReasonDetail:      fmt.Sprintf("Call through function-valued variable %s is indirect", targetName),
+		TargetName:        targetName,
+		FilePath:          filePath,
+		Line:              line,
+		Column:            column,
+	}
+}
+
 func declaredReceiverName(selection *types.Selection) (string, bool) {
 	if selection == nil {
 		return "", false
@@ -321,35 +360,50 @@ func extractSelectorReference(ectx *ExtractionContext, sel *ast.SelectorExpr, ca
 
 	if typeInfo != nil {
 		if usesObj, ok := typeInfo.Uses[sel.Sel]; ok {
+			kind, ok := referencedSymbolKind(usesObj)
+			if !ok {
+				return nil
+			}
 			targetPkgPath := ""
 			if usesObj.Pkg() != nil {
 				targetPkgPath = usesObj.Pkg().Path()
 			}
-			// Look for Type, Interface, or Function
-			for _, kind := range []model.SymbolKind{model.SymbolKindType, model.SymbolKindInterface, model.SymbolKindFunction} {
-				rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, "", kind, targetName)
-				if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
-					return &model.SymbolRelation{
-						FromSymbolKeyHash:   callerHash,
-						ToSymbolKeyHash:     targetSym.SymbolKeyHash,
-						RelationType:        model.RelationTypeReference,
-						ResolutionKind:      model.ResolutionKindSemantic,
-						Confidence:          1.0,
-						ReasonCode:          "SEMANTIC_TYPE_OR_SYMBOL_REF",
-						ReasonDetail:        fmt.Sprintf("Reference to %s in pkg %s resolved via go/types", targetName, targetPkgPath),
-						TargetName:          targetName,
-						TargetPackagePath:   targetPkgPath,
-						TargetQualifiedName: targetSym.QualifiedName,
-						FilePath:            filePath,
-						Line:                pos.Line,
-						Column:              pos.Column,
-					}
+			rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, "", kind, targetName)
+			if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
+				return &model.SymbolRelation{
+					FromSymbolKeyHash:   callerHash,
+					ToSymbolKeyHash:     targetSym.SymbolKeyHash,
+					RelationType:        model.RelationTypeReference,
+					ResolutionKind:      model.ResolutionKindSemantic,
+					Confidence:          1.0,
+					ReasonCode:          "SEMANTIC_TYPE_OR_SYMBOL_REF",
+					ReasonDetail:        fmt.Sprintf("Reference to %s in pkg %s resolved via go/types", targetName, targetPkgPath),
+					TargetName:          targetName,
+					TargetPackagePath:   targetPkgPath,
+					TargetQualifiedName: targetSym.QualifiedName,
+					FilePath:            filePath,
+					Line:                pos.Line,
+					Column:              pos.Column,
 				}
 			}
 		}
 	}
 
 	return nil
+}
+
+func referencedSymbolKind(object types.Object) (model.SymbolKind, bool) {
+	switch value := object.(type) {
+	case *types.Func:
+		return model.SymbolKindFunction, true
+	case *types.TypeName:
+		if _, ok := types.Unalias(value.Type()).Underlying().(*types.Interface); ok {
+			return model.SymbolKindInterface, true
+		}
+		return model.SymbolKindType, true
+	default:
+		return "", false
+	}
 }
 
 func findEnclosingSymbol(fset *token.FileSet, funcDecl *ast.FuncDecl, fileSymbols []*model.Symbol) *model.Symbol {

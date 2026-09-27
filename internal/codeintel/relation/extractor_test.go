@@ -112,6 +112,126 @@ func Run(a *pkg_a.Worker, b *pkg_b.Worker) { a.Process(); b.Process() }
 	}
 }
 
+func TestSemanticMethodResolutionSeparatesSamePackageReceiversAndPromotedMethods(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureFile(t, root, "go.mod", "module example.com/root\n\ngo 1.22\n")
+	writeFixtureFile(t, root, "methods.go", `package root
+
+type A struct{}
+func (A) Run() {}
+type B struct{}
+func (B) Run() {}
+type Inner struct{}
+func (Inner) Promoted() {}
+type Outer struct{ Inner }
+
+func CallA(a A) { a.Run() }
+func CallB(b B) { b.Run() }
+func CallPromoted(outer Outer) { outer.Promoted() }
+`)
+
+	result, err := codeintel.NewAnalyzer().Analyze(context.Background(), root, codeintel.DefaultBuildContext())
+	if err != nil {
+		t.Fatalf("Analyze failed: %v", err)
+	}
+	wantCalls := map[string]string{
+		"root.CallA":        "root.A.Run",
+		"root.CallB":        "root.B.Run",
+		"root.CallPromoted": "root.Inner.Promoted",
+	}
+	for callerName, targetName := range wantCalls {
+		caller := findSymbol(result.Symbols, callerName)
+		if caller == nil {
+			t.Fatalf("caller symbol %s not found", callerName)
+		}
+		target := findSymbol(result.Symbols, targetName)
+		if target == nil {
+			t.Fatalf("target symbol %s not found", targetName)
+		}
+		found := false
+		for _, relation := range result.Relations {
+			if relation.FromSymbolKeyHash != caller.SymbolKeyHash || relation.ReasonCode != "SEMANTIC_METHOD_SELECTION" {
+				continue
+			}
+			if relation.ToSymbolKeyHash != target.SymbolKeyHash {
+				t.Errorf("%s resolved to %s, want %s", callerName, relation.TargetQualifiedName, targetName)
+			}
+			found = true
+		}
+		if !found {
+			t.Errorf("missing exact method resolution for %s -> %s", callerName, targetName)
+		}
+	}
+}
+
+func TestFunctionValuedFieldAndVariableAreIndirectCalls(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureFile(t, root, "go.mod", "module example.com/root\n\ngo 1.22\n")
+	writeFixtureFile(t, root, "callbacks.go", `package root
+
+func Run() {}
+type Callbacks struct { Run func() }
+var PackageCallback func()
+
+func CallField(callbacks Callbacks) { callbacks.Run() }
+func CallPackageVariable() { PackageCallback() }
+func CallLocalVariable() {
+    callback := func() {}
+    callback()
+}
+`)
+
+	result, err := codeintel.NewAnalyzer().Analyze(context.Background(), root, codeintel.DefaultBuildContext())
+	if err != nil {
+		t.Fatalf("Analyze failed: %v", err)
+	}
+	wantCallers := map[string]bool{
+		"root.CallField":           false,
+		"root.CallPackageVariable": false,
+		"root.CallLocalVariable":   false,
+	}
+	callerHashes := make(map[string]string, len(wantCallers))
+	for callerName := range wantCallers {
+		caller := findSymbol(result.Symbols, callerName)
+		if caller == nil {
+			t.Fatalf("caller symbol %s not found", callerName)
+		}
+		callerHashes[callerName] = caller.SymbolKeyHash
+	}
+	indirectCount := 0
+	for _, relation := range result.Relations {
+		for callerName, callerHash := range callerHashes {
+			if relation.FromSymbolKeyHash != callerHash {
+				continue
+			}
+			if relation.ReasonCode == "INDIRECT_CALL" {
+				wantCallers[callerName] = true
+				indirectCount++
+			} else if relation.ReasonCode == "SEMANTIC_DIRECT_FUNC_CALL" || relation.ReasonCode == "SEMANTIC_PACKAGE_FUNC_CALL" {
+				t.Errorf("function-valued call in %s became resolved function edge: %+v", callerName, relation)
+			}
+		}
+	}
+	for callerName, found := range wantCallers {
+		if !found {
+			t.Errorf("missing INDIRECT_CALL relation for %s", callerName)
+		}
+	}
+	if indirectCount != len(wantCallers) {
+		t.Errorf("INDIRECT_CALL relation count = %d, want %d", indirectCount, len(wantCallers))
+	}
+	fieldCaller := findSymbol(result.Symbols, "root.CallField")
+	packageFunction := findSymbol(result.Symbols, "root.Run")
+	if fieldCaller == nil || packageFunction == nil {
+		t.Fatal("field caller or same-named package function was not indexed")
+	}
+	for _, relation := range result.Relations {
+		if relation.FromSymbolKeyHash == fieldCaller.SymbolKeyHash && relation.ToSymbolKeyHash == packageFunction.SymbolKeyHash && relation.ResolutionKind == codeintelmodel.ResolutionKindSemantic {
+			t.Fatalf("function-valued field was resolved to same-named package function: %+v", relation)
+		}
+	}
+}
+
 func findSymbol(symbols []*codeintelmodel.Symbol, qualifiedName string) *codeintelmodel.Symbol {
 	for _, symbol := range symbols {
 		if symbol.PackageName+"."+symbol.ReceiverCanonical+symbolNameSeparator(symbol)+symbol.Name == qualifiedName {
