@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 var ErrLineTooLong = errors.New("snapshot file line exceeds the configured range limit")
@@ -45,14 +49,55 @@ type SnapshotStore interface {
 
 type LocalSnapshotStore struct {
 	basePath string
+	resolver func(repoID, snapshotID string) (path string, stable bool)
+	mu       sync.RWMutex
+	resolved map[string]string
 }
 
 func NewLocalSnapshotStore(basePath string) *LocalSnapshotStore {
-	return &LocalSnapshotStore{basePath: basePath}
+	return &LocalSnapshotStore{basePath: basePath, resolved: make(map[string]string)}
+}
+
+// WithSourcePathResolver makes the database's READY snapshot path authoritative
+// for readers. Unready snapshots keep using the legacy root until publication
+// commits its immutable path.
+func (s *LocalSnapshotStore) WithSourcePathResolver(resolver func(repoID, snapshotID string) (path string, stable bool)) *LocalSnapshotStore {
+	s.resolver = resolver
+	return s
 }
 
 func (s *LocalSnapshotStore) GetSourcePath(repoID, snapshotID string) string {
+	key := repoID + "\x00" + snapshotID
+	s.mu.RLock()
+	resolved := s.resolved[key]
+	s.mu.RUnlock()
+	if resolved != "" {
+		return resolved
+	}
+	if s.resolver != nil {
+		if path, stable := s.resolver(repoID, snapshotID); stable && path != "" {
+			s.mu.Lock()
+			s.resolved[key] = path
+			s.mu.Unlock()
+			return path
+		}
+	}
 	return filepath.Join(s.basePath, repoID, snapshotID, "source")
+}
+
+// GetExecutionSourcePath allocates a deterministic but claim-isolated output
+// directory. The claim token is hashed so it cannot introduce path segments.
+func (s *LocalSnapshotStore) GetExecutionSourcePath(repoID, snapshotID string, generation int, claimToken string) (string, error) {
+	if generation < 1 || repoID == "" || snapshotID == "" || claimToken == "" {
+		return "", fmt.Errorf("snapshot execution identity is incomplete")
+	}
+	for _, part := range []string{repoID, snapshotID} {
+		if filepath.Base(part) != part || part == "." || part == ".." {
+			return "", fmt.Errorf("invalid snapshot execution identity")
+		}
+	}
+	digest := sha256.Sum256([]byte(claimToken))
+	return filepath.Join(s.basePath, repoID, snapshotID, "executions", fmt.Sprintf("gen-%d", generation), hex.EncodeToString(digest[:]), "source"), nil
 }
 
 func (s *LocalSnapshotStore) EnsureDir(repoID, snapshotID string) (string, error) {
@@ -71,8 +116,22 @@ func (s *LocalSnapshotStore) ReadFile(ctx context.Context, repoID, snapshotID, r
 	return result.Content, nil
 }
 
+// ReadFileAt reads a file from an explicit immutable source root. It is used
+// while a worker is building a candidate snapshot before the DB points at it.
+func (s *LocalSnapshotStore) ReadFileAt(ctx context.Context, sourceRoot, relativePath string, startLine, endLine int) (string, error) {
+	result, err := s.readFileRangeAt(ctx, sourceRoot, relativePath, startLine, endLine, 0, false)
+	if err != nil {
+		return "", err
+	}
+	return result.Content, nil
+}
+
 func (s *LocalSnapshotStore) ReadFileRange(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int) (FileRange, error) {
-	return s.readFileRange(ctx, repoID, snapshotID, relativePath, startLine, endLine, maxBytes, false)
+	return s.readFileRangeAt(ctx, s.GetSourcePath(repoID, snapshotID), relativePath, startLine, endLine, maxBytes, false)
+}
+
+func (s *LocalSnapshotStore) ReadFileRangeAt(ctx context.Context, sourceRoot, relativePath string, startLine, endLine, maxBytes int) (FileRange, error) {
+	return s.readFileRangeAt(ctx, sourceRoot, relativePath, startLine, endLine, maxBytes, false)
 }
 
 // ReadFileRangeBounded reads only through endLine (or until maxBytes is
@@ -231,10 +290,14 @@ func readBoundedRanges(ctx context.Context, reader *bufio.Reader, ranges []LineR
 }
 
 func (s *LocalSnapshotStore) readFileRange(ctx context.Context, repoID, snapshotID, relativePath string, startLine, endLine, maxBytes int, stopAtEnd bool) (FileRange, error) {
+	return s.readFileRangeAt(ctx, s.GetSourcePath(repoID, snapshotID), relativePath, startLine, endLine, maxBytes, stopAtEnd)
+}
+
+func (s *LocalSnapshotStore) readFileRangeAt(ctx context.Context, sourceRoot, relativePath string, startLine, endLine, maxBytes int, stopAtEnd bool) (FileRange, error) {
 	if err := ctx.Err(); err != nil {
 		return FileRange{}, err
 	}
-	fullPath, err := s.safePath(repoID, snapshotID, relativePath)
+	fullPath, err := safePathAt(sourceRoot, relativePath)
 	if err != nil {
 		return FileRange{}, err
 	}
@@ -359,7 +422,10 @@ func (s *LocalSnapshotStore) FileExists(repoID, snapshotID, relativePath string)
 }
 
 func (s *LocalSnapshotStore) WalkFiles(repoID, snapshotID string, fn func(relPath string, info os.FileInfo) error) error {
-	sourceRoot := s.GetSourcePath(repoID, snapshotID)
+	return s.WalkFilesAt(s.GetSourcePath(repoID, snapshotID), fn)
+}
+
+func (s *LocalSnapshotStore) WalkFilesAt(sourceRoot string, fn func(relPath string, info os.FileInfo) error) error {
 	if _, err := os.Stat(sourceRoot); os.IsNotExist(err) {
 		return fmt.Errorf("snapshot directory does not exist: %s", sourceRoot)
 	}
@@ -385,8 +451,102 @@ func (s *LocalSnapshotStore) WalkFiles(repoID, snapshotID string, fn func(relPat
 	})
 }
 
+// CleanupUnreferencedExecutionPaths removes old immutable snapshot executions
+// absent from the database's materialized_path values. It also removes old
+// interrupted staging directories beneath executions/gen-N.
+func (s *LocalSnapshotStore) CleanupUnreferencedExecutionPaths(referenced map[string]struct{}, olderThan time.Time) (int, error) {
+	root, err := filepath.Abs(s.basePath)
+	if err != nil {
+		return 0, err
+	}
+	refs := make(map[string]struct{}, len(referenced))
+	for path := range referenced {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return 0, err
+		}
+		refs[filepath.Clean(abs)] = struct{}{}
+	}
+	removed := 0
+	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if path == root || info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		parts := strings.Split(filepath.Clean(rel), string(filepath.Separator))
+		if len(parts) < 4 || parts[2] != "executions" || !strings.HasPrefix(parts[3], "gen-") {
+			return nil
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		if len(parts) == 5 && strings.HasPrefix(parts[4], ".snapshot-stage-") {
+			if info.ModTime().Before(olderThan) {
+				if err := removeSnapshotTree(path); err != nil {
+					return err
+				}
+				removed++
+				return filepath.SkipDir
+			}
+			return filepath.SkipDir
+		}
+		if len(parts) != 6 || parts[5] != "source" || len(parts[4]) != 64 || !isSnapshotHex(parts[4]) {
+			return nil
+		}
+		if _, ok := refs[filepath.Clean(path)]; ok || !info.ModTime().Before(olderThan) {
+			return filepath.SkipDir
+		}
+		claimDir := filepath.Dir(path)
+		if err := removeSnapshotTree(claimDir); err != nil {
+			return err
+		}
+		removed++
+		return filepath.SkipDir
+	})
+	return removed, err
+}
+
+func removeSnapshotTree(root string) error {
+	if err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if info.IsDir() {
+			return os.Chmod(path, 0755)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return os.RemoveAll(root)
+}
+
+func isSnapshotHex(value string) bool {
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *LocalSnapshotStore) safePath(repoID, snapshotID, relativePath string) (string, error) {
-	sourceRoot := s.GetSourcePath(repoID, snapshotID)
+	return safePathAt(s.GetSourcePath(repoID, snapshotID), relativePath)
+}
+
+func safePathAt(sourceRoot, relativePath string) (string, error) {
 	cleaned := filepath.Clean(relativePath)
 	if cleaned == "." || filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) || cleaned == ".." {
 		return "", fmt.Errorf("path traversal denied: %s", relativePath)

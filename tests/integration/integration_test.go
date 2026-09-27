@@ -318,7 +318,7 @@ func TestMilestone6_PureGoBM25AndStructuralProductionRetriever(t *testing.T) {
 
 	pub := artifact.NewPublisher(tempBase)
 	rb, _, _ := ciStore.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
-	finalPath, hash, _ := pub.Publish(rb.ID, "tok", "BM25", idx)
+	finalPath, hash, _ := pub.Publish(rb.ID, 1, "tok", "BM25", idx)
 	_ = ciStore.MarkRetrievalBuilding(ctx, rb.ID)
 	_ = ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, hash, 1)
 

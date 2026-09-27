@@ -26,16 +26,16 @@ type Store interface {
 // the identity fields and READY transition in one conditional update so a
 // partially materialized directory can never be advertised as a snapshot.
 type MaterializationFinalizer interface {
-	FinalizeMaterialization(ctx context.Context, id, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
+	FinalizeMaterialization(ctx context.Context, id, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 	FailMaterialization(ctx context.Context, id, errorCode string) error
 }
 
 type ClaimedMaterializationFinalizer interface {
-	FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
+	FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 }
 
 type ClaimedMaterializationRevisionFinalizer interface {
-	FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
+	FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 }
 
 type GormStore struct {
@@ -104,19 +104,20 @@ func (s *GormStore) UpdateStatus(ctx context.Context, id string, expectedOldStat
 	return nil
 }
 
-func (s *GormStore) FinalizeMaterialization(ctx context.Context, id, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
-	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+func (s *GormStore) FinalizeMaterialization(ctx context.Context, id, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if materializedPath == "" || commitSHA == "" || commitSHA == "pending" || contentHash == "" {
 		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", id)
 	}
 	result := s.db.WithContext(ctx).Model(&RepositorySnapshot{}).
 		Where("id = ? AND status = ?", id, StatusMaterializing).
 		Updates(map[string]interface{}{
-			"commit_sha":   commitSHA,
-			"content_hash": contentHash,
-			"file_count":   fileCount,
-			"total_bytes":  totalBytes,
-			"status":       StatusReady,
-			"ready_at":     readyAt,
+			"materialized_path": materializedPath,
+			"commit_sha":        commitSHA,
+			"content_hash":      contentHash,
+			"file_count":        fileCount,
+			"total_bytes":       totalBytes,
+			"status":            StatusReady,
+			"ready_at":          readyAt,
 		})
 	if result.Error != nil {
 		return result.Error
@@ -127,8 +128,8 @@ func (s *GormStore) FinalizeMaterialization(ctx context.Context, id, commitSHA, 
 	return nil
 }
 
-func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
-	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if materializedPath == "" || commitSHA == "" || commitSHA == "pending" || contentHash == "" {
 		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", snapshotID)
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -140,7 +141,7 @@ func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, wo
 			return err
 		}
 		result := tx.Model(&RepositorySnapshot{}).Where("id = ? AND status = ?", snapshotID, StatusMaterializing).Updates(map[string]interface{}{
-			"commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
+			"materialized_path": materializedPath, "commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
 			"total_bytes": totalBytes, "status": StatusReady, "ready_at": readyAt,
 		})
 		if result.Error != nil {
@@ -164,8 +165,8 @@ func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, wo
 
 // FinalizeSnapshotSuccessWithRevision atomically publishes a snapshot,
 // advances its AnalysisRevision, and completes the claimed job.
-func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
-	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if materializedPath == "" || commitSHA == "" || commitSHA == "pending" || contentHash == "" {
 		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", snapshotID)
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -177,7 +178,7 @@ func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, job
 			return err
 		}
 		result := tx.Model(&RepositorySnapshot{}).Where("id = ? AND status = ? AND analysis_revision_id = ?", snapshotID, StatusMaterializing, revisionID).Updates(map[string]interface{}{
-			"commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
+			"materialized_path": materializedPath, "commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
 			"total_bytes": totalBytes, "status": StatusReady, "ready_at": readyAt,
 		})
 		if result.Error != nil {

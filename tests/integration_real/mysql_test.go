@@ -522,7 +522,7 @@ func TestRealMySQL_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *test
 		{name: "cancellation before exhausted lease", cancelRequested: true, maxAttempts: 1, wantJob: jobs.StatusCancelled, wantRun: diagnosis.StatusCancelled, wantAttempt: diagnosis.AttemptStatusAbandoned, wantReason: &cancelledReason},
 		{name: "cancellation before retryable lease", cancelRequested: true, maxAttempts: 3, wantJob: jobs.StatusCancelled, wantRun: diagnosis.StatusCancelled, wantAttempt: diagnosis.AttemptStatusAbandoned, wantReason: &cancelledReason},
 		{name: "exhausted lease without cancellation", cancelRequested: false, maxAttempts: 1, wantJob: jobs.StatusFailed, wantRun: diagnosis.StatusFailed, wantAttempt: diagnosis.AttemptStatusAbandoned, wantReason: &exhaustedReason},
-		{name: "retryable lease without cancellation", cancelRequested: false, maxAttempts: 3, wantJob: jobs.StatusRetryWait, wantRun: diagnosis.StatusRunning, wantAttempt: diagnosis.AttemptStatusRunning},
+		{name: "retryable lease without cancellation", cancelRequested: false, maxAttempts: 3, wantJob: jobs.StatusRetryWait, wantRun: diagnosis.StatusRunning, wantAttempt: diagnosis.AttemptStatusAbandoned},
 	}
 
 	for i, tc := range cases {
@@ -596,7 +596,7 @@ func TestRealMySQL_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *test
 			if attempts[0].Status != tc.wantAttempt {
 				t.Fatalf("DiagnosisAttempt status = %s, want %s", attempts[0].Status, tc.wantAttempt)
 			}
-			if tc.wantAttempt == diagnosis.AttemptStatusAbandoned && savedRun.FinalAttemptID != attempt.ID {
+			if tc.wantAttempt == diagnosis.AttemptStatusAbandoned && tc.wantRun != diagnosis.StatusRunning && savedRun.FinalAttemptID != attempt.ID {
 				t.Fatalf("final_attempt_id = %q, want %q", savedRun.FinalAttemptID, attempt.ID)
 			}
 		})

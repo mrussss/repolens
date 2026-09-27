@@ -123,12 +123,32 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 
 	targetDir := h.storeFS.GetSourcePath(snap.RepositoryID, snap.ID)
+	executionGeneration := job.ExecutionGeneration
+	if executionGeneration < 1 {
+		executionGeneration = 1
+	}
+	claimToken := jobExecutionClaimToken(job)
+	if executionStore, ok := h.storeFS.(interface {
+		GetExecutionSourcePath(string, string, int, string) (string, error)
+	}); ok {
+		targetDir, err = executionStore.GetExecutionSourcePath(snap.RepositoryID, snap.ID, executionGeneration, claimToken)
+		if err != nil {
+			return jobs.NewPermanentError("SNAPSHOT_PATH_INVALID", err.Error(), err)
+		}
+	}
 	commitSHA := snap.CommitSHA
 	if commitSHA == "pending" || commitSHA == "" || !sourceDirectoryExists(targetDir) {
 		// Publish a fully cloned tree only after git has resolved HEAD.  A
 		// retry therefore cannot expose a half-written source directory.
-		stagingDir := targetDir + ".tmp-" + jobClaimSuffix(job)
-		_ = os.RemoveAll(stagingDir)
+		if err := os.MkdirAll(filepath.Dir(targetDir), 0755); err != nil {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
+		}
+		stageRoot := filepath.Dir(filepath.Dir(targetDir))
+		stagingDir, stageErr := os.MkdirTemp(stageRoot, ".snapshot-stage-")
+		if stageErr != nil {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", stageErr.Error(), stageErr)
+		}
+		defer os.RemoveAll(stagingDir)
 		cloneSHA, cloneErr := "", error(nil)
 		if exactCloner, ok := h.cloner.(ExactGitCloner); ok && snap.CommitSHA != "" && snap.CommitSHA != "pending" {
 			cloneSHA, cloneErr = exactCloner.CloneCommitTo(ctx, r.GitURL, snap.CommitSHA, stagingDir)
@@ -148,8 +168,10 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			h.failIfTerminal(ctx, job, snap.ID, "COMMIT_CHANGED_DURING_RESOLVE")
 			return jobs.NewPermanentError("COMMIT_CHANGED_DURING_RESOLVE", fmt.Sprintf("resolved %s but clone returned %s", snap.CommitSHA, cloneSHA), nil)
 		}
-		if err := os.RemoveAll(targetDir); err != nil {
-			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
+		if _, statErr := os.Lstat(targetDir); statErr == nil {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", "immutable execution path already exists", nil)
+		} else if !os.IsNotExist(statErr) {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", statErr.Error(), statErr)
 		}
 		if err := os.Rename(stagingDir, targetDir); err != nil {
 			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
@@ -164,7 +186,20 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	var totalBytes int64
 	manifest := make([]string, 0)
 
-	walkErr := h.storeFS.WalkFiles(snap.RepositoryID, snap.ID, func(relPath string, info os.FileInfo) error {
+	walkFiles := h.storeFS.WalkFiles
+	readFile := h.storeFS.ReadFile
+	if executionStore, ok := h.storeFS.(interface {
+		WalkFilesAt(string, func(string, os.FileInfo) error) error
+		ReadFileAt(context.Context, string, string, int, int) (string, error)
+	}); ok {
+		walkFiles = func(_, _ string, fn func(string, os.FileInfo) error) error {
+			return executionStore.WalkFilesAt(targetDir, fn)
+		}
+		readFile = func(ctx context.Context, _, _, path string, start, end int) (string, error) {
+			return executionStore.ReadFileAt(ctx, targetDir, path, start, end)
+		}
+	}
+	walkErr := walkFiles(snap.RepositoryID, snap.ID, func(relPath string, info os.FileInfo) error {
 		if info.IsDir() {
 			if h.filter.ShouldIgnoreDir(info.Name()) {
 				return filepath.SkipDir
@@ -184,7 +219,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			return jobs.NewPermanentError("REPOSITORY_TOO_LARGE", fmt.Sprintf("repository exceeds maximum size %d bytes", h.maxRepoBytes), nil)
 		}
 
-		content, err := h.storeFS.ReadFile(ctx, snap.RepositoryID, snap.ID, relPath, 1, -1)
+		content, err := readFile(ctx, snap.RepositoryID, snap.ID, relPath, 1, -1)
 		if err != nil {
 			return err
 		}
@@ -229,18 +264,18 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 	stageFinalized := false
 	if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationRevisionFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil && snap.AnalysisRevisionID != "" {
-		if err := finalizer.FinalizeSnapshotSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, snap.AnalysisRevisionID, r.Name, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+		if err := finalizer.FinalizeSnapshotSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, snap.AnalysisRevisionID, r.Name, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return err
 		}
 		stageFinalized = true
 	} else if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil {
-		if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+		if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return err
 		}
 	} else if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
-		if err := finalizer.FinalizeMaterialization(ctx, snap.ID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+		if err := finalizer.FinalizeMaterialization(ctx, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
 		}
@@ -298,16 +333,9 @@ func (h *SnapshotJobHandler) failIfTerminal(ctx context.Context, job *jobs.Analy
 	}
 }
 
-func jobClaimSuffix(job *jobs.AnalysisJob) string {
+func jobExecutionClaimToken(job *jobs.AnalysisJob) string {
 	if job != nil && job.ClaimToken != nil && *job.ClaimToken != "" {
-		return (*job.ClaimToken)[:minInt(12, len(*job.ClaimToken))]
+		return *job.ClaimToken
 	}
 	return fmt.Sprintf("%d", time.Now().UnixNano())
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

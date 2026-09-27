@@ -2,6 +2,7 @@ package retrieval_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -122,6 +123,94 @@ func TestStaleRetrievalHandlerDoesNotFailRevision(t *testing.T) {
 	currentJob, err := jobsStore.GetJobByID(ctx, newClaim[0].ID)
 	if err != nil || currentJob.Status != jobs.StatusRunning || currentJob.ClaimToken == nil || *currentJob.ClaimToken != *newClaim[0].ClaimToken {
 		t.Fatalf("new Retrieval claim changed by stale handler: job=%+v err=%v", currentJob, err)
+	}
+}
+
+func TestStaleRetrievalPublisherCannotReplaceCurrentArtifact(t *testing.T) {
+	db, ciStore, _ := setupRetrievalDB(t)
+	ctx := context.Background()
+	codeBuild, _, err := ciStore.GetOrCreateBuild(ctx, "snap-retrieval-artifact-race", "example.com/race", codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrievalBuild, _, err := ciStore.GetOrCreateRetrievalBuild(ctx, codeBuild.ID, "BM25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ciStore.MarkRetrievalBuilding(ctx, retrievalBuild.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", codeBuild.ID)).Update("status", jobs.StatusSucceeded).Error; err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	oldClaim, err := jobsStore.ClaimJobs(ctx, "retrieval-old-worker", 1, time.Minute)
+	if err != nil || len(oldClaim) != 1 || oldClaim[0].JobType != jobs.JobTypeBuildRetrieval {
+		t.Fatalf("old Retrieval claim = %+v, err=%v", oldClaim, err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
+		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
+		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	newClaim, err := jobsStore.ClaimJobs(ctx, "retrieval-new-worker", 1, time.Minute)
+	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
+		t.Fatalf("new Retrieval claim = %+v, err=%v", newClaim, err)
+	}
+
+	indexRoot := t.TempDir()
+	publisher := artifact.NewPublisher(indexRoot)
+	oldIndex := bm25.NewIndex(1.2, 0.75)
+	oldIndex.AddDocument(bm25.Document{FilePath: "main.go", Content: "stale-worker-marker"})
+	oldIndex.Build()
+	newIndex := bm25.NewIndex(1.2, 0.75)
+	newIndex.AddDocument(bm25.Document{FilePath: "main.go", Content: "current-worker-marker"})
+	newIndex.Build()
+	paused := make(chan struct{})
+	release := make(chan struct{})
+	type oldResult struct {
+		path string
+		hash string
+		err  error
+	}
+	oldDone := make(chan oldResult, 1)
+	go func() {
+		close(paused) // W1 is deterministically stopped immediately before publish.
+		<-release
+		path, hash, publishErr := publisher.Publish(retrievalBuild.ID, int64(oldClaim[0].ExecutionGeneration), *oldClaim[0].ClaimToken, retrievalBuild.Strategy, oldIndex)
+		if publishErr == nil {
+			publishErr = ciStore.FinalizeRetrievalSuccess(ctx, oldClaim[0].ID, *oldClaim[0].WorkerID, *oldClaim[0].ClaimToken, retrievalBuild.ID, path, hash, oldIndex.TotalDocs)
+		}
+		oldDone <- oldResult{path: path, hash: hash, err: publishErr}
+	}()
+	<-paused
+
+	newPath, newHash, err := publisher.Publish(retrievalBuild.ID, int64(newClaim[0].ExecutionGeneration), *newClaim[0].ClaimToken, retrievalBuild.Strategy, newIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ciStore.FinalizeRetrievalSuccess(ctx, newClaim[0].ID, *newClaim[0].WorkerID, *newClaim[0].ClaimToken, retrievalBuild.ID, newPath, newHash, newIndex.TotalDocs); err != nil {
+		t.Fatalf("W2 finalization failed: %v", err)
+	}
+	close(release)
+	old := <-oldDone
+	if !errors.Is(old.err, jobs.ErrOwnershipLost) {
+		t.Fatalf("stale W1 finalization error = %v, want ownership lost", old.err)
+	}
+	if old.path == newPath {
+		t.Fatalf("execution claims shared mutable artifact path %q", newPath)
+	}
+	current, err := ciStore.GetRetrievalBuildByID(ctx, retrievalBuild.ID)
+	if err != nil || current.Status != codeintelmodel.BuildStatusReady || current.ArtifactPath != newPath || current.ArtifactHash != newHash {
+		t.Fatalf("current RetrievalBuild changed after stale W1 resumed: build=%+v err=%v", current, err)
+	}
+	if _, err := artifact.LoadIndexVerified(current.ArtifactPath, retrievalBuild.ID, current.ArtifactHash); err != nil {
+		t.Fatalf("current artifact hash no longer verifies after W1 resumed: %v", err)
 	}
 }
 
@@ -377,7 +466,7 @@ func TestProductionRetriever_SearchAndStructuralExpansion(t *testing.T) {
 	// Publish atomic artifact
 	pub := artifact.NewPublisher(tempBase)
 	rb, _, _ := ciStore.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
-	finalPath, hash, err := pub.Publish(rb.ID, "token-1", "BM25", idx)
+	finalPath, hash, err := pub.Publish(rb.ID, 1, "token-1", "BM25", idx)
 	if err != nil {
 		t.Fatalf("failed publishing artifact: %v", err)
 	}

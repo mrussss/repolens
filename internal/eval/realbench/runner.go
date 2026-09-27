@@ -657,7 +657,7 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 	}
 	idx.Build()
 	indexRoot := filepath.Join(artifactDir, "indexes")
-	artifactPath, artifactHash, err := artifact.NewPublisher(indexRoot).Publish(retrievalBuild.ID, "realbench", productionStrategy, idx)
+	artifactPath, artifactHash, err := artifact.NewPublisher(indexRoot).Publish(retrievalBuild.ID, 1, "realbench", productionStrategy, idx)
 	if err != nil {
 		return nil, productFailure("publish Retrieval artifact", err)
 	}

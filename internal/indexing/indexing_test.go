@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -212,8 +213,9 @@ func (m *materializationRecorder) UpdateStatus(ctx context.Context, id string, o
 	return nil
 }
 
-func (m *materializationRecorder) FinalizeMaterialization(ctx context.Context, id, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+func (m *materializationRecorder) FinalizeMaterialization(ctx context.Context, id, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
 	m.finalized = true
+	m.snap.MaterializedPath = materializedPath
 	m.commitSHA = commitSHA
 	m.contentHash = contentHash
 	m.fileCount = fileCount
@@ -245,6 +247,36 @@ func (c *fixtureCloner) CloneTo(ctx context.Context, gitURL, ref, targetDir stri
 		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(targetDir, "main.go"), []byte("package main\nfunc Hello() {}\n"), 0644); err != nil {
+		return "", err
+	}
+	return c.commitSHA, nil
+}
+
+type firstCloneBarrier struct {
+	commitSHA string
+	started   chan struct{}
+	release   chan struct{}
+	mu        sync.Mutex
+	calls     int
+}
+
+func (c *firstCloneBarrier) ValidateGitURL(string) error { return nil }
+
+func (c *firstCloneBarrier) CloneTo(ctx context.Context, gitURL, ref, targetDir string) (string, error) {
+	c.mu.Lock()
+	c.calls++
+	call := c.calls
+	c.mu.Unlock()
+	content := "current worker\n"
+	if call == 1 {
+		close(c.started)
+		<-c.release
+		content = "stale worker\n"
+	}
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "main.go"), []byte(content), 0644); err != nil {
 		return "", err
 	}
 	return c.commitSHA, nil
@@ -343,6 +375,106 @@ func TestStaleSnapshotHandlerDoesNotFailRevision(t *testing.T) {
 	}
 }
 
+func TestStaleSnapshotExecutionCannotReplaceCurrentMaterialization(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "snapshot_artifact_race.db?_busy_timeout=5000&_journal_mode=WAL")), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mysql.AutoMigrate(db); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const snapshotID = "snap-immutable-race"
+	const repoID = "repo-immutable-race"
+	const commitSHA = "0123456789abcdef0123456789abcdef01234567"
+	store := snapshot.NewStore(db)
+	basePath := t.TempDir()
+	storeFS := snapshotstore.NewLocalSnapshotStore(basePath)
+	t.Cleanup(func() {
+		_ = filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return os.Chmod(path, 0755)
+			}
+			return os.Chmod(path, 0644)
+		})
+	})
+	if err := store.Create(ctx, &snapshot.RepositorySnapshot{
+		ID: snapshotID, RepositoryID: repoID, CommitSHA: commitSHA, Ref: "main",
+		MaterializedPath: filepath.Join(basePath, repoID, snapshotID, "source"), Status: snapshot.StatusMaterializing,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: snapshotID, MaxAttempts: 3}
+	if err := jobsStore.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	oldClaim, err := jobsStore.ClaimJobs(ctx, "snapshot-old-worker", 1, time.Minute)
+	if err != nil || len(oldClaim) != 1 {
+		t.Fatalf("old snapshot claim = %+v, err=%v", oldClaim, err)
+	}
+	barrier := &firstCloneBarrier{commitSHA: commitSHA, started: make(chan struct{}), release: make(chan struct{})}
+	handler := indexing.NewSnapshotJobHandler(
+		&mockRepoStore{}, store, nil, storeFS, barrier,
+		indexing.NewFileFilter(512), indexing.NewCodeChunker(5, 2), nil,
+	)
+	type executionResult struct{ err error }
+	oldDone := make(chan executionResult, 1)
+	go func() { oldDone <- executionResult{err: handler.Execute(ctx, oldClaim[0])} }()
+	<-barrier.started // W1 is paused after claim and before its filesystem publish.
+
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
+		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
+		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	newClaim, err := jobsStore.ClaimJobs(ctx, "snapshot-new-worker", 1, time.Minute)
+	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
+		t.Fatalf("new snapshot claim = %+v, err=%v", newClaim, err)
+	}
+	if err := handler.Execute(ctx, newClaim[0]); err != nil {
+		t.Fatalf("W2 snapshot execution failed: %v", err)
+	}
+	current, err := store.GetByID(ctx, snapshotID)
+	if err != nil || current.Status != snapshot.StatusReady {
+		t.Fatalf("W2 snapshot was not made READY: snapshot=%+v err=%v", current, err)
+	}
+	currentBytes, err := os.ReadFile(filepath.Join(current.MaterializedPath, "main.go"))
+	if err != nil || string(currentBytes) != "current worker\n" {
+		t.Fatalf("current DB path does not contain W2 output: content=%q err=%v", currentBytes, err)
+	}
+
+	close(barrier.release)
+	oldResult := <-oldDone
+	if !errors.Is(oldResult.err, jobs.ErrOwnershipLost) {
+		t.Fatalf("stale W1 finalization error = %v, want ownership lost", oldResult.err)
+	}
+	oldPath, err := storeFS.GetExecutionSourcePath(repoID, snapshotID, oldClaim[0].ExecutionGeneration, *oldClaim[0].ClaimToken)
+	if err != nil || oldPath == current.MaterializedPath {
+		t.Fatalf("snapshot executions shared a materialized path: old=%q current=%q err=%v", oldPath, current.MaterializedPath, err)
+	}
+	oldBytes, err := os.ReadFile(filepath.Join(oldPath, "main.go"))
+	if err != nil || string(oldBytes) != "stale worker\n" {
+		t.Fatalf("stale execution output was not isolated: content=%q err=%v", oldBytes, err)
+	}
+	after, err := store.GetByID(ctx, snapshotID)
+	if err != nil || after.MaterializedPath != current.MaterializedPath || after.ContentHash != current.ContentHash || after.Status != snapshot.StatusReady {
+		t.Fatalf("W1 changed current snapshot pointer or hash: snapshot=%+v err=%v", after, err)
+	}
+	currentBytes, err = os.ReadFile(filepath.Join(after.MaterializedPath, "main.go"))
+	if err != nil || string(currentBytes) != "current worker\n" {
+		t.Fatalf("W1 changed W2's published files: content=%q err=%v", currentBytes, err)
+	}
+}
+
 func TestSnapshotJobHandler_FinalizesOnlyAfterMaterialization(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Cleanup(func() {
@@ -419,6 +551,7 @@ func TestSnapshotJobHandler_DoesNotMarkReadyOnWalkFailure(t *testing.T) {
 }
 
 func TestSnapshotJobHandler_IgnoresOversizedExcludedFilesButRejectsOversizedSource(t *testing.T) {
+	claimToken := "fixture-token"
 	newFixture := func(t *testing.T, files map[string][]byte) (*indexing.SnapshotJobHandler, *materializationRecorder) {
 		t.Helper()
 		root := t.TempDir()
@@ -438,9 +571,12 @@ func TestSnapshotJobHandler_IgnoresOversizedExcludedFilesButRejectsOversizedSour
 			ID: "snap-filter-order", RepositoryID: "repo-filter-order", Ref: "main",
 			CommitSHA: "0123456789abcdef0123456789abcdef01234567", Status: snapshot.StatusMaterializing,
 		}
-		sourceDir, err := storeFS.EnsureDir(snap.RepositoryID, snap.ID)
+		sourceDir, err := storeFS.GetExecutionSourcePath(snap.RepositoryID, snap.ID, 1, claimToken)
 		if err != nil {
-			t.Fatalf("ensure source dir: %v", err)
+			t.Fatalf("get execution source dir: %v", err)
+		}
+		if err := os.MkdirAll(sourceDir, 0755); err != nil {
+			t.Fatalf("create execution source dir: %v", err)
 		}
 		for name, content := range files {
 			if err := os.WriteFile(filepath.Join(sourceDir, name), content, 0o644); err != nil {
@@ -463,7 +599,7 @@ func TestSnapshotJobHandler_IgnoresOversizedExcludedFilesButRejectsOversizedSour
 			".env":      []byte("SECRET=not-indexed"),
 		})
 		err := handler.Execute(context.Background(), &jobs.AnalysisJob{
-			ID: 31, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3,
+			ID: 31, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3, ExecutionGeneration: 1, ClaimToken: &claimToken,
 		})
 		if err != nil {
 			t.Fatalf("snapshot should ignore excluded files regardless of size: %v", err)
@@ -481,7 +617,7 @@ func TestSnapshotJobHandler_IgnoresOversizedExcludedFilesButRejectsOversizedSour
 			"main.go": bytes.Repeat([]byte{'x'}, 513*1024),
 		})
 		err := handler.Execute(context.Background(), &jobs.AnalysisJob{
-			ID: 32, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3,
+			ID: 32, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3, ExecutionGeneration: 1, ClaimToken: &claimToken,
 		})
 		if err == nil {
 			t.Fatal("oversized source should fail materialization")
@@ -514,10 +650,14 @@ func TestSnapshotJobHandler_PartialFailurePropagatesError(t *testing.T) {
 	storeFS := snapshotstore.NewLocalSnapshotStore(tmpDir)
 	repoID := "repo-fail-test"
 	snapID := "snap-fail-test"
+	claimToken := "fixture-token"
 
-	sourceDir, err := storeFS.EnsureDir(repoID, snapID)
+	sourceDir, err := storeFS.GetExecutionSourcePath(repoID, snapID, 1, claimToken)
 	if err != nil {
-		t.Fatalf("failed to ensure source dir: %v", err)
+		t.Fatalf("failed to get execution source dir: %v", err)
+	}
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatalf("failed to create execution source dir: %v", err)
 	}
 	_ = os.WriteFile(filepath.Join(sourceDir, "main.go"), []byte("package main\nfunc Hello() {}\n"), 0644)
 
@@ -542,9 +682,11 @@ func TestSnapshotJobHandler_PartialFailurePropagatesError(t *testing.T) {
 
 	ctx := context.Background()
 	job := &jobs.AnalysisJob{
-		ID:         1,
-		JobType:    jobs.JobTypeMaterializeSnapshot,
-		ResourceID: snapID,
+		ID:                  1,
+		JobType:             jobs.JobTypeMaterializeSnapshot,
+		ResourceID:          snapID,
+		ExecutionGeneration: 1,
+		ClaimToken:          &claimToken,
 	}
 
 	execErr := handler.Execute(ctx, job)

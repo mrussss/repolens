@@ -133,8 +133,11 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	if job.ClaimToken != nil {
 		claimToken = *job.ClaimToken
 	}
-
-	finalPath, artifactHash, err := h.publisher.Publish(rb.ID, claimToken, rb.Strategy, idx)
+	executionGeneration := job.ExecutionGeneration
+	if executionGeneration < 1 {
+		executionGeneration = 1
+	}
+	finalPath, artifactHash, err := h.publisher.Publish(rb.ID, int64(executionGeneration), claimToken, rb.Strategy, idx)
 	if err != nil {
 		log.Error("failed publishing retrieval artifact", "build_id", rb.ID, "error", err)
 		return err

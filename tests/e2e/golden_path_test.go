@@ -55,7 +55,13 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 	reportStore := evidence.NewReportStore(db)
 	citationStore := evidence.NewCitationStore(db)
 	snapshotBasePath := t.TempDir()
-	storeFS := snapshotstore.NewLocalSnapshotStore(snapshotBasePath)
+	storeFS := snapshotstore.NewLocalSnapshotStore(snapshotBasePath).WithSourcePathResolver(func(repoID, snapshotID string) (string, bool) {
+		snap, err := snapshotStore.GetByID(context.Background(), snapshotID)
+		if err != nil || snap.RepositoryID != repoID || snap.Status != snapshot.StatusReady || snap.MaterializedPath == "" {
+			return "", false
+		}
+		return snap.MaterializedPath, true
+	})
 	artifactDir := t.TempDir()
 	t.Cleanup(func() {
 		_ = filepath.Walk(snapshotBasePath, func(path string, info os.FileInfo, err error) error {
