@@ -18,6 +18,7 @@ import (
 	"golang.org/x/mod/modfile"
 
 	"repolens/internal/codeintel/model"
+	"repolens/internal/snapshotpolicy"
 )
 
 // ParsedFile contains the parsed AST along with file metadata and raw content.
@@ -76,8 +77,7 @@ func DiscoverModule(rootPath string) (*ModuleInfo, error) {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules" {
+			if snapshotpolicy.ShouldSkipDirectory(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -97,6 +97,13 @@ func DiscoverModule(rootPath string) (*ModuleInfo, error) {
 
 // ParseRepository walks the repository root and parses all relevant Go files matching the build context.
 func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInfo, bctx model.BuildContext) ([]*ParsedFile, []string, error) {
+	return ParseRepositoryWithAllowedFiles(fset, rootPath, moduleInfo, bctx, nil)
+}
+
+// ParseRepositoryWithAllowedFiles restricts parsing to the snapshot manifest
+// when allowedFiles is non-nil. A nil list retains the shared policy walk used
+// for legacy snapshots that predate manifests.
+func ParseRepositoryWithAllowedFiles(fset *token.FileSet, rootPath string, moduleInfo *ModuleInfo, bctx model.BuildContext, allowedFiles []string) ([]*ParsedFile, []string, error) {
 	var warnings []string
 	if len(moduleInfo.NestedMods) > 0 {
 		warnings = append(warnings, fmt.Sprintf("found %d nested go.mod files (%s); nested modules excluded from root module semantic analysis",
@@ -109,6 +116,13 @@ func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInf
 	}
 
 	var parsedFiles []*ParsedFile
+	var allowed map[string]struct{}
+	if allowedFiles != nil {
+		allowed = make(map[string]struct{}, len(allowedFiles))
+		for _, path := range allowedFiles {
+			allowed[filepath.ToSlash(path)] = struct{}{}
+		}
+	}
 
 	err := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -116,8 +130,7 @@ func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInf
 		}
 
 		if d.IsDir() {
-			name := d.Name()
-			if strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules" || name == "testdata" {
+			if snapshotpolicy.ShouldSkipDirectory(d.Name()) {
 				return filepath.SkipDir
 			}
 			// If this directory is inside a nested module, skip semantic parsing
@@ -140,6 +153,14 @@ func ParseRepository(fset *token.FileSet, rootPath string, moduleInfo *ModuleInf
 			relPath = path
 		}
 		relPath = filepath.ToSlash(relPath)
+		if allowed != nil {
+			if _, ok := allowed[relPath]; !ok {
+				return nil
+			}
+		}
+		if !snapshotpolicy.CanIndex(relPath, 0).Allowed {
+			return nil
+		}
 
 		content, err := os.ReadFile(path)
 		if err != nil {

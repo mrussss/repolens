@@ -21,6 +21,7 @@ import (
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/revision"
 	"repolens/internal/snapshot"
+	"repolens/internal/snapshotpolicy"
 	"repolens/internal/tools"
 )
 
@@ -44,6 +45,42 @@ func setupCodeIntelTestDB(t *testing.T) (*gorm.DB, *jobs.Store, codeintelstore.S
 	ciStore := codeintelstore.NewStore(db)
 	snapStore := snapshot.NewStore(db)
 	return db, jobsStore, ciStore, snapStore
+}
+
+func TestAnalyzerUsesSnapshotManifestFileUniverse(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"go.mod":        "module example.com/manifest\n\ngo 1.22\n",
+		"src/main.go":   "package src\nfunc Visible() {}\n",
+		"dist/leak.go":  "package dist\nfunc HiddenDist() {}\n",
+		"build/leak.go": "package build\nfunc HiddenBuild() {}\n",
+	}
+	for path, content := range files {
+		fullPath := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := snapshotpolicy.NewManifest("snap-manifest", "commit", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", []snapshotpolicy.FileEntry{
+		snapshotpolicy.FileEntryFor("src/main.go", []byte(files["src/main.go"])),
+	})
+	if err := snapshotpolicy.WriteManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := snapshotpolicy.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := codeintel.NewAnalyzer().AnalyzeWithAllowedFiles(context.Background(), root, loaded.AllowedPaths(), codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 1 || result.Files[0].Path != "src/main.go" {
+		t.Fatalf("CodeIndex files = %+v, want only src/main.go from snapshot manifest", result.Files)
+	}
 }
 
 func TestRelatedTestsPersistAndReachFindRelatedTestsTool(t *testing.T) {

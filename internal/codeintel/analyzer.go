@@ -26,6 +26,13 @@ func NewAnalyzer() *Analyzer {
 
 // Analyze runs the complete parsing, symbol extraction, type-checking, relation extraction, and test discovery pipeline.
 func (a *Analyzer) Analyze(ctx context.Context, rootPath string, bctx BuildContext) (*AnalysisResult, error) {
+	return a.AnalyzeWithAllowedFiles(ctx, rootPath, nil, bctx)
+}
+
+// AnalyzeWithAllowedFiles uses a snapshot manifest allowlist when non-nil.
+// Legacy snapshots without a manifest pass nil and still use the shared path
+// policy inside the parser.
+func (a *Analyzer) AnalyzeWithAllowedFiles(ctx context.Context, rootPath string, allowedFiles []string, bctx BuildContext) (*AnalysisResult, error) {
 	// 1. Discover module
 	modInfo, err := parser.DiscoverModule(rootPath)
 	if err != nil {
@@ -35,7 +42,7 @@ func (a *Analyzer) Analyze(ctx context.Context, rootPath string, bctx BuildConte
 	fset := token.NewFileSet()
 
 	// 2. Parse repository files
-	parsedFiles, warnings, err := parser.ParseRepository(fset, rootPath, modInfo, bctx)
+	parsedFiles, warnings, err := parser.ParseRepositoryWithAllowedFiles(fset, rootPath, modInfo, bctx, allowedFiles)
 	if err != nil {
 		return nil, fmt.Errorf("failed parsing repository: %w", err)
 	}

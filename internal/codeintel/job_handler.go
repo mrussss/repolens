@@ -14,6 +14,7 @@ import (
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/revision"
 	"repolens/internal/snapshot"
+	"repolens/internal/snapshotpolicy"
 )
 
 // CodeIndexJobHandler processes BUILD_CODE_INDEX jobs.
@@ -103,7 +104,19 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	snapshotDir := h.storeFS.GetSourcePath(snap.RepositoryID, snap.ID)
 	log.Info("starting code index build execution", "build_id", cib.ID, "snapshot_id", snap.ID, "path", snapshotDir)
 
-	analysisRes, err := h.analyzer.Analyze(ctx, snapshotDir, bc)
+	var allowedFiles []string
+	manifest, manifestErr := snapshotpolicy.LoadManifest(snapshotDir)
+	if manifestErr == nil {
+		if manifest.SnapshotID != snap.ID || manifest.CommitSHA != snap.CommitSHA || manifest.ContentHash != snap.ContentHash {
+			return jobs.NewPermanentError("SNAPSHOT_MANIFEST_IDENTITY_MISMATCH", "snapshot manifest does not match READY snapshot identity", nil)
+		}
+		allowedFiles = manifest.AllowedPaths()
+	} else if errors.Is(manifestErr, snapshotpolicy.ErrManifestNotFound) && snapshotpolicy.RequiresManifest(snapshotDir) {
+		return jobs.NewPermanentError("SNAPSHOT_MANIFEST_MISSING", "immutable READY snapshot is missing its file manifest", manifestErr)
+	} else if !errors.Is(manifestErr, snapshotpolicy.ErrManifestNotFound) {
+		return jobs.NewRetryableError("SNAPSHOT_MANIFEST_UNAVAILABLE", manifestErr.Error(), manifestErr)
+	}
+	analysisRes, err := h.analyzer.AnalyzeWithAllowedFiles(ctx, snapshotDir, allowedFiles, bc)
 	if err != nil {
 		log.Error("code index build analysis failed", "build_id", cib.ID, "error", err)
 		// Terminal business transitions are claim-fenced by the Job Store.
