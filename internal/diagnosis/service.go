@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -14,19 +13,10 @@ import (
 	"repolens/internal/jobs"
 	platformconfig "repolens/internal/platform/config"
 	"repolens/internal/platform/metrics"
+	"repolens/internal/platform/redaction"
 	"repolens/internal/repo"
 	"repolens/internal/revision"
 	"repolens/internal/snapshot"
-)
-
-var (
-	secretPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(api[_-]?key|secret|token|password|auth|bearer)\s*[:=]\s*['"]?([a-zA-Z0-9_\-\.]{8,})['"]?`),
-		regexp.MustCompile(`(?i)ghp_[a-zA-Z0-9]{36}`),
-		regexp.MustCompile(`(?i)glpat-[a-zA-Z0-9\-_]{20}`),
-		regexp.MustCompile(`(?i)sk-[a-zA-Z0-9]{32,}`),
-		regexp.MustCompile(`(?i)AKIA[0-9A-Z]{16}`),
-	}
 )
 
 var ErrInputTooLarge = errors.New("diagnosis input exceeds configured limit")
@@ -46,13 +36,7 @@ func ValidateInput(input CreateDiagnosisInput) error {
 }
 
 func RedactSecrets(input string) string {
-	redacted := input
-	for _, p := range secretPatterns {
-		redacted = p.ReplaceAllStringFunc(redacted, func(match string) string {
-			return "[REDACTED_SECRET]"
-		})
-	}
-	return redacted
+	return redaction.RedactSecrets(input)
 }
 
 type CreateDiagnosisInput struct {
@@ -338,7 +322,7 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		SnapshotID:                  input.SnapshotID,
 		CodeIndexBuildID:            codeIndexBuildID,
 		RetrievalBuildID:            retrievalBuildID,
-		IssueTitle:                  input.IssueTitle,
+		IssueTitle:                  RedactSecrets(input.IssueTitle),
 		IssueDescription:            cleanDesc,
 		ErrorLog:                    cleanLog,
 		Status:                      StatusQueued,

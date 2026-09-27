@@ -68,7 +68,7 @@ func (s ownershipLostFinalizerStore) FinalizeSuccess(ctx context.Context, _ int6
 type invalidReportExecutor struct{}
 
 func (invalidReportExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
-	return &worker.ExecutionResult{RawOutput: `{"unknown":"secret-test-marker"}`, ParseError: "INVALID_STRUCTURED_REPORT: UNKNOWN_FIELD", StructuredReport: false}, fmt.Errorf("%w: UNKNOWN_FIELD", agent.ErrInvalidStructuredReport)
+	return &worker.ExecutionResult{RawOutput: `{"unknown":"value","debug":"Authorization: Bearer short-token"}`, ParseError: "INVALID_STRUCTURED_REPORT: UNKNOWN_FIELD", StructuredReport: false}, fmt.Errorf("%w: UNKNOWN_FIELD", agent.ErrInvalidStructuredReport)
 }
 
 func (s checkpointFailingStore) UpdateAttemptCheckpoint(context.Context, string, diagnosis.AttemptCheckpoint) error {
@@ -411,7 +411,7 @@ type invalidStructuredReportExecutor struct{}
 
 func (invalidStructuredReportExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	return &worker.ExecutionResult{
-		RawOutput:        "{\"conclusion_kind\":\"ROOT_CAUSE\"}",
+		RawOutput:        "{\"conclusion_kind\":\"ROOT_CAUSE\",\"debug\":\"Authorization: Bearer short-token\"}",
 		ParseError:       "INVALID_STRUCTURED_REPORT: root cause report needs summary, root_cause, and at least one finding",
 		StructuredReport: false,
 	}, fmt.Errorf("%w: root cause report needs summary, root_cause, and at least one finding", agent.ErrInvalidStructuredReport)
@@ -444,11 +444,11 @@ func TestWorkerJobHandler_InvalidStructuredReportFailsTerminally(t *testing.T) {
 		t.Fatalf("run = %+v err=%v, want FAILED", savedRun, err)
 	}
 	attempts, err := diagStore.ListAttemptsByRun(ctx, run.ID)
-	if err != nil || len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusFailedTerminal || attempts[0].ErrorCode != "INVALID_STRUCTURED_REPORT" {
+	if err != nil || len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusFailedTerminal || attempts[0].ErrorCode != "INVALID_STRUCTURED_REPORT" || strings.Contains(attempts[0].RawOutput, "short-token") || !strings.Contains(attempts[0].RawOutput, "[REDACTED_SECRET]") {
 		t.Fatalf("attempts = %+v err=%v, want FAILED_TERMINAL with stable error code", attempts, err)
 	}
 	report, err := repStore.GetByRunID(ctx, run.ID)
-	if err != nil || report == nil || report.ReportStatus != evidence.ReportInvalid || report.RawOutput == "" || !strings.Contains(report.ParseError, "INVALID_STRUCTURED_REPORT") {
+	if err != nil || report == nil || report.ReportStatus != evidence.ReportInvalid || report.RawOutput == "" || strings.Contains(report.RawOutput, "short-token") || !strings.Contains(report.RawOutput, "[REDACTED_SECRET]") || !strings.Contains(report.ParseError, "INVALID_STRUCTURED_REPORT") {
 		t.Fatalf("report = %+v err=%v, want INVALID report with raw output and parse error", report, err)
 	}
 	job, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, run.ID)

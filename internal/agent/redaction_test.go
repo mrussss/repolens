@@ -21,6 +21,24 @@ func TestRedactSecrets(t *testing.T) {
 			redacted: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
 		},
 		{
+			name:     "short bearer token with mixed case and tabs",
+			input:    "aUtHoRiZaTiOn:\tBeArEr\tshort",
+			contains: "BeArEr [REDACTED_SECRET]",
+			redacted: "short",
+		},
+		{
+			name:     "basic authorization",
+			input:    "Authorization:  bAsIc\tYWxpY2U6c2VjcmV0",
+			contains: "bAsIc [REDACTED_SECRET]",
+			redacted: "YWxpY2U6c2VjcmV0",
+		},
+		{
+			name:     "basic authorization in JSON",
+			input:    `{"Authorization":"Basic dXNlcjpwYXNz","other":"kept"}`,
+			contains: `"Authorization":"Basic [REDACTED_SECRET]"`,
+			redacted: "dXNlcjpwYXNz",
+		},
+		{
 			name:     "GitHub Token",
 			input:    "const token = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';",
 			contains: "[REDACTED_GITHUB_TOKEN]",

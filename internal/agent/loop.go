@@ -298,7 +298,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		if err != nil {
 			logger.L(ctx).Warn("failed to parse structured report JSON from assistant output", "error", err)
 			return &LoopResult{
-				RawOutput:          finalText,
+				RawOutput:          RedactSecrets(finalText),
 				PromptTokens:       totalPromptTokens,
 				CompletionTokens:   totalCompletionTokens,
 				CachedPromptTokens: totalCachedPromptTokens,
@@ -317,7 +317,7 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 		return &LoopResult{
 			Report:             reportData,
 			ReportDraft:        reportData,
-			RawOutput:          finalText,
+			RawOutput:          RedactSecrets(finalText),
 			PromptTokens:       totalPromptTokens,
 			CompletionTokens:   totalCompletionTokens,
 			CachedPromptTokens: totalCachedPromptTokens,
@@ -421,7 +421,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 	report, parseErr := parseReportJSON(finalText)
 	if parseErr != nil {
 		return &LoopResult{
-			RawOutput:    finalText,
+			RawOutput:    RedactSecrets(finalText),
 			PromptTokens: promptTokens + resp.PromptTokens, CompletionTokens: completionTokens + resp.CompletionTokens,
 			CachedPromptTokens: cachedTokens + resp.CachedPromptTokens, ReasoningTokens: reasoningTokens + resp.ReasoningTokens,
 			ToolCallsCount: toolCalls, ToolNames: toolNames, AgentRounds: rounds + 1,
@@ -430,7 +430,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRu
 		}, parseErr
 	}
 	return &LoopResult{
-		Report: report, ReportDraft: report, RawOutput: finalText,
+		Report: report, ReportDraft: report, RawOutput: RedactSecrets(finalText),
 		PromptTokens: promptTokens + resp.PromptTokens, CompletionTokens: completionTokens + resp.CompletionTokens,
 		CachedPromptTokens: cachedTokens + resp.CachedPromptTokens, ReasoningTokens: reasoningTokens + resp.ReasoningTokens,
 		ToolCallsCount: toolCalls, ToolNames: toolNames, AgentRounds: rounds + 1,
@@ -466,15 +466,15 @@ func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, s
 		AttemptID:         attemptID,
 		Seq:               seq,
 		StepType:          stepType,
-		ToolName:          toolName,
-		ToolArgsSummary:   args,
-		ToolResultSummary: result,
+		ToolName:          RedactSecrets(toolName),
+		ToolArgsSummary:   RedactSecrets(args),
+		ToolResultSummary: RedactSecrets(result),
 		Status:            status,
 		LatencyMs:         latency,
 		InputTokens:       inTok,
 		OutputTokens:      outTok,
-		ErrorCode:         errCode,
-		FinishReason:      finishReason,
+		ErrorCode:         RedactSecrets(errCode),
+		FinishReason:      RedactSecrets(finishReason),
 		CreatedAt:         time.Now(),
 	}
 	return l.traceStore.Create(ctx, step)

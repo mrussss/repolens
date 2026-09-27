@@ -9,6 +9,7 @@ import (
 
 	"repolens/internal/diagnosis"
 	"repolens/internal/llm"
+	"repolens/internal/trace"
 )
 
 type loopResponseProvider struct {
@@ -215,4 +216,44 @@ func TestSystemPromptUsesEvidenceIDOnlyForFinalCitations(t *testing.T) {
 	if !strings.Contains(SystemPrompt, `"evidence_id"`) {
 		t.Fatal("system prompt does not define evidence_id citation field")
 	}
+}
+
+func TestRecordStepRedactsPersistedTraceFields(t *testing.T) {
+	store := &recordingTraceStore{}
+	loop := &AgentLoop{traceStore: store}
+	if err := loop.recordStep(context.Background(), "attempt", 1, trace.StepTypeToolCall,
+		"Authorization: Bearer tool-secret",
+		`{"Authorization":"Basic args-secret"}`,
+		"Authorization: Bearer result-secret", "COMPLETED", 0, 0, 0,
+		"Authorization: Basic error-secret", "Authorization: Bearer finish-secret"); err != nil {
+		t.Fatal(err)
+	}
+	for field, value := range map[string]string{
+		"tool name": store.step.ToolName, "arguments": store.step.ToolArgsSummary,
+		"result": store.step.ToolResultSummary, "error code": store.step.ErrorCode,
+		"finish reason": store.step.FinishReason,
+	} {
+		for _, secret := range []string{"tool-secret", "args-secret", "result-secret", "error-secret", "finish-secret"} {
+			if strings.Contains(value, secret) {
+				t.Errorf("trace %s retained %s: %q", field, secret, value)
+			}
+		}
+	}
+	if !json.Valid([]byte(store.step.ToolArgsSummary)) {
+		t.Fatalf("redaction corrupted JSON trace arguments: %q", store.step.ToolArgsSummary)
+	}
+}
+
+type recordingTraceStore struct{ step *trace.AgentStep }
+
+func (s *recordingTraceStore) Create(_ context.Context, step *trace.AgentStep) error {
+	copy := *step
+	s.step = &copy
+	return nil
+}
+func (*recordingTraceStore) ListByAttempt(context.Context, string) ([]trace.AgentStep, error) {
+	return nil, nil
+}
+func (*recordingTraceStore) ListAfterSeq(context.Context, string, int) ([]trace.AgentStep, error) {
+	return nil, nil
 }

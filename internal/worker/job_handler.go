@@ -207,7 +207,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		}
 		rawOutput := ""
 		if result != nil {
-			rawOutput = result.RawOutput
+			rawOutput = agent.RedactSecrets(result.RawOutput)
 		}
 		report := &evidence.Report{
 			ID:                    uuid.New().String(),
@@ -256,6 +256,14 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		}); ok && progressErr.Progressed() && result != nil {
 			execErr = jobs.NewPermanentError("PROVIDER_PROGRESS_ABORTED", "provider failed after agent progress; explicit diagnosis retry is required", execErr)
 			errorCode = "PROVIDER_PROGRESS_ABORTED"
+		}
+		var codedError interface {
+			ErrorCode() string
+			Permanent() bool
+		}
+		if errors.As(execErr, &codedError) && codedError.Permanent() {
+			errorCode = codedError.ErrorCode()
+			execErr = jobs.NewPermanentError(errorCode, errorCode, execErr)
 		}
 		errClass, errCode := jobs.ClassifyError(execErr)
 		if errorCode != "" {
@@ -318,7 +326,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			StructuredPayloadJSON:  string(structuredPayloadBytes),
 			Confidence:             result.Report.Confidence,
 			ModelClaimedConfidence: result.Report.ModelClaimedConfidence,
-			RawOutput:              result.RawOutput,
+			RawOutput:              agent.RedactSecrets(result.RawOutput),
 			ParseError:             result.ParseError,
 			LimitationsJSON:        string(limitationsBytes),
 			FinalizationReason:     result.FinalizationReason,
@@ -456,7 +464,7 @@ func (h *DiagnosisJobHandler) saveAttemptCheckpoint(attempt *diagnosis.Diagnosis
 	checkpoint := diagnosis.AttemptCheckpoint{
 		ExecutionGeneration: attempt.ExecutionGeneration,
 		Kind:                kind,
-		RawOutput:           result.RawOutput,
+		RawOutput:           agent.RedactSecrets(result.RawOutput),
 		ParsedReportJSON:    string(parsedReport),
 		ParsedDraftJSON:     string(parsedDraft),
 		PromptVersion:       run.PromptVersion,

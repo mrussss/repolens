@@ -102,6 +102,11 @@ func NewCitationValidator(store snapshotstore.SnapshotStore) *CitationValidator 
 }
 
 func (v *CitationValidator) Validate(ctx context.Context, repoID, snapshotID string, c *Citation) {
+	if c.SnapshotID != "" && c.SnapshotID != snapshotID {
+		c.ValidationStatus = CitationInvalid
+		c.ValidationError = "citation snapshot does not match diagnosis snapshot"
+		return
+	}
 	if c.FilePath == "" {
 		c.ValidationStatus = CitationInvalid
 		c.ValidationError = "file_path is empty"
@@ -142,17 +147,28 @@ func (v *CitationValidator) Validate(ctx context.Context, repoID, snapshotID str
 		return
 	}
 
+	hasContentHash := c.ContentHash != ""
 	h := sha256.Sum256([]byte(actualContent))
-	c.ContentHash = hex.EncodeToString(h[:])
+	actualHash := hex.EncodeToString(h[:])
+	if c.ContentHash != "" && !strings.EqualFold(c.ContentHash, actualHash) {
+		c.ValidationStatus = CitationInvalid
+		c.ValidationError = "content hash does not match actual file lines in snapshot"
+		return
+	}
+	c.ContentHash = actualHash
 
 	if c.Excerpt != "" {
-		normExcerpt := strings.TrimSpace(strings.ReplaceAll(c.Excerpt, "\r\n", "\n"))
-		normActual := strings.TrimSpace(strings.ReplaceAll(actualContent, "\r\n", "\n"))
-		if !strings.Contains(normActual, normExcerpt) && !strings.Contains(normExcerpt, normActual) {
+		normExcerpt := strings.ReplaceAll(c.Excerpt, "\r\n", "\n")
+		normActual := strings.ReplaceAll(actualContent, "\r\n", "\n")
+		if normActual != normExcerpt {
 			c.ValidationStatus = CitationInvalid
 			c.ValidationError = "excerpt does not match actual file lines in snapshot"
 			return
 		}
+	} else if !hasContentHash {
+		c.ValidationStatus = CitationInvalid
+		c.ValidationError = "citation requires an exact excerpt or content hash"
+		return
 	}
 
 	c.ValidationStatus = CitationValid
