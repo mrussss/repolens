@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -488,6 +489,142 @@ func TestRealMySQL_ReturnUndispatchedClaimIsClaimFenced(t *testing.T) {
 	}
 	if current.Status != jobs.StatusRunning || current.AttemptCount != 3 || current.WorkerID == nil || *current.WorkerID != "mysql-new-worker" || current.ClaimToken == nil || *current.ClaimToken != *newClaim[0].ClaimToken {
 		t.Fatalf("stale return changed current MySQL claim: %+v", current)
+	}
+}
+
+type mysqlClaimGateResult struct {
+	jobs []*jobs.AnalysisJob
+	err  error
+}
+
+type mysqlClaimGateStore struct {
+	*jobs.Store
+	releaseClaims  chan struct{}
+	claimed        chan mysqlClaimGateResult
+	secondJobID    int64
+	secondReturned chan struct{}
+	secondOnce     sync.Once
+}
+
+func (s *mysqlClaimGateStore) ClaimJobs(ctx context.Context, workerID string, batchSize int, lease time.Duration) ([]*jobs.AnalysisJob, error) {
+	claimed, err := s.Store.ClaimJobs(ctx, workerID, batchSize, lease)
+	s.claimed <- mysqlClaimGateResult{jobs: claimed, err: err}
+	<-s.releaseClaims
+	return claimed, err
+}
+
+func (s *mysqlClaimGateStore) ReturnUndispatchedClaim(ctx context.Context, jobID int64, workerID, token string, generation int) error {
+	err := s.Store.ReturnUndispatchedClaim(ctx, jobID, workerID, token, generation)
+	if err == nil && jobID == s.secondJobID {
+		s.secondOnce.Do(func() { close(s.secondReturned) })
+	}
+	return err
+}
+
+func TestRealMySQL_BatchUndispatchedReturnContinuesPastLockedRow(t *testing.T) {
+	db, jobsStore, cleanup := setupRealMySQL(t)
+	if db == nil {
+		return
+	}
+	defer cleanup()
+	ctx := context.Background()
+	first := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "mysql-batch-return-first", AttemptCount: 2, MaxAttempts: 3}
+	second := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "mysql-batch-return-second", AttemptCount: 2, MaxAttempts: 3}
+	for _, job := range []*jobs.AnalysisJob{first, second} {
+		if err := jobsStore.CreateJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gate := &mysqlClaimGateStore{
+		Store: jobsStore, releaseClaims: make(chan struct{}), claimed: make(chan mysqlClaimGateResult, 1),
+		secondJobID:    second.ID,
+		secondReturned: make(chan struct{}),
+	}
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.WorkerID = "mysql-batch-shutdown-worker"
+	cfg.Concurrency = 2
+	cfg.BatchSize = 2
+	// Keep the held row lock well within a live lease so this test exercises
+	// return-loop fairness rather than lease expiry timing.
+	cfg.LeaseDuration = 30 * time.Second
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.ReapInterval = time.Hour
+	cfg.ShutdownCleanupTimeout = 10 * time.Millisecond
+	worker := jobs.NewWorker(gate, cfg)
+	var handlerCalls atomic.Int32
+	worker.RegisterHandler(jobs.JobTypeRunDiagnosis, jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error {
+		handlerCalls.Add(1)
+		return nil
+	}))
+	worker.Start(ctx)
+	var claimed mysqlClaimGateResult
+	select {
+	case claimed = <-gate.claimed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker did not commit its batch claim")
+	}
+	if claimed.err != nil || len(claimed.jobs) != 2 || claimed.jobs[0].AttemptCount != 3 || claimed.jobs[1].AttemptCount != 3 {
+		t.Fatalf("batch claims=%+v err=%v; want two third-attempt claims", claimed.jobs, claimed.err)
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockTx, err := sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lockedID int64
+	if err := lockTx.QueryRowContext(ctx, `SELECT id FROM analysis_jobs WHERE id = ? FOR UPDATE`, first.ID).Scan(&lockedID); err != nil {
+		_ = lockTx.Rollback()
+		t.Fatalf("lock first batch job: %v", err)
+	}
+	if lockedID != first.ID {
+		_ = lockTx.Rollback()
+		t.Fatalf("locked job id=%d, want %d", lockedID, first.ID)
+	}
+
+	shutdownCtx, cancelShutdown := context.WithCancel(ctx)
+	cancelShutdown()
+	if err := worker.StopGracefully(shutdownCtx); !errors.Is(err, context.Canceled) {
+		_ = lockTx.Rollback()
+		t.Fatalf("initial bounded StopGracefully=%v, want canceled cleanup result", err)
+	}
+	close(gate.releaseClaims)
+	select {
+	case <-gate.secondReturned:
+	case <-time.After(10 * time.Second):
+		_ = lockTx.Rollback()
+		t.Fatal("second independent claim was not returned while the first row was locked")
+	}
+	secondState, err := jobsStore.GetJobByID(ctx, second.ID)
+	if err != nil || secondState.Status != jobs.StatusPending || secondState.AttemptCount != 2 || secondState.ClaimToken != nil || secondState.LeaseUntil != nil {
+		_ = lockTx.Rollback()
+		t.Fatalf("second row while first locked=%+v err=%v; want safely returned attempt 2", secondState, err)
+	}
+	firstState, err := jobsStore.GetJobByID(ctx, first.ID)
+	if err != nil || firstState.Status != jobs.StatusRunning || firstState.AttemptCount != 3 || firstState.LeaseUntil == nil || !firstState.LeaseUntil.After(time.Now().UTC()) {
+		_ = lockTx.Rollback()
+		t.Fatalf("locked first row state=%+v err=%v; want live claim for later return", firstState, err)
+	}
+	if err := lockTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	finishCtx, cancelFinish := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelFinish()
+	if err := worker.StopGracefully(finishCtx); err != nil {
+		t.Fatalf("wait for all MySQL claim returns: %v", err)
+	}
+	for _, id := range []int64{first.ID, second.ID} {
+		returned, err := jobsStore.GetJobByID(ctx, id)
+		if err != nil || returned.Status != jobs.StatusPending || returned.AttemptCount != 2 {
+			t.Fatalf("MySQL returned job %d=%+v err=%v; want PENDING attempt 2", id, returned, err)
+		}
+	}
+	if calls := handlerCalls.Load(); calls != 0 {
+		t.Fatalf("shutdown dispatched %d undispatched jobs", calls)
 	}
 }
 

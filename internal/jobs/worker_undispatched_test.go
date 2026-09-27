@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -176,5 +177,175 @@ func TestReturnUndispatchedClaimRejectsOldOwner(t *testing.T) {
 	}
 	if current.Status != StatusRunning || current.AttemptCount != 1 || current.WorkerID == nil || *current.WorkerID != "new-worker" || current.ClaimToken == nil || *current.ClaimToken != *newClaim[0].ClaimToken {
 		t.Fatalf("stale owner changed the current claim: %+v", current)
+	}
+}
+
+type blockedFirstReturnStore struct {
+	*Store
+	firstJobID         int64
+	secondJobID        int64
+	firstReturnStarted chan struct{}
+	allowFirstReturn   chan struct{}
+	secondReturned     chan struct{}
+	firstReturned      chan struct{}
+	firstOnce          sync.Once
+	secondOnce         sync.Once
+	returnedOnce       sync.Once
+}
+
+func (s *blockedFirstReturnStore) ReturnUndispatchedClaim(ctx context.Context, jobID int64, workerID, claimToken string, generation int) error {
+	if jobID == s.firstJobID {
+		s.firstOnce.Do(func() { close(s.firstReturnStarted) })
+		select {
+		case <-s.allowFirstReturn:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		err := s.Store.ReturnUndispatchedClaim(ctx, jobID, workerID, claimToken, generation)
+		if err == nil {
+			s.returnedOnce.Do(func() { close(s.firstReturned) })
+		}
+		return err
+	}
+	err := s.Store.ReturnUndispatchedClaim(ctx, jobID, workerID, claimToken, generation)
+	if jobID == s.secondJobID && err == nil {
+		s.secondOnce.Do(func() { close(s.secondReturned) })
+	}
+	return err
+}
+
+func TestWorkerReturnsBatchWithoutHeadOfLineBlockingAndProtectsPendingLease(t *testing.T) {
+	store := newUndispatchedWorkerTestStore(t)
+	ctx := context.Background()
+	first := &AnalysisJob{JobType: JobTypeRunDiagnosis, ResourceID: "run-batch-return-first", AttemptCount: 2, MaxAttempts: 3}
+	second := &AnalysisJob{JobType: JobTypeRunDiagnosis, ResourceID: "run-batch-return-second", AttemptCount: 2, MaxAttempts: 3}
+	for _, job := range []*AnalysisJob{first, second} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	controlledStore := &blockedFirstReturnStore{
+		Store: store, firstJobID: first.ID, secondJobID: second.ID,
+		firstReturnStarted: make(chan struct{}), allowFirstReturn: make(chan struct{}),
+		secondReturned: make(chan struct{}), firstReturned: make(chan struct{}),
+	}
+	cfg := DefaultWorkerConfig()
+	cfg.WorkerID = "worker-batch-before-stop"
+	cfg.Concurrency = 2
+	cfg.BatchSize = 2
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LeaseDuration = 400 * time.Millisecond
+	cfg.ReapInterval = time.Hour
+	worker := NewWorker(controlledStore, cfg)
+	claimed := make(chan struct{})
+	allowDispatchCheck := make(chan struct{})
+	worker.afterClaimBeforeDispatch = func() {
+		close(claimed)
+		<-allowDispatchCheck
+	}
+	var unexpectedExecutions atomic.Int32
+	worker.RegisterHandler(JobTypeRunDiagnosis, HandlerFunc(func(context.Context, *AnalysisJob) error {
+		unexpectedExecutions.Add(1)
+		return nil
+	}))
+	worker.Start(ctx)
+	select {
+	case <-claimed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not claim the batch")
+	}
+	firstBefore, err := store.GetJobByID(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBefore, err := store.GetJobByID(ctx, second.ID)
+	if err != nil || firstBefore.Status != StatusRunning || secondBefore.Status != StatusRunning || firstBefore.AttemptCount != 3 || secondBefore.AttemptCount != 3 {
+		t.Fatalf("batch claims first=%+v second=%+v err=%v; want both RUNNING attempt 3", firstBefore, secondBefore, err)
+	}
+
+	stopCtx, cancelStop := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelStop()
+	stopped := make(chan error, 1)
+	go func() { stopped <- worker.StopGracefully(stopCtx) }()
+	<-worker.stopCh
+	close(allowDispatchCheck)
+	select {
+	case <-controlledStore.firstReturnStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first bounded return attempt did not start")
+	}
+	select {
+	case <-controlledStore.secondReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second claim was not returned while first return was blocked")
+	}
+	firstBlocked, err := store.GetJobByID(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondReturned, err := store.GetJobByID(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstBlocked.Status != StatusRunning || firstBlocked.AttemptCount != 3 || firstBlocked.LeaseUntil == nil || firstBefore.LeaseUntil == nil || !firstBlocked.LeaseUntil.After(*firstBefore.LeaseUntil) {
+		t.Fatalf("blocked first claim was not lease-protected: before=%+v after=%+v", firstBefore, firstBlocked)
+	}
+	if secondReturned.Status != StatusPending || secondReturned.AttemptCount != 2 || secondReturned.WorkerID != nil || secondReturned.ClaimToken != nil || secondReturned.LeaseUntil != nil {
+		t.Fatalf("second claim state=%+v; want returned PENDING attempt 2", secondReturned)
+	}
+	close(controlledStore.allowFirstReturn)
+	select {
+	case <-controlledStore.firstReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first claim was not returned after releasing its barrier")
+	}
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("StopGracefully: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not stop after returning the full batch")
+	}
+	for _, id := range []int64{first.ID, second.ID} {
+		returned, err := store.GetJobByID(ctx, id)
+		if err != nil || returned.Status != StatusPending || returned.AttemptCount != 2 {
+			t.Fatalf("returned job %d = %+v err=%v; want PENDING attempt 2", id, returned, err)
+		}
+	}
+	if got := unexpectedExecutions.Load(); got != 0 {
+		t.Fatalf("shutdown started %d handlers for undispatched claims", got)
+	}
+
+	secondCfg := cfg
+	secondCfg.WorkerID = "worker-batch-after-stop"
+	secondWorker := NewWorker(store, secondCfg)
+	actualRuns := make(chan int, 2)
+	secondWorker.RegisterHandler(JobTypeRunDiagnosis, HandlerFunc(func(_ context.Context, job *AnalysisJob) error {
+		actualRuns <- job.AttemptCount
+		return nil
+	}))
+	secondWorker.Start(ctx)
+	for i := 0; i < 2; i++ {
+		select {
+		case attempt := <-actualRuns:
+			if attempt != 3 {
+				t.Fatalf("subsequent handler attempt=%d, want 3", attempt)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("later worker did not execute both returned jobs")
+		}
+	}
+	finishCtx, cancelFinish := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelFinish()
+	if err := secondWorker.StopGracefully(finishCtx); err != nil {
+		t.Fatalf("stop worker after actual batch execution: %v", err)
+	}
+	for _, id := range []int64{first.ID, second.ID} {
+		finished, err := store.GetJobByID(ctx, id)
+		if err != nil || finished.Status != StatusSucceeded || finished.AttemptCount != 3 {
+			t.Fatalf("executed job %d = %+v err=%v; want SUCCEEDED attempt 3", id, finished, err)
+		}
 	}
 }

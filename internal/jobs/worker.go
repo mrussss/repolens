@@ -311,28 +311,71 @@ func (w *Worker) claimLoop(ctx context.Context) {
 }
 
 func (w *Worker) returnUndispatchedClaims(parentCtx context.Context, sem chan struct{}, jobs []*AnalysisJob) {
-	for _, job := range jobs {
-		w.returnUndispatchedClaim(parentCtx, job)
-		<-sem
+	pending := append([]*AnalysisJob(nil), jobs...)
+	operationTimeout := w.undispatchedClaimOperationTimeout()
+	retryDelay := w.cfg.PollInterval
+	if retryDelay > operationTimeout {
+		retryDelay = operationTimeout
+	}
+
+	for len(pending) > 0 {
+		stillOwned := pending[:0]
+		for _, job := range pending {
+			err := w.renewUndispatchedClaimLease(job, operationTimeout)
+			if err != nil {
+				logger.L(parentCtx).Error("error renewing undispatched job lease; return will verify claim ownership", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+			}
+			stillOwned = append(stillOwned, job)
+		}
+		pending = stillOwned
+
+		stillPending := pending[:0]
+		for _, job := range pending {
+			err := w.returnUndispatchedClaim(job, operationTimeout)
+			if err == nil || errors.Is(err, ErrOwnershipLost) {
+				<-sem
+				continue
+			}
+			logger.L(parentCtx).Error("error returning undispatched job claim; will retry after processing the batch", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+			stillPending = append(stillPending, job)
+		}
+		pending = stillPending
+		if len(pending) > 0 {
+			timer := time.NewTimer(retryDelay)
+			<-timer.C
+		}
 	}
 }
 
-func (w *Worker) returnUndispatchedClaim(parentCtx context.Context, job *AnalysisJob) {
+func (w *Worker) undispatchedClaimOperationTimeout() time.Duration {
+	timeout := w.cfg.LeaseDuration / 4
+	if timeout <= 0 {
+		timeout = w.cfg.LeaseDuration
+	}
+	if timeout > time.Second {
+		timeout = time.Second
+	}
+	return timeout
+}
+
+func (w *Worker) undispatchedClaimToken(job *AnalysisJob) string {
 	claimToken := ""
 	if job.ClaimToken != nil {
 		claimToken = *job.ClaimToken
 	}
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := w.store.ReturnUndispatchedClaim(ctx, job.ID, w.cfg.WorkerID, claimToken, job.ExecutionGeneration)
-		cancel()
-		if err == nil || errors.Is(err, ErrOwnershipLost) {
-			return
-		}
-		logger.L(parentCtx).Error("error returning undispatched job claim; retrying", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
-		timer := time.NewTimer(w.cfg.PollInterval)
-		<-timer.C
-	}
+	return claimToken
+}
+
+func (w *Worker) renewUndispatchedClaimLease(job *AnalysisJob, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return w.store.RenewLease(ctx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), time.Now().UTC().Add(w.cfg.LeaseDuration))
+}
+
+func (w *Worker) returnUndispatchedClaim(job *AnalysisJob, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return w.store.ReturnUndispatchedClaim(ctx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), job.ExecutionGeneration)
 }
 
 func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
