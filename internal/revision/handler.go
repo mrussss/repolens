@@ -116,6 +116,8 @@ func (h *Handler) Retry(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"code": "REVISION_NOT_FOUND", "error": "analysis revision not found"})
 		case errors.Is(err, ErrInvalidState):
 			c.JSON(http.StatusConflict, gin.H{"code": "REVISION_NOT_FAILED", "error": "only a failed revision can be retried"})
+		case errors.Is(err, ErrRetryConflict):
+			c.JSON(http.StatusConflict, gin.H{"code": "REVISION_RETRY_CONFLICT", "error": "revision retry was already started"})
 		default:
 			logger.L(c.Request.Context()).Error("failed to retry analysis revision", "revision_id", c.Param("id"), "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})

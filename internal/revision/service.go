@@ -105,6 +105,9 @@ func (s *Service) Retry(ctx context.Context, userID, id string) (*AnalysisRevisi
 		return nil, err
 	}
 	if value.Status != StatusFailed {
+		if value.Status == StatusPreparing {
+			return nil, ErrRetryConflict
+		}
 		return nil, ErrInvalidState
 	}
 	return s.store.Retry(ctx, id)

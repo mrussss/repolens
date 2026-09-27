@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	codeintelmodel "repolens/internal/codeintel/model"
 	"repolens/internal/jobs"
@@ -19,6 +20,7 @@ var (
 	ErrNotFound       = errors.New("analysis revision not found")
 	ErrFailedRevision = errors.New("analysis revision already failed; explicit retry is required")
 	ErrInvalidState   = errors.New("invalid analysis revision state transition")
+	ErrRetryConflict  = errors.New("analysis revision retry conflict")
 	ErrLineage        = errors.New("analysis revision lineage is incomplete or inconsistent")
 	ErrRefResolution  = errors.New("repository ref could not be resolved")
 )
@@ -159,30 +161,41 @@ func createJobGorm(tx *gorm.DB, job *jobs.AnalysisJob) error {
 func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, error) {
 	var value AnalysisRevision
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("id = ?", id).First(&value).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).First(&value).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrNotFound
 			}
 			return err
 		}
 		if value.Status != StatusFailed {
+			if value.Status == StatusPreparing {
+				return ErrRetryConflict
+			}
 			return ErrInvalidState
 		}
 		now := time.Now().UTC()
+		expectedVersion := value.Version
+		expectedGeneration := value.ExecutionGeneration
+		newGeneration := expectedGeneration + 1
+		newVersion := expectedVersion + 1
+		result := tx.Model(&AnalysisRevision{}).Where("id = ? AND status = ? AND version = ? AND execution_generation = ?", id, StatusFailed, expectedVersion, expectedGeneration).Updates(map[string]interface{}{
+			"status": StatusPreparing, "stage": StageMaterializing, "error_code": "", "error_message": "",
+			"ready_at": nil, "execution_generation": newGeneration, "version": newVersion, "updated_at": now,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrRetryConflict
+		}
 		value.Status = StatusPreparing
 		value.Stage = StageMaterializing
 		value.ErrorCode = ""
 		value.ErrorMessage = ""
 		value.ReadyAt = nil
-		value.ExecutionGeneration++
-		value.Version++
+		value.ExecutionGeneration = newGeneration
+		value.Version = newVersion
 		value.UpdatedAt = now
-		if err := tx.Model(&AnalysisRevision{}).Where("id = ? AND status = ?", id, StatusFailed).Updates(map[string]interface{}{
-			"status": StatusPreparing, "stage": StageMaterializing, "error_code": "", "error_message": "",
-			"ready_at": nil, "execution_generation": value.ExecutionGeneration, "version": value.Version,
-		}).Error; err != nil {
-			return err
-		}
 		var snap snapshot.RepositorySnapshot
 		if err := tx.First(&snap, "id = ?", value.SnapshotID).Error; err != nil {
 			return err
