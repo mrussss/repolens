@@ -166,7 +166,7 @@ func run() error {
 		codeIntelStore,
 		filepath.Join(cfg.SnapshotBasePath, "indexes"),
 	)
-	codeIntelHandler := codeintel.NewHandler(codeIntelStore, snapshotStore)
+	codeIntelHandler := codeintel.NewHandler(codeIntelStore, snapshotStore).WithJobStore(jobStore)
 
 	if cfg.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -80,6 +81,124 @@ func TestAnalyzerUsesSnapshotManifestFileUniverse(t *testing.T) {
 	}
 	if len(result.Files) != 1 || result.Files[0].Path != "src/main.go" {
 		t.Fatalf("CodeIndex files = %+v, want only src/main.go from snapshot manifest", result.Files)
+	}
+}
+
+func TestConcurrentGetOrCreateBuildsReturnOneWinner(t *testing.T) {
+	db, _, ciStore, _ := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	const callers = 32
+	buildContext := codeintelmodel.DefaultBuildContext()
+	type buildResult struct {
+		id      int64
+		created bool
+		err     error
+	}
+
+	start := make(chan struct{})
+	results := make(chan buildResult, callers)
+	var ready sync.WaitGroup
+	var callersDone sync.WaitGroup
+	ready.Add(callers)
+	callersDone.Add(callers)
+	for range callers {
+		go func() {
+			defer callersDone.Done()
+			ready.Done()
+			<-start
+			build, created, err := ciStore.GetOrCreateBuild(ctx, "snap-concurrent-build", "example.com/concurrent", buildContext)
+			if err != nil {
+				results <- buildResult{err: err}
+				return
+			}
+			results <- buildResult{id: build.ID, created: created}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	callersDone.Wait()
+	close(results)
+
+	var winnerID int64
+	createdCount := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent GetOrCreateBuild: %v", result.err)
+		}
+		if winnerID == 0 {
+			winnerID = result.id
+		} else if result.id != winnerID {
+			t.Errorf("build winner IDs differ: got %d and %d", result.id, winnerID)
+		}
+		if result.created {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created=true count = %d, want exactly one", createdCount)
+	}
+	var buildCount, jobCount int64
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("snapshot_id = ?", "snap-concurrent-build").Count(&buildCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, strconv.FormatInt(winnerID, 10)).Count(&jobCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if buildCount != 1 || jobCount != 1 {
+		t.Fatalf("concurrent build rows = %d and jobs = %d, want one each", buildCount, jobCount)
+	}
+
+	start = make(chan struct{})
+	retrievalResults := make(chan buildResult, callers)
+	var retrievalReady sync.WaitGroup
+	var retrievalCallersDone sync.WaitGroup
+	retrievalReady.Add(callers)
+	retrievalCallersDone.Add(callers)
+	for range callers {
+		go func() {
+			defer retrievalCallersDone.Done()
+			retrievalReady.Done()
+			<-start
+			build, created, err := ciStore.GetOrCreateRetrievalBuild(ctx, winnerID, "BM25")
+			if err != nil {
+				retrievalResults <- buildResult{err: err}
+				return
+			}
+			retrievalResults <- buildResult{id: build.ID, created: created}
+		}()
+	}
+	retrievalReady.Wait()
+	close(start)
+	retrievalCallersDone.Wait()
+	close(retrievalResults)
+
+	var retrievalWinnerID int64
+	createdCount = 0
+	for result := range retrievalResults {
+		if result.err != nil {
+			t.Fatalf("concurrent GetOrCreateRetrievalBuild: %v", result.err)
+		}
+		if retrievalWinnerID == 0 {
+			retrievalWinnerID = result.id
+		} else if result.id != retrievalWinnerID {
+			t.Errorf("retrieval build winner IDs differ: got %d and %d", result.id, retrievalWinnerID)
+		}
+		if result.created {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("retrieval created=true count = %d, want exactly one", createdCount)
+	}
+	var retrievalCount int64
+	if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("code_index_build_id = ?", winnerID).Count(&retrievalCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildRetrieval, strconv.FormatInt(retrievalWinnerID, 10)).Count(&jobCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retrievalCount != 1 || jobCount != 1 {
+		t.Fatalf("concurrent retrieval rows = %d and jobs = %d, want one each", retrievalCount, jobCount)
 	}
 }
 
