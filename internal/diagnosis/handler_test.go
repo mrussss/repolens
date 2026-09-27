@@ -213,15 +213,29 @@ func TestDiagnosisStatusExposesExplicitProviderRetryPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).Updates(map[string]interface{}{
-		"status": jobs.StatusFailed, "last_error_class": jobs.ErrorClassRetryable, "last_error_code": "PROVIDER_TIMEOUT",
+		"status": jobs.StatusFailed, "last_error_class": jobs.ErrorClassPermanent, "last_error_code": "CHECKPOINT_SAVE_FAILED",
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
 	svc := diagnosis.NewService(store, repo.NewStore(db), snapshot.NewStore(db)).WithJobStore(jobsStore)
 	response := httptest.NewRecorder()
 	diagnosisHandlerRouter(svc).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID, nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"retry_allowed":true`) || !strings.Contains(response.Body.String(), `"retry_error_code":"PROVIDER_TIMEOUT"`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"retry_allowed":true`) || !strings.Contains(response.Body.String(), `"retry_error_code":"CHECKPOINT_SAVE_FAILED"`) {
 		t.Fatalf("retry policy API response = %d %s", response.Code, response.Body.String())
+	}
+
+	retryResponse := httptest.NewRecorder()
+	router := diagnosisHandlerRouter(svc)
+	router.ServeHTTP(retryResponse, httptest.NewRequest(http.MethodPost, "/diagnoses/"+run.ID+"/retry", nil))
+	if retryResponse.Code != http.StatusAccepted {
+		t.Fatalf("explicit retry response = %d %s, want 202", retryResponse.Code, retryResponse.Body.String())
+	}
+	var retriedJob jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).First(&retriedJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retriedJob.Status != jobs.StatusPending || retriedJob.ExecutionGeneration != 2 {
+		t.Fatalf("explicit retry job = status %s generation %d, want PENDING generation 2", retriedJob.Status, retriedJob.ExecutionGeneration)
 	}
 }
 
@@ -499,6 +513,7 @@ func diagnosisHandlerRouter(svc *diagnosis.Service) *gin.Engine {
 	router.GET("/diagnoses/:id", handler.Get)
 	router.GET("/diagnoses/:id/attempts", handler.ListAttempts)
 	router.GET("/diagnoses/:id/steps", handler.GetSteps)
+	router.POST("/diagnoses/:id/retry", handler.Retry)
 	return router
 }
 

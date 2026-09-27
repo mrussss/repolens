@@ -44,12 +44,15 @@ type Store interface {
 	GetAttempt(ctx context.Context, attemptID string) (*DiagnosisAttempt, error)
 	GetLatestFinalCheckpoint(ctx context.Context, runID string, executionGeneration int) (*DiagnosisAttempt, error)
 	ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error)
+	StartAttempt(ctx context.Context, runID string, attempt *DiagnosisAttempt) error
 	UpdateAttemptHeartbeat(ctx context.Context, attemptID string, heartbeatAt time.Time) error
 	CloseAttempt(ctx context.Context, runID, attemptID string, generation int, newStatus AttemptStatus, errCode, errMsg string, retryable bool) error
-	FinishAttempt(ctx context.Context, runID, attemptID string, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool) error
-	FinishAttemptAndRun(ctx context.Context, runID, attemptID string, newRunStatus RunStatus, newAttemptStatus AttemptStatus, promptTokens, completionTokens, toolCalls int, errCode, errMsg string, retryable bool, retryDelay time.Duration) error
+	FinalizeSuccess(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, citations []evidence.Citation, promptTokens, completionTokens, toolCalls int) error
+	FinalizeInvalidStructuredReport(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, promptTokens, completionTokens, toolCalls int, errorCode, errorMessage string) error
+	FinalizeDiagnosisFailure(ctx context.Context, jobID int64, workerID, claimToken string, executionGeneration int, runID, attemptID string, errorClass jobs.ErrorClass, errorCode, errorMessage string, promptTokens, completionTokens, toolCalls int) error
+	FinalizeRetryableAttempt(ctx context.Context, jobID int64, workerID, claimToken string, executionGeneration int, runID, attemptID string, errorCode, errorMessage string, promptTokens, completionTokens, toolCalls int) error
+	FinalizeCancellation(ctx context.Context, jobID int64, workerID, claimToken string, runID, attemptID string) error
 	RequestCancellation(ctx context.Context, runID, userID string) error
-	ConfirmCancellation(ctx context.Context, runID, attemptID string) error
 	FetchStaleAttempts(ctx context.Context, staleDuration time.Duration, limit int) ([]DiagnosisAttempt, error)
 	RecoverStaleAttempt(ctx context.Context, attemptID, runID string, backoff time.Duration) error
 }
@@ -108,30 +111,76 @@ func (s *GormStore) StartAttempt(ctx context.Context, runID string, attempt *Dia
 	})
 }
 
-// FinalizeSuccess atomically persists report/citations, closes the attempt and
-// diagnosis, and fences the AnalysisJob by worker and claim token.
+func lockDiagnosisExecutionTx(ctx context.Context, tx *gorm.DB, jobID int64, workerID, claimToken string, expectedGeneration int, runID, attemptID string, cancellation bool) (*jobs.AnalysisJob, *DiagnosisRun, *DiagnosisAttempt, error) {
+	var job jobs.AnalysisJob
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND job_type = ? AND resource_id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.JobTypeRunDiagnosis, runID, jobs.StatusRunning, workerID, claimToken).
+		First(&job).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			var current jobs.AnalysisJob
+			if lookupErr := tx.Select("status").First(&current, "id = ?", jobID).Error; lookupErr == nil {
+				if current.Status == jobs.StatusSucceeded || current.Status == jobs.StatusFailed || current.Status == jobs.StatusCancelled {
+					return nil, nil, nil, jobs.ErrAlreadyFinalized
+				}
+			}
+			return nil, nil, nil, jobs.ErrOwnershipLost
+		}
+		return nil, nil, nil, err
+	}
+	if expectedGeneration > 0 && job.ExecutionGeneration != expectedGeneration {
+		return nil, nil, nil, jobs.ErrOwnershipLost
+	}
+	if job.CancelRequested && !cancellation {
+		return nil, nil, nil, jobs.ErrCancellationRequested
+	}
+	if !job.CancelRequested && cancellation {
+		return nil, nil, nil, jobs.ErrCancellationNotRequested
+	}
+
+	var run DiagnosisRun
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND status = ?", runID, StatusRunning).First(&run).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, nil, ErrRunTransitionConflict
+		}
+		return nil, nil, nil, err
+	}
+	if run.CancelRequested && !cancellation {
+		return nil, nil, nil, jobs.ErrCancellationRequested
+	}
+	if !run.CancelRequested && cancellation {
+		return nil, nil, nil, jobs.ErrCancellationNotRequested
+	}
+
+	expectedAttemptNo := job.AttemptCount
+	if expectedAttemptNo <= 0 {
+		expectedAttemptNo = 1
+	}
+	var attempt DiagnosisAttempt
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = ?", attemptID, runID, job.ExecutionGeneration, expectedAttemptNo, AttemptStatusRunning).
+		First(&attempt).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, nil, ErrAttemptNotRunning
+		}
+		return nil, nil, nil, err
+	}
+	if attempt.WorkerID != workerID {
+		return nil, nil, nil, jobs.ErrOwnershipLost
+	}
+	return &job, &run, &attempt, nil
+}
+
+// FinalizeSuccess atomically persists report/citations, closes the generation's
+// active attempt and diagnosis, and fences the AnalysisJob by claim ownership.
 func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, citations []evidence.Citation, promptTokens, completionTokens, toolCalls int) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var job jobs.AnalysisJob
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return jobs.ErrOwnershipLost
-			}
+		job, run, attempt, err := lockDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, 0, runID, attemptID, false)
+		if err != nil {
 			return err
-		}
-		if job.CancelRequested {
-			return jobs.ErrCancellationRequested
 		}
 		if report == nil {
 			return errors.New("diagnosis report is required")
-		}
-		var run DiagnosisRun
-		if err := tx.First(&run, "id = ? AND status = ?", runID, StatusRunning).Error; err != nil {
-			return err
-		}
-		if run.CancelRequested {
-			return jobs.ErrCancellationRequested
 		}
 		if report.DiagnosisRunID != runID || report.AttemptID != attemptID {
 			return errors.New("report lineage does not match diagnosis attempt")
@@ -153,7 +202,7 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 			}
 		}
 		now := time.Now().UTC()
-		attRes := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).
+		attRes := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = ?", attemptID, runID, attempt.ExecutionGeneration, attempt.AttemptNo, AttemptStatusRunning).
 			Updates(map[string]interface{}{
 				"status": AttemptStatusSucceeded, "finished_at": now,
 				"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "tool_calls": toolCalls,
@@ -167,7 +216,7 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 		if attRes.RowsAffected != 1 {
 			return fmt.Errorf("attempt %s finalize conflict", attemptID)
 		}
-		runRes := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ?", runID, StatusRunning).
+		runRes := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ? AND cancel_requested = ?", runID, StatusRunning, false).
 			Updates(map[string]interface{}{"status": StatusSucceeded, "final_attempt_id": attemptID, "version": gorm.Expr("version + 1")})
 		if runRes.Error != nil {
 			return runRes.Error
@@ -175,7 +224,7 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 		if runRes.RowsAffected != 1 {
 			return fmt.Errorf("diagnosis %s finalize conflict", runID)
 		}
-		jobRes := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).
+		jobRes := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, false).
 			Updates(map[string]interface{}{"status": jobs.StatusSucceeded, "finished_at": now, "updated_at": now})
 		if jobRes.Error != nil {
 			return jobRes.Error
@@ -193,38 +242,15 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 // stale worker can never overwrite a newer attempt or a user cancellation.
 func (s *GormStore) FinalizeInvalidStructuredReport(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, promptTokens, completionTokens, toolCalls int, errorCode, errorMessage string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var job jobs.AnalysisJob
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				var current jobs.AnalysisJob
-				if lookupErr := tx.Select("status").First(&current, jobID).Error; lookupErr == nil && (current.Status == jobs.StatusFailed || current.Status == jobs.StatusSucceeded || current.Status == jobs.StatusCancelled) {
-					return jobs.ErrAlreadyFinalized
-				}
-				return jobs.ErrOwnershipLost
-			}
+		job, _, attempt, err := lockDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, 0, runID, attemptID, false)
+		if err != nil {
 			return err
-		}
-		if job.CancelRequested {
-			return jobs.ErrCancellationRequested
 		}
 		if report == nil {
 			return errors.New("invalid structured report is required")
 		}
 		if report.DiagnosisRunID != runID || report.AttemptID != attemptID {
 			return errors.New("report lineage does not match diagnosis attempt")
-		}
-
-		var run DiagnosisRun
-		if err := tx.Where("id = ? AND status = ?", runID, StatusRunning).First(&run).Error; err != nil {
-			return err
-		}
-		if run.CancelRequested {
-			return jobs.ErrCancellationRequested
-		}
-		var attempt DiagnosisAttempt
-		if err := tx.Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).First(&attempt).Error; err != nil {
-			return err
 		}
 
 		report.ReportStatus = evidence.ReportInvalid
@@ -252,7 +278,7 @@ func (s *GormStore) FinalizeInvalidStructuredReport(ctx context.Context, jobID i
 
 		now := time.Now().UTC()
 		attemptResult := tx.Model(&DiagnosisAttempt{}).
-			Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).
+			Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = ?", attemptID, runID, attempt.ExecutionGeneration, attempt.AttemptNo, AttemptStatusRunning).
 			Updates(map[string]interface{}{
 				"status": AttemptStatusFailedTerminal, "finished_at": now,
 				"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "tool_calls": toolCalls,
@@ -276,7 +302,7 @@ func (s *GormStore) FinalizeInvalidStructuredReport(ctx context.Context, jobID i
 		}
 
 		jobResult := tx.Model(&jobs.AnalysisJob{}).
-			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).
+			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, false).
 			Updates(map[string]interface{}{
 				"status": jobs.StatusFailed, "terminal_reason": jobs.TerminalReasonPermanent,
 				"last_error_class": jobs.ErrorClassPermanent, "last_error_code": errorCode, "last_error_message": errorMessage,
@@ -292,18 +318,100 @@ func (s *GormStore) FinalizeInvalidStructuredReport(ctx context.Context, jobID i
 	})
 }
 
-func (s *GormStore) FinalizeCancellation(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string) error {
+// FinalizeDiagnosisFailure atomically closes the active Attempt, Run, and Job
+// after a permanent or exhausted failure. The generation and current claim
+// must match before any terminal state is written.
+func (s *GormStore) FinalizeDiagnosisFailure(ctx context.Context, jobID int64, workerID, claimToken string, executionGeneration int, runID, attemptID string, errorClass jobs.ErrorClass, errorCode, errorMessage string, promptTokens, completionTokens, toolCalls int) error {
+	if errorClass != jobs.ErrorClassPermanent && errorClass != jobs.ErrorClassRetryable {
+		return fmt.Errorf("invalid terminal diagnosis error class %q", errorClass)
+	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var job jobs.AnalysisJob
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).First(&job).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return jobs.ErrOwnershipLost
-			}
+		_, _, attempt, err := lockDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, executionGeneration, runID, attemptID, false)
+		if err != nil {
 			return err
 		}
-		attemptResult := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND diagnosis_run_id = ? AND status = ?", attemptID, runID, AttemptStatusRunning).Updates(map[string]interface{}{
-			"status": AttemptStatusCancelled, "finished_at": time.Now().UTC(), "error_code": "CANCELLED",
+		now := time.Now().UTC()
+		attemptResult := tx.Model(&DiagnosisAttempt{}).
+			Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = ?", attemptID, runID, executionGeneration, attempt.AttemptNo, AttemptStatusRunning).
+			Updates(map[string]interface{}{
+				"status": AttemptStatusFailedTerminal, "finished_at": now,
+				"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "tool_calls": toolCalls,
+				"error_code": errorCode, "error_message": errorMessage, "retryable": false,
+			})
+		if attemptResult.Error != nil {
+			return fmt.Errorf("finalize failed diagnosis attempt: %w", attemptResult.Error)
+		}
+		if attemptResult.RowsAffected != 1 {
+			return ErrAttemptNotRunning
+		}
+
+		runResult := tx.Model(&DiagnosisRun{}).
+			Where("id = ? AND status = ? AND cancel_requested = ?", runID, StatusRunning, false).
+			Updates(map[string]interface{}{"status": StatusFailed, "final_attempt_id": attemptID, "version": gorm.Expr("version + 1")})
+		if runResult.Error != nil {
+			return fmt.Errorf("finalize failed diagnosis run: %w", runResult.Error)
+		}
+		if runResult.RowsAffected != 1 {
+			return ErrRunTransitionConflict
+		}
+
+		terminalReason := jobs.TerminalReasonPermanent
+		if errorClass == jobs.ErrorClassRetryable {
+			terminalReason = jobs.TerminalReasonRetryableExhausted
+		}
+		jobResult := tx.Model(&jobs.AnalysisJob{}).
+			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, executionGeneration, false).
+			Updates(map[string]interface{}{
+				"status": jobs.StatusFailed, "terminal_reason": terminalReason,
+				"last_error_class": errorClass, "last_error_code": errorCode, "last_error_message": errorMessage,
+				"finished_at": now, "updated_at": now,
+			})
+		if jobResult.Error != nil {
+			return fmt.Errorf("finalize failed diagnosis job: %w", jobResult.Error)
+		}
+		if jobResult.RowsAffected != 1 {
+			return jobs.ErrOwnershipLost
+		}
+		return nil
+	})
+}
+
+// FinalizeRetryableAttempt closes a retryable Attempt only while the same Job
+// claim and execution generation still own it. The Job Store then schedules
+// the retry or terminal exhaustion through its own claim-fenced finalizer.
+func (s *GormStore) FinalizeRetryableAttempt(ctx context.Context, jobID int64, workerID, claimToken string, executionGeneration int, runID, attemptID string, errorCode, errorMessage string, promptTokens, completionTokens, toolCalls int) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		_, _, attempt, err := lockDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, executionGeneration, runID, attemptID, false)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		result := tx.Model(&DiagnosisAttempt{}).
+			Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = ?", attemptID, runID, executionGeneration, attempt.AttemptNo, AttemptStatusRunning).
+			Updates(map[string]interface{}{
+				"status": AttemptStatusFailedRetryable, "finished_at": now,
+				"prompt_tokens": promptTokens, "completion_tokens": completionTokens, "tool_calls": toolCalls,
+				"error_code": errorCode, "error_message": errorMessage, "retryable": true,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrAttemptNotRunning
+		}
+		return nil
+	})
+}
+
+func (s *GormStore) FinalizeCancellation(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		job, _, attempt, err := lockDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, 0, runID, attemptID, true)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		attemptResult := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = ?", attemptID, runID, job.ExecutionGeneration, attempt.AttemptNo, AttemptStatusRunning).Updates(map[string]interface{}{
+			"status": AttemptStatusCancelled, "finished_at": now, "error_code": "CANCELLED",
 		})
 		if attemptResult.Error != nil {
 			return attemptResult.Error
@@ -311,7 +419,7 @@ func (s *GormStore) FinalizeCancellation(ctx context.Context, jobID int64, worke
 		if attemptResult.RowsAffected != 1 {
 			return jobs.ErrOwnershipLost
 		}
-		runResult := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ?", runID, StatusRunning).Updates(map[string]interface{}{
+		runResult := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ? AND cancel_requested = ?", runID, StatusRunning, true).Updates(map[string]interface{}{
 			"status": StatusCancelled, "final_attempt_id": attemptID, "version": gorm.Expr("version + 1"),
 		})
 		if runResult.Error != nil {
@@ -320,8 +428,8 @@ func (s *GormStore) FinalizeCancellation(ctx context.Context, jobID int64, worke
 		if runResult.RowsAffected != 1 {
 			return fmt.Errorf("diagnosis %s cancellation conflict", runID)
 		}
-		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.StatusRunning, workerID, claimToken).Updates(map[string]interface{}{
-			"status": jobs.StatusCancelled, "terminal_reason": jobs.TerminalReasonCancelled, "finished_at": time.Now().UTC(),
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, true).Updates(map[string]interface{}{
+			"status": jobs.StatusCancelled, "terminal_reason": jobs.TerminalReasonCancelled, "finished_at": now, "updated_at": now,
 		})
 		if jobResult.Error != nil {
 			return jobResult.Error
@@ -852,26 +960,6 @@ func (s *GormStore) RequestCancellation(ctx context.Context, runID, userID strin
 			return fmt.Errorf("diagnosis run %s changed during cancellation", runID)
 		}
 		return nil
-	})
-}
-
-func (s *GormStore) ConfirmCancellation(ctx context.Context, runID, attemptID string) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		now := time.Now()
-		if attemptID != "" {
-			tx.Model(&DiagnosisAttempt{}).
-				Where("id = ?", attemptID).
-				Updates(map[string]interface{}{
-					"status":      AttemptStatusCancelled,
-					"finished_at": &now,
-				})
-		}
-		return tx.Model(&DiagnosisRun{}).
-			Where("id = ?", runID).
-			Updates(map[string]interface{}{
-				"status":  StatusCancelled,
-				"version": gorm.Expr("version + 1"),
-			}).Error
 	})
 }
 

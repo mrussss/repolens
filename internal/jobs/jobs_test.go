@@ -82,6 +82,7 @@ func TestDiagnosisRetryPolicyUsesExplicitProviderErrorAllowlist(t *testing.T) {
 		"PROVIDER_TIMEOUT": true, "PROVIDER_CONNECTION_FAILED": true,
 		"PROVIDER_UPSTREAM_ERROR": true, "PROVIDER_RATE_LIMITED": true,
 		"HTTP_5XX_SERVER_ERROR": true, "TRANSIENT_NETWORK_ERROR": true,
+		"CHECKPOINT_SAVE_FAILED": false, "CHECKPOINT_VERSION_MISMATCH": false,
 		"INVALID_STRUCTURED_REPORT": false, "ATOMIC_FINALIZE_FAILED": false,
 		"UNKNOWN_RETRYABLE_ERROR": false, "PROVIDER_AUTH_FAILED": false,
 	} {
@@ -94,6 +95,11 @@ func TestDiagnosisRetryPolicyUsesExplicitProviderErrorAllowlist(t *testing.T) {
 	}
 	if !jobs.IsRetryableDiagnosisProviderFailure(jobs.ErrorClassPermanent, "PROVIDER_PROGRESS_ABORTED") {
 		t.Fatal("provider failure after Agent progress must permit only explicit retry")
+	}
+	for _, code := range []string{"CHECKPOINT_SAVE_FAILED", "CHECKPOINT_VERSION_MISMATCH"} {
+		if !jobs.IsRetryableDiagnosisProviderFailure(jobs.ErrorClassPermanent, code) {
+			t.Errorf("%s must permit an explicit diagnosis retry", code)
+		}
 	}
 	if !jobs.IsRetryableDiagnosisProviderFailure(jobs.ErrorClassRetryable, "PROVIDER_TIMEOUT") {
 		t.Fatal("retryable provider timeout should be allowed")
@@ -465,7 +471,7 @@ func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
 		`CREATE TABLE code_index_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
 		`CREATE TABLE retrieval_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
 		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, final_attempt_id TEXT, version INTEGER NOT NULL)`,
-		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, created_at DATETIME)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, error_code TEXT, error_message TEXT, created_at DATETIME)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)
@@ -542,7 +548,7 @@ func TestStore_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *testing.
 	ctx := context.Background()
 	for _, ddl := range []string{
 		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, cancel_requested BOOLEAN NOT NULL DEFAULT 0, final_attempt_id TEXT, version INTEGER NOT NULL)`,
-		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, created_at DATETIME)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, error_code TEXT, error_message TEXT, created_at DATETIME)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)
@@ -565,7 +571,7 @@ func TestStore_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *testing.
 		{name: "cancelled and exhausted", cancelRequested: true, attemptCount: 1, maxAttempts: 1, wantJob: jobs.StatusCancelled, wantRun: "CANCELLED", wantAttempt: "ABANDONED", wantReason: &cancelledReason},
 		{name: "cancelled with attempts remaining", cancelRequested: true, attemptCount: 1, maxAttempts: 3, wantJob: jobs.StatusCancelled, wantRun: "CANCELLED", wantAttempt: "ABANDONED", wantReason: &cancelledReason},
 		{name: "not cancelled and exhausted", cancelRequested: false, attemptCount: 1, maxAttempts: 1, wantJob: jobs.StatusFailed, wantRun: "FAILED", wantAttempt: "ABANDONED", wantReason: &retryExhaustedReason},
-		{name: "not cancelled with attempts remaining", cancelRequested: false, attemptCount: 1, maxAttempts: 3, wantJob: jobs.StatusRetryWait, wantRun: "RUNNING", wantAttempt: "RUNNING"},
+		{name: "not cancelled with attempts remaining", cancelRequested: false, attemptCount: 1, maxAttempts: 3, wantJob: jobs.StatusRetryWait, wantRun: "RUNNING", wantAttempt: "ABANDONED"},
 	}
 
 	store := jobs.NewStoreWithDriver(db, "sqlite3")
@@ -626,7 +632,7 @@ func TestStore_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *testing.
 			if attemptStatus != tc.wantAttempt {
 				t.Fatalf("attempt status = %s, want %s", attemptStatus, tc.wantAttempt)
 			}
-			if tc.wantAttempt == "ABANDONED" && (!finalAttemptID.Valid || finalAttemptID.String != attemptID) {
+			if tc.wantRun != "RUNNING" && (!finalAttemptID.Valid || finalAttemptID.String != attemptID) {
 				t.Fatalf("final_attempt_id = %v, want %s", finalAttemptID, attemptID)
 			}
 		})

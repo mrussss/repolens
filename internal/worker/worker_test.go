@@ -331,8 +331,8 @@ func TestOwnershipLostFinalizerClosesStaleAttemptWithoutChangingWinningRun(t *te
 	if err != nil || len(attempts) != 1 {
 		t.Fatalf("attempts=%+v err=%v", attempts, err)
 	}
-	if attempts[0].Status != diagnosis.AttemptStatusAbandoned || attempts[0].ErrorCode != "FINALIZATION_OWNERSHIP_LOST" {
-		t.Fatalf("stale Attempt = %+v; want ABANDONED after ownership loss", attempts[0])
+	if attempts[0].Status != diagnosis.AttemptStatusRunning {
+		t.Fatalf("stale Attempt = %+v; a worker without the active claim must not terminalize it", attempts[0])
 	}
 	savedRun, err := baseStore.GetByID(ctx, run.ID)
 	if err != nil || savedRun.Status != diagnosis.StatusSucceeded || savedRun.FinalAttemptID != "winning-worker-attempt" {
@@ -375,8 +375,8 @@ func TestInvalidFinalReportCheckpointSurvivesFinalizerRollback(t *testing.T) {
 	executor := &checkpointCountingExecutor{}
 	retry := worker.NewDiagnosisJobHandler(baseStore, reportStore, evidence.NewCitationStore(db), nil, executor)
 	retryErr := retry.Execute(ctx, retryClaim[0])
-	if retryErr == nil || !strings.Contains(retryErr.Error(), "INVALID_STRUCTURED_REPORT") {
-		t.Fatalf("restored invalid report error = %v", retryErr)
+	if !errors.Is(retryErr, jobs.ErrAlreadyFinalized) {
+		t.Fatalf("restored invalid report finalization = %v, want ErrAlreadyFinalized", retryErr)
 	}
 	if executor.calls != 0 {
 		t.Fatalf("provider calls after invalid checkpoint restore = %d", executor.calls)
@@ -436,8 +436,8 @@ func TestWorkerJobHandler_InvalidStructuredReportFailsTerminally(t *testing.T) {
 	}
 	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, nil, invalidStructuredReportExecutor{})
 	err = handler.Execute(ctx, claimed[0])
-	if err == nil || !strings.Contains(err.Error(), "INVALID_STRUCTURED_REPORT") {
-		t.Fatalf("expected terminal invalid structured error, got %v", err)
+	if !errors.Is(err, jobs.ErrAlreadyFinalized) {
+		t.Fatalf("expected atomic terminal finalization, got %v", err)
 	}
 	savedRun, err := diagStore.GetByID(ctx, run.ID)
 	if err != nil || savedRun.Status != diagnosis.StatusFailed {
@@ -458,10 +458,16 @@ func TestWorkerJobHandler_InvalidStructuredReportFailsTerminally(t *testing.T) {
 }
 
 type cancellingDiagnosisExecutor struct {
-	cancel context.CancelFunc
+	cancel        context.CancelFunc
+	requestCancel func() error
 }
 
 func (e cancellingDiagnosisExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+	if e.requestCancel != nil {
+		if err := e.requestCancel(); err != nil {
+			return nil, err
+		}
+	}
 	e.cancel()
 	return nil, context.Canceled
 }
@@ -499,11 +505,16 @@ func TestWorkerJobHandler_CancellationFinalizesWithIndependentContext(t *testing
 		repStore,
 		citStore,
 		citVal,
-		cancellingDiagnosisExecutor{cancel: cancel},
+		cancellingDiagnosisExecutor{
+			cancel: cancel,
+			requestCancel: func() error {
+				return diagStore.RequestCancellation(context.Background(), run.ID, run.UserID)
+			},
+		},
 	)
 	err = handler.Execute(ctx, claimed[0])
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected cancellation error, got %v", err)
+	if !errors.Is(err, jobs.ErrAlreadyFinalized) {
+		t.Fatalf("expected atomic cancellation finalization, got %v", err)
 	}
 
 	savedRun, err := diagStore.GetByID(context.Background(), run.ID)

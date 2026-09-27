@@ -442,6 +442,153 @@ func TestFinalizeInvalidStructuredReportDoesNotOverwriteCancellationOrStaleClaim
 	assertInvalidFinalizationRolledBack(t, db, run.ID, attempt.ID, job.ID)
 }
 
+func TestFinalizeDiagnosisFailureFencesClaimGenerationAndStates(t *testing.T) {
+	type terminalFailureFinalizer interface {
+		FinalizeDiagnosisFailure(context.Context, int64, string, string, int, string, string, jobs.ErrorClass, string, string, int, int, int) error
+	}
+
+	t.Run("current owner atomically terminalizes attempt run and job", func(t *testing.T) {
+		db := setupTestDB(t)
+		store := diagnosis.NewStore(db)
+		run, job, attempt := newClaimedDiagnosisExecution(t, db, store, "run-failure-finalize", "attempt-failure-finalize")
+		finalizer, ok := any(store).(terminalFailureFinalizer)
+		if !ok {
+			t.Fatal("Diagnosis Store has no claim-fenced terminal failure finalizer")
+		}
+		err := finalizer.FinalizeDiagnosisFailure(context.Background(), job.ID, *job.WorkerID, *job.ClaimToken,
+			job.ExecutionGeneration, run.ID, attempt.ID, jobs.ErrorClassPermanent,
+			"CHECKPOINT_SAVE_FAILED", "checkpoint write failed", 7, 8, 2)
+		if err != nil {
+			t.Fatalf("FinalizeDiagnosisFailure: %v", err)
+		}
+		var savedRun diagnosis.DiagnosisRun
+		var savedAttempt diagnosis.DiagnosisAttempt
+		var savedJob jobs.AnalysisJob
+		if err := db.First(&savedRun, "id = ?", run.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.First(&savedAttempt, "id = ?", attempt.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.First(&savedJob, job.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if savedRun.Status != diagnosis.StatusFailed || savedRun.FinalAttemptID != attempt.ID || savedAttempt.Status != diagnosis.AttemptStatusFailedTerminal || savedJob.Status != jobs.StatusFailed {
+			t.Fatalf("terminal failure states = run=%s/%s attempt=%s job=%s", savedRun.Status, savedRun.FinalAttemptID, savedAttempt.Status, savedJob.Status)
+		}
+		if savedJob.LastErrorCode == nil || *savedJob.LastErrorCode != "CHECKPOINT_SAVE_FAILED" || savedJob.LastErrorClass == nil || *savedJob.LastErrorClass != string(jobs.ErrorClassPermanent) {
+			t.Fatalf("job failure details = class %v code %v", savedJob.LastErrorClass, savedJob.LastErrorCode)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T, db *gorm.DB, run *diagnosis.DiagnosisRun, job *jobs.AnalysisJob, attempt *diagnosis.DiagnosisAttempt)
+		want   error
+	}{
+		{
+			name: "old claim",
+			mutate: func(t *testing.T, db *gorm.DB, _ *diagnosis.DiagnosisRun, job *jobs.AnalysisJob, _ *diagnosis.DiagnosisAttempt) {
+				if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Update("claim_token", "replacement-token").Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: jobs.ErrOwnershipLost,
+		},
+		{
+			name: "generation changed",
+			mutate: func(t *testing.T, db *gorm.DB, _ *diagnosis.DiagnosisRun, job *jobs.AnalysisJob, _ *diagnosis.DiagnosisAttempt) {
+				if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Update("execution_generation", job.ExecutionGeneration+1).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: jobs.ErrOwnershipLost,
+		},
+		{
+			name: "run terminal",
+			mutate: func(t *testing.T, db *gorm.DB, run *diagnosis.DiagnosisRun, _ *jobs.AnalysisJob, _ *diagnosis.DiagnosisAttempt) {
+				if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Update("status", diagnosis.StatusCancelled).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: diagnosis.ErrRunTransitionConflict,
+		},
+		{
+			name: "attempt terminal",
+			mutate: func(t *testing.T, db *gorm.DB, _ *diagnosis.DiagnosisRun, _ *jobs.AnalysisJob, attempt *diagnosis.DiagnosisAttempt) {
+				if err := db.Model(&diagnosis.DiagnosisAttempt{}).Where("id = ?", attempt.ID).Update("status", diagnosis.AttemptStatusAbandoned).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: diagnosis.ErrAttemptNotRunning,
+		},
+		{
+			name: "cancellation requested",
+			mutate: func(t *testing.T, db *gorm.DB, run *diagnosis.DiagnosisRun, job *jobs.AnalysisJob, _ *diagnosis.DiagnosisAttempt) {
+				if err := db.Model(&diagnosis.DiagnosisRun{}).Where("id = ?", run.ID).Update("cancel_requested", true).Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Update("cancel_requested", true).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: jobs.ErrCancellationRequested,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupTestDB(t)
+			store := diagnosis.NewStore(db)
+			run, job, attempt := newClaimedDiagnosisExecution(t, db, store, "run-fence-"+strings.ReplaceAll(tc.name, " ", "-"), "attempt-fence-"+strings.ReplaceAll(tc.name, " ", "-"))
+			finalizer, ok := any(store).(terminalFailureFinalizer)
+			if !ok {
+				t.Fatal("Diagnosis Store has no claim-fenced terminal failure finalizer")
+			}
+			tc.mutate(t, db, run, job, attempt)
+			err := finalizer.FinalizeDiagnosisFailure(context.Background(), job.ID, *job.WorkerID, *job.ClaimToken,
+				job.ExecutionGeneration, run.ID, attempt.ID, jobs.ErrorClassPermanent, "MODEL_OUTPUT_TRUNCATED", "output truncated", 1, 1, 1)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("FinalizeDiagnosisFailure = %v, want %v", err, tc.want)
+			}
+			var savedAttempt diagnosis.DiagnosisAttempt
+			if err := db.First(&savedAttempt, "id = ?", attempt.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "cancellation requested" && savedAttempt.Status != diagnosis.AttemptStatusRunning {
+				t.Fatalf("cancellation race terminalized attempt as %s before cancellation finalizer", savedAttempt.Status)
+			}
+		})
+	}
+}
+
+func newClaimedDiagnosisExecution(t *testing.T, db *gorm.DB, store *diagnosis.GormStore, runID, attemptID string) (*diagnosis.DiagnosisRun, *jobs.AnalysisJob, *diagnosis.DiagnosisAttempt) {
+	t.Helper()
+	ctx := context.Background()
+	run := &diagnosis.DiagnosisRun{
+		ID: runID, UserID: "user-" + runID, RepositoryID: "repo", SnapshotID: "snap",
+		IssueTitle: "claim fenced failure", IdempotencyKey: "key-" + runID, IdempotencyRequestHash: "hash-" + runID,
+	}
+	if err := store.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	claimed, err := jobStore.ClaimJobs(ctx, "worker-"+runID, 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim diagnosis job = %d, %v", len(claimed), err)
+	}
+	attempt := &diagnosis.DiagnosisAttempt{
+		ID: attemptID, DiagnosisRunID: run.ID, ExecutionGeneration: claimed[0].ExecutionGeneration,
+		AttemptNo: claimed[0].AttemptCount, WorkerID: *claimed[0].WorkerID,
+	}
+	if err := store.StartAttempt(ctx, run.ID, attempt); err != nil {
+		t.Fatal(err)
+	}
+	return run, claimed[0], attempt
+}
+
 func assertInvalidFinalizationRolledBack(t *testing.T, db *gorm.DB, runID, attemptID string, jobID int64) {
 	t.Helper()
 	var run diagnosis.DiagnosisRun

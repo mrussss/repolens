@@ -729,9 +729,23 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 				    updated_at = ?
 				WHERE id = ?
 			`
-			_, err := tx.ExecContext(ctx, retryQuery, nextRun, now, ej.id)
+			result, err := tx.ExecContext(ctx, retryQuery, nextRun, now, ej.id)
 			if err != nil {
 				return 0, fmt.Errorf("failed reaping job %d to retry_wait: %w", ej.id, err)
+			}
+			if affected, err := result.RowsAffected(); err != nil {
+				return 0, err
+			} else if affected != 1 {
+				return 0, fmt.Errorf("expired job %d changed before retry scheduling", ej.id)
+			}
+			if ej.jobType == JobTypeRunDiagnosis {
+				if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts
+					SET status = 'ABANDONED', finished_at = ?, error_code = 'LEASE_EXPIRED',
+					    error_message = 'Job lease expired; current attempt abandoned'
+					WHERE diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = 'RUNNING'`,
+					now, ej.resourceID, ej.executionGeneration, ej.attemptCount); err != nil {
+					return 0, fmt.Errorf("failed abandoning expired diagnosis attempt for %s: %w", ej.resourceID, err)
+				}
 			}
 		} else {
 			if err := s.failBusinessForReapedJob(ctx, tx, ej.id); err != nil {
@@ -782,8 +796,8 @@ func (s *Store) cancelExpiredDiagnosisTx(ctx context.Context, tx *sql.Tx, expire
 	// expired job's execution generation so an older attempt cannot be touched.
 	if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts
 		SET status = 'ABANDONED', finished_at = ?
-		WHERE diagnosis_run_id = ? AND execution_generation = ? AND status = 'RUNNING'`,
-		now, expired.resourceID, expired.executionGeneration); err != nil {
+		WHERE diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = 'RUNNING'`,
+		now, expired.resourceID, expired.executionGeneration, expired.attemptCount); err != nil {
 		return fmt.Errorf("failed abandoning expired diagnosis attempts for %s: %w", expired.resourceID, err)
 	}
 
@@ -791,10 +805,11 @@ func (s *Store) cancelExpiredDiagnosisTx(ctx context.Context, tx *sql.Tx, expire
 		SET status = 'CANCELLED', cancel_requested = TRUE,
 		    final_attempt_id = (SELECT id FROM diagnosis_attempts
 		        WHERE diagnosis_run_id = ? AND execution_generation = ?
+		          AND attempt_no = ?
 		        ORDER BY attempt_no DESC, created_at DESC LIMIT 1),
 		    version = version + 1
 		WHERE id = ? AND status IN ('QUEUED', 'RUNNING')`,
-		expired.resourceID, expired.executionGeneration, expired.resourceID)
+		expired.resourceID, expired.executionGeneration, expired.attemptCount, expired.resourceID)
 	if err != nil {
 		return fmt.Errorf("failed cancelling expired diagnosis run %s: %w", expired.resourceID, err)
 	}
@@ -965,7 +980,7 @@ func IsRetryableDiagnosisProviderFailure(class ErrorClass, code string) bool {
 	// A provider failure after useful Agent progress is deliberately PERMANENT
 	// for automatic retries (to avoid replaying billable partial work), while
 	// the user may explicitly start a fresh execution generation.
-	if class == ErrorClassPermanent && code == "PROVIDER_PROGRESS_ABORTED" {
+	if class == ErrorClassPermanent && (code == "PROVIDER_PROGRESS_ABORTED" || code == "CHECKPOINT_SAVE_FAILED" || code == "CHECKPOINT_VERSION_MISMATCH") {
 		return true
 	}
 	return class == ErrorClassRetryable && IsRetryableDiagnosisProviderError(code)
