@@ -233,6 +233,39 @@ func (s *Store) ClaimJobs(ctx context.Context, workerID string, batchSize int, l
 	return claimedJobs, nil
 }
 
+// ReturnUndispatchedClaim returns a claim to PENDING without charging an
+// execution attempt. The active claim identity fences the update from stale
+// workers and a zero attempt count is never allowed.
+func (s *Store) ReturnUndispatchedClaim(ctx context.Context, jobID int64, workerID, claimToken string, executionGeneration int) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE analysis_jobs
+		SET status = 'PENDING',
+		    attempt_count = attempt_count - 1,
+		    worker_id = NULL,
+		    claim_token = NULL,
+		    lease_until = NULL,
+		    finished_at = NULL,
+		    updated_at = ?
+		WHERE id = ?
+		  AND status = 'RUNNING'
+		  AND worker_id = ?
+		  AND claim_token = ?
+		  AND execution_generation = ?
+		  AND attempt_count > 0
+	`, time.Now().UTC(), jobID, workerID, claimToken, executionGeneration)
+	if err != nil {
+		return fmt.Errorf("failed returning undispatched claim for job %d: %w", jobID, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed checking undispatched claim return for job %d: %w", jobID, err)
+	}
+	if rowsAffected != 1 {
+		return ErrOwnershipLost
+	}
+	return nil
+}
+
 // RenewLease extends the lease duration of a RUNNING job if the caller owns the claim.
 func (s *Store) RenewLease(ctx context.Context, jobID int64, workerID, claimToken string, newLeaseUntil time.Time) error {
 	query := `

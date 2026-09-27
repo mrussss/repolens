@@ -54,6 +54,7 @@ func DefaultWorkerConfig() WorkerConfig {
 
 type workerStore interface {
 	ClaimJobs(context.Context, string, int, time.Duration) ([]*AnalysisJob, error)
+	ReturnUndispatchedClaim(context.Context, int64, string, string, int) error
 	RenewLease(context.Context, int64, string, string, time.Time) error
 	IsCancelRequested(context.Context, int64, string, string) (bool, error)
 	ConditionalFinalizeSuccess(context.Context, int64, string, string) error
@@ -64,17 +65,20 @@ type workerStore interface {
 
 // Worker executes async jobs claimed from the store.
 type Worker struct {
-	store    workerStore
-	cfg      WorkerConfig
-	handlers map[JobType]Handler
-	mu       sync.RWMutex
-	loopWG   sync.WaitGroup
-	jobWG    sync.WaitGroup
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	activeMu sync.Mutex
-	active   map[int64]context.CancelCauseFunc
-	stopping bool
+	store                    workerStore
+	cfg                      WorkerConfig
+	handlers                 map[JobType]Handler
+	mu                       sync.RWMutex
+	dispatchMu               sync.Mutex
+	dispatchStopped          bool
+	afterClaimBeforeDispatch func()
+	loopWG                   sync.WaitGroup
+	jobWG                    sync.WaitGroup
+	stopCh                   chan struct{}
+	stopOnce                 sync.Once
+	activeMu                 sync.Mutex
+	active                   map[int64]context.CancelCauseFunc
+	stopping                 bool
 }
 
 // NewWorker constructs a new Worker.
@@ -136,7 +140,10 @@ func (w *Worker) Stop() {
 // cancels remaining handlers with ErrWorkerShutdown and waits for bounded
 // cleanup. Jobs that do not finish remain RUNNING for lease recovery.
 func (w *Worker) StopGracefully(ctx context.Context) error {
+	w.dispatchMu.Lock()
+	w.dispatchStopped = true
 	w.stopOnce.Do(func() { close(w.stopCh) })
+	w.dispatchMu.Unlock()
 	loopsDone := waitGroupDone(&w.loopWG)
 	if err := waitForContext(ctx, loopsDone); err != nil {
 		w.cancelActive(ErrWorkerShutdown)
@@ -266,15 +273,6 @@ func (w *Worker) claimLoop(ctx context.Context) {
 			}
 			continue
 		}
-		select {
-		case <-w.stopCh:
-			for i := 0; i < reserved; i++ {
-				<-sem
-			}
-			return
-		default:
-		}
-
 		for i := len(jobs); i < reserved; i++ {
 			<-sem
 		}
@@ -289,7 +287,16 @@ func (w *Worker) claimLoop(ctx context.Context) {
 			}
 		}
 
-		for _, job := range jobs {
+		if w.afterClaimBeforeDispatch != nil {
+			w.afterClaimBeforeDispatch()
+		}
+		for i, job := range jobs {
+			w.dispatchMu.Lock()
+			if w.dispatchStopped || ctx.Err() != nil {
+				w.dispatchMu.Unlock()
+				w.returnUndispatchedClaims(ctx, sem, jobs[i:])
+				return
+			}
 			w.jobWG.Add(1)
 			go func(j *AnalysisJob) {
 				defer func() {
@@ -298,7 +305,33 @@ func (w *Worker) claimLoop(ctx context.Context) {
 				}()
 				w.executeJob(ctx, j)
 			}(job)
+			w.dispatchMu.Unlock()
 		}
+	}
+}
+
+func (w *Worker) returnUndispatchedClaims(parentCtx context.Context, sem chan struct{}, jobs []*AnalysisJob) {
+	for _, job := range jobs {
+		w.returnUndispatchedClaim(parentCtx, job)
+		<-sem
+	}
+}
+
+func (w *Worker) returnUndispatchedClaim(parentCtx context.Context, job *AnalysisJob) {
+	claimToken := ""
+	if job.ClaimToken != nil {
+		claimToken = *job.ClaimToken
+	}
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := w.store.ReturnUndispatchedClaim(ctx, job.ID, w.cfg.WorkerID, claimToken, job.ExecutionGeneration)
+		cancel()
+		if err == nil || errors.Is(err, ErrOwnershipLost) {
+			return
+		}
+		logger.L(parentCtx).Error("error returning undispatched job claim; retrying", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+		timer := time.NewTimer(w.cfg.PollInterval)
+		<-timer.C
 	}
 }
 

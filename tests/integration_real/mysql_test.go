@@ -450,6 +450,47 @@ func TestRealMySQL_ConcurrentSkipLockedClaim(t *testing.T) {
 	}
 }
 
+func TestRealMySQL_ReturnUndispatchedClaimIsClaimFenced(t *testing.T) {
+	_, jobsStore, cleanup := setupRealMySQL(t)
+	if jobsStore == nil {
+		return
+	}
+	defer cleanup()
+	ctx := context.Background()
+	job := &jobs.AnalysisJob{
+		JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "return-undispatched-mysql",
+		AttemptCount: 2, MaxAttempts: 3,
+	}
+	if err := jobsStore.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	oldClaim, err := jobsStore.ClaimJobs(ctx, "mysql-old-worker", 1, time.Minute)
+	if err != nil || len(oldClaim) != 1 || oldClaim[0].AttemptCount != 3 {
+		t.Fatalf("claim final attempt: jobs=%+v err=%v", oldClaim, err)
+	}
+	if err := jobsStore.ReturnUndispatchedClaim(ctx, job.ID, "mysql-old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration); err != nil {
+		t.Fatalf("return undispatched claim: %v", err)
+	}
+	returned, err := jobsStore.GetJobByID(ctx, job.ID)
+	if err != nil || returned.Status != jobs.StatusPending || returned.AttemptCount != 2 || returned.WorkerID != nil || returned.ClaimToken != nil || returned.LeaseUntil != nil {
+		t.Fatalf("returned job=%+v err=%v; want PENDING attempt 2 with cleared claim", returned, err)
+	}
+	newClaim, err := jobsStore.ClaimJobs(ctx, "mysql-new-worker", 1, time.Minute)
+	if err != nil || len(newClaim) != 1 || newClaim[0].AttemptCount != 3 {
+		t.Fatalf("reclaim final attempt: jobs=%+v err=%v", newClaim, err)
+	}
+	if err := jobsStore.ReturnUndispatchedClaim(ctx, job.ID, "mysql-old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration); !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("stale claim return error=%v, want ErrOwnershipLost", err)
+	}
+	current, err := jobsStore.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != jobs.StatusRunning || current.AttemptCount != 3 || current.WorkerID == nil || *current.WorkerID != "mysql-new-worker" || current.ClaimToken == nil || *current.ClaimToken != *newClaim[0].ClaimToken {
+		t.Fatalf("stale return changed current MySQL claim: %+v", current)
+	}
+}
+
 func TestRealMySQL_LeaseRenewalAndReaping(t *testing.T) {
 	db, jobsStore, cleanup := setupRealMySQL(t)
 	if db == nil {
