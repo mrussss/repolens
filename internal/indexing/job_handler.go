@@ -24,24 +24,24 @@ import (
 
 // SnapshotJobHandler handles MATERIALIZE_SNAPSHOT jobs.
 type SnapshotJobHandler struct {
-	repoStore      repo.Store
-	snapshotStore  snapshot.Store
-	indexStore     repoindex.Store
-	codeIntelStore codeintelstore.Store
-	storeFS        snapshotstore.SnapshotStore
-	cloner         GitCloner
-	filter         *FileFilter
-	chunker        *CodeChunker
-	indexWriter    ChunkIndexWriter
-	maxRepoBytes   int64
-	maxFileCount   int
-	revisionStore  interface {
+	repoStore               repo.Store
+	snapshotStore           snapshot.Store
+	indexStore              repoindex.Store
+	codeIntelStore          codeintelstore.Store
+	storeFS                 snapshotstore.SnapshotStore
+	cloner                  GitCloner
+	filter                  *FileFilter
+	chunker                 *CodeChunker
+	indexWriter             ChunkIndexWriter
+	maxIndexableSourceBytes int64
+	maxFileCount            int
+	revisionStore           interface {
 		MarkSnapshotReady(context.Context, string, string) error
 	}
 }
 
 func (h *SnapshotJobHandler) WithResourceLimits(maxRepoBytes int64, maxFileCount int) *SnapshotJobHandler {
-	h.maxRepoBytes = maxRepoBytes
+	h.maxIndexableSourceBytes = maxRepoBytes
 	h.maxFileCount = maxFileCount
 	return h
 }
@@ -158,6 +158,10 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		}
 		if cloneErr != nil {
 			log.Error("failed to clone repository for snapshot", "error", cloneErr)
+			if errors.Is(cloneErr, ErrRepositoryCloneSizeLimit) {
+				h.failIfTerminal(ctx, job, snap.ID, "REPOSITORY_CLONE_SIZE_LIMIT")
+				return jobs.NewPermanentError("REPOSITORY_CLONE_SIZE_LIMIT", cloneErr.Error(), cloneErr)
+			}
 			if err := h.cloner.ValidateGitURL(r.GitURL); err != nil {
 				h.failIfTerminal(ctx, job, snap.ID, "INVALID_GIT_URL")
 				return jobs.NewPermanentError("INVALID_GIT_URL", err.Error(), err)
@@ -217,8 +221,8 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		if h.maxFileCount > 0 && fileCount >= h.maxFileCount {
 			return jobs.NewPermanentError("TOO_MANY_FILES", fmt.Sprintf("repository exceeds maximum file count %d", h.maxFileCount), nil)
 		}
-		if h.maxRepoBytes > 0 && totalBytes+info.Size() > h.maxRepoBytes {
-			return jobs.NewPermanentError("REPOSITORY_TOO_LARGE", fmt.Sprintf("repository exceeds maximum size %d bytes", h.maxRepoBytes), nil)
+		if h.maxIndexableSourceBytes > 0 && totalBytes+info.Size() > h.maxIndexableSourceBytes {
+			return jobs.NewPermanentError("REPOSITORY_TOO_LARGE", fmt.Sprintf("indexable source exceeds maximum size %d bytes", h.maxIndexableSourceBytes), nil)
 		}
 
 		content, err := readFile(ctx, snap.RepositoryID, snap.ID, relPath, 1, -1)

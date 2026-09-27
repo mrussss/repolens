@@ -93,7 +93,7 @@ func run() error {
 	indexStorageDir := filepath.Join(cfg.SnapshotBasePath, "indexes")
 	activeRetriever := retrieval.NewProductionRetriever(codeIntelStore, indexStorageDir)
 
-	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
+	cloner := indexing.NewSafeGitClonerWithDiskLimit(cfg.AllowHosts, cfg.MaxCloneDiskBytes, 2*time.Minute)
 	filter := indexing.NewFileFilter(cfg.MaxFileSizeKB)
 	chunker := indexing.NewCodeChunker(60, 10)
 
@@ -129,7 +129,7 @@ func run() error {
 	snapshotJobHandler.WithCodeIntelStore(codeIntelStore)
 	snapshotJobHandler.WithRevisionStore(revisionStore)
 	snapshotJobHandler.WithResourceLimits(
-		cfg.MaxRepoSizeMB*1024*1024,
+		cfg.MaxIndexableSourceBytes,
 		cfg.MaxFileCount,
 	)
 

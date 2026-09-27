@@ -30,6 +30,29 @@ func TestLoadKeepsExplicitRuntimePaths(t *testing.T) {
 	}
 }
 
+func TestCloneAndIndexableSourceLimitsAreSeparate(t *testing.T) {
+	t.Setenv("MAX_CLONE_DISK_BYTES", "")
+	t.Setenv("MAX_INDEXABLE_SOURCE_BYTES", "")
+	t.Setenv("MAX_REPO_SIZE_MB", "")
+	defaults := Load()
+	if defaults.MaxCloneDiskBytes != DefaultMaxCloneDiskBytes || defaults.MaxIndexableSourceBytes != DefaultMaxIndexableSourceBytes {
+		t.Fatalf("default clone/source limits=%d/%d, want %d/%d", defaults.MaxCloneDiskBytes, defaults.MaxIndexableSourceBytes, DefaultMaxCloneDiskBytes, DefaultMaxIndexableSourceBytes)
+	}
+
+	t.Setenv("MAX_REPO_SIZE_MB", "80")
+	legacy := Load()
+	if legacy.MaxIndexableSourceBytes != 80<<20 || legacy.MaxCloneDiskBytes != 320<<20 {
+		t.Fatalf("legacy MAX_REPO_SIZE_MB mapping=%d/%d, want 80/320 MiB", legacy.MaxIndexableSourceBytes, legacy.MaxCloneDiskBytes)
+	}
+
+	t.Setenv("MAX_CLONE_DISK_BYTES", "10485760")
+	t.Setenv("MAX_INDEXABLE_SOURCE_BYTES", "5242880")
+	explicit := Load()
+	if explicit.MaxCloneDiskBytes != 10<<20 || explicit.MaxIndexableSourceBytes != 5<<20 {
+		t.Fatalf("explicit clone/source limits=%d/%d, want 10/5 MiB", explicit.MaxCloneDiskBytes, explicit.MaxIndexableSourceBytes)
+	}
+}
+
 func TestProviderTimeoutSecondsUsesPositiveValueOrDefault(t *testing.T) {
 	tests := []struct {
 		name  string

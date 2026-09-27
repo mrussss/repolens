@@ -79,7 +79,7 @@ func run() error {
 	citationStore := evidence.NewCitationStore(db.GormDB)
 	traceStore := trace.NewStore(db.GormDB)
 	jobStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)
-	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
+	cloner := indexing.NewSafeGitClonerWithDiskLimit(cfg.AllowHosts, cfg.MaxCloneDiskBytes, 2*time.Minute)
 	revisionStore := revision.NewStore(db.GormDB)
 
 	// Services & Managers

@@ -9,15 +9,35 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"repolens/internal/platform/redaction"
+)
+
+const (
+	MaxProviderResponseBytes     int64 = 16 << 20
+	maxProviderErrorBodyBytes          = 8 << 10
+	ProviderResponseTooLargeCode       = "PROVIDER_RESPONSE_TOO_LARGE"
 )
 
 type OpenAICompatibleProvider struct {
-	apiKey       string
-	baseURL      string
-	defaultModel string
-	authMode     string
-	httpClient   *http.Client
+	apiKey           string
+	baseURL          string
+	defaultModel     string
+	authMode         string
+	httpClient       *http.Client
+	maxResponseBytes int64
 }
+
+type ProviderResponseTooLargeError struct {
+	LimitBytes int64
+}
+
+func (e *ProviderResponseTooLargeError) Error() string {
+	return ProviderResponseTooLargeCode
+}
+
+func (e *ProviderResponseTooLargeError) ErrorCode() string { return ProviderResponseTooLargeCode }
+func (e *ProviderResponseTooLargeError) Permanent() bool   { return true }
 
 type HTTPError struct {
 	StatusCode int
@@ -25,7 +45,7 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("llm provider returned HTTP %d: %s", e.StatusCode, e.Body)
+	return fmt.Sprintf("llm provider returned HTTP %d: %s", e.StatusCode, redaction.RedactSecrets(e.Body))
 }
 
 func (e *HTTPError) RetryableProviderError() bool {
@@ -51,10 +71,11 @@ func NewOpenAICompatibleProviderWithAuthModeAndTimeout(apiKey, baseURL, defaultM
 		timeout = 60 * time.Second
 	}
 	return &OpenAICompatibleProvider{
-		apiKey:       apiKey,
-		baseURL:      baseURL,
-		defaultModel: defaultModel,
-		authMode:     normalizeAuthMode(authMode),
+		apiKey:           apiKey,
+		baseURL:          baseURL,
+		defaultModel:     defaultModel,
+		authMode:         normalizeAuthMode(authMode),
+		maxResponseBytes: MaxProviderResponseBytes,
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
@@ -131,13 +152,26 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBodyBytes+1))
+		if readErr != nil {
+			return GenerateResponse{}, fmt.Errorf("failed to read llm error response body: %w", readErr)
+		}
+		if int64(len(errorBody)) > maxProviderErrorBodyBytes {
+			errorBody = append(errorBody[:maxProviderErrorBodyBytes], []byte("...[truncated]")...)
+		}
+		return GenerateResponse{}, &HTTPError{StatusCode: resp.StatusCode, Body: redaction.RedactSecrets(string(errorBody))}
+	}
+	maxBytes := p.maxResponseBytes
+	if maxBytes <= 0 {
+		maxBytes = MaxProviderResponseBytes
+	}
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return GenerateResponse{}, fmt.Errorf("failed to read llm response body: %w", err)
 	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return GenerateResponse{}, &HTTPError{StatusCode: resp.StatusCode, Body: string(respBytes)}
+	if int64(len(respBytes)) > maxBytes {
+		return GenerateResponse{}, &ProviderResponseTooLargeError{LimitBytes: maxBytes}
 	}
 
 	var openAIResp openAIResponse
@@ -146,7 +180,7 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 	}
 
 	if openAIResp.Error != nil {
-		return GenerateResponse{}, fmt.Errorf("llm provider error: %s", openAIResp.Error.Message)
+		return GenerateResponse{}, fmt.Errorf("llm provider error: %s", redaction.RedactSecrets(openAIResp.Error.Message))
 	}
 	if len(openAIResp.Choices) == 0 {
 		return GenerateResponse{}, fmt.Errorf("empty choices from llm provider")

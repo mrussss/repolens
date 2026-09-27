@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
@@ -51,26 +52,46 @@ func isPrivateOrLocalIP(ip net.IP) bool {
 
 type SafeGitCloner struct {
 	allowHosts   []string
-	maxSizeMB    int64
+	maxDiskBytes int64
 	cloneTimeout time.Duration
 }
 
 func NewSafeGitCloner(allowHosts []string, maxSizeMB int64, timeout time.Duration) *SafeGitCloner {
+	if maxSizeMB <= 0 {
+		maxSizeMB = 50
+	}
+	return NewSafeGitClonerWithDiskLimit(allowHosts, maxSizeMB*1024*1024, timeout)
+}
+
+func NewSafeGitClonerWithDiskLimit(allowHosts []string, maxDiskBytes int64, timeout time.Duration) *SafeGitCloner {
 	if len(allowHosts) == 0 {
 		allowHosts = []string{"github.com"}
 	}
-	if maxSizeMB <= 0 {
-		maxSizeMB = 50
+	if maxDiskBytes <= 0 {
+		maxDiskBytes = 200 << 20
 	}
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
 	return &SafeGitCloner{
 		allowHosts:   allowHosts,
-		maxSizeMB:    maxSizeMB,
+		maxDiskBytes: maxDiskBytes,
 		cloneTimeout: timeout,
 	}
 }
+
+var ErrRepositoryCloneSizeLimit = errors.New("REPOSITORY_CLONE_SIZE_LIMIT")
+
+type CloneDiskLimitError struct {
+	SizeBytes  int64
+	LimitBytes int64
+}
+
+func (e *CloneDiskLimitError) Error() string {
+	return fmt.Sprintf("REPOSITORY_CLONE_SIZE_LIMIT: staging tree uses %d bytes; limit is %d bytes", e.SizeBytes, e.LimitBytes)
+}
+
+func (e *CloneDiskLimitError) Unwrap() error { return ErrRepositoryCloneSizeLimit }
 
 // ResolveRef resolves a ref before a Snapshot row is created. This makes the
 // natural identity repository_id + exact commit_sha available to the API and
@@ -227,6 +248,9 @@ func (c *SafeGitCloner) CloneTo(ctx context.Context, gitURL, ref, targetDir stri
 		}
 		return "", fmt.Errorf("git clone failed: %v, output: %s", err, string(out))
 	}
+	if err := c.checkCloneDiskLimit(targetDir); err != nil {
+		return "", err
+	}
 
 	// Get commit sha
 	shaCmd := exec.CommandContext(ctx, "git", "-C", targetDir, "rev-parse", "HEAD")
@@ -282,6 +306,9 @@ func (c *SafeGitCloner) CloneCommitTo(ctx context.Context, gitURL, commitSHA, ta
 			}
 			return "", fmt.Errorf("git exact commit command %d failed: %v, output: %s", index+1, err, string(output))
 		}
+		if err := c.checkCloneDiskLimit(targetDir); err != nil {
+			return "", err
+		}
 		if index == len(commands)-1 {
 			resolved := strings.TrimSpace(string(output))
 			if resolved != commitSHA {
@@ -292,4 +319,38 @@ func (c *SafeGitCloner) CloneCommitTo(ctx context.Context, gitURL, commitSHA, ta
 	}
 	_ = os.RemoveAll(filepath.Join(targetDir, ".git"))
 	return commitSHA, nil
+}
+
+func (c *SafeGitCloner) checkCloneDiskLimit(targetDir string) error {
+	if c.maxDiskBytes <= 0 {
+		return nil
+	}
+	var total int64
+	err := filepath.WalkDir(targetDir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() > c.maxDiskBytes-total {
+			total = c.maxDiskBytes + 1
+			return filepath.SkipAll
+		}
+		total += info.Size()
+		return nil
+	})
+	if err != nil && !errors.Is(err, filepath.SkipAll) {
+		_ = os.RemoveAll(targetDir)
+		return fmt.Errorf("failed to measure clone staging size: %w", err)
+	}
+	if total <= c.maxDiskBytes {
+		return nil
+	}
+	_ = os.RemoveAll(targetDir)
+	return &CloneDiskLimitError{SizeBytes: total, LimitBytes: c.maxDiskBytes}
 }

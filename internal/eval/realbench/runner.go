@@ -1353,7 +1353,7 @@ func flattenCitations(report *evidence.DiagnosisReportData) []evidence.Citation 
 }
 
 func ensureExactCheckout(ctx context.Context, cloneURL, commitSHA, sourceDir string) error {
-	cloner := indexing.NewSafeGitCloner([]string{"github.com"}, 50, 10*time.Minute)
+	cloner := indexing.NewSafeGitClonerWithDiskLimit([]string{"github.com"}, platformconfig.DefaultMaxCloneDiskBytes, 10*time.Minute)
 	if err := cloner.ValidateGitURL(cloneURL); err != nil {
 		return fmt.Errorf("repository validation failed: %w", err)
 	}
