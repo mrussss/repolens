@@ -11,22 +11,24 @@ func TestRedactRawAndEscapedJSONCredentialPairs(t *testing.T) {
 		"api_key", "apikey", "secret", "client_secret", "authorization",
 	}
 	for _, key := range keys {
-		for _, escaped := range []bool{false, true} {
-			name := key + "/raw"
-			input := `{"` + key + `" : "credential-value"}`
-			if escaped {
-				name = key + "/escaped"
-				input = strings.ReplaceAll(input, `"`, `\"`)
+		for _, spelling := range []string{key, strings.ToUpper(key)} {
+			for _, escaped := range []bool{false, true} {
+				name := spelling + "/raw"
+				input := `{"` + spelling + `" : "credential-value"}`
+				if escaped {
+					name = spelling + "/escaped"
+					input = strings.ReplaceAll(input, `"`, `\"`)
+				}
+				t.Run(name, func(t *testing.T) {
+					got := RedactSecrets("context=kept " + input)
+					if strings.Contains(got, "credential-value") {
+						t.Fatalf("credential remained visible: %s", got)
+					}
+					if !strings.Contains(got, "context=kept") || !strings.Contains(got, "[REDACTED_SECRET]") {
+						t.Fatalf("ordinary context or redaction marker missing: %s", got)
+					}
+				})
 			}
-			t.Run(name, func(t *testing.T) {
-				got := RedactSecrets("context=kept " + input)
-				if strings.Contains(got, "credential-value") {
-					t.Fatalf("credential remained visible: %s", got)
-				}
-				if !strings.Contains(got, "context=kept") || !strings.Contains(got, "[REDACTED_SECRET]") {
-					t.Fatalf("ordinary context or redaction marker missing: %s", got)
-				}
-			})
 		}
 	}
 }
