@@ -12,20 +12,16 @@ import (
 	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/snapshotstore"
-	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 	"repolens/internal/snapshotpolicy"
 )
 
 // CodeIndexJobHandler processes BUILD_CODE_INDEX jobs.
 type CodeIndexJobHandler struct {
-	store         store.Store
-	snapStore     snapshot.Store
-	storeFS       snapshotstore.SnapshotStore
-	analyzer      *Analyzer
-	revisionStore interface {
-		MarkCodeIndexReady(context.Context, string, int64) error
-	}
+	store     store.Store
+	snapStore snapshot.Store
+	storeFS   snapshotstore.SnapshotStore
+	analyzer  *Analyzer
 }
 
 // NewCodeIndexJobHandler constructs a new handler for BUILD_CODE_INDEX jobs.
@@ -46,15 +42,11 @@ func NewCodeIndexJobHandler(
 	}
 }
 
-func (h *CodeIndexJobHandler) WithRevisionStore(store interface {
-	MarkCodeIndexReady(context.Context, string, int64) error
-}) *CodeIndexJobHandler {
-	h.revisionStore = store
-	return h
-}
-
 // Execute performs full code intelligence extraction for a code_index_build.
 func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
+	if job == nil || job.WorkerID == nil || job.ClaimToken == nil || *job.WorkerID == "" || *job.ClaimToken == "" {
+		return jobs.ErrOwnershipLost
+	}
 	log := logger.L(ctx)
 	buildID, err := strconv.ParseInt(job.ResourceID, 10, 64)
 	if err != nil {
@@ -65,11 +57,6 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		return fmt.Errorf("failed fetching code index build %d: %w", buildID, err)
 	}
 	if cib.Status == model.BuildStatusReady {
-		if h.revisionStore != nil && cib.AnalysisRevisionID != "" {
-			if err := h.revisionStore.MarkCodeIndexReady(ctx, cib.AnalysisRevisionID, cib.ID); err != nil && !errors.Is(err, revision.ErrLineage) {
-				return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
-			}
-		}
 		return nil
 	}
 
@@ -122,32 +109,20 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	var saveErr error
 	stageFinalized := false
-	if finalizer, ok := h.store.(interface {
-		FinalizeCodeIndexSuccessWithRevision(context.Context, int64, string, string, int64, string, *model.AnalysisResult) error
-	}); ok && job.WorkerID != nil && job.ClaimToken != nil && cib.AnalysisRevisionID != "" {
-		saveErr = finalizer.FinalizeCodeIndexSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, cib.AnalysisRevisionID, analysisRes)
+	if cib.AnalysisRevisionID != "" {
+		saveErr = h.store.FinalizeCodeIndexSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, cib.AnalysisRevisionID, analysisRes)
 		stageFinalized = saveErr == nil
-	} else if finalizer, ok := h.store.(interface {
-		FinalizeCodeIndexSuccess(context.Context, int64, string, string, int64, *model.AnalysisResult) error
-	}); ok && job.WorkerID != nil && job.ClaimToken != nil {
-		saveErr = finalizer.FinalizeCodeIndexSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, analysisRes)
 	} else {
-		saveErr = h.store.SaveAnalysisResult(ctx, cib.ID, analysisRes)
+		saveErr = h.store.FinalizeCodeIndexSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, analysisRes)
 	}
 	if saveErr != nil {
 		log.Error("failed persisting code index analysis result", "build_id", cib.ID, "error", saveErr)
 		return saveErr
 	}
 
-	// The revision-aware finalizer creates the next stage in the same
-	// transaction. Keep this fallback for legacy/non-revision stores only.
+	// Non-revision builds retain the older follow-up stage creation path.
 	if !stageFinalized {
 		_, _, _ = h.store.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
-	}
-	if !stageFinalized && h.revisionStore != nil && cib.AnalysisRevisionID != "" {
-		if err := h.revisionStore.MarkCodeIndexReady(ctx, cib.AnalysisRevisionID, cib.ID); err != nil {
-			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
-		}
 	}
 
 	log.Info("code index build completed successfully",

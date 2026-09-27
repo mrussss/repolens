@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ import (
 	"repolens/internal/snapshot"
 )
 
-func setupRetrievalDB(t *testing.T) (*gorm.DB, codeintelstore.Store, snapshot.Store) {
+func setupRetrievalDB(t *testing.T) (*gorm.DB, *jobs.Store, codeintelstore.Store, snapshot.Store) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "retrieval_test.db")
 	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000&_journal_mode=WAL"), &gorm.Config{})
@@ -37,22 +38,34 @@ func setupRetrievalDB(t *testing.T) (*gorm.DB, codeintelstore.Store, snapshot.St
 	}
 	ciStore := codeintelstore.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	return db, ciStore, snapStore
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get database connection: %v", err)
+	}
+	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	return db, jobsStore, ciStore, snapStore
 }
 
-type retrievalRevisionFailureRecorder struct{ calls int }
-
-func (r *retrievalRevisionFailureRecorder) MarkRetrievalReady(context.Context, string, int64) error {
-	return nil
-}
-
-func (r *retrievalRevisionFailureRecorder) MarkFailed(context.Context, string, revision.Stage, string, string) error {
-	r.calls++
-	return nil
+func claimRetrievalJobForTest(t *testing.T, db *gorm.DB, jobsStore *jobs.Store, retrievalBuildID int64, workerID string) *jobs.AnalysisJob {
+	t.Helper()
+	var retrievalBuild codeintelmodel.RetrievalBuild
+	if err := db.First(&retrievalBuild, "id = ?", retrievalBuildID).Error; err != nil {
+		t.Fatalf("load retrieval build %d: %v", retrievalBuildID, err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).
+		Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, strconv.FormatInt(retrievalBuild.CodeIndexBuildID, 10)).
+		Update("status", jobs.StatusSucceeded).Error; err != nil {
+		t.Fatalf("complete code-index fixture job: %v", err)
+	}
+	claimed, err := jobsStore.ClaimJobs(context.Background(), workerID, 1, time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].JobType != jobs.JobTypeBuildRetrieval || claimed[0].ResourceID != strconv.FormatInt(retrievalBuildID, 10) {
+		t.Fatalf("claim retrieval job: claimed=%+v err=%v", claimed, err)
+	}
+	return claimed[0]
 }
 
 func TestStaleRetrievalHandlerDoesNotFailRevision(t *testing.T) {
-	db, ciStore, snapStore := setupRetrievalDB(t)
+	db, jobsStore, ciStore, snapStore := setupRetrievalDB(t)
 	ctx := context.Background()
 	revisionID := "revision-stale-retrieval"
 	if err := db.Create(&revision.AnalysisRevision{
@@ -77,11 +90,6 @@ func TestStaleRetrievalHandlerDoesNotFailRevision(t *testing.T) {
 	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", codeBuild.ID)).Update("status", jobs.StatusSucceeded).Error; err != nil {
 		t.Fatal(err)
 	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
 	rbResourceID := fmt.Sprintf("%d", retrievalBuild.ID)
 	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildRetrieval, rbResourceID).Update("max_attempts", 1).Error; err != nil {
 		t.Fatal(err)
@@ -105,16 +113,11 @@ func TestStaleRetrievalHandlerDoesNotFailRevision(t *testing.T) {
 	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
 		t.Fatalf("new Retrieval claim = %+v, err=%v", newClaim, err)
 	}
-	revisionFailures := &retrievalRevisionFailureRecorder{}
 	handler := retrieval.NewRetrievalJobHandler(ciStore, t.TempDir()).
-		WithSnapshotSource(snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir())).
-		WithRevisionStore(revisionFailures)
+		WithSnapshotSource(snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()))
 	err = handler.Execute(ctx, oldClaim[0])
 	if err == nil {
 		t.Fatal("retrieval build unexpectedly executed without a READY CodeIndex")
-	}
-	if revisionFailures.calls != 0 {
-		t.Fatalf("stale Retrieval handler wrote revision failure %d times without a claim", revisionFailures.calls)
 	}
 	currentRevision, err := revision.NewStore(db).GetByID(ctx, revisionID)
 	if err != nil || currentRevision.Status != revision.StatusPreparing || currentRevision.ExecutionGeneration != 2 {
@@ -127,7 +130,7 @@ func TestStaleRetrievalHandlerDoesNotFailRevision(t *testing.T) {
 }
 
 func TestStaleRetrievalPublisherCannotReplaceCurrentArtifact(t *testing.T) {
-	db, ciStore, _ := setupRetrievalDB(t)
+	db, jobsStore, ciStore, _ := setupRetrievalDB(t)
 	ctx := context.Background()
 	codeBuild, _, err := ciStore.GetOrCreateBuild(ctx, "snap-retrieval-artifact-race", "example.com/race", codeintelmodel.DefaultBuildContext())
 	if err != nil {
@@ -143,11 +146,6 @@ func TestStaleRetrievalPublisherCannotReplaceCurrentArtifact(t *testing.T) {
 	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", codeBuild.ID)).Update("status", jobs.StatusSucceeded).Error; err != nil {
 		t.Fatal(err)
 	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
 	oldClaim, err := jobsStore.ClaimJobs(ctx, "retrieval-old-worker", 1, time.Minute)
 	if err != nil || len(oldClaim) != 1 || oldClaim[0].JobType != jobs.JobTypeBuildRetrieval {
 		t.Fatalf("old Retrieval claim = %+v, err=%v", oldClaim, err)
@@ -215,7 +213,7 @@ func TestStaleRetrievalPublisherCannotReplaceCurrentArtifact(t *testing.T) {
 }
 
 func TestRetrievalJobHandlerIndexesSymbolSourceBody(t *testing.T) {
-	_, ciStore, snapStore := setupRetrievalDB(t)
+	db, jobsStore, ciStore, snapStore := setupRetrievalDB(t)
 	ctx := context.Background()
 	storageDir := t.TempDir()
 	snapshotBase := t.TempDir()
@@ -278,7 +276,11 @@ func TestRetrievalJobHandlerIndexesSymbolSourceBody(t *testing.T) {
 		t.Fatalf("create retrieval build: %v", err)
 	}
 	handler := retrieval.NewRetrievalJobHandler(ciStore, storageDir).WithSnapshotSource(snapStore, storeFS)
-	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: fmt.Sprintf("%d", rb.ID)}); err != nil {
+	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: fmt.Sprintf("%d", rb.ID)}); !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("unclaimed retrieval job error = %v, want ownership lost", err)
+	}
+	claimed := claimRetrievalJobForTest(t, db, jobsStore, rb.ID, "worker-retrieval-source-body")
+	if err := handler.Execute(ctx, claimed); err != nil {
 		t.Fatalf("execute retrieval build: %v", err)
 	}
 	retriever := retrieval.NewProductionRetriever(ciStore, storageDir)
@@ -309,7 +311,7 @@ func TestRetrievalJobHandlerIndexesSymbolSourceBody(t *testing.T) {
 }
 
 func TestRetrievalJobHandlerIndexesAllSymbols(t *testing.T) {
-	_, ciStore, _ := setupRetrievalDB(t)
+	db, jobsStore, ciStore, _ := setupRetrievalDB(t)
 	ctx := context.Background()
 	storageDir := t.TempDir()
 
@@ -350,7 +352,8 @@ func TestRetrievalJobHandlerIndexesAllSymbols(t *testing.T) {
 		t.Fatalf("create retrieval build: %v", err)
 	}
 	handler := retrieval.NewRetrievalJobHandler(ciStore, storageDir)
-	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: fmt.Sprintf("%d", rb.ID)}); err != nil {
+	claimed := claimRetrievalJobForTest(t, db, jobsStore, rb.ID, "worker-retrieval-all-symbols")
+	if err := handler.Execute(ctx, claimed); err != nil {
 		t.Fatalf("execute retrieval build: %v", err)
 	}
 
@@ -376,7 +379,7 @@ func TestRetrievalJobHandlerIndexesAllSymbols(t *testing.T) {
 }
 
 func TestProductionRetriever_SearchAndStructuralExpansion(t *testing.T) {
-	_, ciStore, snapStore := setupRetrievalDB(t)
+	_, _, ciStore, snapStore := setupRetrievalDB(t)
 	ctx := context.Background()
 	tempBase := t.TempDir()
 

@@ -3,6 +3,7 @@ package codeintel_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -442,7 +443,7 @@ func TestCodeIndexBuild_IdempotencyAndJobCreation(t *testing.T) {
 }
 
 func TestQueuedCodeIndexJobRestoresPersistedBuildTags(t *testing.T) {
-	_, _, ciStore, snapStore := setupCodeIntelTestDB(t)
+	_, jobsStore, ciStore, snapStore := setupCodeIntelTestDB(t)
 	ctx := context.Background()
 	base := t.TempDir()
 	storeFS := snapshotstore.NewLocalSnapshotStore(base)
@@ -470,7 +471,18 @@ func TestQueuedCodeIndexJobRestoresPersistedBuildTags(t *testing.T) {
 		t.Fatalf("persisted build tags = %q, want [\"custom\"]", build.BuildTagsJSON)
 	}
 	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, storeFS, codeintel.NewAnalyzer())
-	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: strconv.FormatInt(build.ID, 10), MaxAttempts: 3}); err != nil {
+	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: strconv.FormatInt(build.ID, 10), MaxAttempts: 3}); !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("unclaimed code-index job error = %v, want ownership lost", err)
+	}
+	unchanged, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil || unchanged.Status != codeintelmodel.BuildStatusCreated {
+		t.Fatalf("unclaimed handler changed build: build=%+v err=%v", unchanged, err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-build-tags-success", 1, time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].JobType != jobs.JobTypeBuildCodeIndex {
+		t.Fatalf("claim code-index build job: claimed=%+v err=%v", claimed, err)
+	}
+	if err := handler.Execute(ctx, claimed[0]); err != nil {
 		t.Fatalf("execute queued code-index job: %v", err)
 	}
 	ready, err := ciStore.GetByID(ctx, build.ID)
@@ -566,17 +578,6 @@ func TestQueuedCodeIndexJobFailsClosedWhenLegacyTagNamesAreUnavailable(t *testin
 	}
 }
 
-type codeIndexRevisionFailureRecorder struct{ calls int }
-
-func (r *codeIndexRevisionFailureRecorder) MarkCodeIndexReady(context.Context, string, int64) error {
-	return nil
-}
-
-func (r *codeIndexRevisionFailureRecorder) MarkFailed(context.Context, string, revision.Stage, string, string) error {
-	r.calls++
-	return nil
-}
-
 func TestStaleCodeIndexHandlerDoesNotFailRevision(t *testing.T) {
 	db, jobsStore, ciStore, snapStore := setupCodeIntelTestDB(t)
 	ctx := context.Background()
@@ -621,15 +622,10 @@ func TestStaleCodeIndexHandlerDoesNotFailRevision(t *testing.T) {
 	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
 		t.Fatalf("new CodeIndex claim = %+v, err=%v", newClaim, err)
 	}
-	revisionFailures := &codeIndexRevisionFailureRecorder{}
-	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()), codeintel.NewAnalyzer()).
-		WithRevisionStore(revisionFailures)
+	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()), codeintel.NewAnalyzer())
 	err = handler.Execute(ctx, oldClaim[0])
 	if err == nil {
 		t.Fatal("CodeIndex handler unexpectedly succeeded with a missing source snapshot")
-	}
-	if revisionFailures.calls != 0 {
-		t.Fatalf("stale CodeIndex handler wrote revision failure %d times without a claim", revisionFailures.calls)
 	}
 	currentRevision, err := revision.NewStore(db).GetByID(ctx, revisionID)
 	if err != nil || currentRevision.Status != revision.StatusPreparing || currentRevision.ExecutionGeneration != 2 {

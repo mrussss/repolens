@@ -139,13 +139,10 @@ func run() error {
 		storeFS,
 		codeintel.NewAnalyzer(),
 	)
-	codeIndexJobHandler.WithRevisionStore(revisionStore)
-
 	retrievalJobHandler := retrieval.NewRetrievalJobHandler(
 		codeIntelStore,
 		indexStorageDir,
 	).WithSnapshotSource(snapshotStore, storeFS)
-	retrievalJobHandler.WithRevisionStore(revisionStore)
 
 	jobsWorker := jobs.NewWorker(jobsStore, jobs.DefaultWorkerConfig())
 	jobsWorker.RegisterHandler(jobs.JobTypeRunDiagnosis, diagJobHandler)

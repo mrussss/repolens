@@ -27,7 +27,7 @@ type Store interface {
 	GetBySnapshot(ctx context.Context, snapshotID string) (*model.CodeIndexBuild, error)
 	SaveAnalysisResult(ctx context.Context, buildID int64, result *model.AnalysisResult) error
 	FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, result *model.AnalysisResult) error
-	FailBuild(ctx context.Context, buildID int64, errorCode string) error
+	FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, revisionID string, result *model.AnalysisResult) error
 	MarkBuildBuilding(ctx context.Context, buildID int64) error
 	ListSymbols(ctx context.Context, buildID int64, query string, limit int) ([]*model.Symbol, error)
 	ListAllSymbols(ctx context.Context, buildID int64) ([]*model.Symbol, error)
@@ -41,7 +41,7 @@ type Store interface {
 	GetRetrievalBuildByCodeIndexBuild(ctx context.Context, codeIndexBuildID int64) (*model.RetrievalBuild, error)
 	CompleteRetrievalBuild(ctx context.Context, id int64, artifactPath, artifactHash string, docCount int) error
 	FinalizeRetrievalSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, artifactPath, artifactHash string, docCount int) error
-	FailRetrievalBuild(ctx context.Context, id int64, errorCode string) error
+	FinalizeRetrievalSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, revisionID, artifactPath, artifactHash string, docCount int) error
 	MarkRetrievalBuilding(ctx context.Context, id int64) error
 
 	// Lineage Validation
@@ -400,13 +400,6 @@ func (s *GormStore) MarkBuildBuilding(ctx context.Context, buildID int64) error 
 	return nil
 }
 
-func (s *GormStore) FailBuild(ctx context.Context, buildID int64, errorCode string) error {
-	return s.db.WithContext(ctx).Model(&model.CodeIndexBuild{}).Where("id = ? AND status != ?", buildID, model.BuildStatusReady).Updates(map[string]interface{}{
-		"status":     model.BuildStatusFailed,
-		"error_code": errorCode,
-	}).Error
-}
-
 func (s *GormStore) MarkRetrievalBuilding(ctx context.Context, id int64) error {
 	result := s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).
 		Where("id = ? AND status IN (?, ?)", id, model.BuildStatusCreated, model.BuildStatusBuilding).
@@ -662,13 +655,6 @@ func (s *GormStore) FinalizeRetrievalSuccessWithRevision(ctx context.Context, jo
 		}
 		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
 	})
-}
-
-func (s *GormStore) FailRetrievalBuild(ctx context.Context, id int64, errorCode string) error {
-	return s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).Where("id = ? AND status != ?", id, model.BuildStatusReady).Updates(map[string]interface{}{
-		"status":     model.BuildStatusFailed,
-		"error_code": errorCode,
-	}).Error
 }
 
 func requireOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) error {

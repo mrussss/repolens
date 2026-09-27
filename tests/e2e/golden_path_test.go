@@ -123,10 +123,9 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 		snapshotStore,
 		storeFS,
 		codeintel.NewAnalyzer(),
-	).WithRevisionStore(revisionStore)
+	)
 	retrievalHandler := retrieval.NewRetrievalJobHandler(codeIndexStore, artifactDir).
-		WithSnapshotSource(snapshotStore, storeFS).
-		WithRevisionStore(revisionStore)
+		WithSnapshotSource(snapshotStore, storeFS)
 
 	retriever := retrieval.NewProductionRetriever(codeIndexStore, artifactDir)
 	provider := &scriptedProvider{}
