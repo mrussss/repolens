@@ -57,6 +57,26 @@ func setupTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+type workerStoreFaults struct {
+	*jobs.Store
+	cancelPollErr error
+	renewErr      error
+}
+
+func (s workerStoreFaults) IsCancelRequested(ctx context.Context, jobID int64, workerID, claimToken string) (bool, error) {
+	if s.cancelPollErr != nil {
+		return false, s.cancelPollErr
+	}
+	return s.Store.IsCancelRequested(ctx, jobID, workerID, claimToken)
+}
+
+func (s workerStoreFaults) RenewLease(ctx context.Context, jobID int64, workerID, claimToken string, leaseUntil time.Time) error {
+	if s.renewErr != nil {
+		return s.renewErr
+	}
+	return s.Store.RenewLease(ctx, jobID, workerID, claimToken, leaseUntil)
+}
+
 func TestDiagnosisRetryPolicyUsesExplicitProviderErrorAllowlist(t *testing.T) {
 	for code, want := range map[string]bool{
 		"PROVIDER_TIMEOUT": true, "PROVIDER_CONNECTION_FAILED": true,
@@ -90,7 +110,11 @@ func TestErrorClassification(t *testing.T) {
 		{errors.New("context deadline exceeded"), jobs.ErrorClassRetryable},
 		{errors.New("invalid url format"), jobs.ErrorClassPermanent},
 		{errors.New("ssrf blocked link-local"), jobs.ErrorClassPermanent},
-		{context.Canceled, jobs.ErrorClassCancelled},
+		{context.Canceled, jobs.ErrorClassRetryable},
+		{jobs.ErrUserCancellation, jobs.ErrorClassCancelled},
+		{fmt.Errorf("%w: database unavailable", jobs.ErrCancelPollFailed), jobs.ErrorClassRetryable},
+		{fmt.Errorf("%w: database unavailable", jobs.ErrLeaseRenewFailed), jobs.ErrorClassRetryable},
+		{jobs.ErrWorkerShutdown, jobs.ErrorClassOwnershipLost},
 		{jobs.ErrOwnershipLost, jobs.ErrorClassOwnershipLost},
 		{jobs.NewPermanentError("BAD_REQ", "malformed json", nil), jobs.ErrorClassPermanent},
 		{jobs.NewRetryableError("RATE_LIMIT", "rate limit exceeded", nil), jobs.ErrorClassRetryable},
@@ -101,6 +125,90 @@ func TestErrorClassification(t *testing.T) {
 		if class != tt.expectedClass {
 			t.Errorf("ClassifyError(%v) = %v, want %v", tt.err, class, tt.expectedClass)
 		}
+	}
+}
+
+func TestCancelFinalizerRequiresDurableCancelRequested(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	ctx := context.Background()
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "diag-cancel-guard"}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "worker-cancel-guard", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimJobs = %d, %v; want one claim", len(claimed), err)
+	}
+
+	err = store.ConditionalFinalizeCancel(ctx, claimed[0].ID, "worker-cancel-guard", *claimed[0].ClaimToken)
+	if err == nil {
+		t.Fatal("cancel finalizer succeeded without durable cancel_requested")
+	}
+	saved, err := store.GetJobByID(ctx, claimed[0].ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if saved.Status != jobs.StatusRunning || saved.CancelRequested {
+		t.Fatalf("job after rejected cancellation = status %s, cancel_requested %t; want RUNNING/false", saved.Status, saved.CancelRequested)
+	}
+}
+
+func TestNonDiagnosisJobCannotBeCancelled(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: "snap-cancel-unsupported"}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := store.RequestCancel(ctx, job.JobType, job.ResourceID); !errors.Is(err, jobs.ErrCancellationUnsupported) {
+		t.Fatalf("RequestCancel(non-diagnosis) = %v, want ErrCancellationUnsupported", err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "worker-cancel-unsupported", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimJobs = %d, %v; want one claim", len(claimed), err)
+	}
+	if err := store.ConditionalFinalizeCancel(ctx, claimed[0].ID, "worker-cancel-unsupported", *claimed[0].ClaimToken); !errors.Is(err, jobs.ErrCancellationUnsupported) {
+		t.Fatalf("ConditionalFinalizeCancel(non-diagnosis) = %v, want ErrCancellationUnsupported", err)
+	}
+	saved, err := store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if saved.Status != jobs.StatusRunning || saved.CancelRequested {
+		t.Fatalf("non-diagnosis job after cancellation attempt = status %s, cancel_requested %t; want RUNNING/false", saved.Status, saved.CancelRequested)
+	}
+}
+
+func TestAcceptedCancellationWinsOverSuccessFinalization(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "diag-cancel-wins"}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "worker-cancel-wins", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimJobs = %d, %v; want one claim", len(claimed), err)
+	}
+	if err := store.RequestCancel(ctx, job.JobType, job.ResourceID); err != nil {
+		t.Fatalf("RequestCancel: %v", err)
+	}
+	if err := store.ConditionalFinalizeSuccess(ctx, job.ID, "worker-cancel-wins", *claimed[0].ClaimToken); err != nil {
+		t.Fatalf("ConditionalFinalizeSuccess: %v", err)
+	}
+	saved, err := store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if saved.Status != jobs.StatusCancelled || !saved.CancelRequested {
+		t.Fatalf("job after accepted cancellation = status %s, cancel_requested %t; want CANCELLED/true", saved.Status, saved.CancelRequested)
 	}
 }
 
@@ -806,15 +914,29 @@ func TestWorkerRuntime_UserCancellationStillCancelsJob(t *testing.T) {
 
 	worker := jobs.NewWorker(store, cfg)
 	startedCh := make(chan struct{})
-	worker.RegisterHandler(jobs.JobTypeMaterializeSnapshot, jobs.HandlerFunc(func(ctx context.Context, job *jobs.AnalysisJob) error {
+	worker.RegisterHandler(jobs.JobTypeRunDiagnosis, jobs.HandlerFunc(func(ctx context.Context, job *jobs.AnalysisJob) error {
 		close(startedCh)
 		<-ctx.Done()
 		return ctx.Err()
 	}))
 
-	job := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: "snap-user-cancel-1"}
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "diag-user-cancel-1"}
+	for _, ddl := range []string{
+		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, cancel_requested BOOLEAN NOT NULL DEFAULT 0, final_attempt_id TEXT, version INTEGER NOT NULL)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, created_at DATETIME)`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			t.Fatalf("create diagnosis cancellation fixture: %v", err)
+		}
+	}
 	if err := store.CreateJob(ctx, job); err != nil {
 		t.Fatalf("CreateJob failed: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO diagnosis_runs (id, status, cancel_requested, version) VALUES (?, 'RUNNING', FALSE, 1)`, job.ResourceID); err != nil {
+		t.Fatalf("insert diagnosis run: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO diagnosis_attempts (id, diagnosis_run_id, execution_generation, attempt_no, status) VALUES (?, ?, 1, 1, 'RUNNING')`, "attempt-"+job.ResourceID, job.ResourceID); err != nil {
+		t.Fatalf("insert diagnosis attempt: %v", err)
 	}
 	worker.Start(ctx)
 	defer worker.Stop()
@@ -835,9 +957,201 @@ func TestWorkerRuntime_UserCancellationStillCancelsJob(t *testing.T) {
 			t.Fatalf("GetJobByID failed: %v", err)
 		}
 		if cancelledJob.Status == jobs.StatusCancelled {
+			if !cancelledJob.CancelRequested {
+				t.Fatal("cancelled job lost its durable cancel_requested flag")
+			}
+			var runStatus, finalAttemptID, attemptStatus string
+			if err := db.QueryRow(`SELECT status, final_attempt_id FROM diagnosis_runs WHERE id = ?`, job.ResourceID).Scan(&runStatus, &finalAttemptID); err != nil {
+				t.Fatalf("read cancelled diagnosis run: %v", err)
+			}
+			if runStatus != "CANCELLED" || finalAttemptID != "attempt-"+job.ResourceID {
+				t.Fatalf("run state = %s/%s; want CANCELLED/current attempt", runStatus, finalAttemptID)
+			}
+			if err := db.QueryRow(`SELECT status FROM diagnosis_attempts WHERE diagnosis_run_id = ?`, job.ResourceID).Scan(&attemptStatus); err != nil {
+				t.Fatalf("read cancelled diagnosis attempt: %v", err)
+			}
+			if attemptStatus != "ABANDONED" {
+				t.Fatalf("attempt status = %s, want ABANDONED", attemptStatus)
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("user cancellation did not finalize the job as CANCELLED")
+}
+
+func TestWorkerShutdownDoesNotBecomeUserCancellation(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	first := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: "snap-shutdown-running"}
+	second := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: "snap-shutdown-pending"}
+	for _, job := range []*jobs.AnalysisJob{first, second} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ResourceID, err)
+		}
+	}
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.WorkerID = "worker-shutdown-bound"
+	cfg.Concurrency = 1
+	cfg.BatchSize = 1
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LeaseDuration = 10 * time.Second
+	cfg.ShutdownCleanupTimeout = 100 * time.Millisecond
+	worker := jobs.NewWorker(store, cfg)
+	started := make(chan struct{})
+	worker.RegisterHandler(jobs.JobTypeMaterializeSnapshot, jobs.HandlerFunc(func(ctx context.Context, _ *jobs.AnalysisJob) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+	worker.Start(ctx)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancelShutdown()
+	startedAt := time.Now()
+	if err := worker.StopGracefully(shutdownCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("StopGracefully = %v, want grace deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("shutdown took %s, want a bounded exit under 1s", elapsed)
+	}
+
+	running, err := store.GetJobByID(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID(first): %v", err)
+	}
+	if running.Status != jobs.StatusRunning || running.CancelRequested {
+		t.Fatalf("in-flight job after shutdown = status %s, cancel_requested %t; want RUNNING/false for lease recovery", running.Status, running.CancelRequested)
+	}
+	pending, err := store.GetJobByID(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID(second): %v", err)
+	}
+	if pending.Status != jobs.StatusPending {
+		t.Fatalf("job after shutdown = %s, want PENDING because no new claims are allowed", pending.Status)
+	}
+}
+
+func TestCancelPollDBErrorDoesNotFinalizeCancelled(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	baseStore := jobs.NewStoreWithDriver(db, "sqlite3")
+	store := workerStoreFaults{Store: baseStore, cancelPollErr: errors.New("injected database unavailable")}
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "diag-poll-error", MaxAttempts: 3}
+	if err := baseStore.CreateJob(ctx, job); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LeaseDuration = 10 * time.Second
+	worker := jobs.NewWorker(store, cfg)
+	started := make(chan struct{})
+	worker.RegisterHandler(jobs.JobTypeRunDiagnosis, jobs.HandlerFunc(func(ctx context.Context, _ *jobs.AnalysisJob) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+	worker.Start(ctx)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	worker.Stop()
+
+	saved, err := baseStore.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if saved.Status == jobs.StatusCancelled {
+		t.Fatal("cancel poll database error was finalized as user cancellation")
+	}
+	if saved.Status != jobs.StatusRetryWait || saved.LastErrorCode == nil || *saved.LastErrorCode != "CANCEL_POLL_FAILED" {
+		t.Fatalf("job after cancel poll failure = status %s, error_code %v; want RETRY_WAIT/CANCEL_POLL_FAILED", saved.Status, saved.LastErrorCode)
+	}
+}
+
+func TestLeaseRenewFailureDoesNotFinalizeCancelled(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	baseStore := jobs.NewStoreWithDriver(db, "sqlite3")
+	store := workerStoreFaults{Store: baseStore, renewErr: errors.New("injected database unavailable")}
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "diag-renew-error", MaxAttempts: 3}
+	if err := baseStore.CreateJob(ctx, job); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LeaseDuration = 300 * time.Millisecond
+	worker := jobs.NewWorker(store, cfg)
+	started := make(chan struct{})
+	worker.RegisterHandler(jobs.JobTypeRunDiagnosis, jobs.HandlerFunc(func(ctx context.Context, _ *jobs.AnalysisJob) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+	worker.Start(ctx)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	worker.Stop()
+
+	saved, err := baseStore.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if saved.Status == jobs.StatusCancelled {
+		t.Fatal("lease renewal failure was finalized as user cancellation")
+	}
+	if saved.Status != jobs.StatusRetryWait || saved.LastErrorCode == nil || *saved.LastErrorCode != "LEASE_RENEW_FAILED" {
+		t.Fatalf("job after lease renewal failure = status %s, error_code %v; want RETRY_WAIT/LEASE_RENEW_FAILED", saved.Status, saved.LastErrorCode)
+	}
+}
+
+func TestOwnershipLostDoesNotFinalizeCancelled(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	baseStore := jobs.NewStoreWithDriver(db, "sqlite3")
+	store := workerStoreFaults{Store: baseStore, cancelPollErr: jobs.ErrOwnershipLost}
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "diag-ownership-lost", MaxAttempts: 3}
+	if err := baseStore.CreateJob(ctx, job); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LeaseDuration = 10 * time.Second
+	worker := jobs.NewWorker(store, cfg)
+	started := make(chan struct{})
+	worker.RegisterHandler(jobs.JobTypeRunDiagnosis, jobs.HandlerFunc(func(ctx context.Context, _ *jobs.AnalysisJob) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+	worker.Start(ctx)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	worker.Stop()
+
+	saved, err := baseStore.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if saved.Status != jobs.StatusRunning || saved.CancelRequested {
+		t.Fatalf("job after ownership loss = status %s, cancel_requested %t; want RUNNING/false for lease recovery", saved.Status, saved.CancelRequested)
+	}
 }

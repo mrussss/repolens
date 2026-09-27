@@ -157,13 +157,13 @@ func run() error {
 	log.Info("received shutdown signal", "signal", sig.String())
 
 	log.Info("shutting down worker daemon, draining in-flight jobs...")
-	jobsWorker.Stop()
-	// Stop first so the worker stops claiming new jobs and lets in-flight jobs
-	// finish. Cancelling the shared service context before draining would be
-	// observed by job handlers as context.Canceled and incorrectly finalize
-	// ordinary work as user-cancelled.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := jobsWorker.StopGracefully(shutdownCtx); err != nil {
+		log.Warn("worker drain ended with unfinished jobs; lease recovery will resume them", "error", err)
+	}
+	cancelShutdown()
 	cancel()
-	log.Info("analysis jobs worker shut down cleanly")
+	log.Info("analysis jobs worker shut down")
 
 	return nil
 }

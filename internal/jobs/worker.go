@@ -26,42 +26,59 @@ func (f HandlerFunc) Execute(ctx context.Context, job *AnalysisJob) error {
 
 // WorkerConfig holds configuration for the job worker runtime.
 type WorkerConfig struct {
-	WorkerID      string
-	Concurrency   int
-	BatchSize     int
-	PollInterval  time.Duration
-	LeaseDuration time.Duration
-	ReapInterval  time.Duration
-	BaseBackoff   time.Duration
-	MaxBackoff    time.Duration
+	WorkerID               string
+	Concurrency            int
+	BatchSize              int
+	PollInterval           time.Duration
+	LeaseDuration          time.Duration
+	ReapInterval           time.Duration
+	BaseBackoff            time.Duration
+	MaxBackoff             time.Duration
+	ShutdownCleanupTimeout time.Duration
 }
 
 // DefaultWorkerConfig returns production defaults for the worker.
 func DefaultWorkerConfig() WorkerConfig {
 	return WorkerConfig{
-		WorkerID:      "worker-" + uuid.New().String()[:8],
-		Concurrency:   4,
-		BatchSize:     4,
-		PollInterval:  time.Second,
-		LeaseDuration: 30 * time.Second,
-		ReapInterval:  10 * time.Second,
-		BaseBackoff:   2 * time.Second,
-		MaxBackoff:    60 * time.Second,
+		WorkerID:               "worker-" + uuid.New().String()[:8],
+		Concurrency:            4,
+		BatchSize:              4,
+		PollInterval:           time.Second,
+		LeaseDuration:          30 * time.Second,
+		ReapInterval:           10 * time.Second,
+		BaseBackoff:            2 * time.Second,
+		MaxBackoff:             60 * time.Second,
+		ShutdownCleanupTimeout: 5 * time.Second,
 	}
+}
+
+type workerStore interface {
+	ClaimJobs(context.Context, string, int, time.Duration) ([]*AnalysisJob, error)
+	RenewLease(context.Context, int64, string, string, time.Time) error
+	IsCancelRequested(context.Context, int64, string, string) (bool, error)
+	ConditionalFinalizeSuccess(context.Context, int64, string, string) error
+	ConditionalFinalizeFailure(context.Context, int64, string, string, ErrorClass, string, string, *TerminalReason, bool, time.Time) error
+	ConditionalFinalizeCancel(context.Context, int64, string, string) error
+	ReapExpiredJobs(context.Context, int) (int, error)
 }
 
 // Worker executes async jobs claimed from the store.
 type Worker struct {
-	store    *Store
+	store    workerStore
 	cfg      WorkerConfig
 	handlers map[JobType]Handler
 	mu       sync.RWMutex
-	wg       sync.WaitGroup
+	loopWG   sync.WaitGroup
+	jobWG    sync.WaitGroup
 	stopCh   chan struct{}
+	stopOnce sync.Once
+	activeMu sync.Mutex
+	active   map[int64]context.CancelCauseFunc
+	stopping bool
 }
 
 // NewWorker constructs a new Worker.
-func NewWorker(store *Store, cfg WorkerConfig) *Worker {
+func NewWorker(store workerStore, cfg WorkerConfig) *Worker {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 1
 	}
@@ -77,12 +94,16 @@ func NewWorker(store *Store, cfg WorkerConfig) *Worker {
 	if cfg.ReapInterval <= 0 {
 		cfg.ReapInterval = 10 * time.Second
 	}
+	if cfg.ShutdownCleanupTimeout <= 0 {
+		cfg.ShutdownCleanupTimeout = 5 * time.Second
+	}
 
 	return &Worker{
 		store:    store,
 		cfg:      cfg,
 		handlers: make(map[JobType]Handler),
 		stopCh:   make(chan struct{}),
+		active:   make(map[int64]context.CancelCauseFunc),
 	}
 }
 
@@ -98,19 +119,101 @@ func (w *Worker) Start(ctx context.Context) {
 	log := logger.L(ctx)
 	log.Info("starting analysis jobs worker", "worker_id", w.cfg.WorkerID, "concurrency", w.cfg.Concurrency)
 
-	w.wg.Add(2)
+	w.loopWG.Add(2)
 	go w.claimLoop(ctx)
 	go w.reapLoop(ctx)
 }
 
-// Stop gracefully shuts down the worker, waiting for active jobs to finish.
+// Stop waits for in-flight jobs for a bounded period before asking remaining
+// handlers to stop as worker shutdown.
 func (w *Worker) Stop() {
-	close(w.stopCh)
-	w.wg.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = w.StopGracefully(ctx)
+}
+
+// StopGracefully stops new claims, drains active jobs until ctx expires, then
+// cancels remaining handlers with ErrWorkerShutdown and waits for bounded
+// cleanup. Jobs that do not finish remain RUNNING for lease recovery.
+func (w *Worker) StopGracefully(ctx context.Context) error {
+	w.stopOnce.Do(func() { close(w.stopCh) })
+	loopsDone := waitGroupDone(&w.loopWG)
+	if err := waitForContext(ctx, loopsDone); err != nil {
+		w.cancelActive(ErrWorkerShutdown)
+		return w.waitForShutdownCleanup(loopsDone, err)
+	}
+
+	jobsDone := waitGroupDone(&w.jobWG)
+	if err := waitForContext(ctx, jobsDone); err != nil {
+		w.cancelActive(ErrWorkerShutdown)
+		return w.waitForShutdownCleanup(jobsDone, err)
+	}
+	return nil
+}
+
+func waitGroupDone(wg *sync.WaitGroup) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+func waitForContext(ctx context.Context, done <-chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (w *Worker) waitForShutdownCleanup(done <-chan struct{}, cause error) error {
+	timer := time.NewTimer(w.cfg.ShutdownCleanupTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return cause
+	case <-timer.C:
+		return fmt.Errorf("worker shutdown cleanup exceeded %s: %w", w.cfg.ShutdownCleanupTimeout, cause)
+	}
+}
+
+func (w *Worker) registerActive(jobID int64, cancel context.CancelCauseFunc) {
+	w.activeMu.Lock()
+	defer w.activeMu.Unlock()
+	if w.stopping {
+		cancel(ErrWorkerShutdown)
+		return
+	}
+	w.active[jobID] = cancel
+}
+
+func (w *Worker) unregisterActive(jobID int64) {
+	w.activeMu.Lock()
+	delete(w.active, jobID)
+	w.activeMu.Unlock()
+}
+
+func (w *Worker) cancelActive(cause error) {
+	w.activeMu.Lock()
+	w.stopping = true
+	cancels := make([]context.CancelCauseFunc, 0, len(w.active))
+	for _, cancel := range w.active {
+		cancels = append(cancels, cancel)
+	}
+	w.activeMu.Unlock()
+	for _, cancel := range cancels {
+		cancel(cause)
+	}
 }
 
 func (w *Worker) claimLoop(ctx context.Context) {
-	defer w.wg.Done()
+	defer w.loopWG.Done()
 	sem := make(chan struct{}, w.cfg.Concurrency)
 
 	for {
@@ -163,6 +266,14 @@ func (w *Worker) claimLoop(ctx context.Context) {
 			}
 			continue
 		}
+		select {
+		case <-w.stopCh:
+			for i := 0; i < reserved; i++ {
+				<-sem
+			}
+			return
+		default:
+		}
 
 		for i := len(jobs); i < reserved; i++ {
 			<-sem
@@ -179,11 +290,11 @@ func (w *Worker) claimLoop(ctx context.Context) {
 		}
 
 		for _, job := range jobs {
-			w.wg.Add(1)
+			w.jobWG.Add(1)
 			go func(j *AnalysisJob) {
 				defer func() {
 					<-sem
-					w.wg.Done()
+					w.jobWG.Done()
 				}()
 				w.executeJob(ctx, j)
 			}(job)
@@ -216,13 +327,15 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 		return
 	}
 
-	// Create cancellable execution context
-	jobCtx, cancelJob := context.WithCancel(parentCtx)
-	defer cancelJob()
+	jobCtx, cancelJob := context.WithCancelCause(parentCtx)
+	w.registerActive(job.ID, cancelJob)
+	defer w.unregisterActive(job.ID)
+	defer cancelJob(context.Canceled)
 
 	// Start background lease renewer
 	renewer := StartLeaseRenewer(jobCtx, w.store, job.ID, w.cfg.WorkerID, *job.ClaimToken, w.cfg.LeaseDuration, cancelJob)
 	defer renewer.Stop()
+	cancelPollStop := make(chan struct{})
 	cancelPollDone := make(chan struct{})
 	go func() {
 		defer close(cancelPollDone)
@@ -232,10 +345,20 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 			select {
 			case <-jobCtx.Done():
 				return
+			case <-cancelPollStop:
+				return
 			case <-ticker.C:
 				requested, err := w.store.IsCancelRequested(jobCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
-				if err != nil || requested {
-					cancelJob()
+				if err != nil {
+					if errors.Is(err, ErrOwnershipLost) {
+						cancelJob(ErrOwnershipLost)
+					} else {
+						cancelJob(fmt.Errorf("%w: %w", ErrCancelPollFailed, err))
+					}
+					return
+				}
+				if requested {
+					cancelJob(ErrUserCancellation)
 					return
 				}
 			}
@@ -245,18 +368,30 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	// Check if cancellation was requested before execution
 	if job.CancelRequested {
 		log.Info("job was cancel_requested prior to execution")
+		cancelJob(ErrUserCancellation)
+		close(cancelPollStop)
+		<-cancelPollDone
+		renewer.Stop()
 		finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancelFinalize()
 		_ = w.store.ConditionalFinalizeCancel(finalizeCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
-		cancelJob()
-		<-cancelPollDone
 		return
 	}
 
 	start := time.Now()
 	err := handler.Execute(jobCtx, job)
-	cancelJob()
+	close(cancelPollStop)
 	<-cancelPollDone
+	renewer.Stop()
+	cause := context.Cause(jobCtx)
+	if errors.Is(cause, ErrWorkerShutdown) {
+		log.Info("job execution stopped for worker shutdown; lease recovery will resume it")
+		return
+	}
+	if cause != nil {
+		err = cause
+	}
+	cancelJob(context.Canceled)
 	latency := time.Since(start)
 
 	finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
@@ -279,7 +414,7 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 
 	// Handle failure or cancellation
 	errClass, errCode := ClassifyError(err)
-	if errors.Is(err, context.Canceled) || errClass == ErrorClassCancelled {
+	if errClass == ErrorClassCancelled {
 		log.Info("job execution was cancelled", "error", err)
 		_ = w.store.ConditionalFinalizeCancel(finalizeCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
 		return
@@ -317,7 +452,7 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 }
 
 func (w *Worker) reapLoop(ctx context.Context) {
-	defer w.wg.Done()
+	defer w.loopWG.Done()
 	ticker := time.NewTicker(w.cfg.ReapInterval)
 	defer ticker.Stop()
 

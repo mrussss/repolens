@@ -263,6 +263,17 @@ func (s *Store) RenewLease(ctx context.Context, jobID int64, workerID, claimToke
 
 // ConditionalFinalizeSuccessTx marks a job SUCCEEDED in the provided transaction with strict claim verification.
 func (s *Store) ConditionalFinalizeSuccessTx(ctx context.Context, tx *sql.Tx, jobID int64, workerID, claimToken string) error {
+	owned, err := s.loadOwnedRunningJobTx(ctx, tx, jobID, workerID, claimToken)
+	if err != nil {
+		return err
+	}
+	if owned.cancelRequested {
+		if owned.jobType != JobTypeRunDiagnosis {
+			return ErrCancellationUnsupported
+		}
+		return s.ConditionalFinalizeCancelTx(ctx, tx, jobID, workerID, claimToken)
+	}
+
 	query := `
 		UPDATE analysis_jobs
 		SET status = 'SUCCEEDED',
@@ -272,6 +283,7 @@ func (s *Store) ConditionalFinalizeSuccessTx(ctx context.Context, tx *sql.Tx, jo
 		  AND status = 'RUNNING'
 		  AND worker_id = ?
 		  AND claim_token = ?
+		  AND cancel_requested = FALSE
 	`
 	now := time.Now().UTC()
 	res, err := tx.ExecContext(ctx, query, now, now, jobID, workerID, claimToken)
@@ -284,6 +296,13 @@ func (s *Store) ConditionalFinalizeSuccessTx(ctx context.Context, tx *sql.Tx, jo
 		return err
 	}
 	if rowsAffected == 0 {
+		current, currentErr := s.loadOwnedRunningJobTx(ctx, tx, jobID, workerID, claimToken)
+		if currentErr == nil && current.cancelRequested {
+			if current.jobType != JobTypeRunDiagnosis {
+				return ErrCancellationUnsupported
+			}
+			return s.ConditionalFinalizeCancelTx(ctx, tx, jobID, workerID, claimToken)
+		}
 		var status JobStatus
 		if err := tx.QueryRowContext(ctx, `SELECT status FROM analysis_jobs WHERE id = ?`, jobID).Scan(&status); err == nil && (status == StatusSucceeded || status == StatusFailed || status == StatusCancelled) {
 			return ErrAlreadyFinalized
@@ -518,6 +537,12 @@ func (s *Store) ConditionalFinalizeCancelTx(ctx context.Context, tx *sql.Tx, job
 	if err != nil {
 		return err
 	}
+	if owned.jobType != JobTypeRunDiagnosis {
+		return ErrCancellationUnsupported
+	}
+	if !owned.cancelRequested {
+		return ErrCancellationNotRequested
+	}
 	query := `
 		UPDATE analysis_jobs
 		SET status = 'CANCELLED',
@@ -528,6 +553,7 @@ func (s *Store) ConditionalFinalizeCancelTx(ctx context.Context, tx *sql.Tx, job
 		  AND status = 'RUNNING'
 		  AND worker_id = ?
 		  AND claim_token = ?
+		  AND cancel_requested = TRUE
 	`
 	now := time.Now().UTC()
 	res, err := tx.ExecContext(ctx, query, now, now, jobID, workerID, claimToken)
@@ -543,17 +569,29 @@ func (s *Store) ConditionalFinalizeCancelTx(ctx context.Context, tx *sql.Tx, job
 		return ErrOwnershipLost
 	}
 	if owned.jobType == JobTypeRunDiagnosis {
-		if err := s.cancelDiagnosisRunTx(ctx, tx, owned.resourceID); err != nil {
+		if err := s.cancelDiagnosisRunTx(ctx, tx, owned.resourceID, owned.executionGeneration); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) cancelDiagnosisRunTx(ctx context.Context, tx *sql.Tx, runID string) error {
+func (s *Store) cancelDiagnosisRunTx(ctx context.Context, tx *sql.Tx, runID string, generation int) error {
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts
+		SET status = 'ABANDONED', finished_at = ?
+		WHERE diagnosis_run_id = ? AND execution_generation = ? AND status = 'RUNNING'`, now, runID, generation); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("failed abandoning cancelled diagnosis attempts for %s: %w", runID, err)
+		}
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE diagnosis_runs
-		SET status = 'CANCELLED', cancel_requested = TRUE, version = version + 1
-		WHERE id = ? AND status IN ('QUEUED', 'RUNNING')`, runID)
+		SET status = 'CANCELLED', cancel_requested = TRUE,
+		    final_attempt_id = COALESCE((SELECT id FROM diagnosis_attempts
+	        WHERE diagnosis_run_id = ? AND execution_generation = ?
+	        ORDER BY attempt_no DESC, created_at DESC LIMIT 1), final_attempt_id),
+		    version = version + 1
+		WHERE id = ? AND status IN ('QUEUED', 'RUNNING')`, runID, generation, runID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
 			return nil
@@ -595,6 +633,9 @@ func (s *Store) ConditionalFinalizeCancel(ctx context.Context, jobID int64, work
 
 // RequestCancel sets cancel_requested = TRUE for active job states.
 func (s *Store) RequestCancel(ctx context.Context, jobType JobType, resourceID string) error {
+	if jobType != JobTypeRunDiagnosis {
+		return ErrCancellationUnsupported
+	}
 	query := `
 		UPDATE analysis_jobs
 		SET cancel_requested = TRUE,
@@ -603,8 +644,16 @@ func (s *Store) RequestCancel(ctx context.Context, jobType JobType, resourceID s
 		  AND resource_id = ?
 		  AND status IN ('PENDING', 'RUNNING', 'RETRY_WAIT')
 	`
-	_, err := s.db.ExecContext(ctx, query, time.Now().UTC(), jobType, resourceID)
-	return err
+	res, err := s.db.ExecContext(ctx, query, time.Now().UTC(), jobType, resourceID)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err != nil {
+		return err
+	} else if rows == 0 {
+		return ErrCancellationNotRequested
+	}
+	return nil
 }
 
 // IsCancelRequested reads the authoritative cancellation flag for a claimed

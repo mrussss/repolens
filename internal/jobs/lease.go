@@ -2,6 +2,9 @@ package jobs
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"time"
 
 	"repolens/internal/platform/logger"
@@ -9,18 +12,23 @@ import (
 
 // LeaseRenewer runs a background ticker to renew a job's lease.
 type LeaseRenewer struct {
-	store         *Store
+	store interface {
+		RenewLease(context.Context, int64, string, string, time.Time) error
+	}
 	jobID         int64
 	workerID      string
 	claimToken    string
 	leaseDuration time.Duration
-	cancelFunc    context.CancelFunc
+	cancelFunc    context.CancelCauseFunc
 	stopCh        chan struct{}
 	doneCh        chan struct{}
+	stopOnce      sync.Once
 }
 
 // StartLeaseRenewer creates and starts a new lease renewer.
-func StartLeaseRenewer(ctx context.Context, store *Store, jobID int64, workerID, claimToken string, leaseDuration time.Duration, cancelFunc context.CancelFunc) *LeaseRenewer {
+func StartLeaseRenewer(ctx context.Context, store interface {
+	RenewLease(context.Context, int64, string, string, time.Time) error
+}, jobID int64, workerID, claimToken string, leaseDuration time.Duration, cancelFunc context.CancelCauseFunc) *LeaseRenewer {
 	lr := &LeaseRenewer{
 		store:         store,
 		jobID:         jobID,
@@ -58,7 +66,11 @@ func (lr *LeaseRenewer) run(ctx context.Context) {
 				log := logger.L(ctx)
 				log.Warn("lease renewal failed", "job_id", lr.jobID, "worker_id", lr.workerID, "error", err)
 				if lr.cancelFunc != nil {
-					lr.cancelFunc()
+					if errors.Is(err, ErrOwnershipLost) {
+						lr.cancelFunc(ErrOwnershipLost)
+					} else {
+						lr.cancelFunc(fmt.Errorf("%w: %w", ErrLeaseRenewFailed, err))
+					}
 				}
 				return
 			}
@@ -68,6 +80,6 @@ func (lr *LeaseRenewer) run(ctx context.Context) {
 
 // Stop stops the lease renewer and waits for it to exit.
 func (lr *LeaseRenewer) Stop() {
-	close(lr.stopCh)
+	lr.stopOnce.Do(func() { close(lr.stopCh) })
 	<-lr.doneCh
 }

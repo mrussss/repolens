@@ -6,13 +6,18 @@ import (
 )
 
 // ErrOwnershipLost is returned when a worker attempts to renew a lease or finalize a job after its claim has expired or been stolen.
-var ErrOwnershipLost = errors.New("job ownership lost: claim token or lease is no longer valid")
+var ErrOwnershipLost = error(StopOwnershipLost)
 
 // ErrAlreadyFinalized tells the generic worker that a handler atomically
 // finalized both its business object and AnalysisJob already.
 var ErrAlreadyFinalized = errors.New("job already finalized")
 
-var ErrCancellationRequested = errors.New("job cancellation was requested")
+var ErrCancellationRequested = ErrUserCancellation
+
+var (
+	ErrCancellationNotRequested = errors.New("durable job cancellation was not requested")
+	ErrCancellationUnsupported  = errors.New("cancellation is supported only for diagnosis jobs")
+)
 
 // JobType represents the type of async job.
 type JobType string
