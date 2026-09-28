@@ -308,7 +308,7 @@ func (s *GormStore) Retry(ctx context.Context, id string) (*AnalysisRevision, er
 
 func resetJobTx(tx *gorm.DB, jobType jobs.JobType, resourceID string, generation int, now time.Time) error {
 	updates := map[string]interface{}{
-		"status": jobs.StatusPending, "execution_generation": generation, "attempt_count": 0,
+		"status": jobs.StatusPending, "execution_generation": generation, "attempt_count": 0, "execution_started": false,
 		"next_run_at": now, "worker_id": nil, "claim_token": nil, "lease_until": nil,
 		"cancel_requested": false, "terminal_reason": nil, "last_error_class": nil,
 		"last_error_code": nil, "last_error_message": nil, "finished_at": nil,

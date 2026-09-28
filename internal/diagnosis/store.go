@@ -114,7 +114,7 @@ func (s *GormStore) StartAttempt(ctx context.Context, runID string, attempt *Dia
 func lockDiagnosisExecutionTx(ctx context.Context, tx *gorm.DB, jobID int64, workerID, claimToken string, expectedGeneration int, runID, attemptID string, cancellation bool) (*jobs.AnalysisJob, *DiagnosisRun, *DiagnosisAttempt, error) {
 	var job jobs.AnalysisJob
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("id = ? AND job_type = ? AND resource_id = ? AND status = ? AND worker_id = ? AND claim_token = ?", jobID, jobs.JobTypeRunDiagnosis, runID, jobs.StatusRunning, workerID, claimToken).
+		Where("id = ? AND job_type = ? AND resource_id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ?", jobID, jobs.JobTypeRunDiagnosis, runID, jobs.StatusRunning, workerID, claimToken, true).
 		First(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			var current jobs.AnalysisJob
@@ -224,7 +224,7 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 		if runRes.RowsAffected != 1 {
 			return fmt.Errorf("diagnosis %s finalize conflict", runID)
 		}
-		jobRes := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, false).
+		jobRes := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, true, false).
 			Updates(map[string]interface{}{"status": jobs.StatusSucceeded, "finished_at": now, "updated_at": now})
 		if jobRes.Error != nil {
 			return jobRes.Error
@@ -302,7 +302,7 @@ func (s *GormStore) FinalizeInvalidStructuredReport(ctx context.Context, jobID i
 		}
 
 		jobResult := tx.Model(&jobs.AnalysisJob{}).
-			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, false).
+			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, true, false).
 			Updates(map[string]interface{}{
 				"status": jobs.StatusFailed, "terminal_reason": jobs.TerminalReasonPermanent,
 				"last_error_class": jobs.ErrorClassPermanent, "last_error_code": errorCode, "last_error_message": errorMessage,
@@ -360,7 +360,7 @@ func (s *GormStore) FinalizeDiagnosisFailure(ctx context.Context, jobID int64, w
 			terminalReason = jobs.TerminalReasonRetryableExhausted
 		}
 		jobResult := tx.Model(&jobs.AnalysisJob{}).
-			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, executionGeneration, false).
+			Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, executionGeneration, true, false).
 			Updates(map[string]interface{}{
 				"status": jobs.StatusFailed, "terminal_reason": terminalReason,
 				"last_error_class": errorClass, "last_error_code": errorCode, "last_error_message": errorMessage,
@@ -428,7 +428,7 @@ func (s *GormStore) FinalizeCancellation(ctx context.Context, jobID int64, worke
 		if runResult.RowsAffected != 1 {
 			return fmt.Errorf("diagnosis %s cancellation conflict", runID)
 		}
-		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, true).Updates(map[string]interface{}{
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, job.ExecutionGeneration, true, true).Updates(map[string]interface{}{
 			"status": jobs.StatusCancelled, "terminal_reason": jobs.TerminalReasonCancelled, "finished_at": now, "updated_at": now,
 		})
 		if jobResult.Error != nil {
@@ -998,7 +998,7 @@ func (s *GormStore) RecoverStaleAttempt(ctx context.Context, attemptID, runID st
 		if jobErr != nil && !errors.Is(jobErr, gorm.ErrRecordNotFound) {
 			return jobErr
 		}
-		jobOwnsAttempt := jobErr == nil && job.Status == jobs.StatusRunning &&
+		jobOwnsAttempt := jobErr == nil && job.Status == jobs.StatusRunning && job.ExecutionStarted &&
 			job.ExecutionGeneration == attempt.ExecutionGeneration && job.AttemptCount == attempt.AttemptNo &&
 			job.WorkerID != nil && *job.WorkerID == attempt.WorkerID &&
 			job.LeaseUntil != nil && job.LeaseUntil.After(now)

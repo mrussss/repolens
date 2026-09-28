@@ -69,6 +69,7 @@ type AnalysisJob struct {
 	ExecutionGeneration int             `json:"execution_generation" gorm:"not null;default:1"`
 	TerminalReason      *TerminalReason `json:"terminal_reason,omitempty" gorm:"size:32"`
 	AttemptCount        int             `json:"attempt_count" gorm:"not null;default:0"`
+	ExecutionStarted    bool            `json:"-" gorm:"not null;default:false"`
 	MaxAttempts         int             `json:"max_attempts" gorm:"not null;default:3"`
 	NextRunAt           time.Time       `json:"next_run_at" gorm:"not null;index:ix_job_claim,priority:2"`
 	WorkerID            *string         `json:"worker_id,omitempty" gorm:"size:64"`

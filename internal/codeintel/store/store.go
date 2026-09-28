@@ -659,7 +659,7 @@ func (s *GormStore) FinalizeRetrievalSuccessWithRevision(ctx context.Context, jo
 
 func requireOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) error {
 	var job jobs.AnalysisJob
-	if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+	if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).First(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return jobs.ErrOwnershipLost
 		}
@@ -670,7 +670,7 @@ func requireOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) erro
 
 func finalizeOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) error {
 	now := time.Now().UTC()
-	result := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+	result := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).Updates(map[string]interface{}{
 		"status": jobs.StatusSucceeded, "finished_at": &now, "updated_at": &now,
 	})
 	if result.Error != nil {

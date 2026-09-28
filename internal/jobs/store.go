@@ -32,6 +32,7 @@ type expiredJob struct {
 	attemptCount        int
 	maxAttempts         int
 	cancelRequested     bool
+	executionStarted    bool
 }
 
 // NewStore creates a new Store instance defaulting to MySQL.
@@ -112,7 +113,7 @@ func (s *Store) GetJobByID(ctx context.Context, id int64) (*AnalysisJob, error) 
 		       terminal_reason, attempt_count, max_attempts, next_run_at,
 		       worker_id, claim_token, lease_until, cancel_requested,
 		       last_error_class, last_error_code, last_error_message,
-		       created_at, updated_at, finished_at
+		       created_at, updated_at, finished_at, execution_started
 		FROM analysis_jobs
 		WHERE id = ?
 	`
@@ -127,7 +128,7 @@ func (s *Store) GetJobByResource(ctx context.Context, jobType JobType, resourceI
 		       terminal_reason, attempt_count, max_attempts, next_run_at,
 		       worker_id, claim_token, lease_until, cancel_requested,
 		       last_error_class, last_error_code, last_error_message,
-		       created_at, updated_at, finished_at
+		       created_at, updated_at, finished_at, execution_started
 		FROM analysis_jobs
 		WHERE job_type = ? AND resource_id = ?
 	`
@@ -195,7 +196,7 @@ func (s *Store) ClaimJobs(ctx context.Context, workerID string, batchSize int, l
 		    worker_id = ?,
 		    claim_token = ?,
 		    lease_until = ?,
-		    attempt_count = attempt_count + 1,
+		    execution_started = FALSE,
 		    updated_at = ?
 		WHERE id = ?
 	`
@@ -215,7 +216,8 @@ func (s *Store) ClaimJobs(ctx context.Context, workerID string, batchSize int, l
 			ResourceID:          cand.resourceID,
 			Status:              StatusRunning,
 			ExecutionGeneration: cand.executionGeneration,
-			AttemptCount:        cand.attemptCount + 1,
+			AttemptCount:        cand.attemptCount,
+			ExecutionStarted:    false,
 			MaxAttempts:         cand.maxAttempts,
 			NextRunAt:           now,
 			WorkerID:            &workerID,
@@ -233,14 +235,89 @@ func (s *Store) ClaimJobs(ctx context.Context, workerID string, batchSize int, l
 	return claimedJobs, nil
 }
 
+// MarkExecutionStarted durably charges an attempt immediately before the
+// Worker invokes the business handler. It is idempotent for the same live
+// claim so a caller can safely resolve an ambiguous database response.
+func (s *Store) MarkExecutionStarted(ctx context.Context, jobID int64, workerID, claimToken string, executionGeneration int) (int, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return 0, fmt.Errorf("failed starting execution-start transaction for job %d: %w", jobID, err)
+	}
+	defer tx.Rollback()
+
+	leasePredicate := s.liveLeasePredicate()
+	updateArgs := []interface{}{time.Now().UTC(), jobID, workerID, claimToken, executionGeneration}
+	query := `UPDATE analysis_jobs
+		SET execution_started = TRUE,
+		    attempt_count = attempt_count + 1,
+		    updated_at = ?
+		WHERE id = ?
+		  AND status = 'RUNNING'
+		  AND worker_id = ?
+		  AND claim_token = ?
+		  AND execution_generation = ?
+		  AND execution_started = FALSE
+		  AND ` + leasePredicate
+	result, err := tx.ExecContext(ctx, query, updateArgs...)
+	if err != nil {
+		return 0, fmt.Errorf("failed marking execution started for job %d: %w", jobID, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed checking execution-start transition for job %d: %w", jobID, err)
+	}
+	if rowsAffected > 1 {
+		return 0, fmt.Errorf("execution-start transition for job %d affected %d rows", jobID, rowsAffected)
+	}
+
+	// RowsAffected=0 can mean either that this call's earlier response was
+	// ambiguous and the same claim is already started, or that ownership was
+	// lost. Read under the transaction and accept only the former.
+	selectQuery := `SELECT attempt_count
+		FROM analysis_jobs
+		WHERE id = ? AND status = 'RUNNING' AND worker_id = ? AND claim_token = ?
+		  AND execution_generation = ? AND execution_started = TRUE AND ` + leasePredicate
+	selectArgs := []interface{}{jobID, workerID, claimToken, executionGeneration}
+	if s.driver != "sqlite" && s.driver != "sqlite3" {
+		selectQuery += " FOR UPDATE"
+	}
+	var attemptCount int
+	if err := tx.QueryRowContext(ctx, selectQuery, selectArgs...).Scan(&attemptCount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrOwnershipLost
+		}
+		return 0, fmt.Errorf("failed resolving execution-start state for job %d: %w", jobID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed committing execution-start transition for job %d: %w", jobID, err)
+	}
+	return attemptCount, nil
+}
+
+func (s *Store) liveLeasePredicate() string {
+	if s.driver == "sqlite" || s.driver == "sqlite3" {
+		return "julianday(lease_until) > julianday('now')"
+	}
+	// go-sql-driver/mysql serializes time.Time values in the DSN's `loc`.
+	// RepoLens configures `loc=Local`, so DATETIME lease values use the local
+	// wall clock even though the application constructs them in UTC. Convert
+	// MySQL's UTC clock to that same wall clock before comparing; a row update
+	// that waited behind a lock must be judged at execution time, not with the
+	// stale client timestamp from when it was issued.
+	_, offsetSeconds := time.Now().In(time.Local).Zone()
+	if offsetSeconds >= 0 {
+		return fmt.Sprintf("lease_until > DATE_ADD(UTC_TIMESTAMP(3), INTERVAL %d SECOND)", offsetSeconds)
+	}
+	return fmt.Sprintf("lease_until > DATE_SUB(UTC_TIMESTAMP(3), INTERVAL %d SECOND)", -offsetSeconds)
+}
+
 // ReturnUndispatchedClaim returns a claim to PENDING without charging an
-// execution attempt. The active claim identity fences the update from stale
-// workers and a zero attempt count is never allowed.
+// execution attempt. The active claim identity and execution_started marker
+// fence the update from stale workers and from a claim already dispatched.
 func (s *Store) ReturnUndispatchedClaim(ctx context.Context, jobID int64, workerID, claimToken string, executionGeneration int) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE analysis_jobs
 		SET status = 'PENDING',
-		    attempt_count = attempt_count - 1,
 		    worker_id = NULL,
 		    claim_token = NULL,
 		    lease_until = NULL,
@@ -251,7 +328,7 @@ func (s *Store) ReturnUndispatchedClaim(ctx context.Context, jobID int64, worker
 		  AND worker_id = ?
 		  AND claim_token = ?
 		  AND execution_generation = ?
-		  AND attempt_count > 0
+		  AND execution_started = FALSE
 	`, time.Now().UTC(), jobID, workerID, claimToken, executionGeneration)
 	if err != nil {
 		return fmt.Errorf("failed returning undispatched claim for job %d: %w", jobID, err)
@@ -276,10 +353,9 @@ func (s *Store) RenewLease(ctx context.Context, jobID int64, workerID, claimToke
 		  AND status = 'RUNNING'
 		  AND worker_id = ?
 		  AND claim_token = ?
-		  AND lease_until > ?
-	`
+		  AND ` + s.liveLeasePredicate()
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, query, newLeaseUntil, now, jobID, workerID, claimToken, now)
+	res, err := s.db.ExecContext(ctx, query, newLeaseUntil, now, jobID, workerID, claimToken)
 	if err != nil {
 		return fmt.Errorf("failed renewing lease for job %d: %w", jobID, err)
 	}
@@ -316,6 +392,7 @@ func (s *Store) ConditionalFinalizeSuccessTx(ctx context.Context, tx *sql.Tx, jo
 		  AND status = 'RUNNING'
 		  AND worker_id = ?
 		  AND claim_token = ?
+		  AND execution_started = TRUE
 		  AND cancel_requested = FALSE
 	`
 	now := time.Now().UTC()
@@ -390,6 +467,7 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 			  AND status = 'RUNNING'
 			  AND worker_id = ?
 			  AND claim_token = ?
+			  AND execution_started = TRUE
 		`
 		args = []interface{}{terminalReason, string(errClass), errCode, errMsg, now, now, jobID, workerID, claimToken}
 	} else {
@@ -405,6 +483,7 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 			  AND status = 'RUNNING'
 			  AND worker_id = ?
 			  AND claim_token = ?
+			  AND execution_started = TRUE
 		`
 		args = []interface{}{nextRunAt, string(errClass), errCode, errMsg, now, jobID, workerID, claimToken}
 	}
@@ -440,7 +519,7 @@ func (s *Store) ConditionalFinalizeFailureTx(ctx context.Context, tx *sql.Tx, jo
 func (s *Store) loadOwnedRunningJobTx(ctx context.Context, tx *sql.Tx, jobID int64, workerID, claimToken string) (ownedRunningJob, error) {
 	query := `SELECT job_type, resource_id, execution_generation, cancel_requested
 		FROM analysis_jobs
-		WHERE id = ? AND status = 'RUNNING' AND worker_id = ? AND claim_token = ?`
+		WHERE id = ? AND status = 'RUNNING' AND worker_id = ? AND claim_token = ? AND execution_started = TRUE`
 	if s.driver != "sqlite" && s.driver != "sqlite3" {
 		query += " FOR UPDATE"
 	}
@@ -586,6 +665,7 @@ func (s *Store) ConditionalFinalizeCancelTx(ctx context.Context, tx *sql.Tx, job
 		  AND status = 'RUNNING'
 		  AND worker_id = ?
 		  AND claim_token = ?
+		  AND execution_started = TRUE
 		  AND cancel_requested = TRUE
 	`
 	now := time.Now().UTC()
@@ -712,7 +792,7 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 
 	selectQuery := `
 		SELECT id, job_type, resource_id, execution_generation,
-		       attempt_count, max_attempts, cancel_requested
+		       attempt_count, max_attempts, cancel_requested, execution_started
 		FROM analysis_jobs
 		WHERE status = 'RUNNING'
 		  AND lease_until < ?
@@ -732,7 +812,7 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 	for rows.Next() {
 		var ej expiredJob
 		if err := rows.Scan(&ej.id, &ej.jobType, &ej.resourceID, &ej.executionGeneration,
-			&ej.attemptCount, &ej.maxAttempts, &ej.cancelRequested); err != nil {
+			&ej.attemptCount, &ej.maxAttempts, &ej.cancelRequested, &ej.executionStarted); err != nil {
 			return 0, err
 		}
 		expired = append(expired, ej)
@@ -744,6 +824,28 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 		if ej.jobType == JobTypeRunDiagnosis && ej.cancelRequested {
 			if err := s.cancelExpiredDiagnosisTx(ctx, tx, ej, now); err != nil {
 				return 0, err
+			}
+			reapedCount++
+			continue
+		}
+		if !ej.executionStarted {
+			// Ownership expired before the Worker crossed its durable start
+			// boundary. Put the claim back without spending an execution attempt
+			// or mutating its business resource.
+			result, err := tx.ExecContext(ctx, `
+				UPDATE analysis_jobs
+				SET status = 'PENDING', next_run_at = ?, worker_id = NULL,
+				    claim_token = NULL, lease_until = NULL, execution_started = FALSE,
+				    finished_at = NULL, updated_at = ?
+				WHERE id = ? AND status = 'RUNNING' AND execution_started = FALSE
+			`, now, now, ej.id)
+			if err != nil {
+				return 0, fmt.Errorf("failed requeueing never-started job %d: %w", ej.id, err)
+			}
+			if affected, err := result.RowsAffected(); err != nil {
+				return 0, err
+			} else if affected != 1 {
+				return 0, fmt.Errorf("never-started job %d changed before requeue", ej.id)
 			}
 			reapedCount++
 			continue
@@ -910,6 +1012,7 @@ func (s *Store) ManualRequeueTx(ctx context.Context, tx *sql.Tx, jobType JobType
 		SET status = 'PENDING',
 		    execution_generation = execution_generation + 1,
 		    attempt_count = 0,
+		    execution_started = FALSE,
 		    next_run_at = ?,
 		    worker_id = NULL,
 		    claim_token = NULL,
@@ -981,7 +1084,7 @@ func (s *Store) RetryDiagnosis(ctx context.Context, resourceID string) error {
 	} else if affected != 1 {
 		return fmt.Errorf("diagnosis %s is not in FAILED state", resourceID)
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE analysis_jobs SET status = 'PENDING', execution_generation = execution_generation + 1, attempt_count = 0, next_run_at = ?, worker_id = NULL, claim_token = NULL, lease_until = NULL, cancel_requested = FALSE, last_error_class = NULL, last_error_code = NULL, last_error_message = NULL, terminal_reason = NULL, finished_at = NULL, updated_at = ? WHERE job_type = ? AND resource_id = ? AND status = 'FAILED'`, now, now, JobTypeRunDiagnosis, resourceID)
+	result, err := tx.ExecContext(ctx, `UPDATE analysis_jobs SET status = 'PENDING', execution_generation = execution_generation + 1, attempt_count = 0, execution_started = FALSE, next_run_at = ?, worker_id = NULL, claim_token = NULL, lease_until = NULL, cancel_requested = FALSE, last_error_class = NULL, last_error_code = NULL, last_error_message = NULL, terminal_reason = NULL, finished_at = NULL, updated_at = ? WHERE job_type = ? AND resource_id = ? AND status = 'FAILED'`, now, now, JobTypeRunDiagnosis, resourceID)
 	if err != nil {
 		return err
 	}
@@ -1048,7 +1151,7 @@ func scanJob(row *sql.Row) (*AnalysisJob, error) {
 		&termReason, &job.AttemptCount, &job.MaxAttempts, &job.NextRunAt,
 		&workerID, &claimToken, &leaseUntil, &job.CancelRequested,
 		&lastErrClass, &lastErrCode, &lastErrMsg,
-		&job.CreatedAt, &job.UpdatedAt, &finishedAt,
+		&job.CreatedAt, &job.UpdatedAt, &finishedAt, &job.ExecutionStarted,
 	)
 	if err != nil {
 		return nil, err

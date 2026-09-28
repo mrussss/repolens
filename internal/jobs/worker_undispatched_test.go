@@ -29,6 +29,7 @@ func newUndispatchedWorkerTestStore(t *testing.T) *Store {
 			execution_generation INTEGER NOT NULL DEFAULT 1,
 			terminal_reason TEXT,
 			attempt_count INTEGER NOT NULL DEFAULT 0,
+			execution_started BOOLEAN NOT NULL DEFAULT 0,
 			max_attempts INTEGER NOT NULL DEFAULT 3,
 			next_run_at DATETIME NOT NULL,
 			worker_id TEXT,
@@ -87,8 +88,8 @@ func TestWorkerReturnsClaimedUndispatchedAttemptOnGracefulShutdown(t *testing.T)
 	}
 
 	claimedJob, err := store.GetJobByID(ctx, job.ID)
-	if err != nil || claimedJob.Status != StatusRunning || claimedJob.AttemptCount != 3 || claimedJob.ClaimToken == nil {
-		t.Fatalf("committed claim = %+v, err=%v; want RUNNING attempt 3 with token", claimedJob, err)
+	if err != nil || claimedJob.Status != StatusRunning || claimedJob.AttemptCount != 2 || claimedJob.ExecutionStarted || claimedJob.ClaimToken == nil {
+		t.Fatalf("committed claim = %+v, err=%v; want RUNNING unstarted attempt 2 with token", claimedJob, err)
 	}
 
 	stopCtx, cancelStop := context.WithTimeout(ctx, 5*time.Second)
@@ -168,6 +169,9 @@ func TestReturnUndispatchedClaimRejectsOldOwner(t *testing.T) {
 	if err != nil || len(newClaim) != 1 {
 		t.Fatalf("new claim = %d, err=%v", len(newClaim), err)
 	}
+	if _, err := store.MarkExecutionStarted(ctx, job.ID, "old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration); !errors.Is(err, ErrOwnershipLost) {
+		t.Fatalf("stale execution start error=%v, want ErrOwnershipLost", err)
+	}
 	if err := store.ReturnUndispatchedClaim(ctx, job.ID, "old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration); !errors.Is(err, ErrOwnershipLost) {
 		t.Fatalf("stale return error=%v, want ErrOwnershipLost", err)
 	}
@@ -175,8 +179,11 @@ func TestReturnUndispatchedClaimRejectsOldOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.Status != StatusRunning || current.AttemptCount != 1 || current.WorkerID == nil || *current.WorkerID != "new-worker" || current.ClaimToken == nil || *current.ClaimToken != *newClaim[0].ClaimToken {
+	if current.Status != StatusRunning || current.AttemptCount != 0 || current.ExecutionStarted || current.WorkerID == nil || *current.WorkerID != "new-worker" || current.ClaimToken == nil || *current.ClaimToken != *newClaim[0].ClaimToken {
 		t.Fatalf("stale owner changed the current claim: %+v", current)
+	}
+	if attempt, err := store.MarkExecutionStarted(ctx, job.ID, "new-worker", *newClaim[0].ClaimToken, newClaim[0].ExecutionGeneration); err != nil || attempt != 1 {
+		t.Fatalf("new owner execution start=%d err=%v; want attempt 1", attempt, err)
 	}
 }
 
@@ -260,8 +267,8 @@ func TestWorkerReturnsBatchWithoutHeadOfLineBlockingAndProtectsPendingLease(t *t
 		t.Fatal(err)
 	}
 	secondBefore, err := store.GetJobByID(ctx, second.ID)
-	if err != nil || firstBefore.Status != StatusRunning || secondBefore.Status != StatusRunning || firstBefore.AttemptCount != 3 || secondBefore.AttemptCount != 3 {
-		t.Fatalf("batch claims first=%+v second=%+v err=%v; want both RUNNING attempt 3", firstBefore, secondBefore, err)
+	if err != nil || firstBefore.Status != StatusRunning || secondBefore.Status != StatusRunning || firstBefore.AttemptCount != 2 || secondBefore.AttemptCount != 2 || firstBefore.ExecutionStarted || secondBefore.ExecutionStarted {
+		t.Fatalf("batch claims first=%+v second=%+v err=%v; want both RUNNING unstarted attempt 2", firstBefore, secondBefore, err)
 	}
 
 	stopCtx, cancelStop := context.WithTimeout(ctx, 5*time.Second)
@@ -288,7 +295,7 @@ func TestWorkerReturnsBatchWithoutHeadOfLineBlockingAndProtectsPendingLease(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if firstBlocked.Status != StatusRunning || firstBlocked.AttemptCount != 3 || firstBlocked.LeaseUntil == nil || firstBefore.LeaseUntil == nil || !firstBlocked.LeaseUntil.After(*firstBefore.LeaseUntil) {
+	if firstBlocked.Status != StatusRunning || firstBlocked.AttemptCount != 2 || firstBlocked.LeaseUntil == nil || firstBefore.LeaseUntil == nil || !firstBlocked.LeaseUntil.After(*firstBefore.LeaseUntil) {
 		t.Fatalf("blocked first claim was not lease-protected: before=%+v after=%+v", firstBefore, firstBlocked)
 	}
 	if secondReturned.Status != StatusPending || secondReturned.AttemptCount != 2 || secondReturned.WorkerID != nil || secondReturned.ClaimToken != nil || secondReturned.LeaseUntil != nil {

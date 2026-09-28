@@ -49,6 +49,16 @@ func setupCodeIntelTestDB(t *testing.T) (*gorm.DB, *jobs.Store, codeintelstore.S
 	return db, jobsStore, ciStore, snapStore
 }
 
+func startCodeIndexJob(t *testing.T, store *jobs.Store, job *jobs.AnalysisJob, workerID string) {
+	t.Helper()
+	attempt, err := store.MarkExecutionStarted(context.Background(), job.ID, workerID, *job.ClaimToken, job.ExecutionGeneration)
+	if err != nil {
+		t.Fatalf("MarkExecutionStarted: %v", err)
+	}
+	job.AttemptCount = attempt
+	job.ExecutionStarted = true
+}
+
 func TestAnalyzerUsesSnapshotManifestFileUniverse(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
@@ -482,6 +492,7 @@ func TestQueuedCodeIndexJobRestoresPersistedBuildTags(t *testing.T) {
 	if err != nil || len(claimed) != 1 || claimed[0].JobType != jobs.JobTypeBuildCodeIndex {
 		t.Fatalf("claim code-index build job: claimed=%+v err=%v", claimed, err)
 	}
+	startCodeIndexJob(t, jobsStore, claimed[0], "worker-build-tags-success")
 	if err := handler.Execute(ctx, claimed[0]); err != nil {
 		t.Fatalf("execute queued code-index job: %v", err)
 	}
@@ -542,6 +553,7 @@ func TestQueuedCodeIndexJobFailsClosedWhenLegacyTagNamesAreUnavailable(t *testin
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim build job: jobs=%d err=%v", len(claimed), err)
 	}
+	startCodeIndexJob(t, jobsStore, claimed[0], "worker-build-tags")
 	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()), codeintel.NewAnalyzer())
 	handlerErr := handler.Execute(ctx, claimed[0])
 	if handlerErr == nil {

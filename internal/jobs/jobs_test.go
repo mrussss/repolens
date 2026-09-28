@@ -33,6 +33,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 		execution_generation INTEGER NOT NULL DEFAULT 1,
 		terminal_reason TEXT,
 		attempt_count INTEGER NOT NULL DEFAULT 0,
+		execution_started BOOLEAN NOT NULL DEFAULT 0,
 		max_attempts INTEGER NOT NULL DEFAULT 3,
 		next_run_at DATETIME NOT NULL,
 		worker_id TEXT,
@@ -55,6 +56,16 @@ func setupTestDB(t *testing.T) *sql.DB {
 	}
 
 	return db
+}
+
+func markExecutionStarted(t *testing.T, store *jobs.Store, job *jobs.AnalysisJob, workerID string) {
+	t.Helper()
+	attempt, err := store.MarkExecutionStarted(context.Background(), job.ID, workerID, *job.ClaimToken, job.ExecutionGeneration)
+	if err != nil {
+		t.Fatalf("MarkExecutionStarted: %v", err)
+	}
+	job.AttemptCount = attempt
+	job.ExecutionStarted = true
 }
 
 type workerStoreFaults struct {
@@ -148,6 +159,7 @@ func TestCancelFinalizerRequiresDurableCancelRequested(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("ClaimJobs = %d, %v; want one claim", len(claimed), err)
 	}
+	markExecutionStarted(t, store, claimed[0], "worker-cancel-guard")
 
 	err = store.ConditionalFinalizeCancel(ctx, claimed[0].ID, "worker-cancel-guard", *claimed[0].ClaimToken)
 	if err == nil {
@@ -178,6 +190,7 @@ func TestNonDiagnosisJobCannotBeCancelled(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("ClaimJobs = %d, %v; want one claim", len(claimed), err)
 	}
+	markExecutionStarted(t, store, claimed[0], "worker-cancel-unsupported")
 	if err := store.ConditionalFinalizeCancel(ctx, claimed[0].ID, "worker-cancel-unsupported", *claimed[0].ClaimToken); !errors.Is(err, jobs.ErrCancellationUnsupported) {
 		t.Fatalf("ConditionalFinalizeCancel(non-diagnosis) = %v, want ErrCancellationUnsupported", err)
 	}
@@ -203,6 +216,7 @@ func TestAcceptedCancellationWinsOverSuccessFinalization(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("ClaimJobs = %d, %v; want one claim", len(claimed), err)
 	}
+	markExecutionStarted(t, store, claimed[0], "worker-cancel-wins")
 	if err := store.RequestCancel(ctx, job.JobType, job.ResourceID); err != nil {
 		t.Fatalf("RequestCancel: %v", err)
 	}
@@ -313,6 +327,7 @@ func TestStore_LeaseRenewalAndStaleFinalize(t *testing.T) {
 		t.Fatalf("failed claiming job: %v", err)
 	}
 	cj := claimed[0]
+	markExecutionStarted(t, store, cj, "worker-A")
 
 	// 1. Successful lease renewal
 	newLease := time.Now().UTC().Add(30 * time.Second)
@@ -372,6 +387,171 @@ func TestStore_ExpiredLeaseCannotBeRenewed(t *testing.T) {
 	}
 }
 
+func TestStore_ClaimDoesNotChargeAttemptUntilExecutionStarts(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "claim-start-boundary", AttemptCount: 2, MaxAttempts: 3}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "boundary-worker", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimJobs = %d, %v; want one claim", len(claimed), err)
+	}
+	if claimed[0].AttemptCount != 2 || claimed[0].ExecutionStarted {
+		t.Fatalf("claim state = count %d started %t; want 2/false", claimed[0].AttemptCount, claimed[0].ExecutionStarted)
+	}
+	attempt, err := store.MarkExecutionStarted(ctx, job.ID, "boundary-worker", *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+	if err != nil || attempt != 3 {
+		t.Fatalf("MarkExecutionStarted = %d, %v; want attempt 3", attempt, err)
+	}
+	attempt, err = store.MarkExecutionStarted(ctx, job.ID, "boundary-worker", *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+	if err != nil || attempt != 3 {
+		t.Fatalf("idempotent MarkExecutionStarted = %d, %v; want unchanged attempt 3", attempt, err)
+	}
+	saved, err := store.GetJobByID(ctx, job.ID)
+	if err != nil || saved.AttemptCount != 3 || !saved.ExecutionStarted {
+		t.Fatalf("saved started job = %+v err=%v; want count 3/started", saved, err)
+	}
+}
+
+func TestStore_NeverStartedExpiredClaimReturnsWithoutFailingBusinessResource(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.Exec(`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, cancel_requested BOOLEAN NOT NULL DEFAULT 0, final_attempt_id TEXT, version INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO diagnosis_runs (id, status, version) VALUES ('never-started-run', 'QUEUED', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "never-started-run", AttemptCount: 2, MaxAttempts: 3}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "never-started-worker", 1, time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].AttemptCount != 2 {
+		t.Fatalf("ClaimJobs = %+v, %v; want one uncharged claim at attempt 2", claimed, err)
+	}
+	if _, err := db.Exec(`UPDATE analysis_jobs SET lease_until=datetime('now','-1 second') WHERE id=?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := store.ReapExpiredJobs(ctx, 10); err != nil || count != 1 {
+		t.Fatalf("ReapExpiredJobs = %d, %v; want one requeued claim", count, err)
+	}
+	saved, err := store.GetJobByID(ctx, job.ID)
+	if err != nil || saved.Status != jobs.StatusPending || saved.AttemptCount != 2 || saved.ExecutionStarted || saved.WorkerID != nil || saved.ClaimToken != nil || saved.LeaseUntil != nil {
+		t.Fatalf("never-started reaped job = %+v err=%v; want PENDING attempt 2 without ownership", saved, err)
+	}
+	var runStatus string
+	if err := db.QueryRow(`SELECT status FROM diagnosis_runs WHERE id='never-started-run'`).Scan(&runStatus); err != nil || runStatus != "QUEUED" {
+		t.Fatalf("business run status = %q err=%v; want QUEUED", runStatus, err)
+	}
+	reclaimed, err := store.ClaimJobs(ctx, "next-worker", 1, time.Minute)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].AttemptCount != 2 {
+		t.Fatalf("reclaim = %+v, %v; want attempt 2", reclaimed, err)
+	}
+	attempt, err := store.MarkExecutionStarted(ctx, job.ID, "next-worker", *reclaimed[0].ClaimToken, reclaimed[0].ExecutionGeneration)
+	if err != nil || attempt != 3 {
+		t.Fatalf("next execution start = %d, %v; want attempt 3", attempt, err)
+	}
+}
+
+func TestStore_StartedExpiredClaimUsesNormalExhaustion(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "started-expired-build", AttemptCount: 2, MaxAttempts: 3}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "started-worker", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimJobs = %d, %v", len(claimed), err)
+	}
+	attempt, err := store.MarkExecutionStarted(ctx, job.ID, "started-worker", *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+	if err != nil || attempt != 3 {
+		t.Fatalf("MarkExecutionStarted = %d, %v; want attempt 3", attempt, err)
+	}
+	if _, err := db.Exec(`UPDATE analysis_jobs SET lease_until=datetime('now','-1 second') WHERE id=?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := store.ReapExpiredJobs(ctx, 10); err != nil || count != 1 {
+		t.Fatalf("ReapExpiredJobs = %d, %v; want one exhausted started attempt", count, err)
+	}
+	saved, err := store.GetJobByID(ctx, job.ID)
+	if err != nil || saved.Status != jobs.StatusFailed || saved.AttemptCount != 3 || !saved.ExecutionStarted {
+		t.Fatalf("started reaped job = %+v err=%v; want FAILED attempt 3", saved, err)
+	}
+}
+
+func TestStore_ReturnUndispatchedClaimRacesExecutionStartWithSingleWinner(t *testing.T) {
+	for i := 0; i < 12; i++ {
+		t.Run(fmt.Sprintf("iteration-%02d", i), func(t *testing.T) {
+			db := setupTestDB(t)
+			defer db.Close()
+			ctx := context.Background()
+			store := jobs.NewStoreWithDriver(db, "sqlite3")
+			job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: fmt.Sprintf("return-start-race-%d", i), AttemptCount: 2, MaxAttempts: 3}
+			if err := store.CreateJob(ctx, job); err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := store.ClaimJobs(ctx, "race-worker", 1, time.Minute)
+			if err != nil || len(claimed) != 1 {
+				t.Fatalf("ClaimJobs = %d, %v", len(claimed), err)
+			}
+			gate := make(chan struct{})
+			ready := make(chan struct{}, 2)
+			results := make(chan error, 2)
+			go func() {
+				ready <- struct{}{}
+				<-gate
+				results <- store.ReturnUndispatchedClaim(ctx, job.ID, "race-worker", *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+			}()
+			go func() {
+				ready <- struct{}{}
+				<-gate
+				_, err := store.MarkExecutionStarted(ctx, job.ID, "race-worker", *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+				results <- err
+			}()
+			<-ready
+			<-ready
+			close(gate)
+			first, second := <-results, <-results
+			successes := 0
+			for _, result := range []error{first, second} {
+				if result == nil {
+					successes++
+				} else if !errors.Is(result, jobs.ErrOwnershipLost) {
+					t.Fatalf("race operation error = %v; want nil or ErrOwnershipLost", result)
+				}
+			}
+			if successes != 1 {
+				t.Fatalf("successful return/start transitions = %d; want exactly one (results %v, %v)", successes, first, second)
+			}
+			saved, err := store.GetJobByID(ctx, job.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved.Status == jobs.StatusPending {
+				if saved.AttemptCount != 2 || saved.ExecutionStarted || saved.WorkerID != nil {
+					t.Fatalf("return winner state = %+v; want PENDING attempt 2", saved)
+				}
+			} else if saved.Status == jobs.StatusRunning {
+				if saved.AttemptCount != 3 || !saved.ExecutionStarted || saved.WorkerID == nil {
+					t.Fatalf("start winner state = %+v; want RUNNING started attempt 3", saved)
+				}
+			} else {
+				t.Fatalf("unexpected race winner state = %+v", saved)
+			}
+		})
+	}
+}
+
 func TestStore_ReaperAndRetryExhaustion(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
@@ -393,6 +573,7 @@ func TestStore_ReaperAndRetryExhaustion(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("Claim failed: %v", err)
 	}
+	markExecutionStarted(t, store, claimed[0], "worker-1")
 
 	// Wait for lease to expire
 	time.Sleep(10 * time.Millisecond)
@@ -419,8 +600,9 @@ func TestStore_ReaperAndRetryExhaustion(t *testing.T) {
 	if err != nil || len(claimed2) != 1 {
 		t.Fatalf("Second claim failed: %v", err)
 	}
+	markExecutionStarted(t, store, claimed2[0], "worker-2")
 	if claimed2[0].AttemptCount != 2 {
-		t.Fatalf("expected attempt count 2, got %d", claimed2[0].AttemptCount)
+		t.Fatalf("expected attempt count 2 after execution start, got %d", claimed2[0].AttemptCount)
 	}
 
 	time.Sleep(10 * time.Millisecond)
@@ -498,7 +680,7 @@ func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
 		if err := store.CreateJob(ctx, job); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`UPDATE analysis_jobs SET status='RUNNING', attempt_count=1, worker_id='dead-worker', claim_token='dead-token', lease_until=datetime('now','-1 second') WHERE id=?`, job.ID); err != nil {
+		if _, err := db.Exec(`UPDATE analysis_jobs SET status='RUNNING', attempt_count=1, execution_started=1, worker_id='dead-worker', claim_token='dead-token', lease_until=datetime('now','-1 second') WHERE id=?`, job.ID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -594,7 +776,7 @@ func TestStore_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *testing.
 			}
 			if _, err := db.Exec(`UPDATE analysis_jobs
 				SET status='RUNNING', worker_id='dead-worker', claim_token='dead-token',
-				    lease_until=datetime('now','-1 second'), cancel_requested=?
+				    lease_until=datetime('now','-1 second'), cancel_requested=?, execution_started=1
 				WHERE id=?`, tc.cancelRequested, job.ID); err != nil {
 				t.Fatal(err)
 			}
@@ -668,6 +850,7 @@ func TestStore_TerminalStageFailureSynchronizesAnalysisRevision(t *testing.T) {
 		t.Fatalf("claim failed: %v", err)
 	}
 	claim := claimed[0]
+	markExecutionStarted(t, store, claim, "worker-terminal")
 	if err := store.ConditionalFinalizeFailure(ctx, claim.ID, "worker-terminal", *claim.ClaimToken, jobs.ErrorClassPermanent, "CODE_INDEX_ANALYSIS_FAILED", "analysis failed", nil, true, time.Time{}); err != nil {
 		t.Fatal(err)
 	}

@@ -310,6 +310,71 @@ func TestRealMySQL_Migration013ResumesAndScopesSnapshotIdentityByRevision(t *tes
 	}
 }
 
+func TestRealMySQL_ExecutionStartMigrationUpgradeAndBoundary(t *testing.T) {
+	allMigrations := filepath.Join("..", "..", "migrations")
+	pre016Dir := t.TempDir()
+	entries, err := os.ReadDir(allMigrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= "016_v2_2_execution_start_boundary.sql" {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(allMigrations, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pre016Dir, entry.Name()), contents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db, jobsStore, cleanup := setupRealMySQL(t, pre016Dir)
+	if db == nil {
+		return
+	}
+	defer cleanup()
+	ctx := context.Background()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `INSERT INTO analysis_jobs
+		(job_type, resource_id, status, attempt_count, max_attempts, next_run_at, worker_id, claim_token, lease_until)
+		VALUES ('BUILD_CODE_INDEX', 'legacy-running-before-016', 'RUNNING', 2, 3, UTC_TIMESTAMP(3), 'legacy-worker', 'legacy-token', DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 1 MINUTE))`); err != nil {
+		t.Fatalf("seed legacy RUNNING job before 016: %v", err)
+	}
+	if err := mysql.ApplyMigrations(&mysql.DB{GormDB: db, SqlDB: sqlDB}, allMigrations); err != nil {
+		t.Fatalf("upgrade schema through migration 016: %v", err)
+	}
+	var legacyStarted bool
+	var legacyAttempt int
+	if err := sqlDB.QueryRowContext(ctx, `SELECT execution_started, attempt_count FROM analysis_jobs WHERE resource_id = 'legacy-running-before-016'`).Scan(&legacyStarted, &legacyAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if !legacyStarted || legacyAttempt != 2 {
+		t.Fatalf("legacy RUNNING migration state = started %t / attempt %d, want true / 2", legacyStarted, legacyAttempt)
+	}
+	var migrationRecords int
+	if err := sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = '016_v2_2_execution_start_boundary.sql'`).Scan(&migrationRecords); err != nil || migrationRecords != 1 {
+		t.Fatalf("migration 016 records = %d err=%v; want one", migrationRecords, err)
+	}
+
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "fresh-job-start-boundary", AttemptCount: 0, MaxAttempts: 3}
+	if err := jobsStore.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "fresh-worker", 1, time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].AttemptCount != 0 || claimed[0].ExecutionStarted {
+		t.Fatalf("fresh MySQL claim = %+v err=%v; want attempt 0 and not started", claimed, err)
+	}
+	attempt, err := jobsStore.MarkExecutionStarted(ctx, job.ID, "fresh-worker", *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+	if err != nil || attempt != 1 {
+		t.Fatalf("fresh MySQL execution start = %d err=%v; want attempt 1", attempt, err)
+	}
+}
+
 func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
 	db, jobsStore, cleanup := setupRealMySQL(t)
 	if db == nil {
@@ -466,8 +531,8 @@ func TestRealMySQL_ReturnUndispatchedClaimIsClaimFenced(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldClaim, err := jobsStore.ClaimJobs(ctx, "mysql-old-worker", 1, time.Minute)
-	if err != nil || len(oldClaim) != 1 || oldClaim[0].AttemptCount != 3 {
-		t.Fatalf("claim final attempt: jobs=%+v err=%v", oldClaim, err)
+	if err != nil || len(oldClaim) != 1 || oldClaim[0].AttemptCount != 2 || oldClaim[0].ExecutionStarted {
+		t.Fatalf("claim final attempt without starting: jobs=%+v err=%v", oldClaim, err)
 	}
 	if err := jobsStore.ReturnUndispatchedClaim(ctx, job.ID, "mysql-old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration); err != nil {
 		t.Fatalf("return undispatched claim: %v", err)
@@ -477,8 +542,11 @@ func TestRealMySQL_ReturnUndispatchedClaimIsClaimFenced(t *testing.T) {
 		t.Fatalf("returned job=%+v err=%v; want PENDING attempt 2 with cleared claim", returned, err)
 	}
 	newClaim, err := jobsStore.ClaimJobs(ctx, "mysql-new-worker", 1, time.Minute)
-	if err != nil || len(newClaim) != 1 || newClaim[0].AttemptCount != 3 {
-		t.Fatalf("reclaim final attempt: jobs=%+v err=%v", newClaim, err)
+	if err != nil || len(newClaim) != 1 || newClaim[0].AttemptCount != 2 || newClaim[0].ExecutionStarted {
+		t.Fatalf("reclaim final attempt without starting: jobs=%+v err=%v", newClaim, err)
+	}
+	if _, err := jobsStore.MarkExecutionStarted(ctx, job.ID, "mysql-old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration); !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("stale execution start error=%v, want ErrOwnershipLost", err)
 	}
 	if err := jobsStore.ReturnUndispatchedClaim(ctx, job.ID, "mysql-old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration); !errors.Is(err, jobs.ErrOwnershipLost) {
 		t.Fatalf("stale claim return error=%v, want ErrOwnershipLost", err)
@@ -487,8 +555,11 @@ func TestRealMySQL_ReturnUndispatchedClaimIsClaimFenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.Status != jobs.StatusRunning || current.AttemptCount != 3 || current.WorkerID == nil || *current.WorkerID != "mysql-new-worker" || current.ClaimToken == nil || *current.ClaimToken != *newClaim[0].ClaimToken {
+	if current.Status != jobs.StatusRunning || current.AttemptCount != 2 || current.ExecutionStarted || current.WorkerID == nil || *current.WorkerID != "mysql-new-worker" || current.ClaimToken == nil || *current.ClaimToken != *newClaim[0].ClaimToken {
 		t.Fatalf("stale return changed current MySQL claim: %+v", current)
+	}
+	if attempt, err := jobsStore.MarkExecutionStarted(ctx, job.ID, "mysql-new-worker", *newClaim[0].ClaimToken, newClaim[0].ExecutionGeneration); err != nil || attempt != 3 {
+		t.Fatalf("current execution start = %d err=%v; want third attempt", attempt, err)
 	}
 }
 
@@ -564,8 +635,8 @@ func TestRealMySQL_BatchUndispatchedReturnContinuesPastLockedRow(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("worker did not commit its batch claim")
 	}
-	if claimed.err != nil || len(claimed.jobs) != 2 || claimed.jobs[0].AttemptCount != 3 || claimed.jobs[1].AttemptCount != 3 {
-		t.Fatalf("batch claims=%+v err=%v; want two third-attempt claims", claimed.jobs, claimed.err)
+	if claimed.err != nil || len(claimed.jobs) != 2 || claimed.jobs[0].AttemptCount != 2 || claimed.jobs[1].AttemptCount != 2 || claimed.jobs[0].ExecutionStarted || claimed.jobs[1].ExecutionStarted {
+		t.Fatalf("batch claims=%+v err=%v; want two unstarted claims at attempt 2", claimed.jobs, claimed.err)
 	}
 
 	sqlDB, err := db.DB()
@@ -605,7 +676,7 @@ func TestRealMySQL_BatchUndispatchedReturnContinuesPastLockedRow(t *testing.T) {
 		t.Fatalf("second row while first locked=%+v err=%v; want safely returned attempt 2", secondState, err)
 	}
 	firstState, err := jobsStore.GetJobByID(ctx, first.ID)
-	if err != nil || firstState.Status != jobs.StatusRunning || firstState.AttemptCount != 3 || firstState.LeaseUntil == nil || !firstState.LeaseUntil.After(time.Now().UTC()) {
+	if err != nil || firstState.Status != jobs.StatusRunning || firstState.AttemptCount != 2 || firstState.LeaseUntil == nil || !firstState.LeaseUntil.After(time.Now().UTC()) {
 		_ = lockTx.Rollback()
 		t.Fatalf("locked first row state=%+v err=%v; want live claim for later return", firstState, err)
 	}
@@ -649,14 +720,24 @@ func TestRealMySQL_LeaseRenewalAndReaping(t *testing.T) {
 	}
 	_ = diagStore.Create(ctx, run)
 
-	// Claim with a short lease (500ms)
-	claimed, err := jobsStore.ClaimJobs(ctx, "worker-crashing", 1, 500*time.Millisecond)
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-crashing", 1, time.Minute)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim failed: %v", err)
 	}
+	if attempt, err := jobsStore.MarkExecutionStarted(ctx, claimed[0].ID, "worker-crashing", *claimed[0].ClaimToken, claimed[0].ExecutionGeneration); err != nil || attempt != 1 {
+		t.Fatalf("mark real MySQL execution started = %d err=%v", attempt, err)
+	}
 
-	// Wait for lease expiration
-	time.Sleep(700 * time.Millisecond)
+	// Set the persisted lease to the past using the same driver time encoding
+	// as the Store. This keeps the real MySQL recovery assertion independent
+	// from host/container clock skew and scheduler delays.
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `UPDATE analysis_jobs SET lease_until = ? WHERE id = ?`, time.Now().UTC().Add(-time.Second), claimed[0].ID); err != nil {
+		t.Fatalf("expire started job lease: %v", err)
+	}
 
 	// Reaper runs on real MySQL
 	reaped, err := jobsStore.ReapExpiredJobs(ctx, 10)
@@ -673,6 +754,108 @@ func TestRealMySQL_LeaseRenewalAndReaping(t *testing.T) {
 	}
 	if reapedJob.Status != jobs.StatusRetryWait {
 		t.Errorf("expected job in RETRY_WAIT after reaping on MySQL, got %s", reapedJob.Status)
+	}
+}
+
+func TestRealMySQL_NeverStartedExpiredClaimDoesNotExhaustUnderRowLock(t *testing.T) {
+	db, jobsStore, cleanup := setupRealMySQL(t)
+	if db == nil {
+		return
+	}
+	defer cleanup()
+	ctx := context.Background()
+	diagStore := diagnosis.NewStore(db)
+	run := &diagnosis.DiagnosisRun{
+		ID: "diag-never-started-lock-reap", UserID: "user-never-started-lock-reap",
+		RepositoryID: "repo-never-started-lock-reap", SnapshotID: "snap-never-started-lock-reap",
+		IssueTitle: "never started under row lock", IdempotencyKey: "key-never-started-lock-reap",
+		IdempotencyRequestHash: "hash-never-started-lock-reap",
+	}
+	if err := diagStore.Create(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	job, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Updates(map[string]interface{}{"attempt_count": 2, "max_attempts": 3}).Error; err != nil {
+		t.Fatal(err)
+	}
+	job.AttemptCount, job.MaxAttempts = 2, 3
+	lease := 650 * time.Millisecond
+	claimed, err := jobsStore.ClaimJobs(ctx, "mysql-never-started-worker", 1, lease)
+	if err != nil || len(claimed) != 1 || claimed[0].AttemptCount != 2 || claimed[0].ExecutionStarted {
+		t.Fatalf("claim before shutdown race = %+v err=%v; want unstarted attempt 2", claimed, err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockTx, err := sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lockedID int64
+	if err := lockTx.QueryRowContext(ctx, `SELECT id FROM analysis_jobs WHERE id = ? FOR UPDATE`, job.ID).Scan(&lockedID); err != nil {
+		_ = lockTx.Rollback()
+		t.Fatalf("lock never-started claim row: %v", err)
+	}
+	if lockedID != job.ID {
+		_ = lockTx.Rollback()
+		t.Fatalf("locked job ID=%d, want %d", lockedID, job.ID)
+	}
+	// Keep the row locked past its committed claim lease. The timer is an
+	// explicit lease-boundary gate; while locked the reaper must skip the row,
+	// then recover it as never-started once the lock is released. Avoid issuing
+	// a timed-out write while the row is locked: a request already sent to MySQL
+	// may resolve after unlock and extend the lease, making the interleaving
+	// dependent on driver cancellation timing rather than the durable marker.
+	timer := time.NewTimer(lease + 150*time.Millisecond)
+	<-timer.C
+	if reaped, err := jobsStore.ReapExpiredJobs(ctx, 10); err != nil || reaped != 0 {
+		_ = lockTx.Rollback()
+		t.Fatalf("reaper while row remains locked = %d err=%v; want skipped row", reaped, err)
+	}
+	if err := lockTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	// Make expiry explicit after holding the lock beyond the lease duration.
+	// The claim itself still expires naturally while locked; this write removes
+	// host/container subsecond clock skew from the post-unlock reaper boundary.
+	if _, err := sqlDB.ExecContext(ctx, `UPDATE analysis_jobs SET lease_until = ? WHERE id = ?`, time.Now().UTC().Add(-time.Second), job.ID); err != nil {
+		t.Fatalf("make released claim lease explicitly expired: %v", err)
+	}
+	reaped, reapErr := jobsStore.ReapExpiredJobs(ctx, 10)
+	if reapErr != nil || reaped != 1 {
+		state, stateErr := jobsStore.GetJobByID(ctx, job.ID)
+		t.Fatalf("reaper after releasing expired row = %d err=%v; state=%+v stateErr=%v, want one never-started recovery", reaped, reapErr, state, stateErr)
+	}
+	saved, err := jobsStore.GetJobByID(ctx, job.ID)
+	if err != nil || saved.Status != jobs.StatusPending || saved.AttemptCount != 2 || saved.ExecutionStarted || saved.WorkerID != nil || saved.ClaimToken != nil {
+		t.Fatalf("never-started recovery = %+v err=%v; want PENDING attempt 2", saved, err)
+	}
+	savedRun, err := diagStore.GetByID(ctx, run.ID)
+	if err != nil || savedRun.Status != diagnosis.StatusQueued {
+		t.Fatalf("business run after never-started recovery = %+v err=%v; want QUEUED", savedRun, err)
+	}
+
+	reclaimed, err := jobsStore.ClaimJobs(ctx, "mysql-after-expiry-worker", 1, time.Minute)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].AttemptCount != 2 || reclaimed[0].ExecutionStarted {
+		t.Fatalf("reclaim after expiry = %+v err=%v; want unstarted attempt 2", reclaimed, err)
+	}
+	if attempt, err := jobsStore.MarkExecutionStarted(ctx, job.ID, "mysql-after-expiry-worker", *reclaimed[0].ClaimToken, reclaimed[0].ExecutionGeneration); err != nil || attempt != 3 {
+		t.Fatalf("start reclaimed execution = %d err=%v; want attempt 3", attempt, err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `UPDATE analysis_jobs SET lease_until = DATE_SUB(UTC_TIMESTAMP(3), INTERVAL 1 SECOND) WHERE id = ?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if reaped, err := jobsStore.ReapExpiredJobs(ctx, 10); err != nil || reaped != 1 {
+		t.Fatalf("reaper for truly started attempt = %d err=%v; want normal exhaustion", reaped, err)
+	}
+	finalJob, err := jobsStore.GetJobByID(ctx, job.ID)
+	finalRun, runErr := diagStore.GetByID(ctx, run.ID)
+	if err != nil || runErr != nil || finalJob.Status != jobs.StatusFailed || finalJob.AttemptCount != 3 || !finalJob.ExecutionStarted || finalRun.Status != diagnosis.StatusFailed {
+		t.Fatalf("started-attempt exhaustion job=%+v run=%+v errors=%v/%v", finalJob, finalRun, err, runErr)
 	}
 }
 
@@ -718,6 +901,11 @@ func TestRealMySQL_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *test
 			if err != nil || len(claimed) != 1 || claimed[0].ResourceID != runID {
 				t.Fatalf("claim diagnosis job: claimed=%+v err=%v", claimed, err)
 			}
+			attemptNo, err := jobsStore.MarkExecutionStarted(ctx, claimed[0].ID, "worker-reaper-cancel", *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+			if err != nil {
+				t.Fatalf("mark diagnosis execution started: %v", err)
+			}
+			claimed[0].AttemptCount, claimed[0].ExecutionStarted = attemptNo, true
 			attempt := &diagnosis.DiagnosisAttempt{
 				ID: runID + "-attempt", DiagnosisRunID: runID, ExecutionGeneration: claimed[0].ExecutionGeneration,
 				AttemptNo: claimed[0].AttemptCount, WorkerID: "worker-reaper-cancel",

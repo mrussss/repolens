@@ -61,6 +61,11 @@ func claimRetrievalJobForTest(t *testing.T, db *gorm.DB, jobsStore *jobs.Store, 
 	if err != nil || len(claimed) != 1 || claimed[0].JobType != jobs.JobTypeBuildRetrieval || claimed[0].ResourceID != strconv.FormatInt(retrievalBuildID, 10) {
 		t.Fatalf("claim retrieval job: claimed=%+v err=%v", claimed, err)
 	}
+	attempt, err := jobsStore.MarkExecutionStarted(context.Background(), claimed[0].ID, workerID, *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatalf("start retrieval job: %v", err)
+	}
+	claimed[0].AttemptCount, claimed[0].ExecutionStarted = attempt, true
 	return claimed[0]
 }
 
@@ -98,6 +103,11 @@ func TestStaleRetrievalHandlerDoesNotFailRevision(t *testing.T) {
 	if err != nil || len(oldClaim) != 1 {
 		t.Fatalf("old Retrieval claim = %d jobs, err=%v", len(oldClaim), err)
 	}
+	oldAttempt, err := jobsStore.MarkExecutionStarted(ctx, oldClaim[0].ID, "old-retrieval-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim[0].AttemptCount, oldClaim[0].ExecutionStarted = oldAttempt, true
 	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
 		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
 		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
@@ -150,6 +160,11 @@ func TestStaleRetrievalPublisherCannotReplaceCurrentArtifact(t *testing.T) {
 	if err != nil || len(oldClaim) != 1 || oldClaim[0].JobType != jobs.JobTypeBuildRetrieval {
 		t.Fatalf("old Retrieval claim = %+v, err=%v", oldClaim, err)
 	}
+	oldAttempt, err := jobsStore.MarkExecutionStarted(ctx, oldClaim[0].ID, "retrieval-old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim[0].AttemptCount, oldClaim[0].ExecutionStarted = oldAttempt, true
 	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
 		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
 		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
@@ -160,6 +175,11 @@ func TestStaleRetrievalPublisherCannotReplaceCurrentArtifact(t *testing.T) {
 	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
 		t.Fatalf("new Retrieval claim = %+v, err=%v", newClaim, err)
 	}
+	newAttempt, err := jobsStore.MarkExecutionStarted(ctx, newClaim[0].ID, "retrieval-new-worker", *newClaim[0].ClaimToken, newClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newClaim[0].AttemptCount, newClaim[0].ExecutionStarted = newAttempt, true
 
 	indexRoot := t.TempDir()
 	publisher := artifact.NewPublisher(indexRoot)

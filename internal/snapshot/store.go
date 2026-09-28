@@ -143,7 +143,7 @@ func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, wo
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job jobs.AnalysisJob
-		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return jobs.ErrOwnershipLost
 			}
@@ -159,7 +159,7 @@ func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, wo
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("snapshot %s materialization finalize conflict", snapshotID)
 		}
-		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).Updates(map[string]interface{}{
 			"status": jobs.StatusSucceeded, "finished_at": readyAt, "updated_at": readyAt,
 		})
 		if jobResult.Error != nil {
@@ -180,7 +180,7 @@ func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, job
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job jobs.AnalysisJob
-		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return jobs.ErrOwnershipLost
 			}
@@ -258,7 +258,7 @@ func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, job
 		if revisionResult.RowsAffected != 1 {
 			return fmt.Errorf("analysis revision %s lineage transition conflict", revisionID)
 		}
-		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).Updates(map[string]interface{}{
 			"status": jobs.StatusSucceeded, "finished_at": readyAt, "updated_at": readyAt,
 		})
 		if jobResult.Error != nil {

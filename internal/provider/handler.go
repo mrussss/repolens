@@ -369,7 +369,7 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 		now := time.Now().UTC()
 		leaseUntil := now.Add(time.Hour)
 		result := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ?", demoJob.ID, jobs.StatusPending).Updates(map[string]interface{}{
-			"status": jobs.StatusRunning, "attempt_count": 1,
+			"status": jobs.StatusRunning, "attempt_count": 1, "execution_started": true,
 			"worker_id": demoWorkerID, "claim_token": demoClaimToken,
 			"lease_until": leaseUntil, "updated_at": now,
 		})
@@ -381,6 +381,7 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 		}
 		demoJob.Status = jobs.StatusRunning
 		demoJob.AttemptCount = 1
+		demoJob.ExecutionStarted = true
 		demoJob.WorkerID = &demoWorkerID
 		demoJob.ClaimToken = &demoClaimToken
 		demoJob.LeaseUntil = &leaseUntil

@@ -155,6 +155,15 @@ func ApplyMigrations(db *DB, dir string) error {
 			}
 			continue
 		}
+		if version == "016_v2_2_execution_start_boundary.sql" {
+			if err := applyExecutionStartMigration016(ctx, conn); err != nil {
+				return fmt.Errorf("apply resumable migration %s: %w", version, err)
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, CURRENT_TIMESTAMP(3))`, version); err != nil {
+				return fmt.Errorf("record migration %s: %w", version, err)
+			}
+			continue
+		}
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -182,6 +191,34 @@ func ApplyMigrations(db *DB, dir string) error {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// applyExecutionStartMigration016 tolerates a process restart after MySQL has
+// committed the ALTER TABLE but before schema_migrations was updated.
+func applyExecutionStartMigration016(ctx context.Context, conn *sql.Conn) error {
+	var columnType, nullable string
+	var defaultValue sql.NullString
+	err := conn.QueryRowContext(ctx, `SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'analysis_jobs' AND COLUMN_NAME = 'execution_started'`).
+		Scan(&columnType, &nullable, &defaultValue)
+	if err == sql.ErrNoRows {
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE analysis_jobs ADD COLUMN execution_started BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
+			return fmt.Errorf("add analysis_jobs.execution_started: %w", err)
+		}
+		columnType, nullable, defaultValue = "tinyint(1)", "NO", sql.NullString{String: "0", Valid: true}
+	} else if err != nil {
+		return fmt.Errorf("inspect analysis_jobs.execution_started: %w", err)
+	}
+	if !strings.EqualFold(columnType, "tinyint(1)") || !strings.EqualFold(nullable, "NO") || !defaultValue.Valid || defaultValue.String != "0" {
+		return fmt.Errorf("analysis_jobs.execution_started has incompatible definition: type=%s nullable=%s default=%v", columnType, nullable, defaultValue)
+	}
+	// Before this migration, a RUNNING row had already incremented its attempt
+	// count at claim time. Preserve that legacy accounting as a started attempt.
+	if _, err := conn.ExecContext(ctx, `UPDATE analysis_jobs SET execution_started = TRUE WHERE status = 'RUNNING' AND execution_started = FALSE`); err != nil {
+		return fmt.Errorf("mark legacy running jobs as execution started: %w", err)
 	}
 	return nil
 }

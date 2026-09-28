@@ -54,6 +54,7 @@ func DefaultWorkerConfig() WorkerConfig {
 
 type workerStore interface {
 	ClaimJobs(context.Context, string, int, time.Duration) ([]*AnalysisJob, error)
+	MarkExecutionStarted(context.Context, int64, string, string, int) (int, error)
 	ReturnUndispatchedClaim(context.Context, int64, string, string, int) error
 	RenewLease(context.Context, int64, string, string, time.Time) error
 	IsCancelRequested(context.Context, int64, string, string) (bool, error)
@@ -297,6 +298,21 @@ func (w *Worker) claimLoop(ctx context.Context) {
 				w.returnUndispatchedClaims(ctx, sem, jobs[i:])
 				return
 			}
+			attemptCount, err := w.startClaimedExecution(job)
+			if err != nil {
+				w.dispatchMu.Unlock()
+				if errors.Is(err, ErrOwnershipLost) {
+					<-sem
+					continue
+				}
+				logger.L(ctx).Error("unable to resolve execution-start transition", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+				// startClaimedExecution only returns non-ownership errors when its
+				// retry context is cancelled; leave the claim for lease recovery.
+				<-sem
+				continue
+			}
+			job.AttemptCount = attemptCount
+			job.ExecutionStarted = true
 			w.jobWG.Add(1)
 			go func(j *AnalysisJob) {
 				defer func() {
@@ -307,6 +323,27 @@ func (w *Worker) claimLoop(ctx context.Context) {
 			}(job)
 			w.dispatchMu.Unlock()
 		}
+	}
+}
+
+// startClaimedExecution commits the attempt charge before a handler can be
+// launched. It retries ambiguous/transient store errors because the durable
+// transition is idempotent for the same live claim.
+func (w *Worker) startClaimedExecution(job *AnalysisJob) (int, error) {
+	for {
+		operationTimeout := w.undispatchedClaimOperationTimeout()
+		ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
+		attemptCount, err := w.store.MarkExecutionStarted(ctx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), job.ExecutionGeneration)
+		cancel()
+		if err == nil || errors.Is(err, ErrOwnershipLost) {
+			return attemptCount, err
+		}
+		logger.L(context.Background()).Error("error marking execution started; retrying claim-fenced transition", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+		if renewErr := w.renewUndispatchedClaimLease(job, operationTimeout); renewErr != nil && !errors.Is(renewErr, ErrOwnershipLost) {
+			logger.L(context.Background()).Warn("error renewing claim while resolving execution-start transition", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", renewErr)
+		}
+		timer := time.NewTimer(w.cfg.PollInterval)
+		<-timer.C
 	}
 }
 

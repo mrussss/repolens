@@ -339,6 +339,11 @@ func TestStaleSnapshotHandlerDoesNotFailRevision(t *testing.T) {
 	if err != nil || len(oldClaim) != 1 {
 		t.Fatalf("old Snapshot claim = %d jobs, err=%v", len(oldClaim), err)
 	}
+	oldAttempt, err := jobsStore.MarkExecutionStarted(ctx, oldClaim[0].ID, "old-snapshot-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim[0].AttemptCount, oldClaim[0].ExecutionStarted = oldAttempt, true
 	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
 		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
 		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
@@ -420,6 +425,11 @@ func TestStaleSnapshotExecutionCannotReplaceCurrentMaterialization(t *testing.T)
 	if err != nil || len(oldClaim) != 1 {
 		t.Fatalf("old snapshot claim = %+v, err=%v", oldClaim, err)
 	}
+	oldAttempt, err := jobsStore.MarkExecutionStarted(ctx, oldClaim[0].ID, "snapshot-old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim[0].AttemptCount, oldClaim[0].ExecutionStarted = oldAttempt, true
 	barrier := &firstCloneBarrier{commitSHA: commitSHA, started: make(chan struct{}), release: make(chan struct{})}
 	handler := indexing.NewSnapshotJobHandler(
 		&mockRepoStore{}, store, nil, storeFS, barrier,
@@ -440,6 +450,11 @@ func TestStaleSnapshotExecutionCannotReplaceCurrentMaterialization(t *testing.T)
 	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
 		t.Fatalf("new snapshot claim = %+v, err=%v", newClaim, err)
 	}
+	newAttempt, err := jobsStore.MarkExecutionStarted(ctx, newClaim[0].ID, "snapshot-new-worker", *newClaim[0].ClaimToken, newClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newClaim[0].AttemptCount, newClaim[0].ExecutionStarted = newAttempt, true
 	if err := handler.Execute(ctx, newClaim[0]); err != nil {
 		t.Fatalf("W2 snapshot execution failed: %v", err)
 	}
