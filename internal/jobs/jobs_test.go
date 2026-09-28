@@ -569,14 +569,19 @@ func TestStore_ReaperAndRetryExhaustion(t *testing.T) {
 	}
 
 	// First claim
-	claimed, err := store.ClaimJobs(ctx, "worker-1", 1, time.Millisecond)
+	claimed, err := store.ClaimJobs(ctx, "worker-1", 1, time.Minute)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("Claim failed: %v", err)
 	}
 	markExecutionStarted(t, store, claimed[0], "worker-1")
+	if claimed[0].AttemptCount != 1 {
+		t.Fatalf("expected attempt count 1 after execution start, got %d", claimed[0].AttemptCount)
+	}
 
-	// Wait for lease to expire
-	time.Sleep(10 * time.Millisecond)
+	// Expire the started claim explicitly, without racing execution start.
+	if _, err := db.Exec("UPDATE analysis_jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?", job.ID); err != nil {
+		t.Fatalf("Expire first lease failed: %v", err)
+	}
 
 	// Reaper runs
 	reaped, err := store.ReapExpiredJobs(ctx, 10)
@@ -596,7 +601,7 @@ func TestStore_ReaperAndRetryExhaustion(t *testing.T) {
 	_, _ = db.Exec("UPDATE analysis_jobs SET next_run_at = datetime('now', '-1 minute') WHERE id = ?", job.ID)
 
 	// Second claim (attempt 2 of 2)
-	claimed2, err := store.ClaimJobs(ctx, "worker-2", 1, time.Millisecond)
+	claimed2, err := store.ClaimJobs(ctx, "worker-2", 1, time.Minute)
 	if err != nil || len(claimed2) != 1 {
 		t.Fatalf("Second claim failed: %v", err)
 	}
@@ -605,7 +610,9 @@ func TestStore_ReaperAndRetryExhaustion(t *testing.T) {
 		t.Fatalf("expected attempt count 2 after execution start, got %d", claimed2[0].AttemptCount)
 	}
 
-	time.Sleep(10 * time.Millisecond)
+	if _, err := db.Exec("UPDATE analysis_jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?", job.ID); err != nil {
+		t.Fatalf("Expire second lease failed: %v", err)
+	}
 
 	// Reaper runs again -> attempt_count (2) >= max_attempts (2) -> terminal FAILED
 	reaped2, err := store.ReapExpiredJobs(ctx, 10)
