@@ -41,7 +41,7 @@ func (r *Resolver) RepositoryForRevision(ctx context.Context, revisionID string)
 }
 
 func (r *Resolver) ResolveLegacyReady(ctx context.Context, repositoryID, snapshotID string, codeIndexBuildID, retrievalBuildID int64) (ResolvedLineage, error) {
-	if r == nil || r.snapshots == nil {
+	if r == nil || r.snapshots == nil || r.codeintel == nil {
 		return ResolvedLineage{}, errors.New("READY lineage resolver is not configured")
 	}
 	if repositoryID == "" || snapshotID == "" || codeIndexBuildID <= 0 || retrievalBuildID <= 0 {
@@ -59,9 +59,6 @@ func (r *Resolver) ResolveLegacyReady(ctx context.Context, repositoryID, snapsho
 	}
 	if snap.Status != snapshot.StatusReady {
 		return ResolvedLineage{}, fmt.Errorf("snapshot %s is not READY (current status: %s)", snapshotID, snap.Status)
-	}
-	if r.codeintel == nil {
-		return ResolvedLineage{RepositoryID: repositoryID, CommitSHA: snap.CommitSHA, SnapshotID: snap.ID, CodeIndexBuildID: codeIndexBuildID, RetrievalBuildID: retrievalBuildID}, nil
 	}
 	if snap.RepositoryID != repositoryID {
 		return ResolvedLineage{}, codeintelstore.ErrBuildLineageMismatch

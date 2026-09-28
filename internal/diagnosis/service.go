@@ -183,9 +183,11 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	}
 
 	if input.AnalysisRevisionID == "" {
-		if _, err := s.lineage.ResolveLegacyReady(ctx, input.RepositoryID, input.SnapshotID, input.CodeIndexBuildID, input.RetrievalBuildID); err != nil {
+		lineage, err := s.lineage.ResolveLegacyReady(ctx, input.RepositoryID, input.SnapshotID, input.CodeIndexBuildID, input.RetrievalBuildID)
+		if err != nil {
 			return nil, false, err
 		}
+		selectedLineage = lineage
 	}
 
 	cleanDesc := RedactSecrets(input.IssueDescription)
@@ -238,11 +240,11 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	run := &DiagnosisRun{
 		ID:                          uuid.New().String(),
 		UserID:                      input.UserID,
-		RepositoryID:                input.RepositoryID,
-		AnalysisRevisionID:          input.AnalysisRevisionID,
-		SnapshotID:                  input.SnapshotID,
-		CodeIndexBuildID:            input.CodeIndexBuildID,
-		RetrievalBuildID:            input.RetrievalBuildID,
+		RepositoryID:                selectedLineage.RepositoryID,
+		AnalysisRevisionID:          selectedLineage.RevisionID,
+		SnapshotID:                  selectedLineage.SnapshotID,
+		CodeIndexBuildID:            selectedLineage.CodeIndexBuildID,
+		RetrievalBuildID:            selectedLineage.RetrievalBuildID,
 		IssueTitle:                  RedactSecrets(input.IssueTitle),
 		IssueDescription:            cleanDesc,
 		ErrorLog:                    cleanLog,
