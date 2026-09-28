@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	"repolens/internal/analysispipeline"
 	codeintelmodel "repolens/internal/codeintel/model"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
@@ -24,6 +26,10 @@ import (
 	"repolens/internal/snapshot"
 )
 
+func newPipelineRevisionService(db *gorm.DB, revisions revision.Store, repositories repo.Store, resolver analysispipeline.RefResolver, snapshotBasePath string) *analysispipeline.RevisionService {
+	return analysispipeline.NewRevisionService(analysispipeline.NewService(analysispipeline.NewStore(db)), revisions, repositories, resolver, snapshotBasePath)
+}
+
 type fixedResolver struct{ sha string }
 
 func (r fixedResolver) ResolveRef(context.Context, string, string) (string, error) { return r.sha, nil }
@@ -32,6 +38,19 @@ type failingResolver struct{}
 
 func (failingResolver) ResolveRef(context.Context, string, string) (string, error) {
 	return "", errors.New("remote ref does not exist")
+}
+
+type firstIdentityLookupMiss struct {
+	revision.Store
+	calls int
+}
+
+func (s *firstIdentityLookupMiss) GetByIdentity(ctx context.Context, repositoryID, commitSHA, fingerprint string) (*revision.AnalysisRevision, error) {
+	s.calls++
+	if s.calls == 1 {
+		return nil, revision.ErrNotFound
+	}
+	return s.Store.GetByIdentity(ctx, repositoryID, commitSHA, fingerprint)
 }
 
 func newRevisionDB(t *testing.T) *gorm.DB {
@@ -56,7 +75,7 @@ func TestPrepareCreatesOneProductRevisionAndLineage(t *testing.T) {
 	}
 
 	store := revision.NewStore(db)
-	service := revision.NewService(store, repoStore, fixedResolver{sha: "0123456789012345678901234567890123456789"}, t.TempDir())
+	service := newPipelineRevisionService(db, store, repoStore, fixedResolver{sha: "0123456789012345678901234567890123456789"}, t.TempDir())
 	first, created, err := service.Prepare(ctx, "local-user", repository.ID, "main")
 	if err != nil || !created {
 		t.Fatalf("first prepare = created=%v err=%v", created, err)
@@ -80,6 +99,93 @@ func TestPrepareCreatesOneProductRevisionAndLineage(t *testing.T) {
 	snap, err := snapshot.NewStore(db).GetByID(ctx, first.SnapshotID)
 	if err != nil || snap.AnalysisRevisionID != first.ID {
 		t.Fatalf("snapshot lineage = %+v err=%v", snap, err)
+	}
+}
+
+func TestPrepareRereadsConcurrentWinnerAfterUniqueIdentityConflict(t *testing.T) {
+	db := newRevisionDB(t)
+	ctx := context.Background()
+	repositories := repo.NewStore(db)
+	repository := &repo.Repository{ID: "repo-prepare-winner", UserID: "user", Name: "winner", GitURL: "https://github.com/example/winner", DefaultRef: "main"}
+	if err := repositories.Create(ctx, repository); err != nil {
+		t.Fatal(err)
+	}
+	const commitSHA = "0123456789012345678901234567890123456789"
+	pipeline := analysispipeline.NewService(analysispipeline.NewStore(db))
+	winner, err := pipeline.Prepare(ctx, analysispipeline.PrepareSpec{
+		RepositoryID: repository.ID, SourceRef: "main", CommitSHA: commitSHA,
+		PipelineVersion: revision.PipelineVersion, PipelineFingerprint: revision.ComputePipelineFingerprint(),
+		SnapshotBasePath: t.TempDir(), ModulePath: repository.Name,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := &firstIdentityLookupMiss{Store: revision.NewStore(db)}
+	service := analysispipeline.NewRevisionService(pipeline, read, repositories, fixedResolver{sha: commitSHA}, t.TempDir())
+	reused, created, err := service.Prepare(ctx, "user", repository.ID, "main")
+	if err != nil || created || reused == nil || reused.ID != winner.ID || read.calls != 2 {
+		t.Fatalf("winner reread = revision %+v created %v lookups %d err %v", reused, created, read.calls, err)
+	}
+	var revisions, snapshots, jobsCount int64
+	if err := db.Model(&revision.AnalysisRevision{}).Count(&revisions).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&snapshot.RepositorySnapshot{}).Count(&snapshots).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Count(&jobsCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if revisions != 1 || snapshots != 1 || jobsCount != 1 {
+		t.Fatalf("concurrent winner resources = revisions %d snapshots %d jobs %d", revisions, snapshots, jobsCount)
+	}
+}
+
+func TestRetryPreparationCreatesNextStageJobAndRejectsInvalidStates(t *testing.T) {
+	db := newRevisionDB(t)
+	ctx := context.Background()
+	repositories := repo.NewStore(db)
+	repository := &repo.Repository{ID: "repo-retry-next-stage", UserID: "user", Name: "next-stage", GitURL: "https://github.com/example/next-stage", DefaultRef: "main"}
+	if err := repositories.Create(ctx, repository); err != nil {
+		t.Fatal(err)
+	}
+	pipeline := analysispipeline.NewService(analysispipeline.NewStore(db))
+	prepared, err := pipeline.Prepare(ctx, analysispipeline.PrepareSpec{
+		RepositoryID: repository.ID, SourceRef: "main", CommitSHA: "0123456789012345678901234567890123456789",
+		PipelineVersion: revision.PipelineVersion, PipelineFingerprint: revision.ComputePipelineFingerprint(),
+		SnapshotBasePath: t.TempDir(), ModulePath: repository.Name,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&snapshot.RepositorySnapshot{}).Where("id = ?", prepared.SnapshotID).Update("status", snapshot.StatusReady).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", prepared.ID).Update("status", revision.StatusFailed).Error; err != nil {
+		t.Fatal(err)
+	}
+	retried, err := pipeline.Retry(ctx, prepared.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Status != revision.StatusPreparing || retried.Stage != revision.StageBuildingCode || retried.ExecutionGeneration != 2 || retried.CodeIndexBuildID == 0 {
+		t.Fatalf("next stage revision = %+v", retried)
+	}
+	var job jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", retried.CodeIndexBuildID)).First(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != jobs.StatusPending || job.ExecutionGeneration != 2 {
+		t.Fatalf("next stage job = %+v", job)
+	}
+	if _, err := pipeline.Retry(ctx, prepared.ID); !errors.Is(err, revision.ErrRetryConflict) {
+		t.Fatalf("retry PREPARING = %v, want conflict", err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", prepared.ID).Update("status", revision.StatusReady).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipeline.Retry(ctx, prepared.ID); !errors.Is(err, revision.ErrInvalidState) {
+		t.Fatalf("retry READY = %v, want invalid state", err)
 	}
 }
 
@@ -109,7 +215,7 @@ func TestPrepareCreatesNewSnapshotForExistingCommitAfterPipelineChange(t *testin
 		t.Fatalf("seed historical READY snapshot: %v", err)
 	}
 
-	service := revision.NewService(revision.NewStore(db), repoStore, fixedResolver{sha: commitSHA}, t.TempDir())
+	service := newPipelineRevisionService(db, revision.NewStore(db), repoStore, fixedResolver{sha: commitSHA}, t.TempDir())
 	current, created, err := service.Prepare(ctx, "local-user", repository.ID, "main")
 	if err != nil || !created {
 		t.Fatalf("prepare after pipeline change = created=%v err=%v", created, err)
@@ -137,7 +243,7 @@ func TestRevisionTransitionsToReadyAndRetryIsExplicit(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := revision.NewStore(db)
-	service := revision.NewService(store, repoStore, fixedResolver{sha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}, t.TempDir())
+	service := newPipelineRevisionService(db, store, repoStore, fixedResolver{sha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}, t.TempDir())
 	value, _, err := service.Prepare(ctx, "user", "repo-state", "main")
 	if err != nil {
 		t.Fatal(err)
@@ -199,7 +305,7 @@ func TestRevisionHandlerSeparatesRefFailureFromStoreFailure(t *testing.T) {
 		c.Set(string(logger.UserIDKey), "user-handler")
 		c.Next()
 	})
-	handler := revision.NewHandler(revision.NewService(revision.NewStore(db), repoStore, failingResolver{}, t.TempDir()))
+	handler := revision.NewHandler(newPipelineRevisionService(db, revision.NewStore(db), repoStore, failingResolver{}, t.TempDir()))
 	router.POST("/repositories/:id/revisions", handler.Create)
 
 	response := httptest.NewRecorder()
@@ -253,7 +359,7 @@ func TestConcurrentRevisionRetryHasSingleGenerationWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := revision.NewStore(db)
-	service := revision.NewService(store, repoStore, fixedResolver{sha: "0123456789012345678901234567890123456789"}, t.TempDir())
+	service := newPipelineRevisionService(db, store, repoStore, fixedResolver{sha: "0123456789012345678901234567890123456789"}, t.TempDir())
 	value, created, err := service.Prepare(ctx, "user-retry-cas", "repo-retry-cas", "main")
 	if err != nil || !created {
 		t.Fatalf("Prepare = created %t err %v", created, err)
@@ -273,7 +379,7 @@ func TestConcurrentRevisionRetryHasSingleGenerationWinner(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			_, retryErr := store.Retry(ctx, value.ID)
+			_, retryErr := analysispipeline.NewStore(db).RetryPreparation(ctx, value.ID)
 			results <- retryErr
 		}()
 	}
@@ -330,7 +436,7 @@ func TestRevisionRetryCASConflictDoesNotResetPipelineResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := revision.NewStore(db)
-	service := revision.NewService(store, repoStore, fixedResolver{sha: "abcdef0123456789abcdef0123456789abcdef01"}, t.TempDir())
+	service := newPipelineRevisionService(db, store, repoStore, fixedResolver{sha: "abcdef0123456789abcdef0123456789abcdef01"}, t.TempDir())
 	value, created, err := service.Prepare(ctx, "user-retry-cas-conflict", "repo-retry-cas-conflict", "main")
 	if err != nil || !created {
 		t.Fatalf("Prepare = created %t err %v", created, err)
@@ -345,7 +451,7 @@ func TestRevisionRetryCASConflictDoesNotResetPipelineResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Exec("DROP TRIGGER ignore_revision_retry")
-	if _, err := store.Retry(ctx, value.ID); !errors.Is(err, revision.ErrRetryConflict) {
+	if _, err := analysispipeline.NewStore(db).RetryPreparation(ctx, value.ID); !errors.Is(err, revision.ErrRetryConflict) {
 		t.Fatalf("Retry error = %v, want ErrRetryConflict", err)
 	}
 	saved, err := store.GetByID(ctx, value.ID)

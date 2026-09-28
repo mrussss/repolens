@@ -90,7 +90,8 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	revisionService := revision.NewService(
+	revisionService := analysispipeline.NewRevisionService(
+		analysispipeline.NewService(analysispipeline.NewStore(db)),
 		revisionStore,
 		repositoryStore,
 		fixedResolver{},

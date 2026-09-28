@@ -1,6 +1,7 @@
 package revision
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,9 +15,16 @@ import (
 	"repolens/internal/repo"
 )
 
-type Handler struct{ service *Service }
+type RevisionUseCases interface {
+	Prepare(ctx context.Context, userID, repositoryID, requestedRef string) (*AnalysisRevision, bool, error)
+	Get(ctx context.Context, userID, id string) (*AnalysisRevision, error)
+	List(ctx context.Context, userID, repositoryID string, limit int) ([]AnalysisRevision, error)
+	Retry(ctx context.Context, userID, id string) (*AnalysisRevision, error)
+}
 
-func NewHandler(service *Service) *Handler { return &Handler{service: service} }
+type Handler struct{ service RevisionUseCases }
+
+func NewHandler(service RevisionUseCases) *Handler { return &Handler{service: service} }
 
 type prepareRequest struct {
 	Ref string `json:"ref"`

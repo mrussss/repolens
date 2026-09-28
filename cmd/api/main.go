@@ -137,7 +137,8 @@ func run() error {
 	)
 	repoHandler.WithSnapshotResolver(cloner, jobStore)
 	repoHandler.WithSnapshotBasePath(cfg.SnapshotBasePath)
-	revisionSvc := revision.NewService(
+	revisionSvc := analysispipeline.NewRevisionService(
+		analysispipeline.NewService(analysispipeline.NewStore(db.GormDB)),
 		revisionStore,
 		repoStore,
 		cloner,

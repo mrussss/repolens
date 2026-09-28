@@ -2,83 +2,19 @@ package revision
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"strings"
 
 	"repolens/internal/repo"
 )
 
-type RefResolver interface {
-	ResolveRef(ctx context.Context, gitURL, ref string) (string, error)
-}
-
+// Service retains the revision read side; AnalysisPipeline owns preparation
+// and retry writes.
 type Service struct {
 	store     Store
 	repoStore repo.Store
-	resolver  RefResolver
-	basePath  string
 }
 
-func NewService(store Store, repoStore repo.Store, resolver RefResolver, snapshotBasePath string) *Service {
-	return &Service{store: store, repoStore: repoStore, resolver: resolver, basePath: snapshotBasePath}
-}
-
-func (s *Service) Prepare(ctx context.Context, userID, repositoryID, requestedRef string) (*AnalysisRevision, bool, error) {
-	if strings.TrimSpace(requestedRef) == "" {
-		r, err := s.repoStore.GetByIDAndUser(ctx, repositoryID, userID)
-		if err != nil {
-			return nil, false, err
-		}
-		requestedRef = r.DefaultRef
-	}
-	if err := repo.ValidateRefLength(requestedRef); err != nil {
-		return nil, false, err
-	}
-	repository, err := s.repoStore.GetByIDAndUser(ctx, repositoryID, userID)
-	if err != nil {
-		return nil, false, err
-	}
-	if s.resolver == nil {
-		return nil, false, fmt.Errorf("revision ref resolver is not configured")
-	}
-	commitSHA, err := s.resolver.ResolveRef(ctx, repository.GitURL, requestedRef)
-	if err != nil {
-		return nil, false, fmt.Errorf("%w: %v", ErrRefResolution, err)
-	}
-	fingerprint := ComputePipelineFingerprint()
-	existing, lookupErr := s.store.GetByIdentity(ctx, repositoryID, commitSHA, fingerprint)
-	if lookupErr == nil {
-		if existing.Status == StatusFailed {
-			return existing, false, ErrFailedRevision
-		}
-		return existing, false, nil
-	}
-	if !errors.Is(lookupErr, ErrNotFound) {
-		return nil, false, lookupErr
-	}
-
-	created, err := s.store.CreatePreparation(ctx, PrepareSpec{
-		RepositoryID:        repositoryID,
-		SourceRef:           requestedRef,
-		CommitSHA:           commitSHA,
-		PipelineVersion:     PipelineVersion,
-		PipelineFingerprint: fingerprint,
-		SnapshotBasePath:    s.basePath,
-		ModulePath:          repository.Name,
-	})
-	if err != nil {
-		// The unique identity is the concurrency boundary. A losing request
-		// re-reads the winner rather than exposing a database duplicate error.
-		if winner, winnerErr := s.store.GetByIdentity(ctx, repositoryID, commitSHA, fingerprint); winnerErr == nil {
-			if winner.Status == StatusFailed {
-				return winner, false, ErrFailedRevision
-			}
-			return winner, false, nil
-		}
-		return nil, false, err
-	}
-	return created, true, nil
+func NewService(store Store, repoStore repo.Store) *Service {
+	return &Service{store: store, repoStore: repoStore}
 }
 
 func (s *Service) Get(ctx context.Context, userID, id string) (*AnalysisRevision, error) {
@@ -97,18 +33,4 @@ func (s *Service) List(ctx context.Context, userID, repositoryID string, limit i
 		return nil, ErrNotFound
 	}
 	return s.store.ListByRepository(ctx, repositoryID, limit)
-}
-
-func (s *Service) Retry(ctx context.Context, userID, id string) (*AnalysisRevision, error) {
-	value, err := s.Get(ctx, userID, id)
-	if err != nil {
-		return nil, err
-	}
-	if value.Status != StatusFailed {
-		if value.Status == StatusPreparing {
-			return nil, ErrRetryConflict
-		}
-		return nil, ErrInvalidState
-	}
-	return s.store.Retry(ctx, id)
 }
