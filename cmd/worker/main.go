@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"repolens/internal/agent"
+	"repolens/internal/analysispipeline"
 	"repolens/internal/codeintel"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
@@ -71,6 +72,7 @@ func run() error {
 	indexStore := repoindex.NewStore(db.GormDB)
 	codeIntelStore := codeintelstore.NewStore(db.GormDB)
 	revisionStore := revision.NewStore(db.GormDB)
+	pipelineFinalizer := analysispipeline.NewFinalizer(snapshotStore, codeIntelStore)
 	diagnosisStore := diagnosis.NewStore(db.GormDB)
 	reportStore := evidence.NewReportStore(db.GormDB)
 	citationStore := evidence.NewCitationStore(db.GormDB)
@@ -128,6 +130,7 @@ func run() error {
 	)
 	snapshotJobHandler.WithCodeIntelStore(codeIntelStore)
 	snapshotJobHandler.WithRevisionStore(revisionStore)
+	snapshotJobHandler.WithFinalizer(pipelineFinalizer)
 	snapshotJobHandler.WithResourceLimits(
 		cfg.MaxIndexableSourceBytes,
 		cfg.MaxFileCount,
@@ -138,11 +141,11 @@ func run() error {
 		snapshotStore,
 		storeFS,
 		codeintel.NewAnalyzer(),
-	)
+	).WithFinalizer(pipelineFinalizer)
 	retrievalJobHandler := retrieval.NewRetrievalJobHandler(
 		codeIntelStore,
 		indexStorageDir,
-	).WithSnapshotSource(snapshotStore, storeFS)
+	).WithSnapshotSource(snapshotStore, storeFS).WithFinalizer(pipelineFinalizer)
 
 	jobsWorker := jobs.NewWorker(jobsStore, jobs.DefaultWorkerConfig())
 	jobsWorker.RegisterHandler(jobs.JobTypeRunDiagnosis, diagJobHandler)

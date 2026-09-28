@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"repolens/internal/analysispipeline"
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/jobs"
@@ -24,6 +25,12 @@ type RetrievalJobHandler struct {
 	publisher     *artifact.Publisher
 	snapshotStore snapshot.Store
 	storeFS       snapshotstore.SnapshotStore
+	finalizer     *analysispipeline.Finalizer
+}
+
+func (h *RetrievalJobHandler) WithFinalizer(finalizer *analysispipeline.Finalizer) *RetrievalJobHandler {
+	h.finalizer = finalizer
+	return h
 }
 
 // WithSnapshotSource configures immutable snapshot reads for indexing symbol
@@ -132,7 +139,14 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 
 	var finalizeErr error
 	if rb.AnalysisRevisionID != "" {
-		finalizeErr = h.ciStore.FinalizeRetrievalSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, rb.ID, rb.AnalysisRevisionID, finalPath, artifactHash, idx.TotalDocs)
+		if h.finalizer == nil {
+			return fmt.Errorf("analysis pipeline finalizer is not configured")
+		}
+		finalizeErr = h.finalizer.FinalizeRetrieval(ctx, analysispipeline.RetrievalStageResult{
+			Ownership:  analysispipeline.JobOwnership{JobID: job.ID, WorkerID: *job.WorkerID, ClaimToken: *job.ClaimToken},
+			RevisionID: rb.AnalysisRevisionID, RetrievalBuildID: rb.ID,
+			ArtifactPath: finalPath, ArtifactHash: artifactHash, DocCount: idx.TotalDocs,
+		})
 	} else {
 		finalizeErr = h.ciStore.FinalizeRetrievalSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, rb.ID, finalPath, artifactHash, idx.TotalDocs)
 	}

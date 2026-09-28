@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"repolens/internal/analysispipeline"
 	"repolens/internal/codeintel/model"
 	"repolens/internal/codeintel/store"
 	"repolens/internal/jobs"
@@ -22,6 +23,12 @@ type CodeIndexJobHandler struct {
 	snapStore snapshot.Store
 	storeFS   snapshotstore.SnapshotStore
 	analyzer  *Analyzer
+	finalizer *analysispipeline.Finalizer
+}
+
+func (h *CodeIndexJobHandler) WithFinalizer(finalizer *analysispipeline.Finalizer) *CodeIndexJobHandler {
+	h.finalizer = finalizer
+	return h
 }
 
 // NewCodeIndexJobHandler constructs a new handler for BUILD_CODE_INDEX jobs.
@@ -110,7 +117,13 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	var saveErr error
 	stageFinalized := false
 	if cib.AnalysisRevisionID != "" {
-		saveErr = h.store.FinalizeCodeIndexSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, cib.AnalysisRevisionID, analysisRes)
+		if h.finalizer == nil {
+			return fmt.Errorf("analysis pipeline finalizer is not configured")
+		}
+		saveErr = h.finalizer.FinalizeCodeIndex(ctx, analysispipeline.CodeIndexStageResult{
+			Ownership:  analysispipeline.JobOwnership{JobID: job.ID, WorkerID: *job.WorkerID, ClaimToken: *job.ClaimToken},
+			RevisionID: cib.AnalysisRevisionID, CodeIndexBuildID: cib.ID, AnalysisResult: analysisRes,
+		})
 		stageFinalized = saveErr == nil
 	} else {
 		saveErr = h.store.FinalizeCodeIndexSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, analysisRes)

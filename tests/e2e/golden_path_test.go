@@ -52,6 +52,7 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 	snapshotStore := snapshot.NewStore(db)
 	revisionStore := revision.NewStore(db)
 	codeIndexStore := codeintelstore.NewStore(db)
+	pipelineFinalizer := analysispipeline.NewFinalizer(snapshotStore, codeIndexStore)
 	diagnosisStore := diagnosis.NewStore(db)
 	reportStore := evidence.NewReportStore(db)
 	citationStore := evidence.NewCitationStore(db)
@@ -119,15 +120,15 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 		indexing.NewFileFilter(512),
 		indexing.NewCodeChunker(60, 10),
 		nil,
-	).WithRevisionStore(revisionStore)
+	).WithRevisionStore(revisionStore).WithFinalizer(pipelineFinalizer)
 	codeIndexHandler := codeintel.NewCodeIndexJobHandler(
 		codeIndexStore,
 		snapshotStore,
 		storeFS,
 		codeintel.NewAnalyzer(),
-	)
+	).WithFinalizer(pipelineFinalizer)
 	retrievalHandler := retrieval.NewRetrievalJobHandler(codeIndexStore, artifactDir).
-		WithSnapshotSource(snapshotStore, storeFS)
+		WithSnapshotSource(snapshotStore, storeFS).WithFinalizer(pipelineFinalizer)
 
 	retriever := retrieval.NewProductionRetriever(codeIndexStore, artifactDir)
 	provider := &scriptedProvider{}

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"repolens/internal/analysispipeline"
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/jobs"
@@ -38,6 +39,7 @@ type SnapshotJobHandler struct {
 	revisionStore           interface {
 		MarkSnapshotReady(context.Context, string, string) error
 	}
+	finalizer *analysispipeline.Finalizer
 }
 
 func (h *SnapshotJobHandler) WithResourceLimits(maxRepoBytes int64, maxFileCount int) *SnapshotJobHandler {
@@ -90,6 +92,11 @@ func (h *SnapshotJobHandler) WithRevisionStore(store interface {
 	MarkSnapshotReady(context.Context, string, string) error
 }) *SnapshotJobHandler {
 	h.revisionStore = store
+	return h
+}
+
+func (h *SnapshotJobHandler) WithFinalizer(finalizer *analysispipeline.Finalizer) *SnapshotJobHandler {
+	h.finalizer = finalizer
 	return h
 }
 
@@ -279,8 +286,13 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
 	}
 	stageFinalized := false
-	if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationRevisionFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil && snap.AnalysisRevisionID != "" {
-		if err := finalizer.FinalizeSnapshotSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, snap.AnalysisRevisionID, r.Name, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+	if h.finalizer != nil && job.WorkerID != nil && job.ClaimToken != nil && snap.AnalysisRevisionID != "" {
+		if err := h.finalizer.FinalizeSnapshot(ctx, analysispipeline.SnapshotStageResult{
+			Ownership:  analysispipeline.JobOwnership{JobID: job.ID, WorkerID: *job.WorkerID, ClaimToken: *job.ClaimToken},
+			RevisionID: snap.AnalysisRevisionID, SnapshotID: snap.ID, MaterializedPath: targetDir,
+			ModulePath: r.Name, CommitSHA: commitSHA, ContentHash: contentHash,
+			FileCount: fileCount, TotalBytes: totalBytes, ReadyAt: now,
+		}); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return err
 		}
