@@ -444,7 +444,7 @@ func TestOpenAICompatibleAuthModesAndEndpointNormalization(t *testing.T) {
 	}
 }
 
-func TestBuildForDiagnosisPinsMetadataButReloadsRotatedKey(t *testing.T) {
+func TestBuildForExecutionPinsIdentityButReloadsRotatedKey(t *testing.T) {
 	var authorization string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorization = r.Header.Get("Authorization")
@@ -495,5 +495,17 @@ func TestBuildForDiagnosisPinsMetadataButReloadsRotatedKey(t *testing.T) {
 	class, code := jobs.ClassifyError(err)
 	if class != jobs.ErrorClassPermanent || code != "PROVIDER_CONFIG_MISMATCH" {
 		t.Fatalf("expected permanent provider mismatch, got class=%s code=%s err=%v", class, code, err)
+	}
+
+	if err := mgr.SaveConfig(server.URL+"/changed-endpoint", "model-a", "key-d", false); err != nil {
+		t.Fatal(err)
+	}
+	_, err = mgr.BuildForExecution(context.Background(), spec.Provider)
+	if err == nil {
+		t.Fatal("expected provider endpoint drift to be rejected")
+	}
+	class, code = jobs.ClassifyError(err)
+	if class != jobs.ErrorClassPermanent || code != "PROVIDER_ENDPOINT_MISMATCH" {
+		t.Fatalf("expected permanent provider endpoint mismatch, got class=%s code=%s err=%v", class, code, err)
 	}
 }
