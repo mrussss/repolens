@@ -35,8 +35,30 @@ import (
 func newDiagnosisTestService(db *gorm.DB, store diagnosis.Store, repositories repo.Store, snapshots snapshot.Store) *diagnosis.Service {
 	return diagnosis.NewService(diagnosis.ServiceDependencies{
 		Store: store, RepoStore: repositories,
-		Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshots, nil),
+		Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshots, codeintelstore.NewStore(db)),
 	})
+}
+
+func seedDiagnosisLegacyBuilds(t *testing.T, db *gorm.DB, snapshotID string, codeBuildID, retrievalBuildID int64) {
+	t.Helper()
+	buildContext := codeintelmodel.DefaultBuildContext()
+	build := &codeintelmodel.CodeIndexBuild{
+		ID: codeBuildID, SnapshotID: snapshotID, ParserVersion: codeintelmodel.CurrentParserVersion,
+		AnalyzerVersion: codeintelmodel.CurrentAnalyzerVersion, SymbolSchemaVersion: codeintelmodel.CurrentSymbolSchemaVersion,
+		BuildContextHash: buildContext.BuildContextHash(), ModulePath: "test", GOOS: buildContext.GOOS,
+		GOARCH: buildContext.GOARCH, BuildTagsHash: buildContext.BuildTagsHash(), Status: codeintelmodel.BuildStatusReady,
+	}
+	if err := db.Create(build).Error; err != nil {
+		t.Fatal(err)
+	}
+	retrievalBuild := &codeintelmodel.RetrievalBuild{
+		ID: retrievalBuildID, CodeIndexBuildID: codeBuildID, Strategy: "BM25",
+		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion, TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
+		ConfigHash: "test", ArtifactPath: "test-index", ArtifactHash: "test-hash", Status: codeintelmodel.BuildStatusReady,
+	}
+	if err := db.Create(retrievalBuild).Error; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func newDiagnosisTestServiceWithCodeIntel(db *gorm.DB, store diagnosis.Store, repositories repo.Store, snapshots snapshot.Store) *diagnosis.Service {
@@ -576,9 +598,10 @@ func TestDiagnosisCreateIdempotencyReplayPrecedesProviderCheck(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	seedDiagnosisLegacyBuilds(t, db, "snapshot-replay", 11, 12)
 
 	configured := true
-	svc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: diagnosis.NewStore(db), RepoStore: repoStore, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshotStore, nil), ProviderSource: func() diagnosis.ProviderMetadata {
+	svc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: diagnosis.NewStore(db), RepoStore: repoStore, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshotStore, codeintelstore.NewStore(db)), ProviderSource: func() diagnosis.ProviderMetadata {
 		return diagnosis.ProviderMetadata{IsConfigured: configured}
 	}})
 	input := diagnosis.CreateDiagnosisInput{

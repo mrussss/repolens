@@ -31,7 +31,29 @@ import (
 )
 
 func newIntegrationDiagnosisService(db *gorm.DB, store diagnosis.Store, repositories repo.Store, snapshots snapshot.Store) *diagnosis.Service {
-	return diagnosis.NewService(diagnosis.ServiceDependencies{Store: store, RepoStore: repositories, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshots, nil)})
+	return diagnosis.NewService(diagnosis.ServiceDependencies{Store: store, RepoStore: repositories, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshots, codeintelstore.NewStore(db))})
+}
+
+func seedReadyLegacyBuilds(t *testing.T, db *gorm.DB, snapshotID string, codeBuildID, retrievalBuildID int64) {
+	t.Helper()
+	buildContext := codeintelmodel.DefaultBuildContext()
+	build := &codeintelmodel.CodeIndexBuild{
+		ID: codeBuildID, SnapshotID: snapshotID, ParserVersion: codeintelmodel.CurrentParserVersion,
+		AnalyzerVersion: codeintelmodel.CurrentAnalyzerVersion, SymbolSchemaVersion: codeintelmodel.CurrentSymbolSchemaVersion,
+		BuildContextHash: buildContext.BuildContextHash(), ModulePath: "test", GOOS: buildContext.GOOS,
+		GOARCH: buildContext.GOARCH, BuildTagsHash: buildContext.BuildTagsHash(), Status: codeintelmodel.BuildStatusReady,
+	}
+	if err := db.Create(build).Error; err != nil {
+		t.Fatal(err)
+	}
+	retrievalBuild := &codeintelmodel.RetrievalBuild{
+		ID: retrievalBuildID, CodeIndexBuildID: codeBuildID, Strategy: "BM25",
+		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion, TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
+		ConfigHash: "test", ArtifactPath: "test-index", ArtifactHash: "test-hash", Status: codeintelmodel.BuildStatusReady,
+	}
+	if err := db.Create(retrievalBuild).Error; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func integrationExecutionSpec(run *diagnosis.DiagnosisRun) diagnosis.DiagnosisExecutionSpec {
@@ -89,6 +111,7 @@ func TestDiagnosisCreationAndIdempotency(t *testing.T) {
 		Status:       snapshot.StatusReady,
 	}
 	_ = snapStore.Create(ctx, testSnap)
+	seedReadyLegacyBuilds(t, db, testSnap.ID, 1001, 2001)
 
 	input := diagnosis.CreateDiagnosisInput{
 		UserID:           "user-100",
@@ -155,6 +178,7 @@ func TestDiagnosisJSONCredentialIsRedactedBeforeProviderInput(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	seedReadyLegacyBuilds(t, db, "snapshot-json-redaction", 1, 1)
 	diagStore := diagnosis.NewStore(db)
 	diagService := newIntegrationDiagnosisService(db, diagStore, repoStore, snapshotStore)
 	run, created, err := diagService.Create(ctx, diagnosis.CreateDiagnosisInput{
@@ -224,6 +248,7 @@ func TestConcurrentWorkerClaimFencing(t *testing.T) {
 	_ = repoStore.Create(ctx, testRepo)
 	testSnap := &snapshot.RepositorySnapshot{ID: "snap-200", RepositoryID: testRepo.ID, Status: snapshot.StatusReady}
 	_ = snapStore.Create(ctx, testSnap)
+	seedReadyLegacyBuilds(t, db, testSnap.ID, 1002, 2002)
 
 	run, _, err := diagSvc.Create(ctx, diagnosis.CreateDiagnosisInput{
 		UserID:           "u2",
@@ -274,6 +299,7 @@ func TestDBJobWorkerPipeline(t *testing.T) {
 	_ = repoStore.Create(ctx, testRepo)
 	testSnap := &snapshot.RepositorySnapshot{ID: "snap-300", RepositoryID: testRepo.ID, Status: snapshot.StatusReady}
 	_ = snapStore.Create(ctx, testSnap)
+	seedReadyLegacyBuilds(t, db, testSnap.ID, 1003, 2003)
 
 	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
 	citVal := evidence.NewCitationValidator(storeFS)
@@ -479,6 +505,7 @@ func TestApplicationRetryOn429RateLimit(t *testing.T) {
 	_ = repoStore.Create(ctx, testRepo)
 	testSnap := &snapshot.RepositorySnapshot{ID: "snap-400", RepositoryID: testRepo.ID, Status: snapshot.StatusReady}
 	_ = snapStore.Create(ctx, testSnap)
+	seedReadyLegacyBuilds(t, db, testSnap.ID, 1004, 2004)
 
 	flakyExec := &FlakyRateLimitExecutor{}
 	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())

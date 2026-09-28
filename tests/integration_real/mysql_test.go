@@ -19,6 +19,8 @@ import (
 	"gorm.io/gorm/logger"
 
 	"repolens/internal/analysispipeline"
+	codeintelmodel "repolens/internal/codeintel/model"
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
@@ -462,7 +464,7 @@ func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
 	diagStore := diagnosis.NewStore(db)
 	repoStore := repo.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	diagSvc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: diagStore, RepoStore: repoStore, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapStore, nil)})
+	diagSvc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: diagStore, RepoStore: repoStore, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapStore, codeintelstore.NewStore(db))})
 
 	testRepo := &repo.Repository{
 		ID:         "repo-real-mysql",
@@ -482,6 +484,22 @@ func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
 		Status:       snapshot.StatusReady,
 	}
 	_ = snapStore.Create(ctx, testSnap)
+	buildContext := codeintelmodel.DefaultBuildContext()
+	if err := db.Create(&codeintelmodel.CodeIndexBuild{
+		ID: 3001, SnapshotID: testSnap.ID, ParserVersion: codeintelmodel.CurrentParserVersion,
+		AnalyzerVersion: codeintelmodel.CurrentAnalyzerVersion, SymbolSchemaVersion: codeintelmodel.CurrentSymbolSchemaVersion,
+		BuildContextHash: buildContext.BuildContextHash(), ModulePath: "payment-svc", GOOS: buildContext.GOOS,
+		GOARCH: buildContext.GOARCH, BuildTagsHash: buildContext.BuildTagsHash(), Status: codeintelmodel.BuildStatusReady,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&codeintelmodel.RetrievalBuild{
+		ID: 4001, CodeIndexBuildID: 3001, Strategy: "BM25",
+		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion, TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
+		ConfigHash: "test", ArtifactPath: "test-index", ArtifactHash: "test-hash", Status: codeintelmodel.BuildStatusReady,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	input := diagnosis.CreateDiagnosisInput{
 		UserID:           testRepo.UserID,

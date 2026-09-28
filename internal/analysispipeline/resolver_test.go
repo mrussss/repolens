@@ -157,3 +157,61 @@ func TestResolveReadyLineageMissingRevision(t *testing.T) {
 		t.Fatalf("error = %v, want revision not found", err)
 	}
 }
+
+func TestResolveLegacyReadyRequiresCompleteReadyLineage(t *testing.T) {
+	tests := []struct {
+		name    string
+		change  func(*testing.T, *gorm.DB)
+		wantErr bool
+	}{
+		{name: "ready"},
+		{name: "snapshot not ready", change: func(t *testing.T, db *gorm.DB) {
+			setLineageField(t, db, &snapshot.RepositorySnapshot{}, "snapshot-1", "status", snapshot.StatusMaterializing)
+		}, wantErr: true},
+		{name: "snapshot repository mismatch", change: func(t *testing.T, db *gorm.DB) {
+			setLineageField(t, db, &snapshot.RepositorySnapshot{}, "snapshot-1", "repository_id", "other-repo")
+		}, wantErr: true},
+		{name: "code index mismatch", change: func(t *testing.T, db *gorm.DB) {
+			setLineageField(t, db, &codeintelmodel.CodeIndexBuild{}, 10, "snapshot_id", "other-snapshot")
+		}, wantErr: true},
+		{name: "code index not ready", change: func(t *testing.T, db *gorm.DB) {
+			setLineageField(t, db, &codeintelmodel.CodeIndexBuild{}, 10, "status", codeintelmodel.BuildStatusBuilding)
+		}, wantErr: true},
+		{name: "retrieval mismatch", change: func(t *testing.T, db *gorm.DB) {
+			setLineageField(t, db, &codeintelmodel.RetrievalBuild{}, 20, "code_index_build_id", 99)
+		}, wantErr: true},
+		{name: "retrieval not ready", change: func(t *testing.T, db *gorm.DB) {
+			setLineageField(t, db, &codeintelmodel.RetrievalBuild{}, 20, "status", codeintelmodel.BuildStatusBuilding)
+		}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := readyLineageDB(t)
+			if tt.change != nil {
+				tt.change(t, db)
+			}
+			resolver := analysispipeline.NewResolver(revision.NewStore(db), snapshot.NewStore(db), codeintelstore.NewStore(db))
+			lineage, err := resolver.ResolveLegacyReady(context.Background(), "repo-1", "snapshot-1", 10, 20)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("invalid legacy lineage was accepted: %+v", lineage)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lineage.RepositoryID != "repo-1" || lineage.RevisionID != "" || lineage.SnapshotID != "snapshot-1" || lineage.CodeIndexBuildID != 10 || lineage.RetrievalBuildID != 20 || lineage.CommitSHA != testCommitSHA {
+				t.Fatalf("legacy lineage = %+v", lineage)
+			}
+		})
+	}
+}
+
+func TestResolveLegacyReadyRejectsMissingCodeIntelValidator(t *testing.T) {
+	db := readyLineageDB(t)
+	resolver := analysispipeline.NewResolver(revision.NewStore(db), snapshot.NewStore(db), nil)
+	if lineage, err := resolver.ResolveLegacyReady(context.Background(), "repo-1", "snapshot-1", 10, 20); err == nil {
+		t.Fatalf("legacy lineage was accepted without CodeIntel validation: %+v", lineage)
+	}
+}

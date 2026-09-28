@@ -94,6 +94,7 @@ func TestRequestHashAndIdempotencyConflict(t *testing.T) {
 		Status:           snapshot.StatusReady,
 		ReadyAt:          &now,
 	})
+	seedDiagnosisLegacyBuilds(t, db, snapID, 101, 202)
 
 	idempKey := "idemp-test-key-1"
 	codeIndexBuildID := int64(101)
