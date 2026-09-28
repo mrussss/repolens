@@ -80,6 +80,80 @@ func setupRealMySQL(t *testing.T, migrationDir ...string) (*gorm.DB, *jobs.Store
 	return db, jobsStore, cleanup
 }
 
+type mysqlTransientFinalizeStore struct {
+	*jobs.Store
+	calls     atomic.Int32
+	completed chan error
+}
+
+func (s *mysqlTransientFinalizeStore) ConditionalFinalizeSuccess(ctx context.Context, id int64, workerID, claimToken string) error {
+	if s.calls.Add(1) == 1 {
+		return errors.New("injected transient finalization database error")
+	}
+	err := s.Store.ConditionalFinalizeSuccess(ctx, id, workerID, claimToken)
+	s.completed <- err
+	return err
+}
+
+func TestRealMySQL_WorkerRetriesTransientTerminalFinalization(t *testing.T) {
+	_, store, cleanup := setupRealMySQL(t)
+	if store == nil {
+		return
+	}
+	defer cleanup()
+
+	ctx := context.Background()
+	job := &jobs.AnalysisJob{
+		JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "mysql-finalization-retry", MaxAttempts: 3,
+	}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &mysqlTransientFinalizeStore{Store: store, completed: make(chan error, 1)}
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.WorkerID = "mysql-finalize-retry-worker"
+	cfg.Concurrency = 1
+	cfg.BatchSize = 1
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LeaseDuration = 5 * time.Second
+	cfg.ReapInterval = time.Hour
+	worker := jobs.NewWorker(wrapped, cfg)
+	worker.RegisterHandler(jobs.JobTypeBuildCodeIndex, jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error {
+		return nil
+	}))
+	worker.Start(ctx)
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = worker.StopGracefully(stopCtx)
+	})
+
+	select {
+	case err := <-wrapped.completed:
+		if err != nil {
+			t.Fatalf("second MySQL finalization: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker did not retry MySQL terminal finalization")
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := worker.StopGracefully(stopCtx); err != nil {
+		t.Fatalf("StopGracefully after durable MySQL finalization: %v", err)
+	}
+
+	saved, err := store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != jobs.StatusSucceeded || saved.AttemptCount != 1 || !saved.ExecutionStarted {
+		t.Fatalf("MySQL finalization state=%+v; want SUCCEEDED with one started attempt", saved)
+	}
+	if got := wrapped.calls.Load(); got != 2 {
+		t.Fatalf("MySQL success finalization calls=%d; want injected failure plus successful retry", got)
+	}
+}
+
 func TestRealMySQL_Migration009ResumesAfterPartialDDL(t *testing.T) {
 	ctx := context.Background()
 	container, err := tcmysql.RunContainer(ctx,

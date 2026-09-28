@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -54,6 +55,7 @@ func DefaultWorkerConfig() WorkerConfig {
 
 type workerStore interface {
 	ClaimJobs(context.Context, string, int, time.Duration) ([]*AnalysisJob, error)
+	GetJobByID(context.Context, int64) (*AnalysisJob, error)
 	MarkExecutionStarted(context.Context, int64, string, string, int) (int, error)
 	ReturnUndispatchedClaim(context.Context, int64, string, string, int) error
 	RenewLease(context.Context, int64, string, string, time.Time) error
@@ -80,6 +82,8 @@ type Worker struct {
 	activeMu                 sync.Mutex
 	active                   map[int64]context.CancelCauseFunc
 	stopping                 bool
+	finalizationMu           sync.Mutex
+	finalizationErrors       map[int64]error
 }
 
 // NewWorker constructs a new Worker.
@@ -104,11 +108,12 @@ func NewWorker(store workerStore, cfg WorkerConfig) *Worker {
 	}
 
 	return &Worker{
-		store:    store,
-		cfg:      cfg,
-		handlers: make(map[JobType]Handler),
-		stopCh:   make(chan struct{}),
-		active:   make(map[int64]context.CancelCauseFunc),
+		store:              store,
+		cfg:                cfg,
+		handlers:           make(map[JobType]Handler),
+		stopCh:             make(chan struct{}),
+		active:             make(map[int64]context.CancelCauseFunc),
+		finalizationErrors: make(map[int64]error),
 	}
 }
 
@@ -156,6 +161,9 @@ func (w *Worker) StopGracefully(ctx context.Context) error {
 		w.cancelActive(ErrWorkerShutdown)
 		return w.waitForShutdownCleanup(jobsDone, err)
 	}
+	if err := w.unresolvedFinalizationError(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -201,6 +209,17 @@ func (w *Worker) registerActive(jobID int64, cancel context.CancelCauseFunc) {
 	w.active[jobID] = cancel
 }
 
+func (w *Worker) replaceActive(jobID int64, cancel context.CancelCauseFunc) {
+	w.activeMu.Lock()
+	if w.stopping {
+		w.activeMu.Unlock()
+		cancel(ErrWorkerShutdown)
+		return
+	}
+	w.active[jobID] = cancel
+	w.activeMu.Unlock()
+}
+
 func (w *Worker) unregisterActive(jobID int64) {
 	w.activeMu.Lock()
 	delete(w.active, jobID)
@@ -218,6 +237,27 @@ func (w *Worker) cancelActive(cause error) {
 	for _, cancel := range cancels {
 		cancel(cause)
 	}
+}
+
+func (w *Worker) recordFinalizationError(jobID int64, err error) {
+	w.finalizationMu.Lock()
+	w.finalizationErrors[jobID] = err
+	w.finalizationMu.Unlock()
+}
+
+func (w *Worker) clearFinalizationError(jobID int64) {
+	w.finalizationMu.Lock()
+	delete(w.finalizationErrors, jobID)
+	w.finalizationMu.Unlock()
+}
+
+func (w *Worker) unresolvedFinalizationError() error {
+	w.finalizationMu.Lock()
+	defer w.finalizationMu.Unlock()
+	for jobID, err := range w.finalizationErrors {
+		return fmt.Errorf("job %d has unresolved terminal finalization: %w", jobID, err)
+	}
+	return nil
 }
 
 func (w *Worker) claimLoop(ctx context.Context) {
@@ -424,22 +464,6 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 		"worker_id", w.cfg.WorkerID,
 	)
 
-	w.mu.RLock()
-	handler, exists := w.handlers[job.JobType]
-	w.mu.RUnlock()
-
-	if !exists {
-		log.Error("no handler registered for job type", "job_type", job.JobType)
-		termReason := TerminalReasonPermanent
-		_ = w.store.ConditionalFinalizeFailure(
-			parentCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken,
-			ErrorClassPermanent, "NO_HANDLER_REGISTERED",
-			fmt.Sprintf("no handler registered for job type %s", job.JobType),
-			&termReason, true, time.Time{},
-		)
-		return
-	}
-
 	jobCtx, cancelJob := context.WithCancelCause(parentCtx)
 	w.registerActive(job.ID, cancelJob)
 	defer w.unregisterActive(job.ID)
@@ -477,51 +501,87 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 			}
 		}
 	}()
+	stopCancelPoll := func() {
+		select {
+		case <-cancelPollStop:
+		default:
+			close(cancelPollStop)
+		}
+		<-cancelPollDone
+	}
+	finish := func(finalize func(context.Context) error, expected func(*AnalysisJob) bool) {
+		finalCtx, cancelFinal := context.WithCancelCause(context.Background())
+		w.replaceActive(job.ID, cancelFinal)
+		stopFinalLeaseRenewal := w.startFinalizationLeaseRenewer(finalCtx, job)
+		stopCancelPoll()
+		cancelJob(context.Canceled)
+		renewer.Stop()
+
+		if err := w.resolveFinalization(finalCtx, job, finalize, expected); err != nil {
+			if !errors.Is(err, ErrOwnershipLost) {
+				w.recordFinalizationError(job.ID, err)
+				log.Error("terminal job finalization remains unresolved", "error", err)
+			} else {
+				w.clearFinalizationError(job.ID)
+				log.Warn("terminal job finalization stopped after ownership loss", "error", err)
+			}
+		} else {
+			w.clearFinalizationError(job.ID)
+		}
+		stopFinalLeaseRenewal()
+		cancelFinal(context.Canceled)
+	}
+
+	w.mu.RLock()
+	handler, exists := w.handlers[job.JobType]
+	w.mu.RUnlock()
+	if !exists {
+		log.Error("no handler registered for job type", "job_type", job.JobType)
+		termReason := TerminalReasonPermanent
+		code := "NO_HANDLER_REGISTERED"
+		message := fmt.Sprintf("no handler registered for job type %s", job.JobType)
+		finish(func(ctx context.Context) error {
+			return w.store.ConditionalFinalizeFailure(ctx, job.ID, w.cfg.WorkerID, *job.ClaimToken,
+				ErrorClassPermanent, code, message, &termReason, true, time.Time{})
+		}, failureFinalizationExpected(ErrorClassPermanent, code, &termReason, true))
+		return
+	}
 
 	// Check if cancellation was requested before execution
 	if job.CancelRequested {
 		log.Info("job was cancel_requested prior to execution")
 		cancelJob(ErrUserCancellation)
-		close(cancelPollStop)
-		<-cancelPollDone
-		renewer.Stop()
-		finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancelFinalize()
-		_ = w.store.ConditionalFinalizeCancel(finalizeCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
+		finish(func(ctx context.Context) error {
+			return w.store.ConditionalFinalizeCancel(ctx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
+		}, cancelledFinalizationExpected)
 		return
 	}
 
 	start := time.Now()
 	err := handler.Execute(jobCtx, job)
-	close(cancelPollStop)
-	<-cancelPollDone
-	renewer.Stop()
+	stopCancelPoll()
 	cause := context.Cause(jobCtx)
 	if errors.Is(cause, ErrWorkerShutdown) {
+		cancelJob(context.Canceled)
+		renewer.Stop()
 		log.Info("job execution stopped for worker shutdown; lease recovery will resume it")
 		return
 	}
 	if cause != nil {
 		err = cause
 	}
-	cancelJob(context.Canceled)
 	latency := time.Since(start)
-
-	finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelFinalize()
 
 	if err == nil {
 		log.Info("job execution succeeded", "latency_ms", latency.Milliseconds())
-		finalErr := w.store.ConditionalFinalizeSuccess(finalizeCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
-		if errors.Is(finalErr, ErrAlreadyFinalized) {
-			return
-		}
-		if finalErr != nil && errors.Is(finalErr, ErrOwnershipLost) {
-			log.Warn("finalize success skipped due to ownership loss", "error", finalErr)
-		}
+		finish(func(ctx context.Context) error {
+			return w.store.ConditionalFinalizeSuccess(ctx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
+		}, successFinalizationExpected)
 		return
 	}
 	if errors.Is(err, ErrAlreadyFinalized) {
+		cancelJob(context.Canceled)
+		renewer.Stop()
 		return
 	}
 
@@ -529,11 +589,15 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	errClass, errCode := ClassifyError(err)
 	if errClass == ErrorClassCancelled {
 		log.Info("job execution was cancelled", "error", err)
-		_ = w.store.ConditionalFinalizeCancel(finalizeCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
+		finish(func(ctx context.Context) error {
+			return w.store.ConditionalFinalizeCancel(ctx, job.ID, w.cfg.WorkerID, *job.ClaimToken)
+		}, cancelledFinalizationExpected)
 		return
 	}
 
 	if errors.Is(err, ErrOwnershipLost) || errClass == ErrorClassOwnershipLost {
+		cancelJob(context.Canceled)
+		renewer.Stop()
 		log.Warn("job execution aborted because ownership was lost", "error", err)
 		return
 	}
@@ -557,11 +621,160 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 		log.Warn("job execution failed, scheduled retry", "next_run_at", nextRun, "error", err)
 	}
 
-	_ = w.store.ConditionalFinalizeFailure(
-		finalizeCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken,
-		errClass, errCode, err.Error(),
-		termReason, isTerminal, nextRun,
-	)
+	message := err.Error()
+	finish(func(ctx context.Context) error {
+		return w.store.ConditionalFinalizeFailure(ctx, job.ID, w.cfg.WorkerID, *job.ClaimToken,
+			errClass, errCode, message, termReason, isTerminal, nextRun)
+	}, failureFinalizationExpected(errClass, errCode, termReason, isTerminal))
+}
+
+func (w *Worker) resolveFinalization(ctx context.Context, claim *AnalysisJob, finalize func(context.Context) error, expected func(*AnalysisJob) bool) error {
+	var lastErr error
+	for {
+		if err := context.Cause(ctx); err != nil {
+			if lastErr != nil {
+				return fmt.Errorf("finalization context ended after %v: %w", lastErr, err)
+			}
+			return err
+		}
+
+		opCtx, cancel := context.WithTimeout(ctx, w.finalizationOperationTimeout())
+		err := finalize(opCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		readCtx, cancelRead := context.WithTimeout(ctx, w.finalizationOperationTimeout())
+		current, readErr := w.store.GetJobByID(readCtx, claim.ID)
+		cancelRead()
+		if errors.Is(readErr, sql.ErrNoRows) {
+			return ErrOwnershipLost
+		}
+		if readErr == nil {
+			if sameExecutionClaim(claim, current, w.cfg.WorkerID) {
+				if expected(current) {
+					return nil
+				}
+				if current.Status != StatusRunning || !current.ExecutionStarted {
+					return fmt.Errorf("job %d left the active claim without reaching the expected terminal state: status=%s", claim.ID, current.Status)
+				}
+			} else {
+				return ErrOwnershipLost
+			}
+		} else {
+			lastErr = fmt.Errorf("finalization failed (%v) and durable state could not be read: %w", err, readErr)
+		}
+
+		logger.L(ctx).Error("job terminal finalization failed; retrying claim-fenced transition", "job_id", claim.ID, "worker_id", w.cfg.WorkerID, "error", lastErr)
+		timer := time.NewTimer(w.finalizationRetryDelay())
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+	}
+}
+
+func sameExecutionClaim(claim, current *AnalysisJob, workerID string) bool {
+	if claim == nil || current == nil || claim.ClaimToken == nil || current.ClaimToken == nil || current.WorkerID == nil {
+		return false
+	}
+	return claim.ExecutionStarted && current.ExecutionStarted && *current.WorkerID == workerID &&
+		*current.ClaimToken == *claim.ClaimToken &&
+		current.ExecutionGeneration == claim.ExecutionGeneration
+}
+
+func successFinalizationExpected(job *AnalysisJob) bool {
+	return job != nil && (job.Status == StatusSucceeded ||
+		(job.Status == StatusCancelled && job.CancelRequested && job.TerminalReason != nil && *job.TerminalReason == TerminalReasonCancelled))
+}
+
+func cancelledFinalizationExpected(job *AnalysisJob) bool {
+	return job != nil && job.Status == StatusCancelled && job.CancelRequested && job.TerminalReason != nil && *job.TerminalReason == TerminalReasonCancelled
+}
+
+func failureFinalizationExpected(class ErrorClass, code string, reason *TerminalReason, terminal bool) func(*AnalysisJob) bool {
+	return func(job *AnalysisJob) bool {
+		if job == nil {
+			return false
+		}
+		if cancelledFinalizationExpected(job) {
+			return true
+		}
+		if (terminal && job.Status != StatusFailed) || (!terminal && job.Status != StatusRetryWait) {
+			return false
+		}
+		if job.LastErrorClass == nil || *job.LastErrorClass != string(class) || job.LastErrorCode == nil || *job.LastErrorCode != code {
+			return false
+		}
+		if terminal {
+			return reason != nil && job.TerminalReason != nil && *job.TerminalReason == *reason
+		}
+		return true
+	}
+}
+
+func (w *Worker) finalizationOperationTimeout() time.Duration {
+	timeout := w.cfg.LeaseDuration / 4
+	if timeout < 500*time.Millisecond {
+		timeout = 500 * time.Millisecond
+	}
+	if timeout > time.Second {
+		timeout = time.Second
+	}
+	return timeout
+}
+
+func (w *Worker) finalizationRetryDelay() time.Duration {
+	delay := w.cfg.PollInterval
+	if delay < 25*time.Millisecond {
+		delay = 25 * time.Millisecond
+	}
+	if delay > time.Second {
+		delay = time.Second
+	}
+	return delay
+}
+
+func (w *Worker) startFinalizationLeaseRenewer(ctx context.Context, job *AnalysisJob) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	interval := w.cfg.LeaseDuration / 3
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				opCtx, cancel := context.WithTimeout(ctx, w.finalizationOperationTimeout())
+				err := w.store.RenewLease(opCtx, job.ID, w.cfg.WorkerID, *job.ClaimToken, time.Now().UTC().Add(w.cfg.LeaseDuration))
+				cancel()
+				if err != nil && !errors.Is(err, ErrOwnershipLost) {
+					logger.L(ctx).Warn("lease renewal failed while resolving terminal finalization", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(stop) })
+		<-done
+	}
 }
 
 func (w *Worker) reapLoop(ctx context.Context) {
