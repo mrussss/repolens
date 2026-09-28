@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"repolens/internal/analysispipeline"
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/jobs"
@@ -20,7 +21,7 @@ import (
 )
 
 var ErrInputTooLarge = errors.New("diagnosis input exceeds configured limit")
-var ErrRevisionNotReady = errors.New("analysis revision is not ready")
+var ErrRevisionNotReady = analysispipeline.ErrRevisionNotReady
 
 func ValidateInput(input CreateDiagnosisInput) error {
 	if len(input.IssueTitle) == 0 || len(input.IssueTitle) > 255 {
@@ -144,7 +145,7 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	if err := ValidateInput(input); err != nil {
 		return nil, false, err
 	}
-	var selectedRevision *revision.AnalysisRevision
+	var selectedLineage analysispipeline.ResolvedLineage
 	if input.AnalysisRevisionID != "" {
 		if s.revisionStore == nil {
 			return nil, false, fmt.Errorf("analysis revision store is not configured")
@@ -153,8 +154,8 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		if revErr != nil {
 			return nil, false, revErr
 		}
-		// A revision lookup by ID is not an authorization check. Resolve its
-		// repository through the user-scoped store before using its lineage.
+		// Authorize before resolving READY state so another user's revision
+		// cannot reveal whether any of its derived artifacts are ready.
 		if _, repoErr := s.repoStore.GetByIDAndUser(ctx, rev.RepositoryID, input.UserID); repoErr != nil {
 			return nil, false, revision.ErrNotFound
 		}
@@ -162,7 +163,6 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 			return nil, false, codeintelstore.ErrBuildLineageMismatch
 		}
 		input.RepositoryID = rev.RepositoryID
-		selectedRevision = rev
 	}
 	reqHash := ComputeRequestHashForRevision(input.AnalysisRevisionID, input.RepositoryID, input.SnapshotID, input.IssueTitle, input.IssueDescription, input.ErrorLog, input.CodeIndexBuildID, input.RetrievalBuildID)
 
@@ -180,23 +180,17 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	}
 
 	if input.AnalysisRevisionID != "" {
-		if s.revisionStore == nil {
-			return nil, false, fmt.Errorf("analysis revision store is not configured")
+		lineage, resolveErr := analysispipeline.NewResolver(s.revisionStore, s.snapshotStore, s.codeIntelStore).ResolveReadyLineage(ctx, input.AnalysisRevisionID)
+		if resolveErr != nil {
+			return nil, false, resolveErr
 		}
-		rev, revErr := s.revisionStore.GetByIDAndRepository(ctx, input.AnalysisRevisionID, input.RepositoryID)
-		if revErr != nil {
-			return nil, false, revErr
-		}
-		if rev.Status != revision.StatusReady {
-			return nil, false, ErrRevisionNotReady
-		}
-		if (input.SnapshotID != "" && input.SnapshotID != rev.SnapshotID) || (input.CodeIndexBuildID > 0 && input.CodeIndexBuildID != rev.CodeIndexBuildID) || (input.RetrievalBuildID > 0 && input.RetrievalBuildID != rev.RetrievalBuildID) {
+		if lineage.RepositoryID != input.RepositoryID || (input.SnapshotID != "" && input.SnapshotID != lineage.SnapshotID) || (input.CodeIndexBuildID > 0 && input.CodeIndexBuildID != lineage.CodeIndexBuildID) || (input.RetrievalBuildID > 0 && input.RetrievalBuildID != lineage.RetrievalBuildID) {
 			return nil, false, codeintelstore.ErrBuildLineageMismatch
 		}
-		input.SnapshotID = rev.SnapshotID
-		input.CodeIndexBuildID = rev.CodeIndexBuildID
-		input.RetrievalBuildID = rev.RetrievalBuildID
-		selectedRevision = rev
+		input.SnapshotID = lineage.SnapshotID
+		input.CodeIndexBuildID = lineage.CodeIndexBuildID
+		input.RetrievalBuildID = lineage.RetrievalBuildID
+		selectedLineage = lineage
 	} else if input.CodeIndexBuildID <= 0 || input.RetrievalBuildID <= 0 {
 		return nil, false, ErrInvalidBuildSelection
 	}
@@ -215,21 +209,19 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		return nil, false, fmt.Errorf("repository %s not found or access denied", input.RepositoryID)
 	}
 
-	// Validate snapshot
-	snap, err := s.snapshotStore.GetByID(ctx, input.SnapshotID)
-	if err != nil || snap == nil {
-		return nil, false, fmt.Errorf("snapshot %s not found", input.SnapshotID)
-	}
-	if snap.Status != snapshot.StatusReady {
-		return nil, false, fmt.Errorf("snapshot %s is not READY (current status: %s)", input.SnapshotID, snap.Status)
-	}
-	if selectedRevision != nil && (snap.AnalysisRevisionID != selectedRevision.ID || snap.RepositoryID != selectedRevision.RepositoryID || snap.CommitSHA != selectedRevision.CommitSHA) {
-		return nil, false, codeintelstore.ErrBuildLineageMismatch
-	}
-
 	codeIndexBuildID := input.CodeIndexBuildID
 	retrievalBuildID := input.RetrievalBuildID
-	if s.codeIntelStore != nil {
+	if input.AnalysisRevisionID == "" {
+		// Legacy build-ID requests keep their existing validation path.
+		snap, err := s.snapshotStore.GetByID(ctx, input.SnapshotID)
+		if err != nil || snap == nil {
+			return nil, false, fmt.Errorf("snapshot %s not found", input.SnapshotID)
+		}
+		if snap.Status != snapshot.StatusReady {
+			return nil, false, fmt.Errorf("snapshot %s is not READY (current status: %s)", input.SnapshotID, snap.Status)
+		}
+	}
+	if input.AnalysisRevisionID == "" && s.codeIntelStore != nil {
 		if err := s.codeIntelStore.ValidateLineage(ctx, input.RepositoryID, input.SnapshotID, codeIndexBuildID, retrievalBuildID); err != nil {
 			return nil, false, err
 		}
@@ -243,9 +235,6 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		if cib == nil {
 			return nil, false, fmt.Errorf("%w: code index build %d", ErrBuildNotReady, codeIndexBuildID)
 		}
-		if selectedRevision != nil && cib.AnalysisRevisionID != selectedRevision.ID {
-			return nil, false, codeintelstore.ErrBuildLineageMismatch
-		}
 		if cib.Status != codeintelmodel.BuildStatusReady {
 			return nil, false, fmt.Errorf("%w: code index build %d is %s", ErrBuildNotReady, codeIndexBuildID, cib.Status)
 		}
@@ -258,9 +247,6 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		}
 		if rb == nil {
 			return nil, false, fmt.Errorf("%w: retrieval build %d", ErrBuildNotReady, retrievalBuildID)
-		}
-		if selectedRevision != nil && (rb.AnalysisRevisionID != selectedRevision.ID || rb.CodeIndexBuildID != cib.ID) {
-			return nil, false, codeintelstore.ErrBuildLineageMismatch
 		}
 		if rb.Status != codeintelmodel.BuildStatusReady {
 			return nil, false, fmt.Errorf("%w: retrieval build %d is %s", ErrBuildNotReady, retrievalBuildID, rb.Status)
@@ -349,8 +335,8 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		ProviderRetryAttempts:       metadata.ProviderRetryAttempts,
 		Temperature:                 metadata.Temperature,
 	}
-	if selectedRevision != nil {
-		run.PipelineFingerprint = selectedRevision.PipelineFingerprint
+	if selectedLineage.RevisionID != "" {
+		run.PipelineFingerprint = selectedLineage.PipelineFingerprint
 	}
 
 	if err := s.store.Create(ctx, run); err != nil {

@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"repolens/internal/analysispipeline"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
 )
@@ -19,7 +20,7 @@ import (
 var (
 	ErrIdempotencyConflict     = errors.New("idempotency conflict: request payload differs from existing record")
 	ErrInvalidBuildSelection   = errors.New("code index and retrieval build IDs must be positive")
-	ErrBuildNotReady           = errors.New("diagnosis build is not ready")
+	ErrBuildNotReady           = analysispipeline.ErrBuildNotReady
 	ErrProviderNotConfigured   = errors.New("provider is not configured")
 	ErrProviderIdentityChanged = errors.New("provider identity changed since diagnosis was created")
 	ErrRunNotFound             = errors.New("diagnosis run not found")

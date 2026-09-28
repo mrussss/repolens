@@ -19,6 +19,8 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	codeintelmodel "repolens/internal/codeintel/model"
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
@@ -53,6 +55,22 @@ func TestDiagnosisRequestUsesSharedV22Fixture(t *testing.T) {
 	}
 }
 
+func seedReadyDiagnosisLineage(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if err := db.Create(&revision.AnalysisRevision{ID: "private-revision", RepositoryID: "private-repo", CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2", PipelineFingerprint: "fingerprint", SnapshotID: "private-snapshot", CodeIndexBuildID: 101, RetrievalBuildID: 202, Status: revision.StatusReady, Stage: revision.StageReady}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []interface{}{
+		&snapshot.RepositorySnapshot{ID: "private-snapshot", RepositoryID: "private-repo", AnalysisRevisionID: "private-revision", CommitSHA: "0123456789012345678901234567890123456789", Status: snapshot.StatusReady},
+		&codeintelmodel.CodeIndexBuild{ID: 101, SnapshotID: "private-snapshot", AnalysisRevisionID: "private-revision", Status: codeintelmodel.BuildStatusReady},
+		&codeintelmodel.RetrievalBuild{ID: 202, CodeIndexBuildID: 101, AnalysisRevisionID: "private-revision", Status: codeintelmodel.BuildStatusReady},
+	} {
+		if err := db.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestDiagnosisRevisionSubmissionRequiresRepositoryOwnership(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
 	ctx := context.Background()
@@ -60,15 +78,43 @@ func TestDiagnosisRevisionSubmissionRequiresRepositoryOwnership(t *testing.T) {
 	if err := repoStore.Create(ctx, &repo.Repository{ID: "private-repo", UserID: "owner", Name: "private", GitURL: "https://github.com/example/private"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&revision.AnalysisRevision{ID: "private-revision", RepositoryID: "private-repo", CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2", PipelineFingerprint: "fingerprint", Status: revision.StatusReady, Stage: revision.StageReady}).Error; err != nil {
-		t.Fatal(err)
-	}
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repoStore, snapshot.NewStore(db)).WithRevisionStore(revision.NewStore(db))
+	seedReadyDiagnosisLineage(t, db)
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repoStore, snapshot.NewStore(db)).WithRevisionStore(revision.NewStore(db)).WithCodeIntelStore(codeintelstore.NewStore(db))
 	_, _, err := svc.Create(ctx, diagnosis.CreateDiagnosisInput{
 		UserID: "attacker", AnalysisRevisionID: "private-revision", IssueTitle: "should not access", IdempotencyKey: "ownership-key",
 	})
 	if !errors.Is(err, revision.ErrNotFound) {
 		t.Fatalf("cross-user revision submission error = %v, want revision not found", err)
+	}
+}
+
+func TestDiagnosisRevisionSubmissionUsesResolvedLineage(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	ctx := context.Background()
+	repoStore := repo.NewStore(db)
+	if err := repoStore.Create(ctx, &repo.Repository{ID: "private-repo", UserID: "owner", Name: "private", GitURL: "https://github.com/example/private"}); err != nil {
+		t.Fatal(err)
+	}
+	seedReadyDiagnosisLineage(t, db)
+	svc := diagnosis.NewService(diagnosis.NewStore(db), repoStore, snapshot.NewStore(db)).WithRevisionStore(revision.NewStore(db)).WithCodeIntelStore(codeintelstore.NewStore(db))
+	input := diagnosis.CreateDiagnosisInput{
+		UserID: "owner", AnalysisRevisionID: "private-revision", IssueTitle: "issue", IdempotencyKey: "resolved-lineage-key",
+	}
+	run, created, err := svc.Create(ctx, input)
+	if err != nil || !created {
+		t.Fatalf("Create = created=%v err=%v", created, err)
+	}
+	if run.RepositoryID != "private-repo" || run.AnalysisRevisionID != "private-revision" || run.SnapshotID != "private-snapshot" || run.CodeIndexBuildID != 101 || run.RetrievalBuildID != 202 || run.PipelineFingerprint != "fingerprint" {
+		t.Fatalf("DiagnosisRun did not persist resolved lineage: %+v", run)
+	}
+	duplicate, created, err := svc.Create(ctx, input)
+	if err != nil || created || duplicate.ID != run.ID {
+		t.Fatalf("idempotent Create = run=%+v created=%v err=%v", duplicate, created, err)
+	}
+	input.IdempotencyKey = "mismatched-build-key"
+	input.CodeIndexBuildID = 999
+	if _, _, err := svc.Create(ctx, input); !errors.Is(err, codeintelstore.ErrBuildLineageMismatch) {
+		t.Fatalf("mismatched build error = %v, want lineage mismatch", err)
 	}
 }
 
