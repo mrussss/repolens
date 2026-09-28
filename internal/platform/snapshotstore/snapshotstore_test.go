@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"repolens/internal/platform/snapshotstore"
@@ -34,6 +35,94 @@ func TestReadFileRangeNormalizesAndTruncatesAtCompleteLines(t *testing.T) {
 	last, err := store.ReadFileRange(context.Background(), "repo", "snap", "main.go", 3, 3, 0)
 	if err != nil || last.Content != "three" || last.StartLine != 3 || last.EndLine != 3 {
 		t.Fatalf("exact range = %+v err=%v", last, err)
+	}
+}
+
+func TestCleanupUnreferencedExecutionPathsPreservesDatabaseReferences(t *testing.T) {
+	root := t.TempDir()
+	store := snapshotstore.NewLocalSnapshotStore(root)
+	oldPath, err := store.GetExecutionSourcePath("repo", "snapshot", 1, "old-claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentPath, err := store.GetExecutionSourcePath("repo", "snapshot", 2, "current-claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentPath, err := store.GetExecutionSourcePath("repo", "snapshot", 3, "recent-claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{oldPath, currentPath, recentPath} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "main.go"), []byte("package main\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(oldPath, "pkg"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldPath, "pkg", "old.go"), []byte("package old\n"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(oldPath, "pkg"), 0555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(oldPath, 0555); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-48 * time.Hour)
+	for _, path := range []string{oldPath, currentPath} {
+		if err := os.Chtimes(path, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stagePath := filepath.Join(root, "repo", "snapshot", "executions", "gen-4", ".snapshot-stage-interrupted")
+	if err := os.MkdirAll(stagePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(stagePath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.CleanupUnreferencedExecutionPaths(map[string]struct{}{currentPath: {}}, time.Now().Add(-24*time.Hour))
+	if err != nil || removed != 2 {
+		t.Fatalf("cleanup removed %d paths, err=%v; want old orphan plus stale staging", removed, err)
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old unreferenced snapshot execution still exists: err=%v", err)
+	}
+	for _, path := range []string{currentPath, recentPath} {
+		if _, err := os.Stat(filepath.Join(path, "main.go")); err != nil {
+			t.Fatalf("referenced or recent snapshot execution was removed: path=%s err=%v", path, err)
+		}
+	}
+}
+
+func TestReadyMaterializedPathResolverIsAuthoritativeAndCached(t *testing.T) {
+	store := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	authoritativeRoot := filepath.Join(t.TempDir(), "immutable", "source")
+	if err := os.MkdirAll(authoritativeRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authoritativeRoot, "main.go"), []byte("package immutable\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	resolverCalls := 0
+	store.WithSourcePathResolver(func(repoID, snapshotID string) (string, bool) {
+		resolverCalls++
+		return authoritativeRoot, true
+	})
+	for i := 0; i < 2; i++ {
+		content, err := store.ReadFile(context.Background(), "repo", "snapshot", "main.go", 1, -1)
+		if err != nil || content != "package immutable\n" {
+			t.Fatalf("read through authoritative materialized path = %q, err=%v", content, err)
+		}
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("stable READY path resolver calls = %d, want one cached lookup", resolverCalls)
 	}
 }
 

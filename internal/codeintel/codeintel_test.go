@@ -3,10 +3,12 @@ package codeintel_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +21,9 @@ import (
 	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
+	"repolens/internal/snapshotpolicy"
 	"repolens/internal/tools"
 )
 
@@ -43,6 +47,170 @@ func setupCodeIntelTestDB(t *testing.T) (*gorm.DB, *jobs.Store, codeintelstore.S
 	ciStore := codeintelstore.NewStore(db)
 	snapStore := snapshot.NewStore(db)
 	return db, jobsStore, ciStore, snapStore
+}
+
+func startCodeIndexJob(t *testing.T, store *jobs.Store, job *jobs.AnalysisJob, workerID string) {
+	t.Helper()
+	attempt, err := store.MarkExecutionStarted(context.Background(), job.ID, workerID, *job.ClaimToken, job.ExecutionGeneration)
+	if err != nil {
+		t.Fatalf("MarkExecutionStarted: %v", err)
+	}
+	job.AttemptCount = attempt
+	job.ExecutionStarted = true
+}
+
+func TestAnalyzerUsesSnapshotManifestFileUniverse(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"go.mod":        "module example.com/manifest\n\ngo 1.22\n",
+		"src/main.go":   "package src\nfunc Visible() {}\n",
+		"dist/leak.go":  "package dist\nfunc HiddenDist() {}\n",
+		"build/leak.go": "package build\nfunc HiddenBuild() {}\n",
+	}
+	for path, content := range files {
+		fullPath := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := snapshotpolicy.NewManifest("snap-manifest", "commit", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", []snapshotpolicy.FileEntry{
+		snapshotpolicy.FileEntryFor("src/main.go", []byte(files["src/main.go"])),
+	})
+	if err := snapshotpolicy.WriteManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := snapshotpolicy.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := codeintel.NewAnalyzer().AnalyzeWithAllowedFiles(context.Background(), root, loaded.AllowedPaths(), codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 1 || result.Files[0].Path != "src/main.go" {
+		t.Fatalf("CodeIndex files = %+v, want only src/main.go from snapshot manifest", result.Files)
+	}
+}
+
+func TestConcurrentGetOrCreateBuildsReturnOneWinner(t *testing.T) {
+	db, _, ciStore, _ := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	const callers = 32
+	buildContext := codeintelmodel.DefaultBuildContext()
+	type buildResult struct {
+		id      int64
+		created bool
+		err     error
+	}
+
+	start := make(chan struct{})
+	results := make(chan buildResult, callers)
+	var ready sync.WaitGroup
+	var callersDone sync.WaitGroup
+	ready.Add(callers)
+	callersDone.Add(callers)
+	for range callers {
+		go func() {
+			defer callersDone.Done()
+			ready.Done()
+			<-start
+			build, created, err := ciStore.GetOrCreateBuild(ctx, "snap-concurrent-build", "example.com/concurrent", buildContext)
+			if err != nil {
+				results <- buildResult{err: err}
+				return
+			}
+			results <- buildResult{id: build.ID, created: created}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	callersDone.Wait()
+	close(results)
+
+	var winnerID int64
+	createdCount := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent GetOrCreateBuild: %v", result.err)
+		}
+		if winnerID == 0 {
+			winnerID = result.id
+		} else if result.id != winnerID {
+			t.Errorf("build winner IDs differ: got %d and %d", result.id, winnerID)
+		}
+		if result.created {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created=true count = %d, want exactly one", createdCount)
+	}
+	var buildCount, jobCount int64
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("snapshot_id = ?", "snap-concurrent-build").Count(&buildCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, strconv.FormatInt(winnerID, 10)).Count(&jobCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if buildCount != 1 || jobCount != 1 {
+		t.Fatalf("concurrent build rows = %d and jobs = %d, want one each", buildCount, jobCount)
+	}
+
+	start = make(chan struct{})
+	retrievalResults := make(chan buildResult, callers)
+	var retrievalReady sync.WaitGroup
+	var retrievalCallersDone sync.WaitGroup
+	retrievalReady.Add(callers)
+	retrievalCallersDone.Add(callers)
+	for range callers {
+		go func() {
+			defer retrievalCallersDone.Done()
+			retrievalReady.Done()
+			<-start
+			build, created, err := ciStore.GetOrCreateRetrievalBuild(ctx, winnerID, "BM25")
+			if err != nil {
+				retrievalResults <- buildResult{err: err}
+				return
+			}
+			retrievalResults <- buildResult{id: build.ID, created: created}
+		}()
+	}
+	retrievalReady.Wait()
+	close(start)
+	retrievalCallersDone.Wait()
+	close(retrievalResults)
+
+	var retrievalWinnerID int64
+	createdCount = 0
+	for result := range retrievalResults {
+		if result.err != nil {
+			t.Fatalf("concurrent GetOrCreateRetrievalBuild: %v", result.err)
+		}
+		if retrievalWinnerID == 0 {
+			retrievalWinnerID = result.id
+		} else if result.id != retrievalWinnerID {
+			t.Errorf("retrieval build winner IDs differ: got %d and %d", result.id, retrievalWinnerID)
+		}
+		if result.created {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("retrieval created=true count = %d, want exactly one", createdCount)
+	}
+	var retrievalCount int64
+	if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("code_index_build_id = ?", winnerID).Count(&retrievalCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildRetrieval, strconv.FormatInt(retrievalWinnerID, 10)).Count(&jobCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retrievalCount != 1 || jobCount != 1 {
+		t.Fatalf("concurrent retrieval rows = %d and jobs = %d, want one each", retrievalCount, jobCount)
+	}
 }
 
 func TestRelatedTestsPersistAndReachFindRelatedTestsTool(t *testing.T) {
@@ -285,7 +453,7 @@ func TestCodeIndexBuild_IdempotencyAndJobCreation(t *testing.T) {
 }
 
 func TestQueuedCodeIndexJobRestoresPersistedBuildTags(t *testing.T) {
-	_, _, ciStore, snapStore := setupCodeIntelTestDB(t)
+	_, jobsStore, ciStore, snapStore := setupCodeIntelTestDB(t)
 	ctx := context.Background()
 	base := t.TempDir()
 	storeFS := snapshotstore.NewLocalSnapshotStore(base)
@@ -313,7 +481,19 @@ func TestQueuedCodeIndexJobRestoresPersistedBuildTags(t *testing.T) {
 		t.Fatalf("persisted build tags = %q, want [\"custom\"]", build.BuildTagsJSON)
 	}
 	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, storeFS, codeintel.NewAnalyzer())
-	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: strconv.FormatInt(build.ID, 10), MaxAttempts: 3}); err != nil {
+	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: strconv.FormatInt(build.ID, 10), MaxAttempts: 3}); !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("unclaimed code-index job error = %v, want ownership lost", err)
+	}
+	unchanged, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil || unchanged.Status != codeintelmodel.BuildStatusCreated {
+		t.Fatalf("unclaimed handler changed build: build=%+v err=%v", unchanged, err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-build-tags-success", 1, time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].JobType != jobs.JobTypeBuildCodeIndex {
+		t.Fatalf("claim code-index build job: claimed=%+v err=%v", claimed, err)
+	}
+	startCodeIndexJob(t, jobsStore, claimed[0], "worker-build-tags-success")
+	if err := handler.Execute(ctx, claimed[0]); err != nil {
 		t.Fatalf("execute queued code-index job: %v", err)
 	}
 	ready, err := ciStore.GetByID(ctx, build.ID)
@@ -339,28 +519,133 @@ func TestQueuedCodeIndexJobRestoresPersistedBuildTags(t *testing.T) {
 }
 
 func TestQueuedCodeIndexJobFailsClosedWhenLegacyTagNamesAreUnavailable(t *testing.T) {
-	db, _, ciStore, snapStore := setupCodeIntelTestDB(t)
+	db, jobsStore, ciStore, snapStore := setupCodeIntelTestDB(t)
 	ctx := context.Background()
+	const revisionID = "revision-missing-build-tags"
+	if err := db.Create(&revision.AnalysisRevision{
+		ID: revisionID, RepositoryID: "repo-build-tags", SourceRef: "main",
+		CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2",
+		PipelineFingerprint: "fingerprint-missing-build-tags", Status: revision.StatusPreparing,
+		Stage: revision.StageBuildingCode, ExecutionGeneration: 1, Version: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	bc := codeintelmodel.BuildContext{GOOS: "linux", GOARCH: "amd64", BuildTags: []string{"custom"}}
 	build, created, err := ciStore.GetOrCreateBuild(ctx, "snap-legacy-build-tags", "example.com/legacy", bc)
 	if err != nil || !created {
 		t.Fatalf("create custom-tag build: created=%t err=%v", created, err)
+	}
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Update("analysis_revision_id", revisionID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", revisionID).Update("code_index_build_id", build.ID).Error; err != nil {
+		t.Fatal(err)
 	}
 	// Migration 012 backfills the absent legacy JSON as []; the persisted hash
 	// still proves that custom tag names were originally present but lost.
 	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Update("build_tags_json", "[]").Error; err != nil {
 		t.Fatal(err)
 	}
+	if _, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(build.ID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobsStore.ClaimJobs(ctx, "worker-build-tags", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim build job: jobs=%d err=%v", len(claimed), err)
+	}
+	startCodeIndexJob(t, jobsStore, claimed[0], "worker-build-tags")
 	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()), codeintel.NewAnalyzer())
-	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: strconv.FormatInt(build.ID, 10), MaxAttempts: 3}); err == nil {
+	handlerErr := handler.Execute(ctx, claimed[0])
+	if handlerErr == nil {
 		t.Fatal("legacy build with missing custom tag names unexpectedly executed")
 	}
-	retired, err := ciStore.GetByID(ctx, build.ID)
+	class, code := jobs.ClassifyError(handlerErr)
+	if class != jobs.ErrorClassPermanent || code != "BUILD_TAGS_UNAVAILABLE" {
+		t.Fatalf("build tags error classification = %s/%s, want PERMANENT/BUILD_TAGS_UNAVAILABLE", class, code)
+	}
+	unchanged, err := ciStore.GetByID(ctx, build.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retired.Status != codeintelmodel.BuildStatusFailed || retired.ErrorCode != "BUILD_TAGS_UNAVAILABLE" {
-		t.Fatalf("legacy build was not failed closed: %+v", retired)
+	if unchanged.Status != codeintelmodel.BuildStatusCreated {
+		t.Fatalf("handler changed build before claim-fenced terminalization: %+v", unchanged)
+	}
+	terminalReason := jobs.TerminalReasonPermanent
+	if err := jobsStore.ConditionalFinalizeFailure(ctx, claimed[0].ID, "worker-build-tags", *claimed[0].ClaimToken, class, code, handlerErr.Error(), &terminalReason, true, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	failedBuild, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failedBuild.Status != codeintelmodel.BuildStatusFailed || failedBuild.ErrorCode != "BUILD_TAGS_UNAVAILABLE" {
+		t.Fatalf("claim-fenced terminalizer did not fail the build: %+v", failedBuild)
+	}
+	failedRevision := &revision.AnalysisRevision{}
+	if err := db.First(failedRevision, "id = ?", revisionID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if failedRevision.Status != revision.StatusFailed || failedRevision.ErrorCode != "BUILD_TAGS_UNAVAILABLE" {
+		t.Fatalf("claim-fenced terminalizer did not fail the revision: %+v", failedRevision)
+	}
+}
+
+func TestStaleCodeIndexHandlerDoesNotFailRevision(t *testing.T) {
+	db, jobsStore, ciStore, snapStore := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	revisionID := "revision-stale-code-index"
+	if err := db.Create(&revision.AnalysisRevision{
+		ID: revisionID, RepositoryID: "repo-stale-code-index", SourceRef: "main",
+		CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2",
+		PipelineFingerprint: "fingerprint-stale-code-index", Status: revision.StatusPreparing,
+		Stage: revision.StageBuildingCode, ExecutionGeneration: 1, Version: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	buildContext := codeintelmodel.BuildContext{GOOS: "linux", GOARCH: "amd64", BuildTags: []string{"custom"}}
+	build, _, err := ciStore.GetOrCreateBuild(ctx, "snap-missing-stale-code-index", "example.com/stale", buildContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Updates(map[string]interface{}{
+		"analysis_revision_id": revisionID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, strconv.FormatInt(build.ID, 10)).Update("max_attempts", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldClaim, err := jobsStore.ClaimJobs(ctx, "old-code-index-worker", 1, time.Minute)
+	if err != nil || len(oldClaim) != 1 {
+		t.Fatalf("old CodeIndex claim = %d jobs, err=%v", len(oldClaim), err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
+		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
+		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", revisionID).Updates(map[string]interface{}{
+		"execution_generation": 2, "stage": revision.StageBuildingCode,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	newClaim, err := jobsStore.ClaimJobs(ctx, "new-code-index-worker", 1, time.Minute)
+	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
+		t.Fatalf("new CodeIndex claim = %+v, err=%v", newClaim, err)
+	}
+	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()), codeintel.NewAnalyzer())
+	err = handler.Execute(ctx, oldClaim[0])
+	if err == nil {
+		t.Fatal("CodeIndex handler unexpectedly succeeded with a missing source snapshot")
+	}
+	currentRevision, err := revision.NewStore(db).GetByID(ctx, revisionID)
+	if err != nil || currentRevision.Status != revision.StatusPreparing || currentRevision.ExecutionGeneration != 2 {
+		t.Fatalf("new revision after stale CodeIndex error = %+v err=%v", currentRevision, err)
+	}
+	currentJob, err := jobsStore.GetJobByID(ctx, newClaim[0].ID)
+	if err != nil || currentJob.Status != jobs.StatusRunning || currentJob.ClaimToken == nil || *currentJob.ClaimToken != *newClaim[0].ClaimToken {
+		t.Fatalf("new CodeIndex claim changed by stale handler: job=%+v err=%v", currentJob, err)
 	}
 }
 

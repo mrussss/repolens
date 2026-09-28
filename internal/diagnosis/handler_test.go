@@ -200,6 +200,59 @@ func TestDiagnosisReportAPIExposesInvalidStructuredReport(t *testing.T) {
 	}
 }
 
+func TestDiagnosisReportDistinguishesMissingRowsFromStoreFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		reportErr   error
+		citationErr error
+		wantStatus  int
+	}{
+		{name: "missing report", reportErr: gorm.ErrRecordNotFound, wantStatus: http.StatusNotFound},
+		{name: "report store failure", reportErr: errors.New("database unavailable"), wantStatus: http.StatusInternalServerError},
+		{name: "citation store failure", citationErr: errors.New("database unavailable"), wantStatus: http.StatusInternalServerError},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			db := newDiagnosisHandlerTestDB(t)
+			run := &diagnosis.DiagnosisRun{ID: "run-report-store-errors", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusSucceeded, IdempotencyKey: "report-store-errors", IdempotencyRequestHash: "report-store-errors"}
+			if err := db.Create(run).Error; err != nil {
+				t.Fatal(err)
+			}
+			svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+			reportStore := reportStoreStub{report: &evidence.Report{ID: "report-for-errors", DiagnosisRunID: run.ID}, err: tt.reportErr}
+			citationStore := citationStoreStub{err: tt.citationErr}
+			handler := diagnosis.NewHandler(svc, reportStore, citationStore, nil)
+			router := gin.New()
+			router.Use(func(c *gin.Context) { c.Set(string(logger.UserIDKey), "user"); c.Next() })
+			router.GET("/diagnoses/:id/report", handler.GetReport)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID+"/report", nil))
+			if response.Code != tt.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), tt.wantStatus)
+			}
+		})
+	}
+}
+
+type reportStoreStub struct {
+	report *evidence.Report
+	err    error
+}
+
+func (s reportStoreStub) Create(context.Context, *evidence.Report) error { return nil }
+func (s reportStoreStub) GetByRunID(context.Context, string) (*evidence.Report, error) {
+	return s.report, s.err
+}
+func (s reportStoreStub) GetByAttemptID(context.Context, string) (*evidence.Report, error) {
+	return s.report, s.err
+}
+
+type citationStoreStub struct{ err error }
+
+func (s citationStoreStub) CreateBatch(context.Context, []evidence.Citation) error { return nil }
+func (s citationStoreStub) ListByReportID(context.Context, string) ([]evidence.Citation, error) {
+	return nil, s.err
+}
+
 func TestDiagnosisStatusExposesExplicitProviderRetryPolicy(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
 	ctx := context.Background()
@@ -213,15 +266,29 @@ func TestDiagnosisStatusExposesExplicitProviderRetryPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).Updates(map[string]interface{}{
-		"status": jobs.StatusFailed, "last_error_class": jobs.ErrorClassRetryable, "last_error_code": "PROVIDER_TIMEOUT",
+		"status": jobs.StatusFailed, "last_error_class": jobs.ErrorClassPermanent, "last_error_code": "CHECKPOINT_SAVE_FAILED",
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
 	svc := diagnosis.NewService(store, repo.NewStore(db), snapshot.NewStore(db)).WithJobStore(jobsStore)
 	response := httptest.NewRecorder()
 	diagnosisHandlerRouter(svc).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID, nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"retry_allowed":true`) || !strings.Contains(response.Body.String(), `"retry_error_code":"PROVIDER_TIMEOUT"`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"retry_allowed":true`) || !strings.Contains(response.Body.String(), `"retry_error_code":"CHECKPOINT_SAVE_FAILED"`) {
 		t.Fatalf("retry policy API response = %d %s", response.Code, response.Body.String())
+	}
+
+	retryResponse := httptest.NewRecorder()
+	router := diagnosisHandlerRouter(svc)
+	router.ServeHTTP(retryResponse, httptest.NewRequest(http.MethodPost, "/diagnoses/"+run.ID+"/retry", nil))
+	if retryResponse.Code != http.StatusAccepted {
+		t.Fatalf("explicit retry response = %d %s, want 202", retryResponse.Code, retryResponse.Body.String())
+	}
+	var retriedJob jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeRunDiagnosis, run.ID).First(&retriedJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retriedJob.Status != jobs.StatusPending || retriedJob.ExecutionGeneration != 2 {
+		t.Fatalf("explicit retry job = status %s generation %d, want PENDING generation 2", retriedJob.Status, retriedJob.ExecutionGeneration)
 	}
 }
 
@@ -457,11 +524,19 @@ func TestDiagnosisCreateIdempotencyReplayPrecedesProviderCheck(t *testing.T) {
 	})
 	input := diagnosis.CreateDiagnosisInput{
 		UserID: "user", RepositoryID: "repo-replay", SnapshotID: "snapshot-replay",
-		IssueTitle: "issue", IdempotencyKey: "replay-key", CodeIndexBuildID: 11, RetrievalBuildID: 12,
+		IssueTitle: "Authorization: Bearer title-secret", IssueDescription: "Authorization: Basic dXNlcjpwYXNz",
+		ErrorLog: "authorization:\tBearer log-secret", IdempotencyKey: "replay-key", CodeIndexBuildID: 11, RetrievalBuildID: 12,
 	}
 	run, created, err := svc.Create(ctx, input)
 	if err != nil || !created {
 		t.Fatalf("initial create failed: created=%v err=%v", created, err)
+	}
+	for field, value := range map[string]string{
+		"issue title": run.IssueTitle, "issue description": run.IssueDescription, "error log": run.ErrorLog,
+	} {
+		if strings.Contains(value, "title-secret") || strings.Contains(value, "dXNlcjpwYXNz") || strings.Contains(value, "log-secret") || !strings.Contains(value, "[REDACTED_SECRET]") {
+			t.Errorf("%s was not consistently redacted: %q", field, value)
+		}
 	}
 	configured = false
 	replayed, created, err := svc.Create(ctx, input)
@@ -499,6 +574,7 @@ func diagnosisHandlerRouter(svc *diagnosis.Service) *gin.Engine {
 	router.GET("/diagnoses/:id", handler.Get)
 	router.GET("/diagnoses/:id/attempts", handler.ListAttempts)
 	router.GET("/diagnoses/:id/steps", handler.GetSteps)
+	router.POST("/diagnoses/:id/retry", handler.Retry)
 	return router
 }
 

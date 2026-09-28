@@ -164,6 +164,10 @@ func (h *Handler) Register(c *gin.Context) {
 
 	r, err := h.repoSvc.Register(c.Request.Context(), userID, req.Name, req.GitURL, req.DefaultRef)
 	if err != nil {
+		if errors.Is(err, ErrRefTooLong) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "REF_TOO_LONG", "error": "git ref must not exceed 255 characters"})
+			return
+		}
 		logger.L(c.Request.Context()).Error("failed to register repository", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "REPOSITORY_CREATE_FAILED", "error": "failed to create repository"})
 		return
@@ -221,6 +225,10 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 		return
 	}
 	applyTriggerIndexDefaults(&req, r.DefaultRef)
+	if err := ValidateRefLength(req.Ref); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "REF_TOO_LONG", "error": "git ref must not exceed 255 characters"})
+		return
+	}
 	if h.resolver == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "snapshot resolver is not configured"})
 		return
@@ -231,7 +239,7 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "REF_RESOLUTION_FAILED", "error": "failed to resolve repository ref"})
 		return
 	}
-	if existing, lookupErr := h.snapshotStore.GetByCommit(c.Request.Context(), repoID, commitSHA); lookupErr == nil {
+	if existing, lookupErr := h.snapshotStore.GetLegacyByCommit(c.Request.Context(), repoID, commitSHA); lookupErr == nil {
 		if existing.Status == snapshot.StatusFailed && h.jobStore != nil {
 			if requeueErr := h.jobStore.ManualRequeue(c.Request.Context(), jobs.JobTypeMaterializeSnapshot, existing.ID); requeueErr != nil {
 				logger.L(c.Request.Context()).Error("failed to requeue failed snapshot", "error", requeueErr)
@@ -282,7 +290,7 @@ func (h *Handler) TriggerIndex(c *gin.Context) {
 	})
 
 	if err != nil {
-		if existing, lookupErr := h.snapshotStore.GetByCommit(c.Request.Context(), repoID, commitSHA); lookupErr == nil {
+		if existing, lookupErr := h.snapshotStore.GetLegacyByCommit(c.Request.Context(), repoID, commitSHA); lookupErr == nil {
 			c.JSON(http.StatusAccepted, gin.H{"snapshot": existing, "message": "snapshot already exists for this commit"})
 			return
 		}

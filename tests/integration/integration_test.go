@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
+	"repolens/internal/llm"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
@@ -123,6 +125,75 @@ func TestDiagnosisCreationAndIdempotency(t *testing.T) {
 	if err != diagnosis.ErrIdempotencyConflict {
 		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
 	}
+}
+
+func TestDiagnosisJSONCredentialIsRedactedBeforeProviderInput(t *testing.T) {
+	db, _ := setupTestDB(t)
+	ctx := context.Background()
+	repoStore := repo.NewStore(db)
+	snapshotStore := snapshot.NewStore(db)
+	if err := repoStore.Create(ctx, &repo.Repository{ID: "repo-json-redaction", UserID: "user-json-redaction", Name: "json-redaction", GitURL: "https://github.com/example/json-redaction"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotStore.Create(ctx, &snapshot.RepositorySnapshot{
+		ID: "snapshot-json-redaction", RepositoryID: "repo-json-redaction", CommitSHA: "json-redaction-commit",
+		Status: snapshot.StatusReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	diagStore := diagnosis.NewStore(db)
+	diagService := diagnosis.NewService(diagStore, repoStore, snapshotStore)
+	run, created, err := diagService.Create(ctx, diagnosis.CreateDiagnosisInput{
+		UserID: "user-json-redaction", RepositoryID: "repo-json-redaction", SnapshotID: "snapshot-json-redaction",
+		IssueTitle: "credential leak", IssueDescription: `{"password":"supersecret123"}`,
+		ErrorLog: `request_body="{\"password\":\"supersecret123\"}"`, IdempotencyKey: "json-redaction-test",
+		CodeIndexBuildID: 1, RetrievalBuildID: 1,
+	})
+	if err != nil || !created {
+		t.Fatalf("create diagnosis: created=%v err=%v", created, err)
+	}
+	persisted, err := diagStore.GetByID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("reload persisted diagnosis: %v", err)
+	}
+	if strings.Contains(persisted.IssueDescription, "supersecret123") || strings.Contains(persisted.ErrorLog, "supersecret123") {
+		t.Fatalf("persisted input contains original credential: description=%q error_log=%q", persisted.IssueDescription, persisted.ErrorLog)
+	}
+	if !strings.Contains(persisted.ErrorLog, "request_body") || !strings.Contains(persisted.ErrorLog, "[REDACTED_SECRET]") {
+		t.Fatalf("redaction did not preserve escaped JSON context: %q", persisted.ErrorLog)
+	}
+	provider := &diagnosisPromptCaptureProvider{}
+	loop := agent.NewAgentLoop(provider, agent.NewToolRegistry(), nil, agent.DefaultGuardConfig())
+	if _, err := loop.Run(ctx, persisted, &diagnosis.DiagnosisAttempt{ID: "attempt-json-redaction"}); err != nil {
+		t.Fatalf("run AgentLoop: %v", err)
+	}
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider calls=%d, want one", len(provider.requests))
+	}
+	providerLogContext := false
+	for _, message := range provider.requests[0].Messages {
+		if strings.Contains(message.Content, "supersecret123") {
+			t.Fatalf("provider-visible message contains original credential: %s", message.Content)
+		}
+		if strings.Contains(message.Content, "request_body") && strings.Contains(message.Content, "[REDACTED_SECRET]") {
+			providerLogContext = true
+		}
+	}
+	if !providerLogContext {
+		t.Fatal("provider-visible prompt lost the redacted request_body context")
+	}
+}
+
+type diagnosisPromptCaptureProvider struct {
+	requests []llm.GenerateRequest
+}
+
+func (p *diagnosisPromptCaptureProvider) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
+	p.requests = append(p.requests, request)
+	return llm.GenerateResponse{
+		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`},
+		FinishReason: "stop",
+	}, nil
 }
 
 // 2. Test Concurrent Worker Claim Fencing via DB SKIP LOCKED
@@ -318,7 +389,7 @@ func TestMilestone6_PureGoBM25AndStructuralProductionRetriever(t *testing.T) {
 
 	pub := artifact.NewPublisher(tempBase)
 	rb, _, _ := ciStore.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
-	finalPath, hash, _ := pub.Publish(rb.ID, "tok", "BM25", idx)
+	finalPath, hash, _ := pub.Publish(rb.ID, 1, "tok", "BM25", idx)
 	_ = ciStore.MarkRetrievalBuilding(ctx, rb.ID)
 	_ = ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, hash, 1)
 

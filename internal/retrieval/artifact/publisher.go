@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"repolens/internal/retrieval/bm25"
@@ -33,20 +35,28 @@ func NewPublisher(baseDir string) *Publisher {
 	return &Publisher{baseDir: baseDir}
 }
 
-// Publish atomically writes index files to a staging directory, computes checksums, and renames to the final path.
-func (p *Publisher) Publish(buildID int64, claimToken string, strategy string, idx *bm25.Index) (finalPath string, artifactHash string, err error) {
+// Publish atomically writes index files to a staging directory and promotes
+// them to a path owned by this execution. Published paths are immutable: a
+// later claim for the same build receives a distinct directory.
+func (p *Publisher) Publish(buildID int64, executionGeneration int64, claimToken string, strategy string, idx *bm25.Index) (finalPath string, artifactHash string, err error) {
 	if claimToken == "" {
 		claimToken = "default-token"
 	}
+	if executionGeneration < 1 {
+		return "", "", fmt.Errorf("execution generation must be positive")
+	}
 
-	tmpDir := filepath.Join(p.baseDir, ".tmp", fmt.Sprintf("%d-%s", buildID, claimToken))
-	finalDir := filepath.Join(p.baseDir, fmt.Sprintf("%d", buildID))
-
-	// Clean up any stale tmpDir
-	_ = os.RemoveAll(tmpDir)
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+	claimDigest := sha256.Sum256([]byte(claimToken))
+	claimKey := hex.EncodeToString(claimDigest[:])
+	tmpRoot := filepath.Join(p.baseDir, ".tmp")
+	if err := os.MkdirAll(tmpRoot, 0755); err != nil {
+		return "", "", fmt.Errorf("failed creating artifact staging root: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp(tmpRoot, fmt.Sprintf("%d-%d-", buildID, executionGeneration))
+	if err != nil {
 		return "", "", fmt.Errorf("failed creating staging artifact dir: %w", err)
 	}
+	finalDir := filepath.Join(p.baseDir, fmt.Sprintf("%d", buildID), fmt.Sprintf("gen-%d", executionGeneration), claimKey)
 
 	defer func() {
 		// Clean up tmpDir on error
@@ -98,9 +108,11 @@ func (p *Publisher) Publish(buildID int64, claimToken string, strategy string, i
 		return "", "", fmt.Errorf("failed writing manifest: %w", err)
 	}
 
-	// 4. Atomic Rename to final directory
-	_ = os.RemoveAll(finalDir)
-	_ = os.MkdirAll(filepath.Dir(finalDir), 0755)
+	// 4. Atomic rename to this execution's unique immutable directory. Never
+	// remove a published path: a READY database row may point at it.
+	if err := os.MkdirAll(filepath.Dir(finalDir), 0755); err != nil {
+		return "", "", fmt.Errorf("failed creating artifact generation dir: %w", err)
+	}
 	if err := os.Rename(tmpDir, finalDir); err != nil {
 		return "", "", fmt.Errorf("failed atomically renaming artifact dir to %s: %w", finalDir, err)
 	}
@@ -148,4 +160,104 @@ func LoadIndexVerified(artifactDir string, expectedBuildID int64, expectedHash s
 		return nil, fmt.Errorf("retrieval artifact hash mismatch")
 	}
 	return bm25.Load(bytes.NewReader(data))
+}
+
+// CleanupUnreferenced removes only old immutable execution directories that
+// are absent from the database's artifact_path values. It is intended for a
+// periodic maintenance process, never for a job publisher.
+func (p *Publisher) CleanupUnreferenced(referenced map[string]struct{}, olderThan time.Time) (int, error) {
+	root, err := filepath.Abs(p.baseDir)
+	if err != nil {
+		return 0, err
+	}
+	refs := make(map[string]struct{}, len(referenced))
+	for path := range referenced {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return 0, err
+		}
+		refs[filepath.Clean(abs)] = struct{}{}
+	}
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, build := range entries {
+		if build.Name() == ".tmp" {
+			tmpRoot := filepath.Join(root, build.Name())
+			tmpEntries, readErr := os.ReadDir(tmpRoot)
+			if readErr != nil {
+				return removed, readErr
+			}
+			for _, tmp := range tmpEntries {
+				if !tmp.IsDir() || tmp.Type()&os.ModeSymlink != 0 {
+					continue
+				}
+				path := filepath.Join(tmpRoot, tmp.Name())
+				info, statErr := tmp.Info()
+				if statErr != nil {
+					return removed, statErr
+				}
+				if info.ModTime().Before(olderThan) {
+					if err := os.RemoveAll(path); err != nil {
+						return removed, err
+					}
+					removed++
+				}
+			}
+			continue
+		}
+		if _, err := strconv.ParseInt(build.Name(), 10, 64); err != nil || !build.IsDir() || build.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		generationEntries, readErr := os.ReadDir(filepath.Join(root, build.Name()))
+		if readErr != nil {
+			return removed, readErr
+		}
+		for _, generation := range generationEntries {
+			if !strings.HasPrefix(generation.Name(), "gen-") || !generation.IsDir() || generation.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if n, err := strconv.ParseInt(strings.TrimPrefix(generation.Name(), "gen-"), 10, 64); err != nil || n < 1 {
+				continue
+			}
+			claimEntries, readErr := os.ReadDir(filepath.Join(root, build.Name(), generation.Name()))
+			if readErr != nil {
+				return removed, readErr
+			}
+			for _, claim := range claimEntries {
+				if len(claim.Name()) != 64 || !isHexString(claim.Name()) || !claim.IsDir() || claim.Type()&os.ModeSymlink != 0 {
+					continue
+				}
+				path := filepath.Join(root, build.Name(), generation.Name(), claim.Name())
+				if _, ok := refs[filepath.Clean(path)]; ok {
+					continue
+				}
+				info, statErr := claim.Info()
+				if statErr != nil {
+					return removed, statErr
+				}
+				if info.ModTime().Before(olderThan) {
+					if err := os.RemoveAll(path); err != nil {
+						return removed, err
+					}
+					removed++
+				}
+			}
+		}
+	}
+	return removed, nil
+}
+
+func isHexString(value string) bool {
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"repolens/internal/evidence"
@@ -64,9 +65,9 @@ func ProcessTask() error {
 	// 1. Valid citation
 	validCit := evidence.Citation{
 		FilePath:  "worker.go",
-		StartLine: 3,
+		StartLine: 5,
 		EndLine:   5,
-		Excerpt:   "if err != nil",
+		Excerpt:   "    if err != nil {",
 	}
 	validator.Validate(ctx, repoID, snapID, &validCit)
 	if validCit.ValidationStatus != evidence.CitationValid {
@@ -74,6 +75,11 @@ func ProcessTask() error {
 	}
 	if validCit.ContentHash == "" {
 		t.Errorf("expected content hash computed")
+	}
+	hashCitation := evidence.Citation{FilePath: "worker.go", StartLine: 5, EndLine: 5, ContentHash: validCit.ContentHash}
+	validator.Validate(ctx, repoID, snapID, &hashCitation)
+	if hashCitation.ValidationStatus != evidence.CitationValid {
+		t.Errorf("exact range hash was rejected: %s", hashCitation.ValidationError)
 	}
 
 	// 2. Non-existent file citation
@@ -108,5 +114,36 @@ func ProcessTask() error {
 	validator.Validate(ctx, repoID, snapID, &invalidCit3)
 	if invalidCit3.ValidationStatus != evidence.CitationInvalid {
 		t.Errorf("expected INVALID status for mismatched excerpt, got %s", invalidCit3.ValidationStatus)
+	}
+
+	for name, excerpt := range map[string]string{
+		"fabricated prefix": "fabricated prefix\npackage worker",
+		"fabricated suffix": "package worker\nfabricated suffix",
+	} {
+		t.Run(name, func(t *testing.T) {
+			citation := evidence.Citation{FilePath: "worker.go", StartLine: 1, EndLine: 1, Excerpt: excerpt}
+			validator.Validate(ctx, repoID, snapID, &citation)
+			if citation.ValidationStatus != evidence.CitationInvalid {
+				t.Fatalf("fabricated excerpt was accepted: %+v", citation)
+			}
+		})
+	}
+
+	wrongSnapshot := evidence.Citation{SnapshotID: "another-snapshot", FilePath: "worker.go", StartLine: 5, EndLine: 5, Excerpt: "    if err != nil {"}
+	validator.Validate(ctx, repoID, snapID, &wrongSnapshot)
+	if wrongSnapshot.ValidationStatus != evidence.CitationInvalid {
+		t.Fatalf("citation from another snapshot was accepted: %+v", wrongSnapshot)
+	}
+
+	wrongRange := evidence.Citation{FilePath: "worker.go", StartLine: 1, EndLine: 1, Excerpt: "    if err != nil {"}
+	validator.Validate(ctx, repoID, snapID, &wrongRange)
+	if wrongRange.ValidationStatus != evidence.CitationInvalid {
+		t.Fatalf("citation excerpt from another range was accepted: %+v", wrongRange)
+	}
+
+	wrongHash := evidence.Citation{FilePath: "worker.go", StartLine: 5, EndLine: 5, ContentHash: strings.Repeat("0", 64)}
+	validator.Validate(ctx, repoID, snapID, &wrongHash)
+	if wrongHash.ValidationStatus != evidence.CitationInvalid {
+		t.Fatalf("citation with wrong range hash was accepted: %+v", wrongHash)
 	}
 }

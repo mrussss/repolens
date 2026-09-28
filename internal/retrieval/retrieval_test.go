@@ -2,9 +2,11 @@ package retrieval_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,10 +22,11 @@ import (
 	"repolens/internal/retrieval"
 	"repolens/internal/retrieval/artifact"
 	"repolens/internal/retrieval/bm25"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
 
-func setupRetrievalDB(t *testing.T) (*gorm.DB, codeintelstore.Store, snapshot.Store) {
+func setupRetrievalDB(t *testing.T) (*gorm.DB, *jobs.Store, codeintelstore.Store, snapshot.Store) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "retrieval_test.db")
 	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000&_journal_mode=WAL"), &gorm.Config{})
@@ -35,11 +38,202 @@ func setupRetrievalDB(t *testing.T) (*gorm.DB, codeintelstore.Store, snapshot.St
 	}
 	ciStore := codeintelstore.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	return db, ciStore, snapStore
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get database connection: %v", err)
+	}
+	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	return db, jobsStore, ciStore, snapStore
+}
+
+func claimRetrievalJobForTest(t *testing.T, db *gorm.DB, jobsStore *jobs.Store, retrievalBuildID int64, workerID string) *jobs.AnalysisJob {
+	t.Helper()
+	var retrievalBuild codeintelmodel.RetrievalBuild
+	if err := db.First(&retrievalBuild, "id = ?", retrievalBuildID).Error; err != nil {
+		t.Fatalf("load retrieval build %d: %v", retrievalBuildID, err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).
+		Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, strconv.FormatInt(retrievalBuild.CodeIndexBuildID, 10)).
+		Update("status", jobs.StatusSucceeded).Error; err != nil {
+		t.Fatalf("complete code-index fixture job: %v", err)
+	}
+	claimed, err := jobsStore.ClaimJobs(context.Background(), workerID, 1, time.Minute)
+	if err != nil || len(claimed) != 1 || claimed[0].JobType != jobs.JobTypeBuildRetrieval || claimed[0].ResourceID != strconv.FormatInt(retrievalBuildID, 10) {
+		t.Fatalf("claim retrieval job: claimed=%+v err=%v", claimed, err)
+	}
+	attempt, err := jobsStore.MarkExecutionStarted(context.Background(), claimed[0].ID, workerID, *claimed[0].ClaimToken, claimed[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatalf("start retrieval job: %v", err)
+	}
+	claimed[0].AttemptCount, claimed[0].ExecutionStarted = attempt, true
+	return claimed[0]
+}
+
+func TestStaleRetrievalHandlerDoesNotFailRevision(t *testing.T) {
+	db, jobsStore, ciStore, snapStore := setupRetrievalDB(t)
+	ctx := context.Background()
+	revisionID := "revision-stale-retrieval"
+	if err := db.Create(&revision.AnalysisRevision{
+		ID: revisionID, RepositoryID: "repo-stale-retrieval", SourceRef: "main",
+		CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2",
+		PipelineFingerprint: "fingerprint-stale-retrieval", Status: revision.StatusPreparing,
+		Stage: revision.StageBuildingSearch, ExecutionGeneration: 1, Version: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	codeBuild, _, err := ciStore.GetOrCreateBuild(ctx, "snap-stale-retrieval", "example.com/stale", codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrievalBuild, _, err := ciStore.GetOrCreateRetrievalBuild(ctx, codeBuild.ID, "BM25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", retrievalBuild.ID).Update("analysis_revision_id", revisionID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", codeBuild.ID)).Update("status", jobs.StatusSucceeded).Error; err != nil {
+		t.Fatal(err)
+	}
+	rbResourceID := fmt.Sprintf("%d", retrievalBuild.ID)
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildRetrieval, rbResourceID).Update("max_attempts", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldClaim, err := jobsStore.ClaimJobs(ctx, "old-retrieval-worker", 1, time.Minute)
+	if err != nil || len(oldClaim) != 1 {
+		t.Fatalf("old Retrieval claim = %d jobs, err=%v", len(oldClaim), err)
+	}
+	oldAttempt, err := jobsStore.MarkExecutionStarted(ctx, oldClaim[0].ID, "old-retrieval-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim[0].AttemptCount, oldClaim[0].ExecutionStarted = oldAttempt, true
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
+		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
+		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", revisionID).Updates(map[string]interface{}{
+		"execution_generation": 2, "stage": revision.StageBuildingSearch,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	newClaim, err := jobsStore.ClaimJobs(ctx, "new-retrieval-worker", 1, time.Minute)
+	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
+		t.Fatalf("new Retrieval claim = %+v, err=%v", newClaim, err)
+	}
+	handler := retrieval.NewRetrievalJobHandler(ciStore, t.TempDir()).
+		WithSnapshotSource(snapStore, snapshotstore.NewLocalSnapshotStore(t.TempDir()))
+	err = handler.Execute(ctx, oldClaim[0])
+	if err == nil {
+		t.Fatal("retrieval build unexpectedly executed without a READY CodeIndex")
+	}
+	currentRevision, err := revision.NewStore(db).GetByID(ctx, revisionID)
+	if err != nil || currentRevision.Status != revision.StatusPreparing || currentRevision.ExecutionGeneration != 2 {
+		t.Fatalf("new revision after stale Retrieval error = %+v err=%v", currentRevision, err)
+	}
+	currentJob, err := jobsStore.GetJobByID(ctx, newClaim[0].ID)
+	if err != nil || currentJob.Status != jobs.StatusRunning || currentJob.ClaimToken == nil || *currentJob.ClaimToken != *newClaim[0].ClaimToken {
+		t.Fatalf("new Retrieval claim changed by stale handler: job=%+v err=%v", currentJob, err)
+	}
+}
+
+func TestStaleRetrievalPublisherCannotReplaceCurrentArtifact(t *testing.T) {
+	db, jobsStore, ciStore, _ := setupRetrievalDB(t)
+	ctx := context.Background()
+	codeBuild, _, err := ciStore.GetOrCreateBuild(ctx, "snap-retrieval-artifact-race", "example.com/race", codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrievalBuild, _, err := ciStore.GetOrCreateRetrievalBuild(ctx, codeBuild.ID, "BM25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ciStore.MarkRetrievalBuilding(ctx, retrievalBuild.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", codeBuild.ID)).Update("status", jobs.StatusSucceeded).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldClaim, err := jobsStore.ClaimJobs(ctx, "retrieval-old-worker", 1, time.Minute)
+	if err != nil || len(oldClaim) != 1 || oldClaim[0].JobType != jobs.JobTypeBuildRetrieval {
+		t.Fatalf("old Retrieval claim = %+v, err=%v", oldClaim, err)
+	}
+	oldAttempt, err := jobsStore.MarkExecutionStarted(ctx, oldClaim[0].ID, "retrieval-old-worker", *oldClaim[0].ClaimToken, oldClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim[0].AttemptCount, oldClaim[0].ExecutionStarted = oldAttempt, true
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", oldClaim[0].ID).Updates(map[string]interface{}{
+		"status": jobs.StatusPending, "execution_generation": 2, "attempt_count": 0,
+		"worker_id": nil, "claim_token": nil, "lease_until": nil, "next_run_at": time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	newClaim, err := jobsStore.ClaimJobs(ctx, "retrieval-new-worker", 1, time.Minute)
+	if err != nil || len(newClaim) != 1 || newClaim[0].ExecutionGeneration != 2 {
+		t.Fatalf("new Retrieval claim = %+v, err=%v", newClaim, err)
+	}
+	newAttempt, err := jobsStore.MarkExecutionStarted(ctx, newClaim[0].ID, "retrieval-new-worker", *newClaim[0].ClaimToken, newClaim[0].ExecutionGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newClaim[0].AttemptCount, newClaim[0].ExecutionStarted = newAttempt, true
+
+	indexRoot := t.TempDir()
+	publisher := artifact.NewPublisher(indexRoot)
+	oldIndex := bm25.NewIndex(1.2, 0.75)
+	oldIndex.AddDocument(bm25.Document{FilePath: "main.go", Content: "stale-worker-marker"})
+	oldIndex.Build()
+	newIndex := bm25.NewIndex(1.2, 0.75)
+	newIndex.AddDocument(bm25.Document{FilePath: "main.go", Content: "current-worker-marker"})
+	newIndex.Build()
+	paused := make(chan struct{})
+	release := make(chan struct{})
+	type oldResult struct {
+		path string
+		hash string
+		err  error
+	}
+	oldDone := make(chan oldResult, 1)
+	go func() {
+		close(paused) // W1 is deterministically stopped immediately before publish.
+		<-release
+		path, hash, publishErr := publisher.Publish(retrievalBuild.ID, int64(oldClaim[0].ExecutionGeneration), *oldClaim[0].ClaimToken, retrievalBuild.Strategy, oldIndex)
+		if publishErr == nil {
+			publishErr = ciStore.FinalizeRetrievalSuccess(ctx, oldClaim[0].ID, *oldClaim[0].WorkerID, *oldClaim[0].ClaimToken, retrievalBuild.ID, path, hash, oldIndex.TotalDocs)
+		}
+		oldDone <- oldResult{path: path, hash: hash, err: publishErr}
+	}()
+	<-paused
+
+	newPath, newHash, err := publisher.Publish(retrievalBuild.ID, int64(newClaim[0].ExecutionGeneration), *newClaim[0].ClaimToken, retrievalBuild.Strategy, newIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ciStore.FinalizeRetrievalSuccess(ctx, newClaim[0].ID, *newClaim[0].WorkerID, *newClaim[0].ClaimToken, retrievalBuild.ID, newPath, newHash, newIndex.TotalDocs); err != nil {
+		t.Fatalf("W2 finalization failed: %v", err)
+	}
+	close(release)
+	old := <-oldDone
+	if !errors.Is(old.err, jobs.ErrOwnershipLost) {
+		t.Fatalf("stale W1 finalization error = %v, want ownership lost", old.err)
+	}
+	if old.path == newPath {
+		t.Fatalf("execution claims shared mutable artifact path %q", newPath)
+	}
+	current, err := ciStore.GetRetrievalBuildByID(ctx, retrievalBuild.ID)
+	if err != nil || current.Status != codeintelmodel.BuildStatusReady || current.ArtifactPath != newPath || current.ArtifactHash != newHash {
+		t.Fatalf("current RetrievalBuild changed after stale W1 resumed: build=%+v err=%v", current, err)
+	}
+	if _, err := artifact.LoadIndexVerified(current.ArtifactPath, retrievalBuild.ID, current.ArtifactHash); err != nil {
+		t.Fatalf("current artifact hash no longer verifies after W1 resumed: %v", err)
+	}
 }
 
 func TestRetrievalJobHandlerIndexesSymbolSourceBody(t *testing.T) {
-	_, ciStore, snapStore := setupRetrievalDB(t)
+	db, jobsStore, ciStore, snapStore := setupRetrievalDB(t)
 	ctx := context.Background()
 	storageDir := t.TempDir()
 	snapshotBase := t.TempDir()
@@ -102,7 +296,11 @@ func TestRetrievalJobHandlerIndexesSymbolSourceBody(t *testing.T) {
 		t.Fatalf("create retrieval build: %v", err)
 	}
 	handler := retrieval.NewRetrievalJobHandler(ciStore, storageDir).WithSnapshotSource(snapStore, storeFS)
-	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: fmt.Sprintf("%d", rb.ID)}); err != nil {
+	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: fmt.Sprintf("%d", rb.ID)}); !errors.Is(err, jobs.ErrOwnershipLost) {
+		t.Fatalf("unclaimed retrieval job error = %v, want ownership lost", err)
+	}
+	claimed := claimRetrievalJobForTest(t, db, jobsStore, rb.ID, "worker-retrieval-source-body")
+	if err := handler.Execute(ctx, claimed); err != nil {
 		t.Fatalf("execute retrieval build: %v", err)
 	}
 	retriever := retrieval.NewProductionRetriever(ciStore, storageDir)
@@ -133,7 +331,7 @@ func TestRetrievalJobHandlerIndexesSymbolSourceBody(t *testing.T) {
 }
 
 func TestRetrievalJobHandlerIndexesAllSymbols(t *testing.T) {
-	_, ciStore, _ := setupRetrievalDB(t)
+	db, jobsStore, ciStore, _ := setupRetrievalDB(t)
 	ctx := context.Background()
 	storageDir := t.TempDir()
 
@@ -174,7 +372,8 @@ func TestRetrievalJobHandlerIndexesAllSymbols(t *testing.T) {
 		t.Fatalf("create retrieval build: %v", err)
 	}
 	handler := retrieval.NewRetrievalJobHandler(ciStore, storageDir)
-	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: fmt.Sprintf("%d", rb.ID)}); err != nil {
+	claimed := claimRetrievalJobForTest(t, db, jobsStore, rb.ID, "worker-retrieval-all-symbols")
+	if err := handler.Execute(ctx, claimed); err != nil {
 		t.Fatalf("execute retrieval build: %v", err)
 	}
 
@@ -200,7 +399,7 @@ func TestRetrievalJobHandlerIndexesAllSymbols(t *testing.T) {
 }
 
 func TestProductionRetriever_SearchAndStructuralExpansion(t *testing.T) {
-	_, ciStore, snapStore := setupRetrievalDB(t)
+	_, _, ciStore, snapStore := setupRetrievalDB(t)
 	ctx := context.Background()
 	tempBase := t.TempDir()
 
@@ -290,7 +489,7 @@ func TestProductionRetriever_SearchAndStructuralExpansion(t *testing.T) {
 	// Publish atomic artifact
 	pub := artifact.NewPublisher(tempBase)
 	rb, _, _ := ciStore.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
-	finalPath, hash, err := pub.Publish(rb.ID, "token-1", "BM25", idx)
+	finalPath, hash, err := pub.Publish(rb.ID, 1, "token-1", "BM25", idx)
 	if err != nil {
 		t.Fatalf("failed publishing artifact: %v", err)
 	}

@@ -3,9 +3,11 @@ package codeintel_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -16,11 +18,12 @@ import (
 	"repolens/internal/codeintel"
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
+	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/snapshot"
 )
 
-func setupHandlerTestServer(t *testing.T) (*gin.Engine, codeintelstore.Store, snapshot.Store) {
+func setupHandlerTestServer(t *testing.T) (*gin.Engine, codeintelstore.Store, snapshot.Store, *gorm.DB, *jobs.Store) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -35,7 +38,12 @@ func setupHandlerTestServer(t *testing.T) (*gin.Engine, codeintelstore.Store, sn
 
 	ciStore := codeintelstore.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	handler := codeintel.NewHandler(ciStore, snapStore)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("failed getting sql.DB: %v", err)
+	}
+	jobStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	handler := codeintel.NewHandler(ciStore, snapStore).WithJobStore(jobStore)
 
 	r := gin.New()
 	v1 := r.Group("/api/v1")
@@ -51,11 +59,11 @@ func setupHandlerTestServer(t *testing.T) (*gin.Engine, codeintelstore.Store, sn
 		v1.GET("/retrieval-builds/:id", handler.GetRetrievalBuild)
 	}
 
-	return r, ciStore, snapStore
+	return r, ciStore, snapStore, db, jobStore
 }
 
 func TestCodeIntelHTTP_EndToEndEndpoints(t *testing.T) {
-	router, ciStore, snapStore := setupHandlerTestServer(t)
+	router, ciStore, snapStore, _, _ := setupHandlerTestServer(t)
 	ctx := context.Background()
 
 	// 1. Seed Snapshot
@@ -200,5 +208,151 @@ func TestCodeIntelHTTP_EndToEndEndpoints(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected HTTP 202 for retrieval build creation, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTriggerCodeIndexBuildRequeuesOnlyRetryableLegacyFailures(t *testing.T) {
+	router, ciStore, snapStore, db, jobStore := setupHandlerTestServer(t)
+	ctx := context.Background()
+	retryable := jobs.TerminalReasonRetryableExhausted
+	permanent := jobs.TerminalReasonPermanent
+	cases := []struct {
+		name            string
+		buildStatus     codeintelmodel.BuildStatus
+		jobStatus       jobs.JobStatus
+		terminalReason  *jobs.TerminalReason
+		revisionID      string
+		wantHTTP        int
+		wantBuildStatus codeintelmodel.BuildStatus
+		wantJobStatus   jobs.JobStatus
+	}{
+		{name: "ready reuse", buildStatus: codeintelmodel.BuildStatusReady, wantHTTP: http.StatusOK, wantBuildStatus: codeintelmodel.BuildStatusReady},
+		{name: "building reuse", buildStatus: codeintelmodel.BuildStatusBuilding, wantHTTP: http.StatusOK, wantBuildStatus: codeintelmodel.BuildStatusBuilding},
+		{name: "created reuse", buildStatus: codeintelmodel.BuildStatusCreated, wantHTTP: http.StatusOK, wantBuildStatus: codeintelmodel.BuildStatusCreated},
+		{name: "retryable exhausted", buildStatus: codeintelmodel.BuildStatusFailed, jobStatus: jobs.StatusFailed, terminalReason: &retryable, wantHTTP: http.StatusAccepted, wantBuildStatus: codeintelmodel.BuildStatusCreated, wantJobStatus: jobs.StatusPending},
+		{name: "permanent failure", buildStatus: codeintelmodel.BuildStatusFailed, jobStatus: jobs.StatusFailed, terminalReason: &permanent, wantHTTP: http.StatusConflict, wantBuildStatus: codeintelmodel.BuildStatusFailed, wantJobStatus: jobs.StatusFailed},
+		{name: "revision retry required", buildStatus: codeintelmodel.BuildStatusFailed, jobStatus: jobs.StatusFailed, terminalReason: &retryable, revisionID: "revision-retry-through-revision-api", wantHTTP: http.StatusConflict, wantBuildStatus: codeintelmodel.BuildStatusFailed, wantJobStatus: jobs.StatusFailed},
+	}
+	for index, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshotID := fmt.Sprintf("snap-trigger-code-%d", index)
+			if err := snapStore.Create(ctx, &snapshot.RepositorySnapshot{
+				ID: snapshotID, RepositoryID: "repo-trigger-code", CommitSHA: fmt.Sprintf("commit-%d", index),
+				Ref: "main", Status: snapshot.StatusReady,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			build, _, err := ciStore.GetOrCreateBuild(ctx, snapshotID, "example.com/trigger", codeintelmodel.DefaultBuildContext())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Updates(map[string]interface{}{
+				"status": tc.buildStatus, "analysis_revision_id": tc.revisionID,
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+			job, err := jobStore.GetJobByResource(ctx, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(build.ID, 10))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.jobStatus != "" {
+				if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
+					"status": tc.jobStatus, "terminal_reason": tc.terminalReason,
+				}).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/snapshots/"+snapshotID+"/code-index-builds", nil)
+			router.ServeHTTP(response, request)
+			if response.Code != tc.wantHTTP {
+				t.Fatalf("HTTP status = %d, want %d: %s", response.Code, tc.wantHTTP, response.Body.String())
+			}
+			currentBuild, err := ciStore.GetByID(ctx, build.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			currentJob, err := jobStore.GetJobByResource(ctx, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(build.ID, 10))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if currentBuild.Status != tc.wantBuildStatus || (tc.wantJobStatus != "" && currentJob.Status != tc.wantJobStatus) {
+				t.Fatalf("after trigger build/job = %s/%s, want %s/%s", currentBuild.Status, currentJob.Status, tc.wantBuildStatus, tc.wantJobStatus)
+			}
+		})
+	}
+}
+
+func TestTriggerRetrievalBuildRequeuesOnlyRetryableLegacyFailures(t *testing.T) {
+	router, ciStore, _, db, jobStore := setupHandlerTestServer(t)
+	ctx := context.Background()
+	retryable := jobs.TerminalReasonRetryableExhausted
+	permanent := jobs.TerminalReasonPermanent
+	cases := []struct {
+		name            string
+		buildStatus     codeintelmodel.BuildStatus
+		jobStatus       jobs.JobStatus
+		terminalReason  *jobs.TerminalReason
+		revisionID      string
+		wantHTTP        int
+		wantBuildStatus codeintelmodel.BuildStatus
+		wantJobStatus   jobs.JobStatus
+	}{
+		{name: "ready reuse", buildStatus: codeintelmodel.BuildStatusReady, wantHTTP: http.StatusOK, wantBuildStatus: codeintelmodel.BuildStatusReady},
+		{name: "building reuse", buildStatus: codeintelmodel.BuildStatusBuilding, wantHTTP: http.StatusOK, wantBuildStatus: codeintelmodel.BuildStatusBuilding},
+		{name: "created reuse", buildStatus: codeintelmodel.BuildStatusCreated, wantHTTP: http.StatusOK, wantBuildStatus: codeintelmodel.BuildStatusCreated},
+		{name: "retryable exhausted", buildStatus: codeintelmodel.BuildStatusFailed, jobStatus: jobs.StatusFailed, terminalReason: &retryable, wantHTTP: http.StatusAccepted, wantBuildStatus: codeintelmodel.BuildStatusCreated, wantJobStatus: jobs.StatusPending},
+		{name: "permanent failure", buildStatus: codeintelmodel.BuildStatusFailed, jobStatus: jobs.StatusFailed, terminalReason: &permanent, wantHTTP: http.StatusConflict, wantBuildStatus: codeintelmodel.BuildStatusFailed, wantJobStatus: jobs.StatusFailed},
+		{name: "revision retry required", buildStatus: codeintelmodel.BuildStatusFailed, jobStatus: jobs.StatusFailed, terminalReason: &retryable, revisionID: "revision-retry-through-revision-api", wantHTTP: http.StatusConflict, wantBuildStatus: codeintelmodel.BuildStatusFailed, wantJobStatus: jobs.StatusFailed},
+	}
+	for index, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			codeBuild, _, err := ciStore.GetOrCreateBuild(ctx, fmt.Sprintf("snap-trigger-retrieval-%d", index), "example.com/trigger", codeintelmodel.DefaultBuildContext())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", codeBuild.ID).Update("status", codeintelmodel.BuildStatusReady).Error; err != nil {
+				t.Fatal(err)
+			}
+			retrievalBuild, _, err := ciStore.GetOrCreateRetrievalBuild(ctx, codeBuild.ID, "BM25")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("id = ?", retrievalBuild.ID).Updates(map[string]interface{}{
+				"status": tc.buildStatus, "analysis_revision_id": tc.revisionID,
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+			job, err := jobStore.GetJobByResource(ctx, jobs.JobTypeBuildRetrieval, strconv.FormatInt(retrievalBuild.ID, 10))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.jobStatus != "" {
+				if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
+					"status": tc.jobStatus, "terminal_reason": tc.terminalReason,
+				}).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/code-index-builds/%d/retrieval-builds", codeBuild.ID), nil)
+			router.ServeHTTP(response, request)
+			if response.Code != tc.wantHTTP {
+				t.Fatalf("HTTP status = %d, want %d: %s", response.Code, tc.wantHTTP, response.Body.String())
+			}
+			currentBuild, err := ciStore.GetRetrievalBuildByID(ctx, retrievalBuild.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			currentJob, err := jobStore.GetJobByResource(ctx, jobs.JobTypeBuildRetrieval, strconv.FormatInt(retrievalBuild.ID, 10))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if currentBuild.Status != tc.wantBuildStatus || (tc.wantJobStatus != "" && currentJob.Status != tc.wantJobStatus) {
+				t.Fatalf("after trigger build/job = %s/%s, want %s/%s", currentBuild.Status, currentJob.Status, tc.wantBuildStatus, tc.wantJobStatus)
+			}
+		})
 	}
 }

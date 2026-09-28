@@ -20,8 +20,6 @@ import (
 // DiagnosisJobHandler implements jobs.Handler for RUN_DIAGNOSIS jobs.
 type DiagnosisJobHandler struct {
 	diagnosisStore diagnosis.Store
-	reportStore    evidence.ReportStore
-	citationStore  evidence.CitationStore
 	citationVal    *evidence.CitationValidator
 	evidenceIssuer evidence.EvidenceIssuer
 	executor       DiagnosisExecutor
@@ -42,8 +40,6 @@ func NewDiagnosisJobHandler(
 ) *DiagnosisJobHandler {
 	return &DiagnosisJobHandler{
 		diagnosisStore: diagnosisStore,
-		reportStore:    reportStore,
-		citationStore:  citationStore,
 		citationVal:    citationVal,
 		executor:       executor,
 	}
@@ -51,6 +47,12 @@ func NewDiagnosisJobHandler(
 
 // Execute processes a RUN_DIAGNOSIS job.
 func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
+	if errors.Is(context.Cause(ctx), jobs.ErrWorkerShutdown) {
+		return jobs.ErrWorkerShutdown
+	}
+	if errors.Is(context.Cause(ctx), jobs.ErrOwnershipLost) {
+		return jobs.ErrOwnershipLost
+	}
 	runID := job.ResourceID
 	log := logger.L(ctx).With("diagnosis_id", runID, "job_id", job.ID, "attempt", job.AttemptCount)
 
@@ -89,17 +91,8 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		DeadlineAt:          now.Add(30 * time.Minute),
 	}
 
-	if starter, ok := h.diagnosisStore.(interface {
-		StartAttempt(context.Context, string, *diagnosis.DiagnosisAttempt) error
-	}); ok {
-		if err := starter.StartAttempt(ctx, run.ID, attempt); err != nil {
-			return jobs.NewRetryableError("START_ATTEMPT_FAILED", err.Error(), err)
-		}
-	} else {
-		// Compatibility path for lightweight unit stores.
-		if err := h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusRunning, diagnosis.AttemptStatusRunning, 0, 0, 0, "", "", false, 0); err != nil {
-			return jobs.NewRetryableError("START_ATTEMPT_FAILED", err.Error(), err)
-		}
+	if err := h.diagnosisStore.StartAttempt(ctx, run.ID, attempt); err != nil {
+		return jobs.NewRetryableError("START_ATTEMPT_FAILED", err.Error(), err)
 	}
 	// Keep Attempt liveness independent of Provider latency. RecoverySweeper
 	// uses these heartbeats, and its stale duration is longer than this interval.
@@ -134,11 +127,15 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			if checkpoint.CheckpointAgentVersion != "" && (checkpoint.CheckpointAgentVersion != run.AgentVersion || checkpoint.CheckpointPromptVersion != run.PromptVersion) {
 				versionErr := jobs.NewPermanentError("CHECKPOINT_VERSION_MISMATCH", "diagnosis checkpoint uses an incompatible Agent protocol; explicit retry is required", nil)
 				finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-				if finalizeErr := h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, "CHECKPOINT_VERSION_MISMATCH", versionErr.Error(), false, 0); finalizeErr != nil {
+				finalizeErr := h.finalizeDiagnosisFailure(finalizeCtx, job, run, attempt, jobs.ErrorClassPermanent, "CHECKPOINT_VERSION_MISMATCH", versionErr.Error(), nil)
+				if finalizeErr != nil && !errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
 					log.Error("failed to terminalize incompatible diagnosis checkpoint", "error", finalizeErr)
 				}
 				cancelFinalize()
-				return versionErr
+				if finalizeErr == nil || errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
+					return jobs.ErrAlreadyFinalized
+				}
+				return jobs.NewRetryableError("CHECKPOINT_VERSION_MISMATCH_FINALIZE_FAILED", "failed to finalize incompatible diagnosis checkpoint", finalizeErr)
 			}
 			result = executionResultFromCheckpoint(checkpoint)
 			if checkpoint.CheckpointKind == diagnosis.CheckpointKindFinalInvalid {
@@ -185,13 +182,19 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		if checkpointErr := h.saveAttemptCheckpoint(attempt, run, result, checkpointKind); checkpointErr != nil {
 			log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
 			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-			finalizeErr := h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, result.PromptTokens, result.CompletionTokens, result.ToolCalls, "CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", false, 0)
+			finalizeErr := h.finalizeDiagnosisFailure(finalizeCtx, job, run, attempt, jobs.ErrorClassPermanent, "CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", result)
 			cancelFinalize()
-			if finalizeErr != nil {
+			if finalizeErr != nil && !errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
 				log.Error("failed to terminalize diagnosis after checkpoint failure", "error", finalizeErr)
+				return jobs.NewRetryableError("CHECKPOINT_SAVE_FAILED_FINALIZE_FAILED", "failed to finalize diagnosis after checkpoint failure", finalizeErr)
 			}
-			return jobs.NewPermanentError("CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", checkpointErr)
+			return jobs.ErrAlreadyFinalized
 		}
+	}
+	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
+		return cause
+	} else if errors.Is(cause, jobs.ErrUserCancellation) || run.CancelRequested || job.CancelRequested {
+		return h.cancelAttempt(ctx, job, run, attempt)
 	}
 	if errors.Is(execErr, agent.ErrInvalidStructuredReport) {
 		promptTokens, completionTokens, toolCalls := 0, 0, 0
@@ -204,7 +207,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		}
 		rawOutput := ""
 		if result != nil {
-			rawOutput = result.RawOutput
+			rawOutput = agent.RedactSecrets(result.RawOutput)
 		}
 		report := &evidence.Report{
 			ID:                    uuid.New().String(),
@@ -219,82 +222,90 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			LimitationsJSON:       "[]",
 			CreatedAt:             time.Now().UTC(),
 		}
-		if finalizer, ok := h.diagnosisStore.(interface {
-			FinalizeInvalidStructuredReport(context.Context, int64, string, string, string, string, *evidence.Report, int, int, int, string, string) error
-		}); ok {
-			if job.WorkerID == nil || job.ClaimToken == nil {
-				return jobs.ErrOwnershipLost
-			}
-			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-			finalizeErr := finalizer.FinalizeInvalidStructuredReport(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID, report, promptTokens, completionTokens, toolCalls, agent.ErrCodeInvalidStructuredReport, message)
-			cancelFinalize()
-			if errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
-				return jobs.ErrAlreadyFinalized
-			}
-			if errors.Is(finalizeErr, jobs.ErrCancellationRequested) {
-				return h.cancelAttempt(ctx, job, run, attempt)
-			}
-			if finalizeErr != nil {
-				h.closeCheckpointAttempt(ctx, run, attempt, "ATOMIC_INVALID_FINALIZE_FAILED", finalizeErr)
-				return jobs.NewRetryableError("ATOMIC_INVALID_FINALIZE_FAILED", "failed to atomically finalize invalid structured report", finalizeErr)
-			}
-			return jobs.NewPermanentError(agent.ErrCodeInvalidStructuredReport, "agent returned an invalid structured report", execErr)
+		if job.WorkerID == nil || job.ClaimToken == nil {
+			return jobs.ErrOwnershipLost
 		}
-		// Compatibility path for lightweight non-SQL stores.
-		if h.reportStore != nil {
-			if persistErr := h.reportStore.Create(ctx, report); persistErr != nil {
-				return jobs.NewRetryableError("REPORT_PERSIST_FAILED", persistErr.Error(), persistErr)
-			}
+		finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
+		finalizeErr := h.diagnosisStore.FinalizeInvalidStructuredReport(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID, report, promptTokens, completionTokens, toolCalls, agent.ErrCodeInvalidStructuredReport, message)
+		cancelFinalize()
+		if errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
+			return jobs.ErrAlreadyFinalized
 		}
-		_ = h.diagnosisStore.FinishAttemptAndRun(ctx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, promptTokens, completionTokens, toolCalls, agent.ErrCodeInvalidStructuredReport, message, false, 0)
-		return jobs.NewPermanentError(agent.ErrCodeInvalidStructuredReport, "agent returned an invalid structured report", execErr)
+		if errors.Is(finalizeErr, jobs.ErrCancellationRequested) {
+			return h.cancelAttempt(ctx, job, run, attempt)
+		}
+		if finalizeErr != nil {
+			return h.handleFinalizerFailure(ctx, job, run, attempt, "ATOMIC_INVALID_FINALIZE_FAILED", finalizeErr)
+		}
+		return jobs.ErrAlreadyFinalized
 	}
 	if execErr != nil {
 		log.Error("agent execution failed", "error", execErr)
+		if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
+			return cause
+		} else if errors.Is(cause, jobs.ErrUserCancellation) || run.CancelRequested || job.CancelRequested {
+			return h.cancelAttempt(ctx, job, run, attempt)
+		}
+		errorCode := ""
 		if errors.Is(execErr, agent.ErrModelOutputTruncated) {
-			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancelFinalize()
-			promptTokens, completionTokens, toolCalls := 0, 0, 0
-			if result != nil {
-				promptTokens, completionTokens, toolCalls = result.PromptTokens, result.CompletionTokens, result.ToolCalls
-			}
-			if finalizeErr := h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, promptTokens, completionTokens, toolCalls, agent.ErrCodeModelOutputTruncated, execErr.Error(), false, 0); finalizeErr != nil {
-				log.Error("failed to terminalize truncated diagnosis", "error", finalizeErr)
-			}
-			return jobs.NewPermanentError(agent.ErrCodeModelOutputTruncated, "agent output was truncated before a tool call or structured report", execErr)
+			execErr = jobs.NewPermanentError(agent.ErrCodeModelOutputTruncated, "agent output was truncated before a tool call or structured report", execErr)
+			errorCode = agent.ErrCodeModelOutputTruncated
 		}
 		if progressErr, ok := execErr.(interface {
 			Progressed() bool
 		}); ok && progressErr.Progressed() && result != nil {
-			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusFailed, diagnosis.AttemptStatusFailedTerminal, result.PromptTokens, result.CompletionTokens, result.ToolCalls, "PROVIDER_PROGRESS_ABORTED", execErr.Error(), false, 0)
-			cancelFinalize()
-			terminal := jobs.NewPermanentError("PROVIDER_PROGRESS_ABORTED", "provider failed after agent progress; explicit diagnosis retry is required", execErr)
-			return terminal
+			execErr = jobs.NewPermanentError("PROVIDER_PROGRESS_ABORTED", "provider failed after agent progress; explicit diagnosis retry is required", execErr)
+			errorCode = "PROVIDER_PROGRESS_ABORTED"
+		}
+		var codedError interface {
+			ErrorCode() string
+			Permanent() bool
+		}
+		if errors.As(execErr, &codedError) && codedError.Permanent() {
+			errorCode = codedError.ErrorCode()
+			execErr = jobs.NewPermanentError(errorCode, errorCode, execErr)
 		}
 		errClass, errCode := jobs.ClassifyError(execErr)
-		if errors.Is(execErr, context.Canceled) || errClass == jobs.ErrorClassCancelled {
+		if errorCode != "" {
+			errCode = errorCode
+		}
+		if errClass == jobs.ErrorClassOwnershipLost {
+			return jobs.ErrOwnershipLost
+		}
+		if errClass == jobs.ErrorClassCancelled && errors.Is(execErr, jobs.ErrUserCancellation) {
 			return h.cancelAttempt(ctx, job, run, attempt)
 		}
 		isTerminal := (errClass == jobs.ErrorClassPermanent) || (job.AttemptCount >= job.MaxAttempts)
-
-		var newAttemptStatus diagnosis.AttemptStatus
+		counts := result
 		if isTerminal {
-			newAttemptStatus = diagnosis.AttemptStatusFailedTerminal
-		} else {
-			// Retry belongs to AnalysisJob. Diagnosis remains RUNNING while
-			// the job is in RETRY_WAIT.
-			newAttemptStatus = diagnosis.AttemptStatusFailedRetryable
+			return h.finalizeDiagnosisFailure(ctx, job, run, attempt, errClass, errCode, execErr.Error(), counts)
 		}
-
-		// Diagnosis remains RUNNING until the Job Store terminalizes it.
-		_ = h.diagnosisStore.FinishAttempt(ctx, run.ID, attempt.ID, newAttemptStatus, 0, 0, 0, errCode, execErr.Error(), !isTerminal)
+		if err := h.finalizeRetryableAttempt(ctx, job, run, attempt, errCode, execErr.Error(), counts); err != nil {
+			if errors.Is(err, jobs.ErrCancellationRequested) {
+				return h.cancelAttempt(ctx, job, run, attempt)
+			}
+			return jobs.NewRetryableError("ATTEMPT_RETRY_FINALIZE_FAILED", "failed to close diagnosis attempt before retry", err)
+		}
 		return execErr
 	}
 	if result == nil || result.Report == nil {
 		err := jobs.NewRetryableError("EMPTY_AGENT_OUTPUT", "agent did not return a structured diagnosis report", nil)
-		h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
+		if job.AttemptCount >= job.MaxAttempts {
+			class, code := jobs.ClassifyError(err)
+			return h.finalizeDiagnosisFailure(ctx, job, run, attempt, class, code, err.Error(), result)
+		}
+		if finalizeErr := h.finalizeRetryableAttempt(ctx, job, run, attempt, "EMPTY_AGENT_OUTPUT", err.Error(), result); finalizeErr != nil {
+			if errors.Is(finalizeErr, jobs.ErrCancellationRequested) {
+				return h.cancelAttempt(ctx, job, run, attempt)
+			}
+			return jobs.NewRetryableError("ATTEMPT_RETRY_FINALIZE_FAILED", "failed to close diagnosis attempt before retry", finalizeErr)
+		}
 		return err
+	}
+	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
+		return cause
+	} else if errors.Is(cause, jobs.ErrUserCancellation) || run.CancelRequested || job.CancelRequested {
+		return h.cancelAttempt(ctx, job, run, attempt)
 	}
 
 	// Process Report & Citations
@@ -315,7 +326,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			StructuredPayloadJSON:  string(structuredPayloadBytes),
 			Confidence:             result.Report.Confidence,
 			ModelClaimedConfidence: result.Report.ModelClaimedConfidence,
-			RawOutput:              result.RawOutput,
+			RawOutput:              agent.RedactSecrets(result.RawOutput),
 			ParseError:             result.ParseError,
 			LimitationsJSON:        string(limitationsBytes),
 			FinalizationReason:     result.FinalizationReason,
@@ -358,51 +369,21 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		if result != nil {
 			promptTokens, completionTokens, toolCalls = result.PromptTokens, result.CompletionTokens, result.ToolCalls
 		}
-		if finalizer, ok := h.diagnosisStore.(interface {
-			FinalizeSuccess(context.Context, int64, string, string, string, string, *evidence.Report, []evidence.Citation, int, int, int) error
-		}); ok {
-			if job.ClaimToken == nil || job.WorkerID == nil {
-				return jobs.ErrOwnershipLost
-			}
-			if err := finalizer.FinalizeSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID, rep, allCitations, promptTokens, completionTokens, toolCalls); err != nil {
-				if errors.Is(err, jobs.ErrCancellationRequested) {
-					return h.cancelAttempt(ctx, job, run, attempt)
-				}
-				h.closeCheckpointAttempt(ctx, run, attempt, "ATOMIC_FINALIZE_FAILED", err)
-				h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
-				return jobs.NewRetryableError("ATOMIC_FINALIZE_FAILED", err.Error(), err)
-			}
-			log.Info("diagnosis job completed successfully")
-			return nil
+		if job.ClaimToken == nil || job.WorkerID == nil {
+			return jobs.ErrOwnershipLost
 		}
-		// Compatibility fallback for non-SQL test stores.
-		if err := h.reportStore.Create(ctx, rep); err != nil {
-			h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
-			return jobs.NewRetryableError("REPORT_PERSIST_FAILED", err.Error(), err)
+		finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
+		finalizeErr := h.diagnosisStore.FinalizeSuccess(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID, rep, allCitations, promptTokens, completionTokens, toolCalls)
+		cancelFinalize()
+		if errors.Is(finalizeErr, jobs.ErrCancellationRequested) {
+			return h.cancelAttempt(ctx, job, run, attempt)
 		}
-		if err := h.citationStore.CreateBatch(ctx, allCitations); err != nil {
-			h.failDiagnosisIfTerminal(ctx, job, run, attempt, err)
-			return jobs.NewRetryableError("CITATION_PERSIST_FAILED", err.Error(), err)
+		if errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
+			return jobs.ErrAlreadyFinalized
 		}
-	}
-
-	promptTokens := 0
-	completionTokens := 0
-	toolCalls := 0
-	if result != nil {
-		promptTokens = result.PromptTokens
-		completionTokens = result.CompletionTokens
-		toolCalls = result.ToolCalls
-	}
-
-	// Finalize status to SUCCEEDED
-	if err := h.diagnosisStore.FinishAttemptAndRun(
-		ctx, run.ID, attempt.ID, diagnosis.StatusSucceeded, diagnosis.AttemptStatusSucceeded,
-		promptTokens, completionTokens, toolCalls,
-		"", "", false, 0,
-	); err != nil {
-		log.Error("failed marking diagnosis run succeeded", "error", err)
-		return jobs.NewRetryableError("UPDATE_STATUS_FAILED", "failed updating diagnosis run status", err)
+		if finalizeErr != nil {
+			return h.handleFinalizerFailure(ctx, job, run, attempt, "ATOMIC_FINALIZE_FAILED", finalizeErr)
+		}
 	}
 
 	log.Info("diagnosis job completed successfully")
@@ -483,7 +464,7 @@ func (h *DiagnosisJobHandler) saveAttemptCheckpoint(attempt *diagnosis.Diagnosis
 	checkpoint := diagnosis.AttemptCheckpoint{
 		ExecutionGeneration: attempt.ExecutionGeneration,
 		Kind:                kind,
-		RawOutput:           result.RawOutput,
+		RawOutput:           agent.RedactSecrets(result.RawOutput),
 		ParsedReportJSON:    string(parsedReport),
 		ParsedDraftJSON:     string(parsedDraft),
 		PromptVersion:       run.PromptVersion,
@@ -564,17 +545,6 @@ func executionResultFromCheckpoint(checkpoint *diagnosis.DiagnosisAttempt) *Exec
 	return result
 }
 
-func (h *DiagnosisJobHandler) failDiagnosisIfTerminal(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, err error) {
-	if job == nil || job.AttemptCount < job.MaxAttempts {
-		return
-	}
-	class, code := jobs.ClassifyError(err)
-	if class == jobs.ErrorClassOwnershipLost {
-		return
-	}
-	_ = h.diagnosisStore.FinishAttempt(ctx, run.ID, attempt.ID, diagnosis.AttemptStatusFailedTerminal, 0, 0, 0, code, err.Error(), false)
-}
-
 func (h *DiagnosisJobHandler) cancelAttempt(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) error {
 	// The execution context is expected to be cancelled when this path is
 	// reached after an agent stops. Terminal state persistence must therefore
@@ -583,54 +553,73 @@ func (h *DiagnosisJobHandler) cancelAttempt(ctx context.Context, job *jobs.Analy
 	finalizeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if finalizer, ok := h.diagnosisStore.(interface {
-		FinalizeCancellation(context.Context, int64, string, string, string, string) error
-	}); ok && job.WorkerID != nil && job.ClaimToken != nil {
-		if err := finalizer.FinalizeCancellation(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID); err != nil {
-			return err
-		}
-		return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
+	if job == nil || job.WorkerID == nil || job.ClaimToken == nil {
+		return jobs.ErrOwnershipLost
 	}
-	_ = h.diagnosisStore.FinishAttemptAndRun(finalizeCtx, run.ID, attempt.ID, diagnosis.StatusCancelled, diagnosis.AttemptStatusCancelled, 0, 0, 0, "CANCELLED", "User requested cancellation", false, 0)
-	return jobs.NewPermanentError("CANCELLED", "diagnosis was cancelled", context.Canceled)
+	if err := h.diagnosisStore.FinalizeCancellation(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID); err != nil {
+		return err
+	}
+	return jobs.ErrAlreadyFinalized
 }
 
-// closeCheckpointAttempt prevents a durable provider result from leaving its
-// source attempt RUNNING if the atomic finalizer rolls back. The run remains
-// RUNNING while the generic worker schedules a same-generation retry, which
-// restores this checkpoint without another Provider call.
-func (h *DiagnosisJobHandler) closeCheckpointAttempt(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, code string, cause error) {
-	if run == nil || attempt == nil {
-		return
+func (h *DiagnosisJobHandler) finalizeDiagnosisFailure(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, class jobs.ErrorClass, code, message string, result *ExecutionResult) error {
+	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
+		return cause
+	} else if errors.Is(cause, jobs.ErrUserCancellation) || (job != nil && job.CancelRequested) || (run != nil && run.CancelRequested) {
+		return h.cancelAttempt(ctx, job, run, attempt)
 	}
-	getter, ok := h.diagnosisStore.(interface {
-		GetAttempt(context.Context, string) (*diagnosis.DiagnosisAttempt, error)
-	})
-	if !ok {
-		return
+	if job == nil || job.WorkerID == nil || job.ClaimToken == nil || run == nil || attempt == nil {
+		return jobs.ErrOwnershipLost
 	}
+	promptTokens, completionTokens, toolCalls := executionCounts(result)
 	finalizeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	saved, err := getter.GetAttempt(finalizeCtx, attempt.ID)
-	if err != nil || saved.ProviderCompletedAt == nil || (saved.CheckpointKind != diagnosis.CheckpointKindFinalValid && saved.CheckpointKind != diagnosis.CheckpointKindFinalInvalid) {
-		return
+	err := h.diagnosisStore.FinalizeDiagnosisFailure(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken,
+		job.ExecutionGeneration, run.ID, attempt.ID, class, code, message, promptTokens, completionTokens, toolCalls)
+	if errors.Is(err, jobs.ErrCancellationRequested) {
+		return h.cancelAttempt(ctx, job, run, attempt)
 	}
-	status := diagnosis.AttemptStatusFailedRetryable
-	errorCode := code
-	retryable := true
-	freshRun, runErr := h.diagnosisStore.GetByID(finalizeCtx, run.ID)
-	ownershipLost := errors.Is(cause, jobs.ErrOwnershipLost) || errors.Is(cause, jobs.ErrAlreadyFinalized)
-	terminalRun := runErr == nil && (freshRun.Status == diagnosis.StatusSucceeded || freshRun.Status == diagnosis.StatusFailed || freshRun.Status == diagnosis.StatusCancelled)
-	if ownershipLost || errors.Is(runErr, diagnosis.ErrRunNotFound) || terminalRun {
-		status = diagnosis.AttemptStatusAbandoned
-		errorCode = "FINALIZATION_OWNERSHIP_LOST"
-		retryable = false
+	if err != nil {
+		return jobs.NewRetryableError("ATOMIC_FAILURE_FINALIZE_FAILED", "failed to atomically finalize diagnosis failure", err)
 	}
-	message := "final report checkpoint was saved, but this Attempt no longer owns Run finalization"
-	if status == diagnosis.AttemptStatusFailedRetryable {
-		message = "final report checkpoint was saved; automatic retry can resume without another Provider call"
+	return jobs.ErrAlreadyFinalized
+}
+
+func (h *DiagnosisJobHandler) finalizeRetryableAttempt(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, code, message string, result *ExecutionResult) error {
+	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
+		return cause
+	} else if errors.Is(cause, jobs.ErrUserCancellation) || (job != nil && job.CancelRequested) || (run != nil && run.CancelRequested) {
+		return jobs.ErrCancellationRequested
 	}
-	if closeErr := h.diagnosisStore.CloseAttempt(finalizeCtx, run.ID, attempt.ID, saved.ExecutionGeneration, status, errorCode, message, retryable); closeErr != nil && !errors.Is(closeErr, diagnosis.ErrAttemptNotRunning) {
-		logger.L(finalizeCtx).Error("failed to close checkpoint Attempt without changing Run state", "attempt_id", attempt.ID, "error", closeErr)
+	if job == nil || job.WorkerID == nil || job.ClaimToken == nil || run == nil || attempt == nil {
+		return jobs.ErrOwnershipLost
 	}
+	promptTokens, completionTokens, toolCalls := executionCounts(result)
+	finalizeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return h.diagnosisStore.FinalizeRetryableAttempt(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken,
+		job.ExecutionGeneration, run.ID, attempt.ID, code, message, promptTokens, completionTokens, toolCalls)
+}
+
+func (h *DiagnosisJobHandler) handleFinalizerFailure(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, code string, cause error) error {
+	if errors.Is(cause, jobs.ErrAlreadyFinalized) || errors.Is(cause, jobs.ErrOwnershipLost) {
+		return cause
+	}
+	if errors.Is(cause, jobs.ErrCancellationRequested) || errors.Is(context.Cause(ctx), jobs.ErrUserCancellation) {
+		return h.cancelAttempt(ctx, job, run, attempt)
+	}
+	if err := h.finalizeRetryableAttempt(ctx, job, run, attempt, code, cause.Error(), nil); err != nil {
+		if errors.Is(err, jobs.ErrCancellationRequested) {
+			return h.cancelAttempt(ctx, job, run, attempt)
+		}
+		return jobs.NewRetryableError(code, "diagnosis finalization failed and the attempt could not be closed", errors.Join(cause, err))
+	}
+	return jobs.NewRetryableError(code, "diagnosis finalization failed", cause)
+}
+
+func executionCounts(result *ExecutionResult) (int, int, int) {
+	if result == nil {
+		return 0, 0, 0
+	}
+	return result.PromptTokens, result.CompletionTokens, result.ToolCalls
 }

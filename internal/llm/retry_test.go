@@ -37,6 +37,39 @@ func TestRetryingProviderRetriesOnlyDeclaredTemporaryFailures(t *testing.T) {
 	}
 }
 
+func TestRetryingProviderRetriesServerErrorsButNotBadRequests(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		status    int
+		wantCalls int
+		wantError bool
+	}{
+		{name: "server error", status: 503, wantCalls: 2},
+		{name: "bad request", status: 400, wantCalls: 1, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &statusRetryProvider{status: tt.status}
+			_, err := NewRetryingProvider(provider, 1).Generate(context.Background(), GenerateRequest{})
+			if (err != nil) != tt.wantError || provider.calls != tt.wantCalls {
+				t.Fatalf("error=%v calls=%d, want error=%t calls=%d", err, provider.calls, tt.wantError, tt.wantCalls)
+			}
+		})
+	}
+}
+
+type statusRetryProvider struct {
+	status int
+	calls  int
+}
+
+func (p *statusRetryProvider) Generate(context.Context, GenerateRequest) (GenerateResponse, error) {
+	p.calls++
+	if p.calls == 1 {
+		return GenerateResponse{}, &HTTPError{StatusCode: p.status, Body: "injected provider response"}
+	}
+	return GenerateResponse{Message: Message{Role: RoleAssistant, Content: "ok"}}, nil
+}
+
 type errorProvider struct {
 	err   error
 	calls int

@@ -9,6 +9,7 @@ import (
 
 	"repolens/internal/diagnosis"
 	"repolens/internal/llm"
+	"repolens/internal/trace"
 )
 
 type loopResponseProvider struct {
@@ -29,6 +30,27 @@ func (p *generationOptionsProvider) Generate(_ context.Context, request llm.Gene
 		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`},
 		FinishReason: "stop",
 	}, nil
+}
+
+func TestProviderPromptContainsOnlyRedactedPersistedDiagnosisInput(t *testing.T) {
+	provider := &generationOptionsProvider{}
+	loop := NewAgentLoop(provider, NewToolRegistry(), nil, DefaultGuardConfig())
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-redacted-prompt", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "issue", IssueDescription: `{"password":"supersecret123"}`,
+		ErrorLog: `{"password": "supersecret123"}`,
+	}
+	if _, err := loop.Run(context.Background(), run, &diagnosis.DiagnosisAttempt{ID: "attempt-redacted-prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider calls = %d, want one", len(provider.requests))
+	}
+	for _, message := range provider.requests[0].Messages {
+		if strings.Contains(message.Content, "supersecret123") {
+			t.Fatalf("provider-visible prompt contains original credential: %s", message.Content)
+		}
+	}
 }
 
 func runLoopResponseTest(t *testing.T, response llm.GenerateResponse, maxOutputTokens int) (*LoopResult, error) {
@@ -215,4 +237,44 @@ func TestSystemPromptUsesEvidenceIDOnlyForFinalCitations(t *testing.T) {
 	if !strings.Contains(SystemPrompt, `"evidence_id"`) {
 		t.Fatal("system prompt does not define evidence_id citation field")
 	}
+}
+
+func TestRecordStepRedactsPersistedTraceFields(t *testing.T) {
+	store := &recordingTraceStore{}
+	loop := &AgentLoop{traceStore: store}
+	if err := loop.recordStep(context.Background(), "attempt", 1, trace.StepTypeToolCall,
+		"Authorization: Bearer tool-secret",
+		`{"Authorization":"Basic args-secret"}`,
+		"Authorization: Bearer result-secret", "COMPLETED", 0, 0, 0,
+		"Authorization: Basic error-secret", "Authorization: Bearer finish-secret"); err != nil {
+		t.Fatal(err)
+	}
+	for field, value := range map[string]string{
+		"tool name": store.step.ToolName, "arguments": store.step.ToolArgsSummary,
+		"result": store.step.ToolResultSummary, "error code": store.step.ErrorCode,
+		"finish reason": store.step.FinishReason,
+	} {
+		for _, secret := range []string{"tool-secret", "args-secret", "result-secret", "error-secret", "finish-secret"} {
+			if strings.Contains(value, secret) {
+				t.Errorf("trace %s retained %s: %q", field, secret, value)
+			}
+		}
+	}
+	if !json.Valid([]byte(store.step.ToolArgsSummary)) {
+		t.Fatalf("redaction corrupted JSON trace arguments: %q", store.step.ToolArgsSummary)
+	}
+}
+
+type recordingTraceStore struct{ step *trace.AgentStep }
+
+func (s *recordingTraceStore) Create(_ context.Context, step *trace.AgentStep) error {
+	copy := *step
+	s.step = &copy
+	return nil
+}
+func (*recordingTraceStore) ListByAttempt(context.Context, string) ([]trace.AgentStep, error) {
+	return nil, nil
+}
+func (*recordingTraceStore) ListAfterSeq(context.Context, string, int) ([]trace.AgentStep, error) {
+	return nil, nil
 }

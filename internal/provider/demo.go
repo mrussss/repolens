@@ -240,7 +240,7 @@ func publishDemoRetrieval(ctx context.Context, store codeintelstore.Store, build
 		idx.AddDocument(bm25.Document{FilePath: sym.FilePath, StartLine: sym.StartLine, EndLine: sym.EndLine, Content: sym.Signature + " " + sym.Doc + " " + sym.Name, SymbolKeyHash: sym.SymbolKeyHash, SymbolName: sym.Name, Kind: string(sym.Kind)})
 	}
 	idx.Build()
-	path, hash, err := artifact.NewPublisher(baseDir).Publish(rb.ID, "demo", rb.Strategy, idx)
+	path, hash, err := artifact.NewPublisher(baseDir).Publish(rb.ID, 1, "demo", rb.Strategy, idx)
 	if err != nil {
 		return err
 	}

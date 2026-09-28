@@ -54,28 +54,34 @@ func ClassifyError(err error) (ErrorClass, string) {
 		return "", ""
 	}
 
-	if errors.Is(err, ErrOwnershipLost) {
-		return ErrorClassOwnershipLost, "OWNERSHIP_LOST"
-	}
-	if errors.Is(err, ErrCancellationRequested) {
-		return ErrorClassCancelled, "CANCELLATION_REQUESTED"
-	}
-
-	if errors.Is(err, context.Canceled) {
-		return ErrorClassCancelled, "CONTEXT_CANCELED"
-	}
-
 	var catErr *CategorizedError
 	if errors.As(err, &catErr) {
 		return catErr.Class, catErr.Code
 	}
 
-	errStr := strings.ToLower(err.Error())
-
-	// Cancellation checks
-	if strings.Contains(errStr, "cancel") {
-		return ErrorClassCancelled, "OPERATION_CANCELLED"
+	if errors.Is(err, ErrUserCancellation) {
+		return ErrorClassCancelled, "CANCELLATION_REQUESTED"
 	}
+	if errors.Is(err, ErrOwnershipLost) {
+		return ErrorClassOwnershipLost, "OWNERSHIP_LOST"
+	}
+	if errors.Is(err, ErrWorkerShutdown) {
+		return ErrorClassOwnershipLost, "WORKER_SHUTDOWN"
+	}
+	if errors.Is(err, ErrLeaseRenewFailed) {
+		return ErrorClassRetryable, "LEASE_RENEW_FAILED"
+	}
+	if errors.Is(err, ErrCancelPollFailed) {
+		return ErrorClassRetryable, "CANCEL_POLL_FAILED"
+	}
+	if errors.Is(err, context.Canceled) {
+		return ErrorClassRetryable, "CONTEXT_CANCELED"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrorClassRetryable, "CONTEXT_DEADLINE_EXCEEDED"
+	}
+
+	errStr := strings.ToLower(err.Error())
 
 	// Permanent checks
 	if strings.Contains(errStr, "invalid") ||

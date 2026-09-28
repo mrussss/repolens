@@ -12,6 +12,7 @@ import (
 
 	"repolens/internal/platform/redaction"
 	"repolens/internal/platform/snapshotstore"
+	"repolens/internal/snapshotpolicy"
 )
 
 type SourceKind string
@@ -158,8 +159,12 @@ func (s *EvidenceIssuerService) Issue(ctx context.Context, req IssueRequest) (*A
 	if s.storeFS == nil || s.store == nil {
 		return nil, ErrEvidenceSourceUnavailable
 	}
+	decision := snapshotpolicy.CanIssueEvidenceFromSnapshot(s.storeFS.GetSourcePath(req.RepositoryID, req.SnapshotID), req.FilePath)
+	if !decision.Allowed {
+		return nil, fmt.Errorf("%w: file access denied (%s)", ErrEvidenceSourceUnavailable, decision.Reason)
+	}
 
-	fileRange, err := s.storeFS.ReadFileRange(ctx, req.RepositoryID, req.SnapshotID, req.FilePath, req.StartLine, req.EndLine, req.MaxBytes)
+	fileRange, err := readEvidenceRange(ctx, s.storeFS, req.RepositoryID, req.SnapshotID, req.FilePath, req.StartLine, req.EndLine, req.MaxBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrEvidenceSourceUnavailable, err)
 	}
@@ -259,7 +264,11 @@ func (s *EvidenceIssuerService) Verify(ctx context.Context, item *AttemptEvidenc
 	if s.storeFS == nil {
 		return ErrEvidenceSourceUnavailable
 	}
-	fileRange, err := s.storeFS.ReadFileRange(ctx, lineage.RepositoryID, item.SnapshotID, item.FilePath, item.StartLine, item.EndLine, 0)
+	decision := snapshotpolicy.CanIssueEvidenceFromSnapshot(s.storeFS.GetSourcePath(lineage.RepositoryID, item.SnapshotID), item.FilePath)
+	if !decision.Allowed {
+		return fmt.Errorf("%w: file access denied (%s)", ErrEvidenceSourceUnavailable, decision.Reason)
+	}
+	fileRange, err := readEvidenceRange(ctx, s.storeFS, lineage.RepositoryID, item.SnapshotID, item.FilePath, item.StartLine, item.EndLine, 0)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrEvidenceSourceUnavailable, err)
 	}
@@ -267,6 +276,15 @@ func (s *EvidenceIssuerService) Verify(ctx context.Context, item *AttemptEvidenc
 		return ErrEvidenceHashMismatch
 	}
 	return nil
+}
+
+func readEvidenceRange(ctx context.Context, storeFS snapshotstore.SnapshotStore, repoID, snapshotID, path string, startLine, endLine, maxBytes int) (snapshotstore.FileRange, error) {
+	if bounded, ok := storeFS.(interface {
+		ReadFileRangeBounded(context.Context, string, string, string, int, int, int) (snapshotstore.FileRange, error)
+	}); ok {
+		return bounded.ReadFileRangeBounded(ctx, repoID, snapshotID, path, startLine, endLine, maxBytes)
+	}
+	return storeFS.ReadFileRange(ctx, repoID, snapshotID, path, startLine, endLine, maxBytes)
 }
 
 func (s *EvidenceIssuerService) validateLineage(ctx context.Context, req IssueRequest) error {

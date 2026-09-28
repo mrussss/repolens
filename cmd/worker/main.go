@@ -16,6 +16,7 @@ import (
 	"repolens/internal/evidence"
 	"repolens/internal/indexing"
 	"repolens/internal/jobs"
+	"repolens/internal/platform/artifactcleanup"
 	"repolens/internal/platform/config"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/mysql"
@@ -24,10 +25,13 @@ import (
 	"repolens/internal/repo"
 	"repolens/internal/repoindex"
 	"repolens/internal/retrieval"
+	"repolens/internal/retrieval/artifact"
 	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 	"repolens/internal/trace"
 	"repolens/internal/worker"
+
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -57,6 +61,13 @@ func run() error {
 	storeFS := snapshotstore.NewLocalSnapshotStore(cfg.SnapshotBasePath)
 	repoStore := repo.NewStore(db.GormDB)
 	snapshotStore := snapshot.NewStore(db.GormDB)
+	storeFS.WithSourcePathResolver(func(repoID, snapshotID string) (string, bool) {
+		snap, err := snapshotStore.GetByID(context.Background(), snapshotID)
+		if err != nil || snap.RepositoryID != repoID || snap.Status != snapshot.StatusReady || snap.MaterializedPath == "" {
+			return "", false
+		}
+		return snap.MaterializedPath, true
+	})
 	indexStore := repoindex.NewStore(db.GormDB)
 	codeIntelStore := codeintelstore.NewStore(db.GormDB)
 	revisionStore := revision.NewStore(db.GormDB)
@@ -82,7 +93,7 @@ func run() error {
 	indexStorageDir := filepath.Join(cfg.SnapshotBasePath, "indexes")
 	activeRetriever := retrieval.NewProductionRetriever(codeIntelStore, indexStorageDir)
 
-	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
+	cloner := indexing.NewSafeGitClonerWithDiskLimit(cfg.AllowHosts, cfg.MaxCloneDiskBytes, 2*time.Minute)
 	filter := indexing.NewFileFilter(cfg.MaxFileSizeKB)
 	chunker := indexing.NewCodeChunker(60, 10)
 
@@ -118,7 +129,7 @@ func run() error {
 	snapshotJobHandler.WithCodeIntelStore(codeIntelStore)
 	snapshotJobHandler.WithRevisionStore(revisionStore)
 	snapshotJobHandler.WithResourceLimits(
-		cfg.MaxRepoSizeMB*1024*1024,
+		cfg.MaxIndexableSourceBytes,
 		cfg.MaxFileCount,
 	)
 
@@ -128,13 +139,10 @@ func run() error {
 		storeFS,
 		codeintel.NewAnalyzer(),
 	)
-	codeIndexJobHandler.WithRevisionStore(revisionStore)
-
 	retrievalJobHandler := retrieval.NewRetrievalJobHandler(
 		codeIntelStore,
 		indexStorageDir,
 	).WithSnapshotSource(snapshotStore, storeFS)
-	retrievalJobHandler.WithRevisionStore(revisionStore)
 
 	jobsWorker := jobs.NewWorker(jobsStore, jobs.DefaultWorkerConfig())
 	jobsWorker.RegisterHandler(jobs.JobTypeRunDiagnosis, diagJobHandler)
@@ -146,6 +154,7 @@ func run() error {
 	defer cancel()
 
 	jobsWorker.Start(ctx)
+	go runArtifactCleanup(ctx, db.GormDB, storeFS, artifact.NewPublisher(indexStorageDir))
 	recoverySweeper := worker.NewRecoverySweeper(diagnosisStore, 45*time.Second, 10*time.Second, 2*time.Second)
 	go recoverySweeper.Start(ctx)
 	log.Info("analysis jobs worker started successfully with all 4 job handlers: RUN_DIAGNOSIS, MATERIALIZE_SNAPSHOT, BUILD_CODE_INDEX, BUILD_RETRIEVAL")
@@ -157,13 +166,40 @@ func run() error {
 	log.Info("received shutdown signal", "signal", sig.String())
 
 	log.Info("shutting down worker daemon, draining in-flight jobs...")
-	jobsWorker.Stop()
-	// Stop first so the worker stops claiming new jobs and lets in-flight jobs
-	// finish. Cancelling the shared service context before draining would be
-	// observed by job handlers as context.Canceled and incorrectly finalize
-	// ordinary work as user-cancelled.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := jobsWorker.StopGracefully(shutdownCtx); err != nil {
+		log.Warn("worker drain ended with unfinished jobs; lease recovery will resume them", "error", err)
+	}
+	cancelShutdown()
 	cancel()
-	log.Info("analysis jobs worker shut down cleanly")
+	log.Info("analysis jobs worker shut down")
 
 	return nil
+}
+
+func runArtifactCleanup(ctx context.Context, db *gorm.DB, storeFS *snapshotstore.LocalSnapshotStore, publisher *artifact.Publisher) {
+	const ttl = 24 * time.Hour
+	cleanup := func() {
+		cleanupCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		result, err := artifactcleanup.Cleanup(cleanupCtx, db, storeFS, publisher, ttl, time.Now().UTC())
+		if err != nil {
+			logger.L(cleanupCtx).Warn("immutable artifact cleanup failed", "error", err)
+			return
+		}
+		if result.SnapshotPaths+result.RetrievalPaths > 0 {
+			logger.L(cleanupCtx).Info("removed unreferenced immutable artifacts", "snapshot_paths", result.SnapshotPaths, "retrieval_paths", result.RetrievalPaths)
+		}
+	}
+	cleanup()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanup()
+		}
+	}
 }

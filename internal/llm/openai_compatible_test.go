@@ -3,8 +3,10 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -148,6 +150,41 @@ func TestOpenAICompatibleTimeoutDefaultsWhenInvalid(t *testing.T) {
 	provider = NewOpenAICompatibleProviderWithAuthModeAndTimeout("key", "http://localhost", "model", "bearer", 3*time.Second)
 	if provider.httpClient.Timeout != 3*time.Second {
 		t.Fatalf("timeout = %v, want 3s", provider.httpClient.Timeout)
+	}
+}
+
+func TestOpenAICompatibleBoundsProviderResponseIndependentlyOfMaxTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", 33)))
+	}))
+	defer server.Close()
+
+	provider := NewOpenAICompatibleProvider("key", server.URL, "model")
+	provider.maxResponseBytes = 32
+	_, err := provider.Generate(context.Background(), GenerateRequest{MaxTokens: 1})
+	var tooLarge *ProviderResponseTooLargeError
+	if !errors.As(err, &tooLarge) || tooLarge.ErrorCode() != ProviderResponseTooLargeCode {
+		t.Fatalf("error = %v, want %s", err, ProviderResponseTooLargeCode)
+	}
+}
+
+func TestOpenAICompatibleBoundsAndRedactsProviderErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("Authorization: Bearer short-provider-secret\n" + strings.Repeat("x", 12<<10)))
+	}))
+	defer server.Close()
+
+	_, err := NewOpenAICompatibleProvider("key", server.URL, "model").Generate(context.Background(), GenerateRequest{})
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error = %v, want HTTPError", err)
+	}
+	if strings.Contains(httpErr.Body, "short-provider-secret") || len(httpErr.Body) > int(maxProviderErrorBodyBytes)+32 {
+		t.Fatalf("provider error body was not bounded and redacted: bytes=%d body=%q", len(httpErr.Body), httpErr.Body[:min(len(httpErr.Body), 128)])
+	}
+	if !strings.Contains(httpErr.Body, "[truncated]") {
+		t.Fatalf("bounded provider error body is missing truncation marker: %q", httpErr.Body[len(httpErr.Body)-32:])
 	}
 }
 

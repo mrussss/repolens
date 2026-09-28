@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -18,6 +19,17 @@ type Store interface {
 	GetByIDAndUser(ctx context.Context, id, userID string) (*Repository, error)
 	ListByUser(ctx context.Context, userID string, page, pageSize int, status string) ([]Repository, int64, error)
 	Update(ctx context.Context, r *Repository) error
+}
+
+const MaxGitRefLength = 255
+
+var ErrRefTooLong = errors.New("git ref exceeds 255 characters")
+
+func ValidateRefLength(ref string) error {
+	if utf8.RuneCountInString(ref) > MaxGitRefLength {
+		return ErrRefTooLong
+	}
+	return nil
 }
 
 type GormStore struct {
@@ -95,6 +107,9 @@ func NewService(store Store) *Service {
 func (s *Service) Register(ctx context.Context, userID, name, gitURL, defaultRef string) (*Repository, error) {
 	if strings.TrimSpace(defaultRef) == "" {
 		defaultRef = "main"
+	}
+	if err := ValidateRefLength(defaultRef); err != nil {
+		return nil, err
 	}
 	r := &Repository{
 		ID:         uuid.New().String(),

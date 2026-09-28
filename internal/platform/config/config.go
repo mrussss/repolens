@@ -8,56 +8,68 @@ import (
 )
 
 const (
-	DefaultMaxOutputTokens        = 4096
-	DefaultReasoningEffort        = "low"
-	DefaultProviderTimeoutSeconds = 60
+	DefaultMaxOutputTokens               = 4096
+	DefaultReasoningEffort               = "low"
+	DefaultProviderTimeoutSeconds        = 60
+	DefaultMaxIndexableSourceBytes int64 = 50 << 20
+	DefaultMaxCloneDiskBytes       int64 = 200 << 20
 )
 
 type Config struct {
-	Env                    string
-	HTTPPort               string
-	DBDriver               string // "mysql" or "sqlite"
-	DSN                    string
-	SnapshotBasePath       string
-	AllowHosts             []string
-	MaxRepoSizeMB          int64
-	MaxFileCount           int
-	MaxFileSizeKB          int64
-	ProviderType           string // "fake", "openai"
-	ProviderAPIKey         string
-	ProviderBaseURL        string
-	ProviderModel          string
-	ProviderAuthMode       string
-	ProviderTimeoutSeconds int
-	ProviderRetryAttempts  int
-	MaxOutputTokens        int
-	ReasoningEffort        string
-	ProviderSecretPath     string
-	RetrievalStrategy      string // "bm25", "symbol_bm25_structural"
+	Env                     string
+	HTTPPort                string
+	DBDriver                string // "mysql" or "sqlite"
+	DSN                     string
+	SnapshotBasePath        string
+	AllowHosts              []string
+	MaxCloneDiskBytes       int64
+	MaxIndexableSourceBytes int64
+	MaxFileCount            int
+	MaxFileSizeKB           int64
+	ProviderType            string // "fake", "openai"
+	ProviderAPIKey          string
+	ProviderBaseURL         string
+	ProviderModel           string
+	ProviderAuthMode        string
+	ProviderTimeoutSeconds  int
+	ProviderRetryAttempts   int
+	MaxOutputTokens         int
+	ReasoningEffort         string
+	ProviderSecretPath      string
+	RetrievalStrategy       string // "bm25", "symbol_bm25_structural"
 }
 
 func Load() *Config {
+	legacyMaxRepoBytes := getEnvInt64("MAX_REPO_SIZE_MB", DefaultMaxIndexableSourceBytes/(1<<20)) * (1 << 20)
+	cloneDiskDefault := legacyMaxRepoBytes * 4
+	if cloneDiskDefault <= 0 {
+		cloneDiskDefault = DefaultMaxCloneDiskBytes
+	}
+	if legacyMaxRepoBytes <= 0 {
+		legacyMaxRepoBytes = DefaultMaxIndexableSourceBytes
+	}
 	return &Config{
-		Env:                    getEnv("ENV", "development"),
-		HTTPPort:               getEnv("HTTP_PORT", "8080"),
-		DBDriver:               getEnv("DB_DRIVER", "sqlite"),
-		DSN:                    getEnv("DB_DSN", "repolens.db"),
-		SnapshotBasePath:       getEnv("SNAPSHOT_BASE_PATH", defaultSnapshotBasePath()),
-		AllowHosts:             splitHosts(getEnv("GIT_ALLOWED_HOSTS", "github.com")),
-		MaxRepoSizeMB:          getEnvInt64("MAX_REPO_SIZE_MB", 50),
-		MaxFileCount:           getEnvInt("MAX_FILE_COUNT", 2000),
-		MaxFileSizeKB:          getEnvInt64("MAX_FILE_SIZE_KB", 512),
-		ProviderType:           getEnv("REPOLENS_PROVIDER_TYPE", "fake"),
-		ProviderAPIKey:         getEnv("REPOLENS_PROVIDER_API_KEY", ""),
-		ProviderBaseURL:        getEnv("REPOLENS_PROVIDER_BASE_URL", "https://api.openai.com/v1"),
-		ProviderModel:          getEnv("REPOLENS_PROVIDER_MODEL", "gpt-4o"),
-		ProviderAuthMode:       getEnv("REPOLENS_PROVIDER_AUTH_MODE", "bearer"),
-		ProviderTimeoutSeconds: getEnvPositiveInt("REPOLENS_PROVIDER_TIMEOUT_SECONDS", DefaultProviderTimeoutSeconds),
-		ProviderRetryAttempts:  getEnvNonNegativeInt("REPOLENS_PROVIDER_RETRY_ATTEMPTS", 0),
-		MaxOutputTokens:        getEnvPositiveInt("REPOLENS_MAX_OUTPUT_TOKENS", DefaultMaxOutputTokens),
-		ReasoningEffort:        strings.TrimSpace(getEnv("REPOLENS_REASONING_EFFORT", DefaultReasoningEffort)),
-		ProviderSecretPath:     getEnv("PROVIDER_SECRET_PATH", defaultProviderSecretPath()),
-		RetrievalStrategy:      getEnv("RETRIEVAL_STRATEGY", "symbol_bm25_structural"),
+		Env:                     getEnv("ENV", "development"),
+		HTTPPort:                getEnv("HTTP_PORT", "8080"),
+		DBDriver:                getEnv("DB_DRIVER", "sqlite"),
+		DSN:                     getEnv("DB_DSN", "repolens.db"),
+		SnapshotBasePath:        getEnv("SNAPSHOT_BASE_PATH", defaultSnapshotBasePath()),
+		AllowHosts:              splitHosts(getEnv("GIT_ALLOWED_HOSTS", "github.com")),
+		MaxCloneDiskBytes:       getEnvPositiveInt64("MAX_CLONE_DISK_BYTES", cloneDiskDefault),
+		MaxIndexableSourceBytes: getEnvPositiveInt64("MAX_INDEXABLE_SOURCE_BYTES", legacyMaxRepoBytes),
+		MaxFileCount:            getEnvInt("MAX_FILE_COUNT", 2000),
+		MaxFileSizeKB:           getEnvInt64("MAX_FILE_SIZE_KB", 512),
+		ProviderType:            getEnv("REPOLENS_PROVIDER_TYPE", "fake"),
+		ProviderAPIKey:          getEnv("REPOLENS_PROVIDER_API_KEY", ""),
+		ProviderBaseURL:         getEnv("REPOLENS_PROVIDER_BASE_URL", "https://api.openai.com/v1"),
+		ProviderModel:           getEnv("REPOLENS_PROVIDER_MODEL", "gpt-4o"),
+		ProviderAuthMode:        getEnv("REPOLENS_PROVIDER_AUTH_MODE", "bearer"),
+		ProviderTimeoutSeconds:  getEnvPositiveInt("REPOLENS_PROVIDER_TIMEOUT_SECONDS", DefaultProviderTimeoutSeconds),
+		ProviderRetryAttempts:   getEnvNonNegativeInt("REPOLENS_PROVIDER_RETRY_ATTEMPTS", 0),
+		MaxOutputTokens:         getEnvPositiveInt("REPOLENS_MAX_OUTPUT_TOKENS", DefaultMaxOutputTokens),
+		ReasoningEffort:         strings.TrimSpace(getEnv("REPOLENS_REASONING_EFFORT", DefaultReasoningEffort)),
+		ProviderSecretPath:      getEnv("PROVIDER_SECRET_PATH", defaultProviderSecretPath()),
+		RetrievalStrategy:       getEnv("RETRIEVAL_STRATEGY", "symbol_bm25_structural"),
 	}
 }
 
@@ -130,6 +142,15 @@ func getEnvInt(key string, defaultVal int) int {
 func getEnvInt64(key string, defaultVal int64) int64 {
 	if val := os.Getenv(key); val != "" {
 		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return i
+		}
+	}
+	return defaultVal
+}
+
+func getEnvPositiveInt64(key string, defaultVal int64) int64 {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil && i > 0 {
 			return i
 		}
 	}

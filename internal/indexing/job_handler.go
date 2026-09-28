@@ -19,29 +19,29 @@ import (
 	"repolens/internal/repoindex"
 	"repolens/internal/revision"
 	"repolens/internal/snapshot"
+	"repolens/internal/snapshotpolicy"
 )
 
 // SnapshotJobHandler handles MATERIALIZE_SNAPSHOT jobs.
 type SnapshotJobHandler struct {
-	repoStore      repo.Store
-	snapshotStore  snapshot.Store
-	indexStore     repoindex.Store
-	codeIntelStore codeintelstore.Store
-	storeFS        snapshotstore.SnapshotStore
-	cloner         GitCloner
-	filter         *FileFilter
-	chunker        *CodeChunker
-	indexWriter    ChunkIndexWriter
-	maxRepoBytes   int64
-	maxFileCount   int
-	revisionStore  interface {
+	repoStore               repo.Store
+	snapshotStore           snapshot.Store
+	indexStore              repoindex.Store
+	codeIntelStore          codeintelstore.Store
+	storeFS                 snapshotstore.SnapshotStore
+	cloner                  GitCloner
+	filter                  *FileFilter
+	chunker                 *CodeChunker
+	indexWriter             ChunkIndexWriter
+	maxIndexableSourceBytes int64
+	maxFileCount            int
+	revisionStore           interface {
 		MarkSnapshotReady(context.Context, string, string) error
-		MarkFailed(context.Context, string, revision.Stage, string, string) error
 	}
 }
 
 func (h *SnapshotJobHandler) WithResourceLimits(maxRepoBytes int64, maxFileCount int) *SnapshotJobHandler {
-	h.maxRepoBytes = maxRepoBytes
+	h.maxIndexableSourceBytes = maxRepoBytes
 	h.maxFileCount = maxFileCount
 	return h
 }
@@ -88,14 +88,13 @@ func (h *SnapshotJobHandler) WithCodeIntelStore(cis codeintelstore.Store) *Snaps
 // existing snapshot job while keeping the DB-backed job pipeline unchanged.
 func (h *SnapshotJobHandler) WithRevisionStore(store interface {
 	MarkSnapshotReady(context.Context, string, string) error
-	MarkFailed(context.Context, string, revision.Stage, string, string) error
 }) *SnapshotJobHandler {
 	h.revisionStore = store
 	return h
 }
 
 // Execute processes a MATERIALIZE_SNAPSHOT job.
-func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) (executeErr error) {
+func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob) error {
 	snapID := job.ResourceID
 	log := logger.L(ctx).With("snapshot_id", snapID, "job_id", job.ID)
 
@@ -103,12 +102,6 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	if err != nil {
 		return jobs.NewPermanentError("SNAPSHOT_NOT_FOUND", fmt.Sprintf("snapshot %s not found: %v", snapID, err), err)
 	}
-	defer func() {
-		if executeErr != nil && h.revisionStore != nil && snap.AnalysisRevisionID != "" && job.AttemptCount >= job.MaxAttempts {
-			_ = h.revisionStore.MarkFailed(context.Background(), snap.AnalysisRevisionID, revision.StageMaterializing, "SNAPSHOT_MATERIALIZATION_FAILED", executeErr.Error())
-		}
-	}()
-
 	if snap.Status == snapshot.StatusReady {
 		log.Info("snapshot already READY")
 		if h.revisionStore != nil && snap.AnalysisRevisionID != "" {
@@ -131,12 +124,32 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 
 	targetDir := h.storeFS.GetSourcePath(snap.RepositoryID, snap.ID)
+	executionGeneration := job.ExecutionGeneration
+	if executionGeneration < 1 {
+		executionGeneration = 1
+	}
+	claimToken := jobExecutionClaimToken(job)
+	if executionStore, ok := h.storeFS.(interface {
+		GetExecutionSourcePath(string, string, int, string) (string, error)
+	}); ok {
+		targetDir, err = executionStore.GetExecutionSourcePath(snap.RepositoryID, snap.ID, executionGeneration, claimToken)
+		if err != nil {
+			return jobs.NewPermanentError("SNAPSHOT_PATH_INVALID", err.Error(), err)
+		}
+	}
 	commitSHA := snap.CommitSHA
 	if commitSHA == "pending" || commitSHA == "" || !sourceDirectoryExists(targetDir) {
 		// Publish a fully cloned tree only after git has resolved HEAD.  A
 		// retry therefore cannot expose a half-written source directory.
-		stagingDir := targetDir + ".tmp-" + jobClaimSuffix(job)
-		_ = os.RemoveAll(stagingDir)
+		if err := os.MkdirAll(filepath.Dir(targetDir), 0755); err != nil {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
+		}
+		stageRoot := filepath.Dir(filepath.Dir(targetDir))
+		stagingDir, stageErr := os.MkdirTemp(stageRoot, ".snapshot-stage-")
+		if stageErr != nil {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", stageErr.Error(), stageErr)
+		}
+		defer os.RemoveAll(stagingDir)
 		cloneSHA, cloneErr := "", error(nil)
 		if exactCloner, ok := h.cloner.(ExactGitCloner); ok && snap.CommitSHA != "" && snap.CommitSHA != "pending" {
 			cloneSHA, cloneErr = exactCloner.CloneCommitTo(ctx, r.GitURL, snap.CommitSHA, stagingDir)
@@ -145,6 +158,10 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		}
 		if cloneErr != nil {
 			log.Error("failed to clone repository for snapshot", "error", cloneErr)
+			if errors.Is(cloneErr, ErrRepositoryCloneSizeLimit) {
+				h.failIfTerminal(ctx, job, snap.ID, "REPOSITORY_CLONE_SIZE_LIMIT")
+				return jobs.NewPermanentError("REPOSITORY_CLONE_SIZE_LIMIT", cloneErr.Error(), cloneErr)
+			}
 			if err := h.cloner.ValidateGitURL(r.GitURL); err != nil {
 				h.failIfTerminal(ctx, job, snap.ID, "INVALID_GIT_URL")
 				return jobs.NewPermanentError("INVALID_GIT_URL", err.Error(), err)
@@ -156,8 +173,10 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			h.failIfTerminal(ctx, job, snap.ID, "COMMIT_CHANGED_DURING_RESOLVE")
 			return jobs.NewPermanentError("COMMIT_CHANGED_DURING_RESOLVE", fmt.Sprintf("resolved %s but clone returned %s", snap.CommitSHA, cloneSHA), nil)
 		}
-		if err := os.RemoveAll(targetDir); err != nil {
-			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
+		if _, statErr := os.Lstat(targetDir); statErr == nil {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", "immutable execution path already exists", nil)
+		} else if !os.IsNotExist(statErr) {
+			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", statErr.Error(), statErr)
 		}
 		if err := os.Rename(stagingDir, targetDir); err != nil {
 			return jobs.NewRetryableError("SNAPSHOT_PUBLISH_FAILED", err.Error(), err)
@@ -171,8 +190,22 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	fileCount := 0
 	var totalBytes int64
 	manifest := make([]string, 0)
+	manifestFiles := make([]snapshotpolicy.FileEntry, 0)
 
-	walkErr := h.storeFS.WalkFiles(snap.RepositoryID, snap.ID, func(relPath string, info os.FileInfo) error {
+	walkFiles := h.storeFS.WalkFiles
+	readFile := h.storeFS.ReadFile
+	if executionStore, ok := h.storeFS.(interface {
+		WalkFilesAt(string, func(string, os.FileInfo) error) error
+		ReadFileAt(context.Context, string, string, int, int) (string, error)
+	}); ok {
+		walkFiles = func(_, _ string, fn func(string, os.FileInfo) error) error {
+			return executionStore.WalkFilesAt(targetDir, fn)
+		}
+		readFile = func(ctx context.Context, _, _, path string, start, end int) (string, error) {
+			return executionStore.ReadFileAt(ctx, targetDir, path, start, end)
+		}
+	}
+	walkErr := walkFiles(snap.RepositoryID, snap.ID, func(relPath string, info os.FileInfo) error {
 		if info.IsDir() {
 			if h.filter.ShouldIgnoreDir(info.Name()) {
 				return filepath.SkipDir
@@ -188,17 +221,18 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		if h.maxFileCount > 0 && fileCount >= h.maxFileCount {
 			return jobs.NewPermanentError("TOO_MANY_FILES", fmt.Sprintf("repository exceeds maximum file count %d", h.maxFileCount), nil)
 		}
-		if h.maxRepoBytes > 0 && totalBytes+info.Size() > h.maxRepoBytes {
-			return jobs.NewPermanentError("REPOSITORY_TOO_LARGE", fmt.Sprintf("repository exceeds maximum size %d bytes", h.maxRepoBytes), nil)
+		if h.maxIndexableSourceBytes > 0 && totalBytes+info.Size() > h.maxIndexableSourceBytes {
+			return jobs.NewPermanentError("REPOSITORY_TOO_LARGE", fmt.Sprintf("indexable source exceeds maximum size %d bytes", h.maxIndexableSourceBytes), nil)
 		}
 
-		content, err := h.storeFS.ReadFile(ctx, snap.RepositoryID, snap.ID, relPath, 1, -1)
+		content, err := readFile(ctx, snap.RepositoryID, snap.ID, relPath, 1, -1)
 		if err != nil {
 			return err
 		}
 
 		chunks := h.chunker.ChunkFile(snap.ID, relPath, content)
 		allChunks = append(allChunks, chunks...)
+		manifestFiles = append(manifestFiles, snapshotpolicy.FileEntryFor(relPath, []byte(content)))
 		docCount++
 		fileCount++
 		totalBytes += info.Size()
@@ -221,6 +255,11 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		_, _ = hasher.Write([]byte(entry))
 	}
 	contentHash := fmt.Sprintf("%x", hasher.Sum(nil))
+	fileManifest := snapshotpolicy.NewManifest(snap.ID, commitSHA, contentHash, manifestFiles)
+	if err := snapshotpolicy.WriteManifest(targetDir, fileManifest); err != nil {
+		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_MANIFEST_WRITE_FAILED")
+		return jobs.NewRetryableError("SNAPSHOT_MANIFEST_WRITE_FAILED", err.Error(), err)
+	}
 
 	if h.indexWriter != nil && len(allChunks) > 0 {
 		if err := h.indexWriter.IndexChunks(ctx, snap.ID, allChunks); err != nil {
@@ -235,20 +274,24 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_SEAL_FAILED")
 		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
 	}
+	if err := os.Chmod(snapshotpolicy.ManifestPath(targetDir), 0444); err != nil {
+		h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_SEAL_FAILED")
+		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
+	}
 	stageFinalized := false
 	if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationRevisionFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil && snap.AnalysisRevisionID != "" {
-		if err := finalizer.FinalizeSnapshotSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, snap.AnalysisRevisionID, r.Name, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+		if err := finalizer.FinalizeSnapshotSuccessWithRevision(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, snap.AnalysisRevisionID, r.Name, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return err
 		}
 		stageFinalized = true
 	} else if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil {
-		if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+		if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return err
 		}
 	} else if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
-		if err := finalizer.FinalizeMaterialization(ctx, snap.ID, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+		if err := finalizer.FinalizeMaterialization(ctx, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
 			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
 			return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
 		}
@@ -306,16 +349,9 @@ func (h *SnapshotJobHandler) failIfTerminal(ctx context.Context, job *jobs.Analy
 	}
 }
 
-func jobClaimSuffix(job *jobs.AnalysisJob) string {
+func jobExecutionClaimToken(job *jobs.AnalysisJob) string {
 	if job != nil && job.ClaimToken != nil && *job.ClaimToken != "" {
-		return (*job.ClaimToken)[:minInt(12, len(*job.ClaimToken))]
+		return *job.ClaimToken
 	}
 	return fmt.Sprintf("%d", time.Now().UnixNano())
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

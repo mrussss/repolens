@@ -6,13 +6,18 @@ import (
 )
 
 // ErrOwnershipLost is returned when a worker attempts to renew a lease or finalize a job after its claim has expired or been stolen.
-var ErrOwnershipLost = errors.New("job ownership lost: claim token or lease is no longer valid")
+var ErrOwnershipLost = error(StopOwnershipLost)
 
 // ErrAlreadyFinalized tells the generic worker that a handler atomically
 // finalized both its business object and AnalysisJob already.
 var ErrAlreadyFinalized = errors.New("job already finalized")
 
-var ErrCancellationRequested = errors.New("job cancellation was requested")
+var ErrCancellationRequested = ErrUserCancellation
+
+var (
+	ErrCancellationNotRequested = errors.New("durable job cancellation was not requested")
+	ErrCancellationUnsupported  = errors.New("cancellation is supported only for diagnosis jobs")
+)
 
 // JobType represents the type of async job.
 type JobType string
@@ -64,6 +69,7 @@ type AnalysisJob struct {
 	ExecutionGeneration int             `json:"execution_generation" gorm:"not null;default:1"`
 	TerminalReason      *TerminalReason `json:"terminal_reason,omitempty" gorm:"size:32"`
 	AttemptCount        int             `json:"attempt_count" gorm:"not null;default:0"`
+	ExecutionStarted    bool            `json:"-" gorm:"not null;default:false"`
 	MaxAttempts         int             `json:"max_attempts" gorm:"not null;default:3"`
 	NextRunAt           time.Time       `json:"next_run_at" gorm:"not null;index:ix_job_claim,priority:2"`
 	WorkerID            *string         `json:"worker_id,omitempty" gorm:"size:64"`

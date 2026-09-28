@@ -68,7 +68,7 @@ func (s ownershipLostFinalizerStore) FinalizeSuccess(ctx context.Context, _ int6
 type invalidReportExecutor struct{}
 
 func (invalidReportExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
-	return &worker.ExecutionResult{RawOutput: `{"unknown":"secret-test-marker"}`, ParseError: "INVALID_STRUCTURED_REPORT: UNKNOWN_FIELD", StructuredReport: false}, fmt.Errorf("%w: UNKNOWN_FIELD", agent.ErrInvalidStructuredReport)
+	return &worker.ExecutionResult{RawOutput: `{"unknown":"value","debug":"Authorization: Bearer short-token"}`, ParseError: "INVALID_STRUCTURED_REPORT: UNKNOWN_FIELD", StructuredReport: false}, fmt.Errorf("%w: UNKNOWN_FIELD", agent.ErrInvalidStructuredReport)
 }
 
 func (s checkpointFailingStore) UpdateAttemptCheckpoint(context.Context, string, diagnosis.AttemptCheckpoint) error {
@@ -116,6 +116,16 @@ func setupTestEnvironment(t *testing.T) (*gorm.DB, *jobs.Store) {
 	}
 	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
 	return db, jobsStore
+}
+
+func startClaimedJob(t *testing.T, store *jobs.Store, job *jobs.AnalysisJob, workerID string) {
+	t.Helper()
+	attempt, err := store.MarkExecutionStarted(context.Background(), job.ID, workerID, *job.ClaimToken, job.ExecutionGeneration)
+	if err != nil {
+		t.Fatalf("MarkExecutionStarted: %v", err)
+	}
+	job.AttemptCount = attempt
+	job.ExecutionStarted = true
 }
 
 func TestWorkerJobHandler_ExecutionSuccess(t *testing.T) {
@@ -229,6 +239,7 @@ func TestWorkerJobHandler_InvalidEvidenceDegradesButSucceeds(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim invalid-evidence job: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-invalid-evidence")
 	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, nil, invalidEvidenceExecutor{})
 	if err := handler.Execute(ctx, claimed[0]); err != nil {
 		t.Fatal(err)
@@ -259,6 +270,7 @@ func TestFinalizerRollbackClosesDurableCheckpointAttempt(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim failed: %v", err)
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-finalizer-rollback")
 	store := successFinalizerFailingStore{GormStore: baseStore}
 	handler := worker.NewDiagnosisJobHandler(store, reportStore, evidence.NewCitationStore(db), nil, invalidEvidenceExecutor{})
 	handlerErr := handler.Execute(ctx, claimed[0])
@@ -288,6 +300,7 @@ func TestFinalizerRollbackClosesDurableCheckpointAttempt(t *testing.T) {
 	if err != nil || len(retryClaim) != 1 {
 		t.Fatalf("same-generation checkpoint retry claim failed: jobs=%d err=%v", len(retryClaim), err)
 	}
+	startClaimedJob(t, jobsStore, retryClaim[0], "worker-finalizer-retry")
 	executor := &callCountingSuccessExecutor{}
 	retryHandler := worker.NewDiagnosisJobHandler(baseStore, reportStore, evidence.NewCitationStore(db), nil, executor)
 	if err := retryHandler.Execute(ctx, retryClaim[0]); err != nil {
@@ -322,6 +335,7 @@ func TestOwnershipLostFinalizerClosesStaleAttemptWithoutChangingWinningRun(t *te
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim failed: %v", err)
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-stale-finalizer")
 	store := ownershipLostFinalizerStore{GormStore: baseStore, db: db}
 	handler := worker.NewDiagnosisJobHandler(store, evidence.NewReportStore(db), evidence.NewCitationStore(db), nil, invalidEvidenceExecutor{})
 	if err := handler.Execute(ctx, claimed[0]); err == nil {
@@ -331,8 +345,8 @@ func TestOwnershipLostFinalizerClosesStaleAttemptWithoutChangingWinningRun(t *te
 	if err != nil || len(attempts) != 1 {
 		t.Fatalf("attempts=%+v err=%v", attempts, err)
 	}
-	if attempts[0].Status != diagnosis.AttemptStatusAbandoned || attempts[0].ErrorCode != "FINALIZATION_OWNERSHIP_LOST" {
-		t.Fatalf("stale Attempt = %+v; want ABANDONED after ownership loss", attempts[0])
+	if attempts[0].Status != diagnosis.AttemptStatusRunning {
+		t.Fatalf("stale Attempt = %+v; a worker without the active claim must not terminalize it", attempts[0])
 	}
 	savedRun, err := baseStore.GetByID(ctx, run.ID)
 	if err != nil || savedRun.Status != diagnosis.StatusSucceeded || savedRun.FinalAttemptID != "winning-worker-attempt" {
@@ -356,6 +370,7 @@ func TestInvalidFinalReportCheckpointSurvivesFinalizerRollback(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim failed: %v", err)
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-invalid-finalizer")
 	first := worker.NewDiagnosisJobHandler(invalidFinalizerFailingStore{GormStore: baseStore}, reportStore, evidence.NewCitationStore(db), nil, invalidReportExecutor{})
 	if err := first.Execute(ctx, claimed[0]); err == nil {
 		t.Fatal("expected invalid finalizer rollback")
@@ -372,11 +387,12 @@ func TestInvalidFinalReportCheckpointSurvivesFinalizerRollback(t *testing.T) {
 	if err != nil || len(retryClaim) != 1 {
 		t.Fatalf("retry claim failed: %v", err)
 	}
+	startClaimedJob(t, jobsStore, retryClaim[0], "worker-invalid-finalizer-retry")
 	executor := &checkpointCountingExecutor{}
 	retry := worker.NewDiagnosisJobHandler(baseStore, reportStore, evidence.NewCitationStore(db), nil, executor)
 	retryErr := retry.Execute(ctx, retryClaim[0])
-	if retryErr == nil || !strings.Contains(retryErr.Error(), "INVALID_STRUCTURED_REPORT") {
-		t.Fatalf("restored invalid report error = %v", retryErr)
+	if !errors.Is(retryErr, jobs.ErrAlreadyFinalized) {
+		t.Fatalf("restored invalid report finalization = %v, want ErrAlreadyFinalized", retryErr)
 	}
 	if executor.calls != 0 {
 		t.Fatalf("provider calls after invalid checkpoint restore = %d", executor.calls)
@@ -411,7 +427,7 @@ type invalidStructuredReportExecutor struct{}
 
 func (invalidStructuredReportExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	return &worker.ExecutionResult{
-		RawOutput:        "{\"conclusion_kind\":\"ROOT_CAUSE\"}",
+		RawOutput:        "{\"conclusion_kind\":\"ROOT_CAUSE\",\"debug\":\"Authorization: Bearer short-token\"}",
 		ParseError:       "INVALID_STRUCTURED_REPORT: root cause report needs summary, root_cause, and at least one finding",
 		StructuredReport: false,
 	}, fmt.Errorf("%w: root cause report needs summary, root_cause, and at least one finding", agent.ErrInvalidStructuredReport)
@@ -434,21 +450,22 @@ func TestWorkerJobHandler_InvalidStructuredReportFailsTerminally(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim invalid-structured job: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-invalid-structured")
 	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, nil, invalidStructuredReportExecutor{})
 	err = handler.Execute(ctx, claimed[0])
-	if err == nil || !strings.Contains(err.Error(), "INVALID_STRUCTURED_REPORT") {
-		t.Fatalf("expected terminal invalid structured error, got %v", err)
+	if !errors.Is(err, jobs.ErrAlreadyFinalized) {
+		t.Fatalf("expected atomic terminal finalization, got %v", err)
 	}
 	savedRun, err := diagStore.GetByID(ctx, run.ID)
 	if err != nil || savedRun.Status != diagnosis.StatusFailed {
 		t.Fatalf("run = %+v err=%v, want FAILED", savedRun, err)
 	}
 	attempts, err := diagStore.ListAttemptsByRun(ctx, run.ID)
-	if err != nil || len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusFailedTerminal || attempts[0].ErrorCode != "INVALID_STRUCTURED_REPORT" {
+	if err != nil || len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusFailedTerminal || attempts[0].ErrorCode != "INVALID_STRUCTURED_REPORT" || strings.Contains(attempts[0].RawOutput, "short-token") || !strings.Contains(attempts[0].RawOutput, "[REDACTED_SECRET]") {
 		t.Fatalf("attempts = %+v err=%v, want FAILED_TERMINAL with stable error code", attempts, err)
 	}
 	report, err := repStore.GetByRunID(ctx, run.ID)
-	if err != nil || report == nil || report.ReportStatus != evidence.ReportInvalid || report.RawOutput == "" || !strings.Contains(report.ParseError, "INVALID_STRUCTURED_REPORT") {
+	if err != nil || report == nil || report.ReportStatus != evidence.ReportInvalid || report.RawOutput == "" || strings.Contains(report.RawOutput, "short-token") || !strings.Contains(report.RawOutput, "[REDACTED_SECRET]") || !strings.Contains(report.ParseError, "INVALID_STRUCTURED_REPORT") {
 		t.Fatalf("report = %+v err=%v, want INVALID report with raw output and parse error", report, err)
 	}
 	job, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, run.ID)
@@ -458,10 +475,16 @@ func TestWorkerJobHandler_InvalidStructuredReportFailsTerminally(t *testing.T) {
 }
 
 type cancellingDiagnosisExecutor struct {
-	cancel context.CancelFunc
+	cancel        context.CancelFunc
+	requestCancel func() error
 }
 
 func (e cancellingDiagnosisExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+	if e.requestCancel != nil {
+		if err := e.requestCancel(); err != nil {
+			return nil, err
+		}
+	}
 	e.cancel()
 	return nil, context.Canceled
 }
@@ -493,17 +516,23 @@ func TestWorkerJobHandler_CancellationFinalizesWithIndependentContext(t *testing
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim diagnosis job: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-cancel")
 
 	handler := worker.NewDiagnosisJobHandler(
 		diagStore,
 		repStore,
 		citStore,
 		citVal,
-		cancellingDiagnosisExecutor{cancel: cancel},
+		cancellingDiagnosisExecutor{
+			cancel: cancel,
+			requestCancel: func() error {
+				return diagStore.RequestCancellation(context.Background(), run.ID, run.UserID)
+			},
+		},
 	)
 	err = handler.Execute(ctx, claimed[0])
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected cancellation error, got %v", err)
+	if !errors.Is(err, jobs.ErrAlreadyFinalized) {
+		t.Fatalf("expected atomic cancellation finalization, got %v", err)
 	}
 
 	savedRun, err := diagStore.GetByID(context.Background(), run.ID)
@@ -576,6 +605,7 @@ func TestWorkerJobHandlerResumesFromProviderCheckpoint(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim checkpoint job: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-checkpoint")
 	executor := &checkpointCountingExecutor{}
 	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, citVal, executor)
 	if err := handler.Execute(ctx, claimed[0]); err != nil {
@@ -646,6 +676,7 @@ func TestExplicitRetryUsesNewAttemptGenerationAndIgnoresOldCheckpoint(t *testing
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim explicit retry: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "generation-two-worker")
 	if claimed[0].ExecutionGeneration != 2 || claimed[0].AttemptCount != 1 {
 		t.Fatalf("claimed retry = generation %d attempt %d, want generation 2 attempt 1", claimed[0].ExecutionGeneration, claimed[0].AttemptCount)
 	}
@@ -712,6 +743,7 @@ func TestWorkerJobHandlerResumesFinalInvalidCheckpointWithoutProvider(t *testing
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim invalid checkpoint retry: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "invalid-checkpoint-worker")
 	executor := &checkpointCountingExecutor{}
 	handler := worker.NewDiagnosisJobHandler(diagStore, evidence.NewReportStore(db), evidence.NewCitationStore(db), nil, executor)
 	if err := handler.Execute(ctx, claimed[0]); err == nil {
@@ -749,6 +781,7 @@ func TestWorkerJobHandlerDoesNotReplayPartialCheckpoint(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim first provider attempt: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "partial-checkpoint-worker")
 	executor := &partialThenValidExecutor{}
 	handler := worker.NewDiagnosisJobHandler(diagStore, evidence.NewReportStore(db), evidence.NewCitationStore(db), nil, executor)
 	if err := handler.Execute(ctx, claimed[0]); err == nil {
@@ -770,6 +803,7 @@ func TestWorkerJobHandlerDoesNotReplayPartialCheckpoint(t *testing.T) {
 		job, jobErr := jobsStore.GetJobByResource(ctx, jobs.JobTypeRunDiagnosis, run.ID)
 		t.Fatalf("failed to claim automatic retry: err=%v jobs=%d job=%+v jobErr=%v", err, len(claimed), job, jobErr)
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "partial-checkpoint-worker")
 	if claimed[0].ExecutionGeneration != 1 || claimed[0].AttemptCount != 2 {
 		t.Fatalf("automatic retry = generation %d attempt %d, want generation 1 attempt 2", claimed[0].ExecutionGeneration, claimed[0].AttemptCount)
 	}
@@ -843,6 +877,7 @@ func TestWorkerJobHandlerRebindsCheckpointEvidenceToNewAttempt(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim checkpoint job: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-checkpoint-evidence")
 	executor := &checkpointCountingExecutor{}
 	handler := worker.NewDiagnosisJobHandler(diagStore, repStore, citStore, nil, executor).WithEvidenceIssuer(evidenceIssuer)
 	if err := handler.Execute(ctx, claimed[0]); err != nil {
@@ -896,6 +931,7 @@ func TestWorkerJobHandlerCheckpointFailureStopsAutomaticRetry(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("failed to claim checkpoint job: err=%v jobs=%d", err, len(claimed))
 	}
+	startClaimedJob(t, jobsStore, claimed[0], "worker-checkpoint-failure")
 	store := checkpointFailingStore{GormStore: baseStore}
 	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
 	handler := worker.NewDiagnosisJobHandler(

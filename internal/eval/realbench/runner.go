@@ -657,7 +657,7 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 	}
 	idx.Build()
 	indexRoot := filepath.Join(artifactDir, "indexes")
-	artifactPath, artifactHash, err := artifact.NewPublisher(indexRoot).Publish(retrievalBuild.ID, "realbench", productionStrategy, idx)
+	artifactPath, artifactHash, err := artifact.NewPublisher(indexRoot).Publish(retrievalBuild.ID, 1, "realbench", productionStrategy, idx)
 	if err != nil {
 		return nil, productFailure("publish Retrieval artifact", err)
 	}
@@ -1353,7 +1353,7 @@ func flattenCitations(report *evidence.DiagnosisReportData) []evidence.Citation 
 }
 
 func ensureExactCheckout(ctx context.Context, cloneURL, commitSHA, sourceDir string) error {
-	cloner := indexing.NewSafeGitCloner([]string{"github.com"}, 50, 10*time.Minute)
+	cloner := indexing.NewSafeGitClonerWithDiskLimit([]string{"github.com"}, platformconfig.DefaultMaxCloneDiskBytes, 10*time.Minute)
 	if err := cloner.ValidateGitURL(cloneURL); err != nil {
 		return fmt.Errorf("repository validation failed: %w", err)
 	}

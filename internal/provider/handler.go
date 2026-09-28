@@ -17,6 +17,7 @@ import (
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
+	"repolens/internal/jobs"
 	"repolens/internal/platform/logger"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/repo"
@@ -24,6 +25,7 @@ import (
 	"repolens/internal/trace"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
@@ -252,6 +254,10 @@ func (h *Handler) TriggerDemo(c *gin.Context) {
 	if userID == "" {
 		userID = "local-user"
 	}
+	if h.db == nil {
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "demo job store is unavailable", errors.New("demo database is not configured"))
+		return
+	}
 
 	// 1. Ensure Demo Repository
 	demoRepoID := "repo-demo-order-svc"
@@ -341,7 +347,7 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 		IssueTitle:             "[Demo] Order submission worker deadlock under load",
 		IssueDescription:       "Under high concurrent order load, the HTTP handler hangs and stops accepting new orders after 100 requests.",
 		ErrorLog:               "panic: deadlock detected in goroutine 42 [chan send]: main.(*OrderProcessor).SubmitOrder(0xc0000a0, {0x1234, 0x5}) main.go:27",
-		Status:                 diagnosis.StatusSucceeded,
+		Status:                 diagnosis.StatusQueued,
 		IdempotencyKey:         "idemp-demo-" + uuid.New().String()[:8],
 		IdempotencyRequestHash: "hash-demo",
 		Version:                1,
@@ -351,20 +357,49 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return
 	}
+	demoWorkerID := "demo"
+	demoClaimToken := uuid.NewString()
+	var demoJob jobs.AnalysisJob
+	if err := h.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("job_type = ? AND resource_id = ? AND status = ?", jobs.JobTypeRunDiagnosis, demoRun.ID, jobs.StatusPending).
+			First(&demoJob).Error; err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		leaseUntil := now.Add(time.Hour)
+		result := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ?", demoJob.ID, jobs.StatusPending).Updates(map[string]interface{}{
+			"status": jobs.StatusRunning, "attempt_count": 1, "execution_started": true,
+			"worker_id": demoWorkerID, "claim_token": demoClaimToken,
+			"lease_until": leaseUntil, "updated_at": now,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("demo job was claimed concurrently")
+		}
+		demoJob.Status = jobs.StatusRunning
+		demoJob.AttemptCount = 1
+		demoJob.ExecutionStarted = true
+		demoJob.WorkerID = &demoWorkerID
+		demoJob.ClaimToken = &demoClaimToken
+		demoJob.LeaseUntil = &leaseUntil
+		return nil
+	}); err != nil {
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to claim demo diagnosis job", err)
+		return
+	}
 
 	// 4. Create deterministic Demo Report & Citations
 	attemptID := "attempt-demo-1"
-	if starter, ok := h.diagnosisStore.(interface {
-		StartAttempt(context.Context, string, *diagnosis.DiagnosisAttempt) error
-	}); ok {
-		attemptStartedAt := now
-		if err := starter.StartAttempt(ctx, demoRun.ID, &diagnosis.DiagnosisAttempt{
-			ID: attemptID, DiagnosisRunID: demoRun.ID, ExecutionGeneration: 1, AttemptNo: 1, WorkerID: "demo",
-			StartedAt: attemptStartedAt, HeartbeatAt: attemptStartedAt, DeadlineAt: attemptStartedAt.Add(time.Hour),
-		}); err != nil {
-			writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
-			return
-		}
+	attemptStartedAt := now
+	if err := h.diagnosisStore.StartAttempt(ctx, demoRun.ID, &diagnosis.DiagnosisAttempt{
+		ID: attemptID, DiagnosisRunID: demoRun.ID, ExecutionGeneration: demoJob.ExecutionGeneration, AttemptNo: demoJob.AttemptCount, WorkerID: demoWorkerID,
+		StartedAt: attemptStartedAt, HeartbeatAt: attemptStartedAt, DeadlineAt: attemptStartedAt.Add(time.Hour),
+	}); err != nil {
+		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
+		return
 	}
 	demoReport := &evidence.Report{
 		ID:             "report-demo-" + uuid.New().String()[:8],
@@ -392,10 +427,13 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 			"Implement select with ctx.Done() or timeout fallback in SubmitOrder()",
 			"Add integration load test to verify channel drain under high concurrency"
 		]`,
-		Confidence: 0.98,
-		CreatedAt:  now,
+		StructuredPayloadJSON: "{}",
+		LimitationsJSON:       "[]",
+		ReportStatus:          evidence.ReportValid,
+		Confidence:            0.98,
+		CreatedAt:             now,
 	}
-	_ = h.reportStore.Create(ctx, demoReport)
+	var demoCitations []evidence.Citation
 	if h.citationStore != nil {
 		demoCitation := evidence.Citation{
 			ID: uuid.New().String(), ReportID: demoReport.ID, SnapshotID: demoSnapID,
@@ -403,7 +441,7 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 			CreatedAt: now,
 		}
 		evidence.NewCitationValidator(h.storeFS).Validate(ctx, demoRepoID, demoSnapID, &demoCitation)
-		_ = h.citationStore.CreateBatch(ctx, []evidence.Citation{demoCitation})
+		demoCitations = append(demoCitations, demoCitation)
 	}
 
 	// Add Trace Steps
@@ -436,11 +474,11 @@ func (p *OrderProcessor) SubmitOrder(ctx context.Context, order Order) error {
 		CreatedAt:         now.Add(-1 * time.Second),
 	})
 
-	// Mark status succeeded
-	_ = h.diagnosisStore.FinishAttemptAndRun(
-		ctx, demoRun.ID, attemptID, diagnosis.StatusSucceeded, diagnosis.AttemptStatusSucceeded,
-		430, 380, 2, "", "", false, 0,
-	)
+	// Atomically publish the demo report and terminalize its current job claim.
+	if err := h.diagnosisStore.FinalizeSuccess(ctx, demoJob.ID, demoWorkerID, demoClaimToken, demoRun.ID, attemptID, demoReport, demoCitations, 430, 380, 2); err != nil {
+		writeProviderInternalError(c, "DEMO_FINALIZATION_FAILED", "failed to finalize demo diagnosis", err)
+		return
+	}
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message":       "Demo environment and diagnosis initialized successfully",

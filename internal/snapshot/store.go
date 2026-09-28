@@ -19,6 +19,7 @@ type Store interface {
 	GetByID(ctx context.Context, id string) (*RepositorySnapshot, error)
 	GetLatestReady(ctx context.Context, repoID string) (*RepositorySnapshot, error)
 	GetByCommit(ctx context.Context, repoID, commitSHA string) (*RepositorySnapshot, error)
+	GetLegacyByCommit(ctx context.Context, repoID, commitSHA string) (*RepositorySnapshot, error)
 	UpdateStatus(ctx context.Context, id string, expectedOldStatus, newStatus SnapshotStatus, readyAt *time.Time) error
 }
 
@@ -26,16 +27,16 @@ type Store interface {
 // the identity fields and READY transition in one conditional update so a
 // partially materialized directory can never be advertised as a snapshot.
 type MaterializationFinalizer interface {
-	FinalizeMaterialization(ctx context.Context, id, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
+	FinalizeMaterialization(ctx context.Context, id, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 	FailMaterialization(ctx context.Context, id, errorCode string) error
 }
 
 type ClaimedMaterializationFinalizer interface {
-	FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
+	FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 }
 
 type ClaimedMaterializationRevisionFinalizer interface {
-	FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
+	FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 }
 
 type GormStore struct {
@@ -77,6 +78,14 @@ func (s *GormStore) GetByCommit(ctx context.Context, repoID, commitSHA string) (
 	return &snap, nil
 }
 
+func (s *GormStore) GetLegacyByCommit(ctx context.Context, repoID, commitSHA string) (*RepositorySnapshot, error) {
+	var snap RepositorySnapshot
+	if err := s.db.WithContext(ctx).Where("repository_id = ? AND commit_sha = ? AND analysis_revision_id = ''", repoID, commitSHA).Order("created_at DESC, id DESC").First(&snap).Error; err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
 func (s *GormStore) UpdateStatus(ctx context.Context, id string, expectedOldStatus, newStatus SnapshotStatus, readyAt *time.Time) error {
 	if expectedOldStatus == StatusReady || (expectedOldStatus != StatusCreated && expectedOldStatus != StatusMaterializing) {
 		return fmt.Errorf("snapshot %s has immutable or invalid source state %s", id, expectedOldStatus)
@@ -104,19 +113,20 @@ func (s *GormStore) UpdateStatus(ctx context.Context, id string, expectedOldStat
 	return nil
 }
 
-func (s *GormStore) FinalizeMaterialization(ctx context.Context, id, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
-	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+func (s *GormStore) FinalizeMaterialization(ctx context.Context, id, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if materializedPath == "" || commitSHA == "" || commitSHA == "pending" || contentHash == "" {
 		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", id)
 	}
 	result := s.db.WithContext(ctx).Model(&RepositorySnapshot{}).
 		Where("id = ? AND status = ?", id, StatusMaterializing).
 		Updates(map[string]interface{}{
-			"commit_sha":   commitSHA,
-			"content_hash": contentHash,
-			"file_count":   fileCount,
-			"total_bytes":  totalBytes,
-			"status":       StatusReady,
-			"ready_at":     readyAt,
+			"materialized_path": materializedPath,
+			"commit_sha":        commitSHA,
+			"content_hash":      contentHash,
+			"file_count":        fileCount,
+			"total_bytes":       totalBytes,
+			"status":            StatusReady,
+			"ready_at":          readyAt,
 		})
 	if result.Error != nil {
 		return result.Error
@@ -127,20 +137,20 @@ func (s *GormStore) FinalizeMaterialization(ctx context.Context, id, commitSHA, 
 	return nil
 }
 
-func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
-	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if materializedPath == "" || commitSHA == "" || commitSHA == "pending" || contentHash == "" {
 		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", snapshotID)
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job jobs.AnalysisJob
-		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return jobs.ErrOwnershipLost
 			}
 			return err
 		}
 		result := tx.Model(&RepositorySnapshot{}).Where("id = ? AND status = ?", snapshotID, StatusMaterializing).Updates(map[string]interface{}{
-			"commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
+			"materialized_path": materializedPath, "commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
 			"total_bytes": totalBytes, "status": StatusReady, "ready_at": readyAt,
 		})
 		if result.Error != nil {
@@ -149,7 +159,7 @@ func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, wo
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("snapshot %s materialization finalize conflict", snapshotID)
 		}
-		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).Updates(map[string]interface{}{
 			"status": jobs.StatusSucceeded, "finished_at": readyAt, "updated_at": readyAt,
 		})
 		if jobResult.Error != nil {
@@ -164,20 +174,20 @@ func (s *GormStore) FinalizeSnapshotSuccess(ctx context.Context, jobID int64, wo
 
 // FinalizeSnapshotSuccessWithRevision atomically publishes a snapshot,
 // advances its AnalysisRevision, and completes the claimed job.
-func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
-	if commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, revisionID, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if materializedPath == "" || commitSHA == "" || commitSHA == "pending" || contentHash == "" {
 		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", snapshotID)
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job jobs.AnalysisJob
-		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+		if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).First(&job).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return jobs.ErrOwnershipLost
 			}
 			return err
 		}
 		result := tx.Model(&RepositorySnapshot{}).Where("id = ? AND status = ? AND analysis_revision_id = ?", snapshotID, StatusMaterializing, revisionID).Updates(map[string]interface{}{
-			"commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
+			"materialized_path": materializedPath, "commit_sha": commitSHA, "content_hash": contentHash, "file_count": fileCount,
 			"total_bytes": totalBytes, "status": StatusReady, "ready_at": readyAt,
 		})
 		if result.Error != nil {
@@ -248,7 +258,7 @@ func (s *GormStore) FinalizeSnapshotSuccessWithRevision(ctx context.Context, job
 		if revisionResult.RowsAffected != 1 {
 			return fmt.Errorf("analysis revision %s lineage transition conflict", revisionID)
 		}
-		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+		jobResult := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).Updates(map[string]interface{}{
 			"status": jobs.StatusSucceeded, "finished_at": readyAt, "updated_at": readyAt,
 		})
 		if jobResult.Error != nil {

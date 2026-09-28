@@ -27,7 +27,7 @@ type Store interface {
 	GetBySnapshot(ctx context.Context, snapshotID string) (*model.CodeIndexBuild, error)
 	SaveAnalysisResult(ctx context.Context, buildID int64, result *model.AnalysisResult) error
 	FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, result *model.AnalysisResult) error
-	FailBuild(ctx context.Context, buildID int64, errorCode string) error
+	FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, revisionID string, result *model.AnalysisResult) error
 	MarkBuildBuilding(ctx context.Context, buildID int64) error
 	ListSymbols(ctx context.Context, buildID int64, query string, limit int) ([]*model.Symbol, error)
 	ListAllSymbols(ctx context.Context, buildID int64) ([]*model.Symbol, error)
@@ -41,7 +41,7 @@ type Store interface {
 	GetRetrievalBuildByCodeIndexBuild(ctx context.Context, codeIndexBuildID int64) (*model.RetrievalBuild, error)
 	CompleteRetrievalBuild(ctx context.Context, id int64, artifactPath, artifactHash string, docCount int) error
 	FinalizeRetrievalSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, artifactPath, artifactHash string, docCount int) error
-	FailRetrievalBuild(ctx context.Context, id int64, errorCode string) error
+	FinalizeRetrievalSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, revisionID, artifactPath, artifactHash string, docCount int) error
 	MarkRetrievalBuilding(ctx context.Context, id int64) error
 
 	// Lineage Validation
@@ -112,10 +112,27 @@ func (s *GormStore) GetOrCreateBuild(ctx context.Context, snapshotID, modulePath
 	})
 
 	if txErr != nil {
+		// A concurrent request may have won the unique build identity between
+		// our initial read and insert. Treat that winner as an idempotent reuse.
+		if winner, lookupErr := s.getBuildByIdentity(ctx, snapshotID, ctxHash); lookupErr == nil {
+			return winner, false, nil
+		}
 		return nil, false, txErr
 	}
 
 	return build, true, nil
+}
+
+func (s *GormStore) getBuildByIdentity(ctx context.Context, snapshotID, contextHash string) (*model.CodeIndexBuild, error) {
+	var build model.CodeIndexBuild
+	err := s.db.WithContext(ctx).Where(
+		"snapshot_id = ? AND parser_version = ? AND analyzer_version = ? AND symbol_schema_version = ? AND build_context_hash = ?",
+		snapshotID, model.CurrentParserVersion, model.CurrentAnalyzerVersion, model.CurrentSymbolSchemaVersion, contextHash,
+	).First(&build).Error
+	if err != nil {
+		return nil, err
+	}
+	return &build, nil
 }
 
 func (s *GormStore) GetByID(ctx context.Context, id int64) (*model.CodeIndexBuild, error) {
@@ -383,13 +400,6 @@ func (s *GormStore) MarkBuildBuilding(ctx context.Context, buildID int64) error 
 	return nil
 }
 
-func (s *GormStore) FailBuild(ctx context.Context, buildID int64, errorCode string) error {
-	return s.db.WithContext(ctx).Model(&model.CodeIndexBuild{}).Where("id = ? AND status != ?", buildID, model.BuildStatusReady).Updates(map[string]interface{}{
-		"status":     model.BuildStatusFailed,
-		"error_code": errorCode,
-	}).Error
-}
-
 func (s *GormStore) MarkRetrievalBuilding(ctx context.Context, id int64) error {
 	result := s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).
 		Where("id = ? AND status IN (?, ?)", id, model.BuildStatusCreated, model.BuildStatusBuilding).
@@ -515,6 +525,16 @@ func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuil
 	})
 
 	if txErr != nil {
+		// Retrieval builds have the same composite unique identity; reread the
+		// winner if another request inserted it after our first lookup.
+		var winner model.RetrievalBuild
+		lookupErr := s.db.WithContext(ctx).Where(
+			"code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?",
+			codeIndexBuildID, strategy, model.CurrentRetrievalVersion, model.CurrentTokenizerVersion, configHash,
+		).First(&winner).Error
+		if lookupErr == nil {
+			return &winner, false, nil
+		}
 		return nil, false, txErr
 	}
 
@@ -637,16 +657,9 @@ func (s *GormStore) FinalizeRetrievalSuccessWithRevision(ctx context.Context, jo
 	})
 }
 
-func (s *GormStore) FailRetrievalBuild(ctx context.Context, id int64, errorCode string) error {
-	return s.db.WithContext(ctx).Model(&model.RetrievalBuild{}).Where("id = ? AND status != ?", id, model.BuildStatusReady).Updates(map[string]interface{}{
-		"status":     model.BuildStatusFailed,
-		"error_code": errorCode,
-	}).Error
-}
-
 func requireOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) error {
 	var job jobs.AnalysisJob
-	if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).First(&job).Error; err != nil {
+	if err := tx.Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).First(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return jobs.ErrOwnershipLost
 		}
@@ -657,7 +670,7 @@ func requireOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) erro
 
 func finalizeOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) error {
 	now := time.Now().UTC()
-	result := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, false).Updates(map[string]interface{}{
+	result := tx.Model(&jobs.AnalysisJob{}).Where("id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?", jobID, jobs.StatusRunning, workerID, claimToken, true, false).Updates(map[string]interface{}{
 		"status": jobs.StatusSucceeded, "finished_at": &now, "updated_at": &now,
 	})
 	if result.Error != nil {

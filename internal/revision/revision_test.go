@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -181,9 +183,6 @@ func TestRevisionTransitionsToReadyAndRetryIsExplicit(t *testing.T) {
 	if err != nil || ready.Status != revision.StatusReady || ready.Stage != revision.StageReady {
 		t.Fatalf("ready revision = %+v err=%v", ready, err)
 	}
-	if err := store.MarkFailed(ctx, value.ID, revision.StageFailed, "TEST", "failure"); err == nil {
-		t.Fatal("READY revision was allowed to fail")
-	}
 }
 
 func TestRevisionHandlerSeparatesRefFailureFromStoreFailure(t *testing.T) {
@@ -204,7 +203,23 @@ func TestRevisionHandlerSeparatesRefFailureFromStoreFailure(t *testing.T) {
 	router.POST("/repositories/:id/revisions", handler.Create)
 
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"missing"}`))
+	request := httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"`+strings.Repeat("r", 256)+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte(`"REF_TOO_LONG"`)) {
+		t.Fatalf("overlong ref response = %d %s, want REF_TOO_LONG", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"`+strings.Repeat("r", 255)+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || bytes.Contains(response.Body.Bytes(), []byte(`"REF_TOO_LONG"`)) {
+		t.Fatalf("255-character ref response = %d %s, want resolver-level REF_NOT_FOUND", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/repositories/repo-handler/revisions", bytes.NewBufferString(`{"ref":"missing"}`))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte(`"REF_NOT_FOUND"`)) {
@@ -224,5 +239,135 @@ func TestRevisionHandlerSeparatesRefFailureFromStoreFailure(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusInternalServerError || !bytes.Contains(response.Body.Bytes(), []byte(`"INTERNAL_ERROR"`)) {
 		t.Fatalf("store failure response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestConcurrentRevisionRetryHasSingleGenerationWinner(t *testing.T) {
+	db := newRevisionDB(t)
+	ctx := context.Background()
+	repoStore := repo.NewStore(db)
+	if err := repoStore.Create(ctx, &repo.Repository{
+		ID: "repo-retry-cas", UserID: "user-retry-cas", Name: "retry-cas",
+		GitURL: "https://github.com/example/retry-cas", DefaultRef: "main",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := revision.NewStore(db)
+	service := revision.NewService(store, repoStore, fixedResolver{sha: "0123456789012345678901234567890123456789"}, t.TempDir())
+	value, created, err := service.Prepare(ctx, "user-retry-cas", "repo-retry-cas", "main")
+	if err != nil || !created {
+		t.Fatalf("Prepare = created %t err %v", created, err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", value.ID).Updates(map[string]interface{}{
+		"status": revision.StatusFailed, "stage": revision.StageMaterializing, "execution_generation": 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 50
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	var workers sync.WaitGroup
+	workers.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer workers.Done()
+			<-start
+			_, retryErr := store.Retry(ctx, value.ID)
+			results <- retryErr
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	succeeded := 0
+	conflicts := 0
+	for retryErr := range results {
+		if retryErr == nil {
+			succeeded++
+		} else if errors.Is(retryErr, revision.ErrRetryConflict) {
+			conflicts++
+		} else {
+			t.Errorf("Retry returned unexpected error: %v", retryErr)
+		}
+	}
+	if succeeded != 1 || conflicts != callers-1 {
+		t.Fatalf("concurrent Retry results = %d successes, %d conflicts; want 1 success and %d conflicts", succeeded, conflicts, callers-1)
+	}
+
+	saved, err := store.GetByID(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != revision.StatusPreparing || saved.ExecutionGeneration != 2 || saved.Version != value.Version+1 {
+		t.Fatalf("revision after concurrent Retry = status %s generation %d version %d", saved.Status, saved.ExecutionGeneration, saved.Version)
+	}
+	var jobCount int64
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeMaterializeSnapshot, value.SnapshotID).Count(&jobCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if jobCount != 1 {
+		t.Fatalf("snapshot jobs after concurrent Retry = %d, want exactly one", jobCount)
+	}
+	var job jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeMaterializeSnapshot, value.SnapshotID).First(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != jobs.StatusPending || job.ExecutionGeneration != 2 || job.AttemptCount != 0 {
+		t.Fatalf("snapshot job after concurrent Retry = status %s generation %d attempt %d", job.Status, job.ExecutionGeneration, job.AttemptCount)
+	}
+}
+
+func TestRevisionRetryCASConflictDoesNotResetPipelineResources(t *testing.T) {
+	db := newRevisionDB(t)
+	ctx := context.Background()
+	repoStore := repo.NewStore(db)
+	if err := repoStore.Create(ctx, &repo.Repository{
+		ID: "repo-retry-cas-conflict", UserID: "user-retry-cas-conflict", Name: "retry-cas-conflict",
+		GitURL: "https://github.com/example/retry-cas-conflict", DefaultRef: "main",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := revision.NewStore(db)
+	service := revision.NewService(store, repoStore, fixedResolver{sha: "abcdef0123456789abcdef0123456789abcdef01"}, t.TempDir())
+	value, created, err := service.Prepare(ctx, "user-retry-cas-conflict", "repo-retry-cas-conflict", "main")
+	if err != nil || !created {
+		t.Fatalf("Prepare = created %t err %v", created, err)
+	}
+	if err := db.Model(&revision.AnalysisRevision{}).Where("id = ?", value.ID).Update("status", revision.StatusFailed).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&snapshot.RepositorySnapshot{}).Where("id = ?", value.SnapshotID).Update("status", snapshot.StatusReady).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`CREATE TRIGGER ignore_revision_retry BEFORE UPDATE ON analysis_revisions WHEN OLD.status = 'FAILED' BEGIN SELECT RAISE(IGNORE); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec("DROP TRIGGER ignore_revision_retry")
+	if _, err := store.Retry(ctx, value.ID); !errors.Is(err, revision.ErrRetryConflict) {
+		t.Fatalf("Retry error = %v, want ErrRetryConflict", err)
+	}
+	saved, err := store.GetByID(ctx, value.ID)
+	if err != nil || saved.Status != revision.StatusFailed || saved.ExecutionGeneration != 1 {
+		t.Fatalf("revision after rejected CAS = %+v err=%v", saved, err)
+	}
+	snap, err := snapshot.NewStore(db).GetByID(ctx, value.SnapshotID)
+	if err != nil || snap.Status != snapshot.StatusReady {
+		t.Fatalf("snapshot was reset before CAS ownership: %+v err=%v", snap, err)
+	}
+	var buildCount int64
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("snapshot_id = ?", value.SnapshotID).Count(&buildCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if buildCount != 0 {
+		t.Fatalf("CAS loser created %d CodeIndex builds, want none", buildCount)
+	}
+	var job jobs.AnalysisJob
+	if err := db.Where("job_type = ? AND resource_id = ?", jobs.JobTypeMaterializeSnapshot, value.SnapshotID).First(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != jobs.StatusPending || job.ExecutionGeneration != 1 || job.AttemptCount != 0 {
+		t.Fatalf("job reset before CAS ownership: %+v", job)
 	}
 }

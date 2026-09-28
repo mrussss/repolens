@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"repolens/internal/evidence"
 	"repolens/internal/llm"
@@ -72,7 +73,9 @@ func (t *SearchCodeTool) Definition() llm.ToolDefinition {
 					},
 					"top_k": map[string]interface{}{
 						"type":        "integer",
-						"description": "Maximum number of results to return (default 5)",
+						"minimum":     1,
+						"maximum":     20,
+						"description": "Maximum number of results to return (default 5, maximum 20)",
 					},
 				},
 				"required": []string{"query"},
@@ -83,7 +86,7 @@ func (t *SearchCodeTool) Definition() llm.ToolDefinition {
 
 type searchCodeArgs struct {
 	Query string `json:"query"`
-	TopK  int    `json:"top_k"`
+	TopK  *int   `json:"top_k"`
 }
 
 func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, error) {
@@ -92,9 +95,12 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 		return "", fmt.Errorf("invalid arguments for search_code: %w", err)
 	}
 
-	topK := args.TopK
-	if topK <= 0 {
-		topK = 5
+	topK := 5
+	if args.TopK != nil {
+		topK = *args.TopK
+	}
+	if topK < 1 || topK > 20 {
+		return "", fmt.Errorf("top_k must be between 1 and 20")
 	}
 
 	results, err := t.retriever.Search(ctx, retrieval.SearchRequest{
@@ -108,17 +114,28 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 	if len(results) == 0 {
 		return "No code matches found for the query.", nil
 	}
+	if len(results) > topK {
+		results = results[:topK]
+	}
 	if t.evidence != nil {
 		maxBytes := t.maxBytes
 		if maxBytes <= 0 {
 			maxBytes = 24 * 1024
 		}
-		itemMaxBytes := maxBytes
-		if topK > 1 {
-			itemMaxBytes = maxBytes / topK
-			if itemMaxBytes <= 0 {
-				itemMaxBytes = 1
+		eligible := results[:0]
+		for _, result := range results {
+			if result.Path != "" {
+				eligible = append(eligible, result)
 			}
+		}
+		results = eligible
+		if len(results) == 0 {
+			return "No code matches found for the query.", nil
+		}
+		itemMaxBytes := 0
+		results, itemMaxBytes = searchResultsWithinEvidenceBudget(results, maxBytes)
+		if len(results) == 0 {
+			return "No code matches found for the query.", nil
 		}
 		for i := range results {
 			if results[i].Path == "" {
@@ -138,14 +155,24 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 				MaxBytes:         itemMaxBytes,
 			})
 			if issueErr != nil {
-				return "", issueErr
+				if i == 0 {
+					return "", issueErr
+				}
+				results = results[:i]
+				break
+			}
+			if item == nil {
+				if i == 0 {
+					return "", fmt.Errorf("evidence issuer returned an empty item")
+				}
+				results = results[:i]
+				break
 			}
 			results[i].EvidenceID = item.ID
 			results[i].StartLine = item.StartLine
 			results[i].EndLine = item.EndLine
 			results[i].Snippet = item.DisplayExcerpt
 		}
-		results = resultsWithinBudget(results, maxBytes)
 	}
 
 	outBytes, err := json.MarshalIndent(results, "", "  ")
@@ -156,18 +183,46 @@ func (t *SearchCodeTool) Execute(ctx context.Context, argsJSON string) (string, 
 	return string(outBytes), nil
 }
 
-func resultsWithinBudget(results []retrieval.SearchResult, maxBytes int) []retrieval.SearchResult {
+func searchResultsWithinEvidenceBudget(results []retrieval.SearchResult, maxBytes int) ([]retrieval.SearchResult, int) {
 	if maxBytes <= 0 {
-		return results
+		return results, maxBytes
 	}
 	accepted := make([]retrieval.SearchResult, 0, len(results))
+	budgeted := make([]retrieval.SearchResult, 0, len(results))
 	for _, result := range results {
-		candidate := append(append([]retrieval.SearchResult(nil), accepted...), result)
+		candidateResult := result
+		// Reserve room for the opaque handle and a snippet field. The final
+		// snippet allowance is calculated from the space left by these rows.
+		candidateResult.EvidenceID = strings.Repeat("e", 64)
+		candidateResult.Snippet = "x"
+		candidate := append(append([]retrieval.SearchResult(nil), budgeted...), candidateResult)
 		encoded, err := json.MarshalIndent(candidate, "", "  ")
 		if err != nil || len(encoded) > maxBytes {
 			break
 		}
 		accepted = append(accepted, result)
+		budgeted = append(budgeted, candidateResult)
 	}
-	return accepted
+	for len(accepted) > 0 {
+		base, err := json.MarshalIndent(budgeted, "", "  ")
+		if err != nil {
+			return nil, 0
+		}
+		itemMaxBytes := (maxBytes - len(base)) / (len(budgeted) * 6)
+		if itemMaxBytes < 1 {
+			accepted = accepted[:len(accepted)-1]
+			budgeted = budgeted[:len(budgeted)-1]
+			continue
+		}
+		for index := range budgeted {
+			budgeted[index].Snippet = strings.Repeat("x", itemMaxBytes*6)
+		}
+		encoded, err := json.MarshalIndent(budgeted, "", "  ")
+		if err == nil && len(encoded) <= maxBytes {
+			return accepted, itemMaxBytes
+		}
+		accepted = accepted[:len(accepted)-1]
+		budgeted = budgeted[:len(budgeted)-1]
+	}
+	return nil, 0
 }

@@ -65,6 +65,13 @@ func run() error {
 	// Stores
 	repoStore := repo.NewStore(db.GormDB)
 	snapshotStore := snapshot.NewStore(db.GormDB)
+	storeFS.WithSourcePathResolver(func(repoID, snapshotID string) (string, bool) {
+		snap, err := snapshotStore.GetByID(context.Background(), snapshotID)
+		if err != nil || snap.RepositoryID != repoID || snap.Status != snapshot.StatusReady || snap.MaterializedPath == "" {
+			return "", false
+		}
+		return snap.MaterializedPath, true
+	})
 	indexStore := repoindex.NewStore(db.GormDB)
 	codeIntelStore := codeintelstore.NewStore(db.GormDB)
 	diagnosisStore := diagnosis.NewStore(db.GormDB)
@@ -72,7 +79,7 @@ func run() error {
 	citationStore := evidence.NewCitationStore(db.GormDB)
 	traceStore := trace.NewStore(db.GormDB)
 	jobStore := jobs.NewStoreWithDriver(db.SqlDB, cfg.DBDriver)
-	cloner := indexing.NewSafeGitCloner(cfg.AllowHosts, cfg.MaxRepoSizeMB, 2*time.Minute)
+	cloner := indexing.NewSafeGitClonerWithDiskLimit(cfg.AllowHosts, cfg.MaxCloneDiskBytes, 2*time.Minute)
 	revisionStore := revision.NewStore(db.GormDB)
 
 	// Services & Managers
@@ -159,7 +166,7 @@ func run() error {
 		codeIntelStore,
 		filepath.Join(cfg.SnapshotBasePath, "indexes"),
 	)
-	codeIntelHandler := codeintel.NewHandler(codeIntelStore, snapshotStore)
+	codeIntelHandler := codeintel.NewHandler(codeIntelStore, snapshotStore).WithJobStore(jobStore)
 
 	if cfg.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)

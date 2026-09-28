@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"repolens/internal/platform/logger"
+	"repolens/internal/repo"
 )
 
 type Handler struct{ service *Service }
@@ -52,6 +53,8 @@ func (h *Handler) Create(c *gin.Context) {
 	value, created, err := h.service.Prepare(c.Request.Context(), userID, c.Param("id"), request.Ref)
 	if err != nil {
 		switch {
+		case errors.Is(err, repo.ErrRefTooLong):
+			c.JSON(http.StatusBadRequest, gin.H{"code": "REF_TOO_LONG", "error": "git ref must not exceed 255 characters"})
 		case errors.Is(err, ErrFailedRevision):
 			c.JSON(http.StatusConflict, gin.H{"code": "REVISION_PREPARE_FAILED", "error": "analysis revision failed; retry explicitly", "analysis_revision": publicRevision(value)})
 		case errors.Is(err, ErrNotFound):
@@ -116,6 +119,8 @@ func (h *Handler) Retry(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"code": "REVISION_NOT_FOUND", "error": "analysis revision not found"})
 		case errors.Is(err, ErrInvalidState):
 			c.JSON(http.StatusConflict, gin.H{"code": "REVISION_NOT_FAILED", "error": "only a failed revision can be retried"})
+		case errors.Is(err, ErrRetryConflict):
+			c.JSON(http.StatusConflict, gin.H{"code": "REVISION_RETRY_CONFLICT", "error": "revision retry was already started"})
 		default:
 			logger.L(c.Request.Context()).Error("failed to retry analysis revision", "revision_id", c.Param("id"), "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})

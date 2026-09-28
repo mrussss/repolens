@@ -19,7 +19,7 @@ type Repository struct {
 	UserID     string                        `gorm:"index;size:36;not null" json:"user_id"`
 	Name       string                        `gorm:"size:128;not null" json:"name"`
 	GitURL     string                        `gorm:"size:512;not null" json:"git_url"`
-	DefaultRef string                        `gorm:"size:128;not null;default:'main'" json:"default_ref"`
+	DefaultRef string                        `gorm:"size:255;not null;default:'main'" json:"default_ref"`
 	Status     RepositoryStatus              `gorm:"size:32;not null;default:'ACTIVE'" json:"status"`
 	CreatedAt  time.Time                     `json:"created_at"`
 	UpdatedAt  time.Time                     `json:"updated_at"`
