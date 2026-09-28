@@ -470,7 +470,11 @@ func TestBuildForDiagnosisPinsMetadataButReloadsRotatedKey(t *testing.T) {
 	if err := mgr.SaveConfig(server.URL, "model-a", "key-b", false); err != nil {
 		t.Fatal(err)
 	}
-	p, err := mgr.BuildForDiagnosis(context.Background(), run)
+	spec, err := diagnosis.BuildExecutionSpec(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := mgr.BuildForExecution(context.Background(), spec.Provider)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +488,7 @@ func TestBuildForDiagnosisPinsMetadataButReloadsRotatedKey(t *testing.T) {
 	if err := mgr.SaveConfig(server.URL, "model-b", "key-c", false); err != nil {
 		t.Fatal(err)
 	}
-	_, err = mgr.BuildForDiagnosis(context.Background(), run)
+	_, err = mgr.BuildForExecution(context.Background(), spec.Provider)
 	if err == nil {
 		t.Fatal("expected provider model drift to be rejected")
 	}

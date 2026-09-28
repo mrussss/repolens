@@ -67,7 +67,7 @@ func (s ownershipLostFinalizerStore) FinalizeSuccess(ctx context.Context, _ int6
 
 type invalidReportExecutor struct{}
 
-func (invalidReportExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+func (invalidReportExecutor) Execute(context.Context, diagnosis.DiagnosisExecutionSpec, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	return &worker.ExecutionResult{RawOutput: `{"unknown":"value","debug":"Authorization: Bearer short-token"}`, ParseError: "INVALID_STRUCTURED_REPORT: UNKNOWN_FIELD", StructuredReport: false}, fmt.Errorf("%w: UNKNOWN_FIELD", agent.ErrInvalidStructuredReport)
 }
 
@@ -79,24 +79,24 @@ func (s checkpointFailingStore) UpdateAttemptCheckpointWithDraft(context.Context
 	return errors.New("checkpoint storage unavailable")
 }
 
-func (e *checkpointCountingExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+func (e *checkpointCountingExecutor) Execute(context.Context, diagnosis.DiagnosisExecutionSpec, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	e.calls++
 	return nil, errors.New("provider should not be called when a checkpoint exists")
 }
 
-func (e *callCountingSuccessExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+func (e *callCountingSuccessExecutor) Execute(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	e.calls++
-	return invalidEvidenceExecutor{}.Execute(ctx, run, attempt)
+	return invalidEvidenceExecutor{}.Execute(ctx, spec, attempt)
 }
 
-func (e *partialThenValidExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+func (e *partialThenValidExecutor) Execute(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	e.calls++
 	if e.calls == 1 {
 		return &worker.ExecutionResult{
 			RawOutput: `{"progress":"tool completed"}`, FinishReason: "tool_calls", ToolCalls: 1, ProviderCalls: 1,
 		}, jobs.NewRetryableError("PROVIDER_TIMEOUT", "provider timed out after partial progress", nil)
 	}
-	return invalidEvidenceExecutor{}.Execute(ctx, run, attempt)
+	return invalidEvidenceExecutor{}.Execute(ctx, spec, attempt)
 }
 
 func setupTestEnvironment(t *testing.T) (*gorm.DB, *jobs.Store) {
@@ -205,7 +205,7 @@ func TestWorkerJobHandler_ExecutionSuccess(t *testing.T) {
 
 type invalidEvidenceExecutor struct{}
 
-func (invalidEvidenceExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+func (invalidEvidenceExecutor) Execute(context.Context, diagnosis.DiagnosisExecutionSpec, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	return &worker.ExecutionResult{
 		Report: &evidence.DiagnosisReportData{
 			ConclusionKind: evidence.ConclusionRootCause,
@@ -425,7 +425,7 @@ func TestInvalidFinalReportCheckpointSurvivesFinalizerRollback(t *testing.T) {
 
 type invalidStructuredReportExecutor struct{}
 
-func (invalidStructuredReportExecutor) Execute(context.Context, *diagnosis.DiagnosisRun, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+func (invalidStructuredReportExecutor) Execute(context.Context, diagnosis.DiagnosisExecutionSpec, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	return &worker.ExecutionResult{
 		RawOutput:        "{\"conclusion_kind\":\"ROOT_CAUSE\",\"debug\":\"Authorization: Bearer short-token\"}",
 		ParseError:       "INVALID_STRUCTURED_REPORT: root cause report needs summary, root_cause, and at least one finding",
@@ -479,7 +479,7 @@ type cancellingDiagnosisExecutor struct {
 	requestCancel func() error
 }
 
-func (e cancellingDiagnosisExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
+func (e cancellingDiagnosisExecutor) Execute(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	if e.requestCancel != nil {
 		if err := e.requestCancel(); err != nil {
 			return nil, err

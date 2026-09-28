@@ -53,7 +53,7 @@ func (e *ExecutionError) Progressed() bool {
 }
 
 type Executor interface {
-	Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error)
+	Execute(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error)
 }
 
 type AgentRuntimeExecutor struct {
@@ -70,7 +70,7 @@ type AgentRuntimeExecutor struct {
 }
 
 type ProviderFactory interface {
-	BuildForDiagnosis(ctx context.Context, run *diagnosis.DiagnosisRun) (llm.Provider, error)
+	BuildForExecution(ctx context.Context, provider diagnosis.ProviderSnapshot) (llm.Provider, error)
 }
 
 func NewAgentRuntimeExecutor(
@@ -113,12 +113,12 @@ func (e *AgentRuntimeExecutor) WithGenerationOptions(options GenerationOptions) 
 	return e
 }
 
-func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
+func (e *AgentRuntimeExecutor) Execute(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
 	registry := NewToolRegistry()
 	provider := e.provider
 	if e.providerFactory != nil {
 		var err error
-		provider, err = e.providerFactory.BuildForDiagnosis(ctx, run)
+		provider, err = e.providerFactory.BuildForExecution(ctx, spec.Provider)
 		if err != nil {
 			return nil, err
 		}
@@ -127,20 +127,20 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 		return nil, fmt.Errorf("no provider configured")
 	}
 
-	buildID := run.CodeIndexBuildID
-	if e.ciStore != nil && ((run.CodeIndexBuildID == 0) != (run.RetrievalBuildID == 0)) {
+	buildID := spec.Lineage.CodeIndexBuildID
+	if e.ciStore != nil && ((spec.Lineage.CodeIndexBuildID == 0) != (spec.Lineage.RetrievalBuildID == 0)) {
 		return nil, fmt.Errorf("incomplete pinned build lineage")
 	}
 
 	// Register 5 Read-Only Tools (Section 32 of Master Spec)
-	searchTool := tools.NewPinnedSearchCodeTool(e.retriever, run.SnapshotID, run.CodeIndexBuildID, run.RetrievalBuildID)
-	if run.CodeIndexBuildID == 0 && run.RetrievalBuildID == 0 {
-		searchTool = tools.NewSearchCodeTool(e.retriever, run.SnapshotID)
+	searchTool := tools.NewPinnedSearchCodeTool(e.retriever, spec.Lineage.SnapshotID, spec.Lineage.CodeIndexBuildID, spec.Lineage.RetrievalBuildID)
+	if spec.Lineage.CodeIndexBuildID == 0 && spec.Lineage.RetrievalBuildID == 0 {
+		searchTool = tools.NewSearchCodeTool(e.retriever, spec.Lineage.SnapshotID)
 	}
 	getSymbolTool := tools.NewGetSymbolTool(e.ciStore, buildID)
 	findRefTool := tools.NewFindReferencesTool(e.ciStore, buildID)
 	findTestTool := tools.NewFindRelatedTestsTool(e.ciStore, buildID)
-	readFileTool := tools.NewReadFileTool(e.storeFS, run.RepositoryID, run.SnapshotID)
+	readFileTool := tools.NewReadFileTool(e.storeFS, spec.Lineage.RepositoryID, spec.Lineage.SnapshotID)
 
 	registry.Register(searchTool)
 	registry.Register(getSymbolTool)
@@ -149,36 +149,36 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	registry.Register(readFileTool)
 
 	guardCfg := e.guardCfg
-	if run.MaxAgentRounds > 0 {
-		guardCfg.MaxSteps = run.MaxAgentRounds
+	if spec.Budget.MaxAgentRounds > 0 {
+		guardCfg.MaxSteps = spec.Budget.MaxAgentRounds
 	}
-	if run.MaxToolCalls > 0 {
-		guardCfg.MaxToolCalls = run.MaxToolCalls
+	if spec.Budget.MaxToolCalls > 0 {
+		guardCfg.MaxToolCalls = spec.Budget.MaxToolCalls
 	}
-	if run.MaxSearchCalls > 0 {
-		guardCfg.MaxSearchCalls = run.MaxSearchCalls
+	if spec.Budget.MaxSearchCalls > 0 {
+		guardCfg.MaxSearchCalls = spec.Budget.MaxSearchCalls
 	}
-	if run.MaxRepeatCalls > 0 {
-		guardCfg.MaxRepeatCalls = run.MaxRepeatCalls
+	if spec.Budget.MaxRepeatCalls > 0 {
+		guardCfg.MaxRepeatCalls = spec.Budget.MaxRepeatCalls
 	}
-	if run.MaxToolResultBytes > 0 {
-		guardCfg.MaxToolResultBytes = run.MaxToolResultBytes
+	if spec.Budget.MaxToolResultBytes > 0 {
+		guardCfg.MaxToolResultBytes = spec.Budget.MaxToolResultBytes
 	}
-	if run.MaxOutputTokens > 0 {
-		guardCfg.MaxOutputTokens = run.MaxOutputTokens
+	if spec.Generation.MaxOutputTokens > 0 {
+		guardCfg.MaxOutputTokens = spec.Generation.MaxOutputTokens
 	}
 	if e.evidenceIssuer != nil {
 		maxEvidenceBytes := evidenceContentBudget(guardCfg.MaxToolResultBytes)
-		searchTool.WithEvidenceIssuer(e.storeFS, e.evidenceIssuer, attempt.ID, run.ID, maxEvidenceBytes)
-		searchTool.WithEvidenceRepositoryID(run.RepositoryID)
-		readFileTool.WithEvidenceIssuer(e.evidenceIssuer, attempt.ID, run.ID, run.CodeIndexBuildID, maxEvidenceBytes)
+		searchTool.WithEvidenceIssuer(e.storeFS, e.evidenceIssuer, attempt.ID, spec.RunID, maxEvidenceBytes)
+		searchTool.WithEvidenceRepositoryID(spec.Lineage.RepositoryID)
+		readFileTool.WithEvidenceIssuer(e.evidenceIssuer, attempt.ID, spec.RunID, spec.Lineage.CodeIndexBuildID, maxEvidenceBytes)
 	}
 	packetBytes := e.evidenceBytes
-	if run.MaxEvidencePacketBytes > 0 {
-		packetBytes = run.MaxEvidencePacketBytes
+	if spec.Budget.MaxEvidencePacketBytes > 0 {
+		packetBytes = spec.Budget.MaxEvidencePacketBytes
 	}
 	generation := GenerationOptions{
-		ReasoningEffort: strings.TrimSpace(run.ReasoningEffort),
+		ReasoningEffort: strings.TrimSpace(spec.Generation.ReasoningEffort),
 		ResponseFormat:  &llm.ResponseFormat{Type: "json_object"},
 	}
 	if e.generation != nil {
@@ -188,10 +188,10 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	}
 	loop := NewAgentLoop(provider, registry, e.traceStore, guardCfg).WithGenerationOptions(generation)
 	if e.retriever != nil {
-		query := retrieval.BuildQuery(run.IssueTitle, run.IssueDescription, run.ErrorLog)
+		query := retrieval.BuildQuery(spec.Issue.Title, spec.Issue.Description, spec.Issue.ErrorLog)
 		results, searchErr := e.retriever.Search(ctx, retrieval.SearchRequest{
-			SnapshotID: run.SnapshotID, CodeIndexBuildID: run.CodeIndexBuildID,
-			RetrievalBuildID: run.RetrievalBuildID, Query: query, TopK: 8,
+			SnapshotID: spec.Lineage.SnapshotID, CodeIndexBuildID: spec.Lineage.CodeIndexBuildID,
+			RetrievalBuildID: spec.Lineage.RetrievalBuildID, Query: query, TopK: 8,
 		})
 		if searchErr != nil {
 			return nil, jobs.NewPermanentError("RETRIEVAL_FAILED", "initial retrieval failed", searchErr)
@@ -211,10 +211,10 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 			if e.evidenceIssuer != nil {
 				item, issueErr := e.evidenceIssuer.Issue(ctx, evidence.IssueRequest{
 					AttemptID:        attempt.ID,
-					DiagnosisRunID:   run.ID,
-					RepositoryID:     run.RepositoryID,
-					SnapshotID:       run.SnapshotID,
-					CodeIndexBuildID: run.CodeIndexBuildID,
+					DiagnosisRunID:   spec.RunID,
+					RepositoryID:     spec.Lineage.RepositoryID,
+					SnapshotID:       spec.Lineage.SnapshotID,
+					CodeIndexBuildID: spec.Lineage.CodeIndexBuildID,
 					SourceKind:       evidence.SourceInitialRetrieval,
 					RetrievalChunkID: results[i].ChunkID,
 					FilePath:         results[i].Path,
@@ -230,17 +230,17 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 				results[i].StartLine = item.StartLine
 				results[i].EndLine = item.EndLine
 				results[i].Snippet = item.DisplayExcerpt
-			} else if excerpt, readErr := e.storeFS.ReadFile(ctx, run.RepositoryID, run.SnapshotID, results[i].Path, startLine, endLine); readErr == nil && strings.TrimSpace(excerpt) != "" {
+			} else if excerpt, readErr := e.storeFS.ReadFile(ctx, spec.Lineage.RepositoryID, spec.Lineage.SnapshotID, results[i].Path, startLine, endLine); readErr == nil && strings.TrimSpace(excerpt) != "" {
 				results[i].Snippet = excerpt
 			}
 		}
 		loop.WithInitialEvidence(query, retrieval.BuildEvidencePacket(results, packetBytes))
 	}
-	res, err := loop.Run(ctx, run, attempt)
+	res, err := loop.Run(ctx, spec, attempt)
 	if err != nil {
 		if res != nil {
 			progress := &ExecutionResult{
-				Report: resolveDraft(ctx, e.evidenceIssuer, res.ReportDraft, run, attempt), ReportDraft: res.ReportDraft, RawOutput: res.RawOutput,
+				Report: resolveDraft(ctx, e.evidenceIssuer, res.ReportDraft, spec, attempt), ReportDraft: res.ReportDraft, RawOutput: res.RawOutput,
 				PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
 				CachedPromptTokens: res.CachedPromptTokens, ReasoningTokens: res.ReasoningTokens,
 				ToolCalls: res.ToolCallsCount, ToolNames: res.ToolNames, AgentRounds: res.AgentRounds,
@@ -254,7 +254,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, run *diagnosis.Diagn
 	}
 
 	return &ExecutionResult{
-		Report:             resolveDraft(ctx, e.evidenceIssuer, res.ReportDraft, run, attempt),
+		Report:             resolveDraft(ctx, e.evidenceIssuer, res.ReportDraft, spec, attempt),
 		ReportDraft:        res.ReportDraft,
 		RawOutput:          res.RawOutput,
 		PromptTokens:       res.PromptTokens,
@@ -288,16 +288,16 @@ func evidenceContentBudget(toolResultLimit int) int {
 	return toolResultLimit
 }
 
-func resolveDraft(ctx context.Context, issuer evidence.EvidenceIssuer, draft *evidence.ReportDraft, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) *evidence.DiagnosisReportData {
+func resolveDraft(ctx context.Context, issuer evidence.EvidenceIssuer, draft *evidence.ReportDraft, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) *evidence.DiagnosisReportData {
 	if draft == nil {
 		return &evidence.DiagnosisReportData{}
 	}
 	report, _ := evidence.ResolveReportDraft(ctx, issuer, draft, evidence.DraftLineage{
 		AttemptID:        attempt.ID,
-		DiagnosisRunID:   run.ID,
-		RepositoryID:     run.RepositoryID,
-		SnapshotID:       run.SnapshotID,
-		CodeIndexBuildID: run.CodeIndexBuildID,
+		DiagnosisRunID:   spec.RunID,
+		RepositoryID:     spec.Lineage.RepositoryID,
+		SnapshotID:       spec.Lineage.SnapshotID,
+		CodeIndexBuildID: spec.Lineage.CodeIndexBuildID,
 	})
 	if report == nil {
 		return &evidence.DiagnosisReportData{}

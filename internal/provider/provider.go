@@ -164,10 +164,9 @@ type Manager struct {
 	mu              sync.RWMutex
 }
 
-// BuildForDiagnosis loads the current secret for every execution while using
-// the identity pinned on the DiagnosisRun. This permits API-key rotation but
-// prevents a queued diagnosis from silently changing endpoint or model.
-func (m *Manager) BuildForDiagnosis(ctx context.Context, run *diagnosis.DiagnosisRun) (llm.Provider, error) {
+// BuildForExecution reloads only the current secret while keeping the
+// endpoint, model and request settings pinned by the diagnosis run.
+func (m *Manager) BuildForExecution(ctx context.Context, provider diagnosis.ProviderSnapshot) (llm.Provider, error) {
 	cfg, err := m.GetSecretConfig()
 	if err != nil {
 		return nil, err
@@ -176,29 +175,32 @@ func (m *Manager) BuildForDiagnosis(ctx context.Context, run *diagnosis.Diagnosi
 	if err != nil {
 		return nil, fmt.Errorf("invalid current provider endpoint: %w", err)
 	}
-	if run.ProviderEndpointFingerprint != "" && ComputeEndpointFingerprint(normalized) != run.ProviderEndpointFingerprint {
+	if provider.EndpointFingerprint != "" && ComputeEndpointFingerprint(normalized) != provider.EndpointFingerprint {
+		return nil, jobs.NewPermanentError("PROVIDER_ENDPOINT_MISMATCH", "current provider endpoint differs from diagnosis pin", nil)
+	}
+	if provider.NormalizedBaseURL != "" && normalized != provider.NormalizedBaseURL {
 		return nil, jobs.NewPermanentError("PROVIDER_ENDPOINT_MISMATCH", "current provider endpoint differs from diagnosis pin", nil)
 	}
 	modelName := strings.TrimSpace(cfg.Model)
-	if run.ModelName != "" && modelName != run.ModelName {
+	if provider.ModelName != "" && modelName != provider.ModelName {
 		return nil, jobs.NewPermanentError("PROVIDER_CONFIG_MISMATCH", "current provider model differs from diagnosis pin", nil)
 	}
-	if run.ModelName != "" {
-		modelName = run.ModelName
+	if provider.ModelName != "" {
+		modelName = provider.ModelName
 	}
-	if run.ProviderConfigFingerprint != "" && ComputeConfigFingerprint(normalized, modelName, cfg.AuthMode) != run.ProviderConfigFingerprint {
+	if provider.ConfigFingerprint != "" && ComputeConfigFingerprint(normalized, modelName, cfg.AuthMode) != provider.ConfigFingerprint {
 		return nil, jobs.NewPermanentError("PROVIDER_CONFIG_MISMATCH", "current provider model or authentication mode differs from diagnosis pin", nil)
 	}
 	if cfg.IsDemo || m.envProvider == "fake" && normalized == "http://localhost/fake" {
 		return llm.NewFakeProvider(llm.ModeNormalStructured), nil
 	}
 	timeout := m.providerTimeout
-	if run.ProviderTimeoutSeconds > 0 {
-		timeout = time.Duration(run.ProviderTimeoutSeconds) * time.Second
+	if provider.TimeoutSeconds > 0 {
+		timeout = time.Duration(provider.TimeoutSeconds) * time.Second
 	}
 	retries := m.providerRetries
-	if run.ProviderRetryAttempts >= 0 {
-		retries = run.ProviderRetryAttempts
+	if provider.RetryAttempts >= 0 {
+		retries = provider.RetryAttempts
 	}
 	baseProvider := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout(cfg.APIKey, normalized, modelName, cfg.AuthMode, timeout)
 	return llm.NewRetryingProvider(baseProvider, retries), nil

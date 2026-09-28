@@ -167,7 +167,11 @@ func (r *Runner) RunEndToEndDiagnosisEval(ctx context.Context, provider llm.Prov
 			Status:         diagnosis.AttemptStatusRunning,
 		}
 
-		execRes, err := executor.Execute(ctx, diagRun, attempt)
+		spec, err := diagnosis.BuildExecutionSpec(diagRun)
+		if err != nil {
+			return nil, err
+		}
+		execRes, err := executor.Execute(ctx, spec, attempt)
 		latency := time.Since(start).Milliseconds()
 
 		if err != nil || execRes == nil || execRes.Report == nil {

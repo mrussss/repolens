@@ -71,7 +71,7 @@ func TestRequestHashAndIdempotencyConflict(t *testing.T) {
 	diagStore := diagnosis.NewStore(db)
 	repoStore := repo.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	diagSvc := diagnosis.NewService(diagStore, repoStore, snapStore)
+	diagSvc := newDiagnosisTestService(db, diagStore, repoStore, snapStore)
 
 	userID := "user-123"
 	repoID := "repo-123"
@@ -156,7 +156,7 @@ func TestRequestHashAndIdempotencyConflict(t *testing.T) {
 
 func TestCreateRequiresPinnedBuildIDs(t *testing.T) {
 	db := setupTestDB(t)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 
 	_, _, err := svc.Create(context.Background(), diagnosis.CreateDiagnosisInput{
 		UserID:       "user-builds",

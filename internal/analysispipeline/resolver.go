@@ -24,6 +24,86 @@ func NewResolver(revisions revision.Store, snapshots snapshot.Store, codeintel c
 	return &Resolver{revisions: revisions, snapshots: snapshots, codeintel: codeintel}
 }
 
+// RepositoryForRevision exposes only the repository identity needed to
+// authorize a revision before revealing the state of its derived artifacts.
+func (r *Resolver) RepositoryForRevision(ctx context.Context, revisionID string) (string, error) {
+	if r == nil || r.revisions == nil {
+		return "", errors.New("READY lineage resolver is not configured")
+	}
+	rev, err := r.revisions.GetByID(ctx, revisionID)
+	if err != nil {
+		return "", err
+	}
+	if rev == nil {
+		return "", revision.ErrNotFound
+	}
+	return rev.RepositoryID, nil
+}
+
+func (r *Resolver) ResolveLegacyReady(ctx context.Context, repositoryID, snapshotID string, codeIndexBuildID, retrievalBuildID int64) (ResolvedLineage, error) {
+	if r == nil || r.snapshots == nil {
+		return ResolvedLineage{}, errors.New("READY lineage resolver is not configured")
+	}
+	if repositoryID == "" || snapshotID == "" || codeIndexBuildID <= 0 || retrievalBuildID <= 0 {
+		return ResolvedLineage{}, codeintelstore.ErrBuildLineageMismatch
+	}
+	snap, err := r.snapshots.GetByID(ctx, snapshotID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ResolvedLineage{}, fmt.Errorf("snapshot %s not found", snapshotID)
+		}
+		return ResolvedLineage{}, err
+	}
+	if snap == nil {
+		return ResolvedLineage{}, fmt.Errorf("snapshot %s not found", snapshotID)
+	}
+	if snap.Status != snapshot.StatusReady {
+		return ResolvedLineage{}, fmt.Errorf("snapshot %s is not READY (current status: %s)", snapshotID, snap.Status)
+	}
+	if r.codeintel == nil {
+		return ResolvedLineage{RepositoryID: repositoryID, CommitSHA: snap.CommitSHA, SnapshotID: snap.ID, CodeIndexBuildID: codeIndexBuildID, RetrievalBuildID: retrievalBuildID}, nil
+	}
+	if snap.RepositoryID != repositoryID {
+		return ResolvedLineage{}, codeintelstore.ErrBuildLineageMismatch
+	}
+	if err := r.codeintel.ValidateLineage(ctx, repositoryID, snapshotID, codeIndexBuildID, retrievalBuildID); err != nil {
+		return ResolvedLineage{}, err
+	}
+	codeBuild, err := r.codeintel.GetByID(ctx, codeIndexBuildID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ResolvedLineage{}, fmt.Errorf("%w: code index build %d", ErrBuildNotReady, codeIndexBuildID)
+		}
+		return ResolvedLineage{}, fmt.Errorf("failed to load code index build %d: %w", codeIndexBuildID, err)
+	}
+	if codeBuild == nil {
+		return ResolvedLineage{}, fmt.Errorf("%w: code index build %d", ErrBuildNotReady, codeIndexBuildID)
+	}
+	if codeBuild.Status != codeintelmodel.BuildStatusReady {
+		return ResolvedLineage{}, fmt.Errorf("%w: code index build %d is %s", ErrBuildNotReady, codeIndexBuildID, codeBuild.Status)
+	}
+	retrievalBuild, err := r.codeintel.GetRetrievalBuildByID(ctx, retrievalBuildID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ResolvedLineage{}, fmt.Errorf("%w: retrieval build %d", ErrBuildNotReady, retrievalBuildID)
+		}
+		return ResolvedLineage{}, fmt.Errorf("failed to load retrieval build %d: %w", retrievalBuildID, err)
+	}
+	if retrievalBuild == nil {
+		return ResolvedLineage{}, fmt.Errorf("%w: retrieval build %d", ErrBuildNotReady, retrievalBuildID)
+	}
+	if retrievalBuild.Status != codeintelmodel.BuildStatusReady {
+		return ResolvedLineage{}, fmt.Errorf("%w: retrieval build %d is %s", ErrBuildNotReady, retrievalBuildID, retrievalBuild.Status)
+	}
+	return ResolvedLineage{
+		RepositoryID:     repositoryID,
+		CommitSHA:        snap.CommitSHA,
+		SnapshotID:       snap.ID,
+		CodeIndexBuildID: codeBuild.ID,
+		RetrievalBuildID: retrievalBuild.ID,
+	}, nil
+}
+
 func (r *Resolver) ResolveReadyLineage(ctx context.Context, revisionID string) (ResolvedLineage, error) {
 	if r == nil || r.revisions == nil || r.snapshots == nil || r.codeintel == nil {
 		return ResolvedLineage{}, errors.New("READY lineage resolver is not configured")

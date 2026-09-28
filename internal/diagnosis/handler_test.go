@@ -19,6 +19,7 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	"repolens/internal/analysispipeline"
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
@@ -30,6 +31,20 @@ import (
 	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
+
+func newDiagnosisTestService(db *gorm.DB, store diagnosis.Store, repositories repo.Store, snapshots snapshot.Store) *diagnosis.Service {
+	return diagnosis.NewService(diagnosis.ServiceDependencies{
+		Store: store, RepoStore: repositories,
+		Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshots, nil),
+	})
+}
+
+func newDiagnosisTestServiceWithCodeIntel(db *gorm.DB, store diagnosis.Store, repositories repo.Store, snapshots snapshot.Store) *diagnosis.Service {
+	return diagnosis.NewService(diagnosis.ServiceDependencies{
+		Store: store, RepoStore: repositories,
+		Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshots, codeintelstore.NewStore(db)),
+	})
+}
 
 func TestDiagnosisRequestUsesSharedV22Fixture(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
@@ -79,7 +94,7 @@ func TestDiagnosisRevisionSubmissionRequiresRepositoryOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedReadyDiagnosisLineage(t, db)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repoStore, snapshot.NewStore(db)).WithRevisionStore(revision.NewStore(db)).WithCodeIntelStore(codeintelstore.NewStore(db))
+	svc := newDiagnosisTestServiceWithCodeIntel(db, diagnosis.NewStore(db), repoStore, snapshot.NewStore(db))
 	_, _, err := svc.Create(ctx, diagnosis.CreateDiagnosisInput{
 		UserID: "attacker", AnalysisRevisionID: "private-revision", IssueTitle: "should not access", IdempotencyKey: "ownership-key",
 	})
@@ -96,7 +111,7 @@ func TestDiagnosisRevisionSubmissionUsesResolvedLineage(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedReadyDiagnosisLineage(t, db)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repoStore, snapshot.NewStore(db)).WithRevisionStore(revision.NewStore(db)).WithCodeIntelStore(codeintelstore.NewStore(db))
+	svc := newDiagnosisTestServiceWithCodeIntel(db, diagnosis.NewStore(db), repoStore, snapshot.NewStore(db))
 	input := diagnosis.CreateDiagnosisInput{
 		UserID: "owner", AnalysisRevisionID: "private-revision", IssueTitle: "issue", IdempotencyKey: "resolved-lineage-key",
 	}
@@ -121,10 +136,9 @@ func TestDiagnosisRevisionSubmissionUsesResolvedLineage(t *testing.T) {
 func TestDiagnosisCreateRejectsUnconfiguredProviderWithoutCreatingJob(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
 	diagStore := diagnosis.NewStore(db)
-	svc := diagnosis.NewService(diagStore, repo.NewStore(db), snapshot.NewStore(db))
-	svc.WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
+	svc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: diagStore, RepoStore: repo.NewStore(db), Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshot.NewStore(db), nil), ProviderSource: func() diagnosis.ProviderMetadata {
 		return diagnosis.ProviderMetadata{IsConfigured: false}
-	})
+	}})
 
 	router := diagnosisHandlerRouter(svc)
 	body := []byte(`{"repository_id":"repo","snapshot_id":"snapshot","issue_title":"issue","code_index_build_id":1,"retrieval_build_id":2}`)
@@ -158,7 +172,7 @@ func TestDiagnosisCreateRejectsUnconfiguredProviderWithoutCreatingJob(t *testing
 
 func TestDiagnosisCreateRejectsIncompleteBuildSelection(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	router := diagnosisHandlerRouter(svc)
 	for _, body := range []string{
 		`{"issue_title":"issue"}`,
@@ -174,7 +188,7 @@ func TestDiagnosisCreateRejectsIncompleteBuildSelection(t *testing.T) {
 
 func TestDiagnosisCreateAcceptsRevisionSelectionAtHandlerBoundary(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	router := diagnosisHandlerRouter(svc)
 	response := performDiagnosisCreate(router, `{"issue_title":"issue","analysis_revision_id":"rev"}`)
 	if response.Code == http.StatusBadRequest && strings.Contains(response.Body.String(), "INVALID_BUILD_SELECTION") {
@@ -184,7 +198,7 @@ func TestDiagnosisCreateAcceptsRevisionSelectionAtHandlerBoundary(t *testing.T) 
 
 func TestDiagnosisCreateRejectsMalformedTrailingAndUnknownJSON(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	router := diagnosisHandlerRouter(svc)
 	for _, body := range []string{
 		`{"issue_title":"issue","code_index_build_id":1,"retrieval_build_id":2`,
@@ -200,7 +214,7 @@ func TestDiagnosisCreateRejectsMalformedTrailingAndUnknownJSON(t *testing.T) {
 
 func TestDiagnosisCreateRejectsExplicitZeroOrNegativeBuildIDs(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	router := diagnosisHandlerRouter(svc)
 	for _, buildID := range []string{"0", "-1"} {
 		body := `{"analysis_revision_id":"rev","issue_title":"issue","code_index_build_id":` + buildID + `}`
@@ -225,7 +239,7 @@ func TestDiagnosisReportAPIExposesInvalidStructuredReport(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	handler := diagnosis.NewHandler(svc, evidence.NewReportStore(db), evidence.NewCitationStore(db), nil)
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set(string(logger.UserIDKey), "user"); c.Next() })
@@ -263,7 +277,7 @@ func TestDiagnosisReportDistinguishesMissingRowsFromStoreFailures(t *testing.T) 
 			if err := db.Create(run).Error; err != nil {
 				t.Fatal(err)
 			}
-			svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+			svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 			reportStore := reportStoreStub{report: &evidence.Report{ID: "report-for-errors", DiagnosisRunID: run.ID}, err: tt.reportErr}
 			citationStore := citationStoreStub{err: tt.citationErr}
 			handler := diagnosis.NewHandler(svc, reportStore, citationStore, nil)
@@ -316,7 +330,7 @@ func TestDiagnosisStatusExposesExplicitProviderRetryPolicy(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	svc := diagnosis.NewService(store, repo.NewStore(db), snapshot.NewStore(db)).WithJobStore(jobsStore)
+	svc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: store, RepoStore: repo.NewStore(db), Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshot.NewStore(db), nil), JobStore: jobsStore})
 	response := httptest.NewRecorder()
 	diagnosisHandlerRouter(svc).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID, nil))
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"retry_allowed":true`) || !strings.Contains(response.Body.String(), `"retry_error_code":"CHECKPOINT_SAVE_FAILED"`) {
@@ -361,9 +375,9 @@ func TestDiagnosisRetryIsFencedByPinnedProviderIdentity(t *testing.T) {
 	}
 
 	metadata := diagnosis.ProviderMetadata{IsConfigured: true, ConfigFingerprint: "changed-endpoint-model-auth"}
-	svc := diagnosis.NewService(store, repo.NewStore(db), snapshot.NewStore(db)).WithJobStore(jobsStore).WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
+	svc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: store, RepoStore: repo.NewStore(db), Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshot.NewStore(db), nil), JobStore: jobsStore, ProviderSource: func() diagnosis.ProviderMetadata {
 		return metadata
-	})
+	}})
 	if err := svc.Retry(ctx, run.ID, "user"); !errors.Is(err, diagnosis.ErrProviderIdentityChanged) {
 		t.Fatalf("retry with changed provider identity error = %v, want ErrProviderIdentityChanged", err)
 	}
@@ -418,7 +432,7 @@ func TestDiagnosisReportAPIExposesDegradedCitationReport(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	handler := diagnosis.NewHandler(svc, evidence.NewReportStore(db), evidence.NewCitationStore(db), nil)
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set(string(logger.UserIDKey), "user"); c.Next() })
@@ -432,7 +446,7 @@ func TestDiagnosisReportAPIExposesDegradedCitationReport(t *testing.T) {
 
 func TestDiagnosisHandlerGetDistinguishesNotFoundFromStoreFailure(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	router := diagnosisHandlerRouter(svc)
 
 	response := httptest.NewRecorder()
@@ -459,7 +473,7 @@ func TestDiagnosisHandlerGetDistinguishesNotFoundFromStoreFailure(t *testing.T) 
 
 func TestDiagnosisHandlerPaginationValidation(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	router := diagnosisHandlerRouter(svc)
 
 	tests := []struct {
@@ -530,7 +544,7 @@ func TestDiagnosisAttemptEndpointsEnforceRunAndAttemptOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
 	router := diagnosisHandlerRouter(svc)
 
 	response := httptest.NewRecorder()
@@ -564,10 +578,9 @@ func TestDiagnosisCreateIdempotencyReplayPrecedesProviderCheck(t *testing.T) {
 	}
 
 	configured := true
-	svc := diagnosis.NewService(diagnosis.NewStore(db), repoStore, snapshotStore)
-	svc.WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
+	svc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: diagnosis.NewStore(db), RepoStore: repoStore, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshotStore, nil), ProviderSource: func() diagnosis.ProviderMetadata {
 		return diagnosis.ProviderMetadata{IsConfigured: configured}
-	})
+	}})
 	input := diagnosis.CreateDiagnosisInput{
 		UserID: "user", RepositoryID: "repo-replay", SnapshotID: "snapshot-replay",
 		IssueTitle: "Authorization: Bearer title-secret", IssueDescription: "Authorization: Basic dXNlcjpwYXNz",

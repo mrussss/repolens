@@ -18,10 +18,12 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"repolens/internal/analysispipeline"
 	"repolens/internal/diagnosis"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
 	"repolens/internal/repo"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 )
 
@@ -460,7 +462,7 @@ func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
 	diagStore := diagnosis.NewStore(db)
 	repoStore := repo.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	diagSvc := diagnosis.NewService(diagStore, repoStore, snapStore)
+	diagSvc := diagnosis.NewService(diagnosis.ServiceDependencies{Store: diagStore, RepoStore: repoStore, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapStore, nil)})
 
 	testRepo := &repo.Repository{
 		ID:         "repo-real-mysql",

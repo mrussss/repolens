@@ -857,11 +857,15 @@ func runProviderPreflight(ctx context.Context, config providerConfig, guardConfi
 
 	loop := agent.NewAgentLoop(classifiedProvider{Provider: client}, agent.NewToolRegistry(), nil, guardConfig)
 	loop.WithGenerationOptions(generationOptions.AgentOptions())
-	loopResult, err := loop.Run(ctx, &diagnosis.DiagnosisRun{
+	preflightSpec, err := diagnosis.BuildExecutionSpec(&diagnosis.DiagnosisRun{
 		ID: "realbench-preflight", RepositoryID: "preflight", SnapshotID: "preflight",
 		IssueTitle: "preflight structured report", IssueDescription: "Return a concise diagnosis report.",
 		Temperature: 0.1, ModelName: config.Model,
-	}, &diagnosis.DiagnosisAttempt{ID: "realbench-preflight-attempt"})
+	})
+	if err != nil {
+		return result, err
+	}
+	loopResult, err := loop.Run(ctx, preflightSpec, &diagnosis.DiagnosisAttempt{ID: "realbench-preflight-attempt"})
 	if loopResult != nil {
 		result.AgentFinishReason = loopResult.FinishReason
 		result.AgentPromptTokens = loopResult.PromptTokens
@@ -961,7 +965,11 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 	executor.WithEvidenceIssuer(evidenceIssuer)
 	run := buildAgentRun(input, workspace, config.Model, guardConfig.MaxOutputTokens, generationOptions.ReasoningEffort)
 	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
-	result, err := executor.Execute(ctx, run, attempt)
+	spec, err := diagnosis.BuildExecutionSpec(run)
+	if err != nil {
+		return nil, nil, err
+	}
+	result, err := executor.Execute(ctx, spec, attempt)
 	if err != nil {
 		progress := executionProgress(err)
 		metrics := metricsFromExecution(progress, collector, time.Since(started).Milliseconds())

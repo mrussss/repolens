@@ -32,7 +32,7 @@ func TestFinalizeOnlyDoesNotExposeTools(t *testing.T) {
 	loop := NewAgentLoop(spy, NewToolRegistry(), nil, DefaultGuardConfig())
 	result, err := loop.finalizeOnly(
 		context.Background(),
-		&diagnosis.DiagnosisRun{Temperature: 0.1},
+		testExecutionSpec(&diagnosis.DiagnosisRun{Temperature: 0.1}),
 		&diagnosis.DiagnosisAttempt{ID: "attempt-finalize"},
 		[]llm.Message{{Role: llm.RoleUser, Content: "evidence"}},
 		"TOOL_BUDGET", 1, 2, 3, 4, 5, 6, nil, 1, 1,
@@ -49,7 +49,7 @@ func TestFinalizeOnlyReturnsProgressWhenProviderFails(t *testing.T) {
 	loop := NewAgentLoop(failingFinalizationProvider{}, NewToolRegistry(), nil, DefaultGuardConfig())
 	result, err := loop.finalizeOnly(
 		context.Background(),
-		&diagnosis.DiagnosisRun{Temperature: 0.1},
+		testExecutionSpec(&diagnosis.DiagnosisRun{Temperature: 0.1}),
 		&diagnosis.DiagnosisAttempt{ID: "attempt-finalize-error"},
 		[]llm.Message{{Role: llm.RoleUser, Content: "evidence"}},
 		"AGENT_ROUND_BUDGET", 10, 20, 3, 4, 2, 1, []string{"search_code"}, 2, 3,

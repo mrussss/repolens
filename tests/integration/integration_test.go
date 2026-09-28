@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"repolens/internal/agent"
+	"repolens/internal/analysispipeline"
 	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
@@ -24,9 +25,22 @@ import (
 	"repolens/internal/retrieval"
 	"repolens/internal/retrieval/artifact"
 	"repolens/internal/retrieval/bm25"
+	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 	"repolens/internal/worker"
 )
+
+func newIntegrationDiagnosisService(db *gorm.DB, store diagnosis.Store, repositories repo.Store, snapshots snapshot.Store) *diagnosis.Service {
+	return diagnosis.NewService(diagnosis.ServiceDependencies{Store: store, RepoStore: repositories, Lineage: analysispipeline.NewResolver(revision.NewStore(db), snapshots, nil)})
+}
+
+func integrationExecutionSpec(run *diagnosis.DiagnosisRun) diagnosis.DiagnosisExecutionSpec {
+	spec, err := diagnosis.BuildExecutionSpec(run)
+	if err != nil {
+		panic(err)
+	}
+	return spec
+}
 
 func setupTestDB(t *testing.T) (*gorm.DB, *jobs.Store) {
 	t.Helper()
@@ -54,7 +68,7 @@ func TestDiagnosisCreationAndIdempotency(t *testing.T) {
 
 	repoStore := repo.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	diagSvc := diagnosis.NewService(diagStore, repoStore, snapStore)
+	diagSvc := newIntegrationDiagnosisService(db, diagStore, repoStore, snapStore)
 
 	// Seed Repo and Snapshot in READY status
 	testRepo := &repo.Repository{
@@ -142,7 +156,7 @@ func TestDiagnosisJSONCredentialIsRedactedBeforeProviderInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	diagStore := diagnosis.NewStore(db)
-	diagService := diagnosis.NewService(diagStore, repoStore, snapshotStore)
+	diagService := newIntegrationDiagnosisService(db, diagStore, repoStore, snapshotStore)
 	run, created, err := diagService.Create(ctx, diagnosis.CreateDiagnosisInput{
 		UserID: "user-json-redaction", RepositoryID: "repo-json-redaction", SnapshotID: "snapshot-json-redaction",
 		IssueTitle: "credential leak", IssueDescription: `{"password":"supersecret123"}`,
@@ -164,7 +178,7 @@ func TestDiagnosisJSONCredentialIsRedactedBeforeProviderInput(t *testing.T) {
 	}
 	provider := &diagnosisPromptCaptureProvider{}
 	loop := agent.NewAgentLoop(provider, agent.NewToolRegistry(), nil, agent.DefaultGuardConfig())
-	if _, err := loop.Run(ctx, persisted, &diagnosis.DiagnosisAttempt{ID: "attempt-json-redaction"}); err != nil {
+	if _, err := loop.Run(ctx, integrationExecutionSpec(persisted), &diagnosis.DiagnosisAttempt{ID: "attempt-json-redaction"}); err != nil {
 		t.Fatalf("run AgentLoop: %v", err)
 	}
 	if len(provider.requests) != 1 {
@@ -204,7 +218,7 @@ func TestConcurrentWorkerClaimFencing(t *testing.T) {
 	diagStore := diagnosis.NewStore(db)
 	repoStore := repo.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	diagSvc := diagnosis.NewService(diagStore, repoStore, snapStore)
+	diagSvc := newIntegrationDiagnosisService(db, diagStore, repoStore, snapStore)
 
 	testRepo := &repo.Repository{ID: "repo-200", UserID: "u2", Name: "r2", GitURL: "https://github.com/a/b", Status: "ACTIVE"}
 	_ = repoStore.Create(ctx, testRepo)
@@ -254,7 +268,7 @@ func TestDBJobWorkerPipeline(t *testing.T) {
 	citStore := evidence.NewCitationStore(db)
 	repoStore := repo.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	diagSvc := diagnosis.NewService(diagStore, repoStore, snapStore)
+	diagSvc := newIntegrationDiagnosisService(db, diagStore, repoStore, snapStore)
 
 	testRepo := &repo.Repository{ID: "repo-300", UserID: "u3", Name: "r3", GitURL: "https://github.com/a/b", Status: "ACTIVE"}
 	_ = repoStore.Create(ctx, testRepo)
@@ -420,7 +434,7 @@ type FlakyRateLimitExecutor struct {
 	attemptCount int
 }
 
-func (e *FlakyRateLimitExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*agent.ExecutionResult, error) {
+func (e *FlakyRateLimitExecutor) Execute(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*agent.ExecutionResult, error) {
 	e.attemptCount++
 	if e.attemptCount == 1 {
 		return &agent.ExecutionResult{
@@ -459,7 +473,7 @@ func TestApplicationRetryOn429RateLimit(t *testing.T) {
 	citStore := evidence.NewCitationStore(db)
 	repoStore := repo.NewStore(db)
 	snapStore := snapshot.NewStore(db)
-	diagSvc := diagnosis.NewService(diagStore, repoStore, snapStore)
+	diagSvc := newIntegrationDiagnosisService(db, diagStore, repoStore, snapStore)
 
 	testRepo := &repo.Repository{ID: "repo-400", UserID: "u4", Name: "r4", GitURL: "https://github.com/a/b", Status: "ACTIVE"}
 	_ = repoStore.Create(ctx, testRepo)

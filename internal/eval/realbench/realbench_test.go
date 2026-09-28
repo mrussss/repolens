@@ -19,6 +19,14 @@ import (
 	"repolens/internal/trace"
 )
 
+func testRealBenchSpec(run *diagnosis.DiagnosisRun) diagnosis.DiagnosisExecutionSpec {
+	spec, err := diagnosis.BuildExecutionSpec(run)
+	if err != nil {
+		panic(err)
+	}
+	return spec
+}
+
 func TestSyntheticRunnerKeepsGroundTruthOutOfPrediction(t *testing.T) {
 	root := writeSyntheticDataset(t)
 	dataset, err := LoadInputs(root)
@@ -112,7 +120,7 @@ func TestGroundTruthSentinelDoesNotReachProvider(t *testing.T) {
 		ID: "run-leakage", RepositoryID: input.CaseID, SnapshotID: input.CaseID,
 		IssueTitle: input.IssueTitle, IssueDescription: input.IssueDescription, ErrorLog: input.ErrorLog,
 	}
-	if _, err := loop.Run(context.Background(), run, &diagnosis.DiagnosisAttempt{ID: "attempt-leakage"}); err != nil {
+	if _, err := loop.Run(context.Background(), testRealBenchSpec(run), &diagnosis.DiagnosisAttempt{ID: "attempt-leakage"}); err != nil {
 		t.Fatal(err)
 	}
 	for _, request := range provider.requests {
@@ -214,7 +222,7 @@ func TestRealBenchGenerationOptionsReachProviderRequest(t *testing.T) {
 		ReasoningEffort: "low",
 		ResponseFormat:  "none",
 	}).AgentOptions())
-	if _, err := loop.Run(context.Background(), &diagnosis.DiagnosisRun{IssueTitle: "issue"}, &diagnosis.DiagnosisAttempt{ID: "attempt-realbench-options"}); err != nil {
+	if _, err := loop.Run(context.Background(), testRealBenchSpec(&diagnosis.DiagnosisRun{IssueTitle: "issue"}), &diagnosis.DiagnosisAttempt{ID: "attempt-realbench-options"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(provider.requests) != 1 || provider.requests[0].ReasoningEffort != "low" || provider.requests[0].ResponseFormat != nil {

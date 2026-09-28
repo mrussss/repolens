@@ -40,7 +40,7 @@ func TestProviderPromptContainsOnlyRedactedPersistedDiagnosisInput(t *testing.T)
 		IssueTitle: "issue", IssueDescription: `{"password":"supersecret123"}`,
 		ErrorLog: `{"password": "supersecret123"}`,
 	}
-	if _, err := loop.Run(context.Background(), run, &diagnosis.DiagnosisAttempt{ID: "attempt-redacted-prompt"}); err != nil {
+	if _, err := loop.Run(context.Background(), testExecutionSpec(run), &diagnosis.DiagnosisAttempt{ID: "attempt-redacted-prompt"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(provider.requests) != 1 {
@@ -62,10 +62,10 @@ func runLoopResponseTest(t *testing.T, response llm.GenerateResponse, maxOutputT
 		MaxRepeatCalls:  1,
 		MaxOutputTokens: maxOutputTokens,
 	})
-	return loop.Run(context.Background(), &diagnosis.DiagnosisRun{
+	return loop.Run(context.Background(), testExecutionSpec(&diagnosis.DiagnosisRun{
 		ID: "run-loop-response", RepositoryID: "repo", SnapshotID: "snapshot",
 		IssueTitle: "issue", IssueDescription: "description", ErrorLog: "error",
-	}, &diagnosis.DiagnosisAttempt{ID: "attempt-loop-response"})
+	}), &diagnosis.DiagnosisAttempt{ID: "attempt-loop-response"})
 }
 
 func TestAgentLoopRejectsLengthTruncationBeforeParsing(t *testing.T) {
@@ -147,7 +147,7 @@ func TestParseReportJSONRejectsInvalidStructuredReports(t *testing.T) {
 func TestAgentLoopGenerationOptionsReachProviderAndDefaultRemainsCompatible(t *testing.T) {
 	defaultProvider := &generationOptionsProvider{}
 	defaultLoop := NewAgentLoop(defaultProvider, NewToolRegistry(), nil, DefaultGuardConfig())
-	if _, err := defaultLoop.Run(context.Background(), &diagnosis.DiagnosisRun{IssueTitle: "issue"}, &diagnosis.DiagnosisAttempt{ID: "attempt-default-options"}); err != nil {
+	if _, err := defaultLoop.Run(context.Background(), testExecutionSpec(&diagnosis.DiagnosisRun{IssueTitle: "issue"}), &diagnosis.DiagnosisAttempt{ID: "attempt-default-options"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(defaultProvider.requests) != 1 || defaultProvider.requests[0].ReasoningEffort != "" || defaultProvider.requests[0].ResponseFormat == nil || defaultProvider.requests[0].ResponseFormat.Type != "json_object" {
@@ -162,7 +162,7 @@ func TestAgentLoopGenerationOptionsReachProviderAndDefaultRemainsCompatible(t *t
 		ReasoningEffort: "low",
 		ResponseFormat:  nil,
 	})
-	if _, err := experimentLoop.Run(context.Background(), &diagnosis.DiagnosisRun{IssueTitle: "issue"}, &diagnosis.DiagnosisAttempt{ID: "attempt-experiment-options"}); err != nil {
+	if _, err := experimentLoop.Run(context.Background(), testExecutionSpec(&diagnosis.DiagnosisRun{IssueTitle: "issue"}), &diagnosis.DiagnosisAttempt{ID: "attempt-experiment-options"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(experimentProvider.requests) != 1 || experimentProvider.requests[0].ReasoningEffort != "low" || experimentProvider.requests[0].ResponseFormat != nil {

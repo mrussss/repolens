@@ -18,6 +18,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	"repolens/internal/agent"
+	"repolens/internal/analysispipeline"
 	"repolens/internal/codeintel"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
@@ -156,15 +157,16 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 		t.Fatalf("revision = %+v, want READY", readyRevision)
 	}
 
-	diagnosisService := diagnosis.NewService(diagnosisStore, repositoryStore, snapshotStore).
-		WithCodeIntelStore(codeIndexStore).
-		WithRevisionStore(revisionStore).
-		WithProviderMetadata(diagnosis.ProviderMetadata{
-			IsConfigured:    true,
-			ModelName:       "scripted-golden-path",
-			AgentConfigHash: "golden-path-config",
-			Temperature:     0.1,
-		})
+	diagnosisService := diagnosis.NewService(diagnosis.ServiceDependencies{
+		Store: diagnosisStore, RepoStore: repositoryStore,
+		Lineage: analysispipeline.NewResolver(revisionStore, snapshotStore, codeIndexStore),
+		ProviderSource: func() diagnosis.ProviderMetadata {
+			return diagnosis.ProviderMetadata{
+				IsConfigured: true, ModelName: "scripted-golden-path",
+				AgentConfigHash: "golden-path-config", Temperature: 0.1,
+			}
+		},
+	})
 	run, created, err := diagnosisService.Create(ctx, diagnosis.CreateDiagnosisInput{
 		UserID:             repository.UserID,
 		RepositoryID:       repository.ID,

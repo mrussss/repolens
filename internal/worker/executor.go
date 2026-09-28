@@ -17,7 +17,7 @@ func NewFakeDiagnosisExecutor() *FakeDiagnosisExecutor {
 	return &FakeDiagnosisExecutor{}
 }
 
-func (e *FakeDiagnosisExecutor) Execute(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
+func (e *FakeDiagnosisExecutor) Execute(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
 	report := &evidence.DiagnosisReportData{
 		ConclusionKind: evidence.ConclusionRootCause,
 		Summary:        "Root cause identified in repository repository based on logs and code structure",
@@ -28,7 +28,7 @@ func (e *FakeDiagnosisExecutor) Execute(ctx context.Context, run *diagnosis.Diag
 				Reasoning: "The database configuration pointer was accessed without verifying if the config struct was populated",
 				Citations: []evidence.Citation{
 					{
-						SnapshotID: run.SnapshotID,
+						SnapshotID: spec.Lineage.SnapshotID,
 						FilePath:   "internal/platform/config/config.go",
 						StartLine:  1,
 						EndLine:    15,

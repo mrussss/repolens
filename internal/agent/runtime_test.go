@@ -12,6 +12,14 @@ type runtimeGenerationProvider struct {
 	requests []llm.GenerateRequest
 }
 
+func testExecutionSpec(run *diagnosis.DiagnosisRun) diagnosis.DiagnosisExecutionSpec {
+	spec, err := diagnosis.BuildExecutionSpec(run)
+	if err != nil {
+		panic(err)
+	}
+	return spec
+}
+
 func (p *runtimeGenerationProvider) Generate(_ context.Context, request llm.GenerateRequest) (llm.GenerateResponse, error) {
 	p.requests = append(p.requests, request)
 	return llm.GenerateResponse{
@@ -26,7 +34,7 @@ func TestRuntimeUsesFrozenRunReasoningEffortAndSupportsEmptyValue(t *testing.T) 
 			provider := &runtimeGenerationProvider{}
 			executor := NewAgentRuntimeExecutor(provider, nil, nil, nil, DefaultGuardConfig())
 			run := &diagnosis.DiagnosisRun{ID: "run-runtime-" + want, IssueTitle: "issue", ReasoningEffort: want}
-			if _, err := executor.Execute(context.Background(), run, &diagnosis.DiagnosisAttempt{ID: "attempt-runtime-" + want}); err != nil {
+			if _, err := executor.Execute(context.Background(), testExecutionSpec(run), &diagnosis.DiagnosisAttempt{ID: "attempt-runtime-" + want}); err != nil {
 				t.Fatal(err)
 			}
 			if len(provider.requests) != 1 || provider.requests[0].ReasoningEffort != want {
@@ -41,7 +49,7 @@ func TestRuntimeResumeKeepsRunReasoningEffort(t *testing.T) {
 	executor := NewAgentRuntimeExecutor(provider, nil, nil, nil, DefaultGuardConfig())
 	run := &diagnosis.DiagnosisRun{ID: "run-runtime-resume", IssueTitle: "issue", ReasoningEffort: "low"}
 	for _, attemptID := range []string{"attempt-runtime-1", "attempt-runtime-2"} {
-		if _, err := executor.Execute(context.Background(), run, &diagnosis.DiagnosisAttempt{ID: attemptID}); err != nil {
+		if _, err := executor.Execute(context.Background(), testExecutionSpec(run), &diagnosis.DiagnosisAttempt{ID: attemptID}); err != nil {
 			t.Fatal(err)
 		}
 	}

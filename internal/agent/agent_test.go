@@ -100,7 +100,11 @@ func TestAgentLoopExecutionWithToolCalling(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := loop.Run(ctx, run, attempt)
+	spec, err := diagnosis.BuildExecutionSpec(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := loop.Run(ctx, spec, attempt)
 	if err != nil || result == nil {
 		t.Fatalf("agent loop execution failed: %v", err)
 	}

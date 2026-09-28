@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"repolens/internal/analysispipeline"
 	"repolens/internal/codeintel"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/diagnosis"
@@ -94,39 +95,37 @@ func run() error {
 		time.Duration(cfg.ProviderTimeoutSeconds)*time.Second,
 		cfg.ProviderRetryAttempts,
 	)
-	diagnosisSvc := diagnosis.NewService(
-		diagnosisStore,
-		repoStore,
-		snapshotStore,
-	)
-	diagnosisSvc.WithCodeIntelStore(codeIntelStore)
-	diagnosisSvc.WithRevisionStore(revisionStore)
-	diagnosisSvc.WithJobStore(jobStore)
-	diagnosisSvc.WithProviderMetadataSource(func() diagnosis.ProviderMetadata {
-		status := providerMgr.GetPublicStatus()
-		return diagnosis.ProviderMetadata{
-			EndpointFingerprint:    status.EndpointFingerprint,
-			ConfigFingerprint:      status.ConfigFingerprint,
-			NormalizedBaseURL:      status.BaseURL,
-			ModelName:              status.Model,
-			IsConfigured:           status.IsConfigured,
-			IsDemo:                 status.IsDemo,
-			PromptVersion:          diagnosis.CurrentPromptVersion,
-			AgentVersion:           diagnosis.CurrentAgentVersion,
-			AgentConfigHash:        diagnosis.ComputeAgentConfigHashWithGenerationOptions(8, 12, 3, 2, 32*1024, 32*1024, 1, cfg.MaxOutputTokens, cfg.ProviderTimeoutSeconds, cfg.ProviderRetryAttempts, 0.1, cfg.ReasoningEffort, "json_object"),
-			Temperature:            0.1,
-			MaxAgentRounds:         8,
-			MaxToolCalls:           12,
-			MaxSearchCalls:         3,
-			MaxRepeatCalls:         2,
-			MaxEvidencePacketBytes: 32 * 1024,
-			MaxToolResultBytes:     32 * 1024,
-			FinalizationTurns:      1,
-			MaxOutputTokens:        cfg.MaxOutputTokens,
-			ReasoningEffort:        cfg.ReasoningEffort,
-			ProviderTimeoutSeconds: cfg.ProviderTimeoutSeconds,
-			ProviderRetryAttempts:  cfg.ProviderRetryAttempts,
-		}
+	diagnosisSvc := diagnosis.NewService(diagnosis.ServiceDependencies{
+		Store:     diagnosisStore,
+		RepoStore: repoStore,
+		Lineage:   analysispipeline.NewResolver(revisionStore, snapshotStore, codeIntelStore),
+		JobStore:  jobStore,
+		ProviderSource: func() diagnosis.ProviderMetadata {
+			status := providerMgr.GetPublicStatus()
+			return diagnosis.ProviderMetadata{
+				EndpointFingerprint:    status.EndpointFingerprint,
+				ConfigFingerprint:      status.ConfigFingerprint,
+				NormalizedBaseURL:      status.BaseURL,
+				ModelName:              status.Model,
+				IsConfigured:           status.IsConfigured,
+				IsDemo:                 status.IsDemo,
+				PromptVersion:          diagnosis.CurrentPromptVersion,
+				AgentVersion:           diagnosis.CurrentAgentVersion,
+				AgentConfigHash:        diagnosis.ComputeAgentConfigHashWithGenerationOptions(8, 12, 3, 2, 32*1024, 32*1024, 1, cfg.MaxOutputTokens, cfg.ProviderTimeoutSeconds, cfg.ProviderRetryAttempts, 0.1, cfg.ReasoningEffort, "json_object"),
+				Temperature:            0.1,
+				MaxAgentRounds:         8,
+				MaxToolCalls:           12,
+				MaxSearchCalls:         3,
+				MaxRepeatCalls:         2,
+				MaxEvidencePacketBytes: 32 * 1024,
+				MaxToolResultBytes:     32 * 1024,
+				FinalizationTurns:      1,
+				MaxOutputTokens:        cfg.MaxOutputTokens,
+				ReasoningEffort:        cfg.ReasoningEffort,
+				ProviderTimeoutSeconds: cfg.ProviderTimeoutSeconds,
+				ProviderRetryAttempts:  cfg.ProviderRetryAttempts,
+			}
+		},
 	})
 
 	// Handlers

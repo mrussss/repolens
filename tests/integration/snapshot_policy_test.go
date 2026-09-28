@@ -208,10 +208,10 @@ func TestSnapshotVisibilityMatchesManifestCodeIndexReadFileAndEvidence(t *testin
 	)
 	registry.Register(providerReadTool)
 	loop := agent.NewAgentLoop(provider, registry, nil, agent.DefaultGuardConfig())
-	_, err = loop.Run(ctx, &diagnosis.DiagnosisRun{
+	_, err = loop.Run(ctx, integrationExecutionSpec(&diagnosis.DiagnosisRun{
 		ID: "run-policy-provider", RepositoryID: repoID, SnapshotID: snapshotID,
 		IssueTitle: "inspect credentials file",
-	}, &diagnosis.DiagnosisAttempt{ID: "attempt-policy-provider"})
+	}), &diagnosis.DiagnosisAttempt{ID: "attempt-policy-provider"})
 	if err != nil {
 		t.Fatalf("run provider boundary check: %v", err)
 	}

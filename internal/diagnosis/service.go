@@ -6,10 +6,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"gorm.io/gorm"
-
 	"repolens/internal/analysispipeline"
-	codeintelmodel "repolens/internal/codeintel/model"
 	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/jobs"
 	platformconfig "repolens/internal/platform/config"
@@ -17,7 +14,6 @@ import (
 	"repolens/internal/platform/redaction"
 	"repolens/internal/repo"
 	"repolens/internal/revision"
-	"repolens/internal/snapshot"
 )
 
 var ErrInputTooLarge = errors.New("diagnosis input exceeds configured limit")
@@ -77,49 +73,29 @@ type ProviderMetadata struct {
 	ProviderRetryAttempts  int
 }
 
+type ServiceDependencies struct {
+	Store          Store
+	RepoStore      repo.Store
+	Lineage        *analysispipeline.Resolver
+	JobStore       *jobs.Store
+	ProviderSource func() ProviderMetadata
+}
+
 type Service struct {
-	store                  Store
-	repoStore              repo.Store
-	snapshotStore          snapshot.Store
-	codeIntelStore         codeintelstore.Store
-	revisionStore          revision.Store
-	jobStore               *jobs.Store
-	providerMetadata       ProviderMetadata
-	providerMetadataSet    bool
-	providerMetadataSource func() ProviderMetadata
+	store          Store
+	repoStore      repo.Store
+	lineage        *analysispipeline.Resolver
+	jobStore       *jobs.Store
+	providerSource func() ProviderMetadata
 }
 
-func (s *Service) WithCodeIntelStore(store codeintelstore.Store) *Service {
-	s.codeIntelStore = store
-	return s
-}
-
-func (s *Service) WithRevisionStore(store revision.Store) *Service {
-	s.revisionStore = store
-	return s
-}
-
-func (s *Service) WithJobStore(store *jobs.Store) *Service {
-	s.jobStore = store
-	return s
-}
-
-func (s *Service) WithProviderMetadata(metadata ProviderMetadata) *Service {
-	s.providerMetadata = metadata
-	s.providerMetadataSet = true
-	return s
-}
-
-func (s *Service) WithProviderMetadataSource(source func() ProviderMetadata) *Service {
-	s.providerMetadataSource = source
-	return s
-}
-
-func NewService(store Store, repoStore repo.Store, snapshotStore snapshot.Store) *Service {
+func NewService(deps ServiceDependencies) *Service {
 	return &Service{
-		store:         store,
-		repoStore:     repoStore,
-		snapshotStore: snapshotStore,
+		store:          deps.Store,
+		repoStore:      deps.RepoStore,
+		lineage:        deps.Lineage,
+		jobStore:       deps.JobStore,
+		providerSource: deps.ProviderSource,
 	}
 }
 
@@ -147,22 +123,19 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	}
 	var selectedLineage analysispipeline.ResolvedLineage
 	if input.AnalysisRevisionID != "" {
-		if s.revisionStore == nil {
-			return nil, false, fmt.Errorf("analysis revision store is not configured")
-		}
-		rev, revErr := s.revisionStore.GetByID(ctx, input.AnalysisRevisionID)
+		repositoryID, revErr := s.lineage.RepositoryForRevision(ctx, input.AnalysisRevisionID)
 		if revErr != nil {
 			return nil, false, revErr
 		}
 		// Authorize before resolving READY state so another user's revision
 		// cannot reveal whether any of its derived artifacts are ready.
-		if _, repoErr := s.repoStore.GetByIDAndUser(ctx, rev.RepositoryID, input.UserID); repoErr != nil {
+		if _, repoErr := s.repoStore.GetByIDAndUser(ctx, repositoryID, input.UserID); repoErr != nil {
 			return nil, false, revision.ErrNotFound
 		}
-		if input.RepositoryID != "" && input.RepositoryID != rev.RepositoryID {
+		if input.RepositoryID != "" && input.RepositoryID != repositoryID {
 			return nil, false, codeintelstore.ErrBuildLineageMismatch
 		}
-		input.RepositoryID = rev.RepositoryID
+		input.RepositoryID = repositoryID
 	}
 	reqHash := ComputeRequestHashForRevision(input.AnalysisRevisionID, input.RepositoryID, input.SnapshotID, input.IssueTitle, input.IssueDescription, input.ErrorLog, input.CodeIndexBuildID, input.RetrievalBuildID)
 
@@ -180,7 +153,7 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	}
 
 	if input.AnalysisRevisionID != "" {
-		lineage, resolveErr := analysispipeline.NewResolver(s.revisionStore, s.snapshotStore, s.codeIntelStore).ResolveReadyLineage(ctx, input.AnalysisRevisionID)
+		lineage, resolveErr := s.lineage.ResolveReadyLineage(ctx, input.AnalysisRevisionID)
 		if resolveErr != nil {
 			return nil, false, resolveErr
 		}
@@ -195,11 +168,11 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		return nil, false, ErrInvalidBuildSelection
 	}
 
-	metadata := s.providerMetadata
-	if s.providerMetadataSource != nil {
-		metadata = s.providerMetadataSource()
+	metadata := ProviderMetadata{}
+	if s.providerSource != nil {
+		metadata = s.providerSource()
 	}
-	if (s.providerMetadataSet || s.providerMetadataSource != nil) && !metadata.IsConfigured {
+	if s.providerSource != nil && !metadata.IsConfigured {
 		return nil, false, ErrProviderNotConfigured
 	}
 
@@ -209,47 +182,9 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		return nil, false, fmt.Errorf("repository %s not found or access denied", input.RepositoryID)
 	}
 
-	codeIndexBuildID := input.CodeIndexBuildID
-	retrievalBuildID := input.RetrievalBuildID
 	if input.AnalysisRevisionID == "" {
-		// Legacy build-ID requests keep their existing validation path.
-		snap, err := s.snapshotStore.GetByID(ctx, input.SnapshotID)
-		if err != nil || snap == nil {
-			return nil, false, fmt.Errorf("snapshot %s not found", input.SnapshotID)
-		}
-		if snap.Status != snapshot.StatusReady {
-			return nil, false, fmt.Errorf("snapshot %s is not READY (current status: %s)", input.SnapshotID, snap.Status)
-		}
-	}
-	if input.AnalysisRevisionID == "" && s.codeIntelStore != nil {
-		if err := s.codeIntelStore.ValidateLineage(ctx, input.RepositoryID, input.SnapshotID, codeIndexBuildID, retrievalBuildID); err != nil {
+		if _, err := s.lineage.ResolveLegacyReady(ctx, input.RepositoryID, input.SnapshotID, input.CodeIndexBuildID, input.RetrievalBuildID); err != nil {
 			return nil, false, err
-		}
-		cib, err := s.codeIntelStore.GetByID(ctx, codeIndexBuildID)
-		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil, false, fmt.Errorf("%w: code index build %d", ErrBuildNotReady, codeIndexBuildID)
-			}
-			return nil, false, fmt.Errorf("failed to load code index build %d: %w", codeIndexBuildID, err)
-		}
-		if cib == nil {
-			return nil, false, fmt.Errorf("%w: code index build %d", ErrBuildNotReady, codeIndexBuildID)
-		}
-		if cib.Status != codeintelmodel.BuildStatusReady {
-			return nil, false, fmt.Errorf("%w: code index build %d is %s", ErrBuildNotReady, codeIndexBuildID, cib.Status)
-		}
-		rb, err := s.codeIntelStore.GetRetrievalBuildByID(ctx, retrievalBuildID)
-		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil, false, fmt.Errorf("%w: retrieval build %d", ErrBuildNotReady, retrievalBuildID)
-			}
-			return nil, false, fmt.Errorf("failed to load retrieval build %d: %w", retrievalBuildID, err)
-		}
-		if rb == nil {
-			return nil, false, fmt.Errorf("%w: retrieval build %d", ErrBuildNotReady, retrievalBuildID)
-		}
-		if rb.Status != codeintelmodel.BuildStatusReady {
-			return nil, false, fmt.Errorf("%w: retrieval build %d is %s", ErrBuildNotReady, retrievalBuildID, rb.Status)
 		}
 	}
 
@@ -306,8 +241,8 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		RepositoryID:                input.RepositoryID,
 		AnalysisRevisionID:          input.AnalysisRevisionID,
 		SnapshotID:                  input.SnapshotID,
-		CodeIndexBuildID:            codeIndexBuildID,
-		RetrievalBuildID:            retrievalBuildID,
+		CodeIndexBuildID:            input.CodeIndexBuildID,
+		RetrievalBuildID:            input.RetrievalBuildID,
 		IssueTitle:                  RedactSecrets(input.IssueTitle),
 		IssueDescription:            cleanDesc,
 		ErrorLog:                    cleanLog,
@@ -391,11 +326,8 @@ func (s *Service) Retry(ctx context.Context, id, userID string) error {
 		if err != nil {
 			return err
 		}
-		if s.providerMetadataSet || s.providerMetadataSource != nil {
-			metadata := s.providerMetadata
-			if s.providerMetadataSource != nil {
-				metadata = s.providerMetadataSource()
-			}
+		if s.providerSource != nil {
+			metadata := s.providerSource()
 			if !metadata.IsConfigured {
 				return ErrProviderNotConfigured
 			}

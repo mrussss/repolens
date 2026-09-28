@@ -89,7 +89,7 @@ type LoopResult struct {
 
 // GenerationOptions controls optional provider request fields. A standalone
 // AgentLoop defaults to a json_object response format and an empty
-// reasoning_effort; the production runtime supplies the frozen DiagnosisRun
+// reasoning_effort; the production runtime supplies the frozen execution spec
 // value before executing the loop.
 type GenerationOptions struct {
 	ReasoningEffort string
@@ -132,16 +132,16 @@ func NewAgentLoop(
 	}
 }
 
-func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt) (*LoopResult, error) {
+func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*LoopResult, error) {
 	guard := NewAgentGuard(l.guardCfg)
 	toolsDef := l.registry.Definitions()
 
 	initialUserMsg := RedactSecrets(fmt.Sprintf("Repository ID: %s\nSnapshot ID: %s\nIssue Title: %s\n\nIssue Description:\n%s\n\nError Log / CI Log:\n%s",
-		run.RepositoryID,
-		run.SnapshotID,
-		run.IssueTitle,
-		run.IssueDescription,
-		run.ErrorLog,
+		spec.Lineage.RepositoryID,
+		spec.Lineage.SnapshotID,
+		spec.Issue.Title,
+		spec.Issue.Description,
+		spec.Issue.ErrorLog,
 	))
 	if l.initialQuery != "" || l.initialEvidence != "" {
 		initialUserMsg += "\n\nDeterministic initial retrieval query:\n" + RedactSecrets(l.initialQuery) + "\n\nEvidence Packet (candidate evidence only; verify before concluding):\n" + RedactSecrets(l.initialEvidence)
@@ -171,14 +171,14 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 
 		seq++
 		if err := guard.RecordStep(); err != nil {
-			return l.finalizeOnly(ctx, run, attempt, messages, "AGENT_ROUND_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
+			return l.finalizeOnly(ctx, spec, attempt, messages, "AGENT_ROUND_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 		}
 
 		startGen := time.Now()
 		agentRounds++
 		providerCalls++
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "", "")
-		temperature := run.Temperature
+		temperature := spec.Generation.Temperature
 		resp, err := l.provider.Generate(ctx, l.generateRequest(messages, toolsDef, &temperature))
 		latency := time.Since(startGen).Milliseconds()
 
@@ -235,14 +235,14 @@ func (l *AgentLoop) Run(ctx context.Context, run *diagnosis.DiagnosisRun, attemp
 				if tc.Function.Name == "search_code" {
 					searchCalls++
 					if err := guard.RecordSearchCall(); err != nil {
-						return l.finalizeOnly(ctx, run, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "search_code budget exhausted"), "SEARCH_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
+						return l.finalizeOnly(ctx, spec, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "search_code budget exhausted"), "SEARCH_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 					}
 				}
 				toolCallsCount++
 				toolNames = append(toolNames, tc.Function.Name)
 				if err := guard.RecordToolCall(tc.Function.Name, tc.Function.Arguments); err != nil {
 					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+RedactSecrets(err.Error()), resp.FinishReason)
-					return l.finalizeOnly(ctx, run, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "tool budget exhausted"), "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
+					return l.finalizeOnly(ctx, spec, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "tool budget exhausted"), "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 				}
 
 				// Record tool call step
@@ -376,10 +376,10 @@ func modelOutputTruncatedError(resp llm.GenerateResponse, maxOutputTokens int) e
 	return fmt.Errorf("%w: finish_reason=%q completion_tokens=%d reasoning_tokens=%d max_output_tokens=%d", ErrModelOutputTruncated, resp.FinishReason, resp.CompletionTokens, resp.ReasoningTokens, maxOutputTokens)
 }
 
-func (l *AgentLoop) finalizeOnly(ctx context.Context, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, messages []llm.Message, reason string, promptTokens, completionTokens, cachedTokens, reasoningTokens, toolCalls, searchCalls int, toolNames []string, rounds, seq int) (*LoopResult, error) {
+func (l *AgentLoop) finalizeOnly(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt, messages []llm.Message, reason string, promptTokens, completionTokens, cachedTokens, reasoningTokens, toolCalls, searchCalls int, toolNames []string, rounds, seq int) (*LoopResult, error) {
 	finalMessages := append([]llm.Message{}, messages...)
 	finalMessages = append(finalMessages, llm.Message{Role: llm.RoleUser, Content: "FINALIZE_ONLY: exploration budget is exhausted. Do not request tools. Return the best evidence-backed structured JSON now, clearly separating confirmed facts, likely explanation, uncertainty, and next checks."})
-	temperature := run.Temperature
+	temperature := spec.Generation.Temperature
 	start := time.Now()
 	resp, err := l.provider.Generate(ctx, l.generateRequest(finalMessages, nil, &temperature))
 	latency := time.Since(start).Milliseconds()

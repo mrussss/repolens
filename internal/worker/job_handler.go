@@ -65,6 +65,10 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		log.Info("diagnosis run already terminal", "status", run.Status)
 		return nil
 	}
+	spec, err := diagnosis.BuildExecutionSpec(run)
+	if err != nil {
+		return jobs.NewPermanentError("EXECUTION_SPEC_INVALID", "diagnosis execution spec could not be built", err)
+	}
 
 	workerID := "worker"
 	if job.WorkerID != nil {
@@ -124,7 +128,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			return jobs.NewRetryableError("CHECKPOINT_LOAD_FAILED", "failed loading diagnosis checkpoint", checkpointErr)
 		}
 		if checkpoint != nil {
-			if checkpoint.CheckpointAgentVersion != "" && (checkpoint.CheckpointAgentVersion != run.AgentVersion || checkpoint.CheckpointPromptVersion != run.PromptVersion) {
+			if checkpoint.CheckpointAgentVersion != "" && (checkpoint.CheckpointAgentVersion != spec.Generation.AgentVersion || checkpoint.CheckpointPromptVersion != spec.Generation.PromptVersion) {
 				versionErr := jobs.NewPermanentError("CHECKPOINT_VERSION_MISMATCH", "diagnosis checkpoint uses an incompatible Agent protocol; explicit retry is required", nil)
 				finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
 				finalizeErr := h.finalizeDiagnosisFailure(finalizeCtx, job, run, attempt, jobs.ErrorClassPermanent, "CHECKPOINT_VERSION_MISMATCH", versionErr.Error(), nil)
@@ -153,7 +157,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		}
 	}
 	if result == nil {
-		result, execErr = h.executor.Execute(ctx, run, attempt)
+		result, execErr = h.executor.Execute(ctx, spec, attempt)
 	}
 	// A result that claims to be structured must satisfy the same complete
 	// contract used by evidence classification. This guard also protects
