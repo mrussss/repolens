@@ -111,7 +111,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 	if snap.Status == snapshot.StatusReady {
 		log.Info("snapshot already READY")
-		if h.revisionStore != nil && snap.AnalysisRevisionID != "" {
+		if h.finalizer == nil && h.revisionStore != nil && snap.AnalysisRevisionID != "" {
 			if err := h.revisionStore.MarkSnapshotReady(ctx, snap.AnalysisRevisionID, snap.ID); err != nil && !errors.Is(err, revision.ErrLineage) {
 				return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
 			}
@@ -310,7 +310,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	} else if err := h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusReady, &now); err != nil {
 		return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
 	}
-	if !stageFinalized && h.revisionStore != nil && snap.AnalysisRevisionID != "" {
+	if h.finalizer == nil && !stageFinalized && h.revisionStore != nil && snap.AnalysisRevisionID != "" {
 		if err := h.revisionStore.MarkSnapshotReady(ctx, snap.AnalysisRevisionID, snap.ID); err != nil {
 			return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
 		}

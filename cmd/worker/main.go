@@ -27,7 +27,6 @@ import (
 	"repolens/internal/repoindex"
 	"repolens/internal/retrieval"
 	"repolens/internal/retrieval/artifact"
-	"repolens/internal/revision"
 	"repolens/internal/snapshot"
 	"repolens/internal/trace"
 	"repolens/internal/worker"
@@ -71,7 +70,6 @@ func run() error {
 	})
 	indexStore := repoindex.NewStore(db.GormDB)
 	codeIntelStore := codeintelstore.NewStore(db.GormDB)
-	revisionStore := revision.NewStore(db.GormDB)
 	pipelineFinalizer := analysispipeline.NewFinalizer(snapshotStore, codeIntelStore)
 	diagnosisStore := diagnosis.NewStore(db.GormDB)
 	reportStore := evidence.NewReportStore(db.GormDB)
@@ -129,7 +127,6 @@ func run() error {
 		nil,
 	)
 	snapshotJobHandler.WithCodeIntelStore(codeIntelStore)
-	snapshotJobHandler.WithRevisionStore(revisionStore)
 	snapshotJobHandler.WithFinalizer(pipelineFinalizer)
 	snapshotJobHandler.WithResourceLimits(
 		cfg.MaxIndexableSourceBytes,
