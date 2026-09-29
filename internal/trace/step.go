@@ -18,6 +18,8 @@ const (
 	StepTypeError       StepType = "ERROR"
 )
 
+// AgentStep is an attempt-scoped, ordered, append-only execution trace entry.
+// The database schema keeps (attempt_id, seq) unique for each attempt.
 type AgentStep struct {
 	ID                string    `gorm:"primaryKey;size:36" json:"id"`
 	AttemptID         string    `gorm:"size:36;not null;index" json:"attempt_id"`

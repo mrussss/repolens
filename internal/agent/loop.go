@@ -169,7 +169,6 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 			return nil, err
 		}
 
-		seq++
 		if err := guard.RecordStep(); err != nil {
 			return l.finalizeOnly(ctx, spec, attempt, messages, "AGENT_ROUND_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 		}
@@ -177,6 +176,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 		startGen := time.Now()
 		agentRounds++
 		providerCalls++
+		seq++
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "", "")
 		temperature := spec.Generation.Temperature
 		resp, err := l.provider.Generate(ctx, l.generateRequest(messages, toolsDef, &temperature))
@@ -187,6 +187,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 				providerCalls += attempts - 1
 			}
 			// Record error step
+			seq++
 			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+RedactSecrets(err.Error()), "")
 			partial := &LoopResult{
 				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens,
@@ -210,6 +211,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 
 		if isTruncatedResponse(resp, l.guardCfg.MaxOutputTokens) {
 			truncationErr := modelOutputTruncatedError(resp, l.guardCfg.MaxOutputTokens)
+			seq++
 			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, resp.PromptTokens, resp.CompletionTokens, ErrCodeModelOutputTruncated, resp.FinishReason)
 			return &LoopResult{
 				PromptTokens:       totalPromptTokens,
@@ -241,11 +243,13 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 				toolCallsCount++
 				toolNames = append(toolNames, tc.Function.Name)
 				if err := guard.RecordToolCall(tc.Function.Name, tc.Function.Arguments); err != nil {
+					seq++
 					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+RedactSecrets(err.Error()), resp.FinishReason)
 					return l.finalizeOnly(ctx, spec, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "tool budget exhausted"), "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 				}
 
 				// Record tool call step
+				seq++
 				_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolCall, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "", resp.FinishReason)
 
 				// Execute tool
@@ -291,6 +295,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 
 		// Final response received
 		finalText := resp.Message.Content
+		seq++
 		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "", resp.FinishReason)
 
 		reportData, err := parseReportJSON(finalText)
@@ -377,6 +382,7 @@ func modelOutputTruncatedError(resp llm.GenerateResponse, maxOutputTokens int) e
 }
 
 func (l *AgentLoop) finalizeOnly(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt, messages []llm.Message, reason string, promptTokens, completionTokens, cachedTokens, reasoningTokens, toolCalls, searchCalls int, toolNames []string, rounds, seq int) (*LoopResult, error) {
+	seq++
 	finalMessages := append([]llm.Message{}, messages...)
 	finalMessages = append(finalMessages, llm.Message{Role: llm.RoleUser, Content: "FINALIZE_ONLY: exploration budget is exhausted. Do not request tools. Return the best evidence-backed structured JSON now, clearly separating confirmed facts, likely explanation, uncertainty, and next checks."})
 	temperature := spec.Generation.Temperature
