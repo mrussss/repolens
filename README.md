@@ -2,14 +2,32 @@
 
 RepoLens 是一个本地单用户 Go 代码诊断工具：它把固定版本的 Go 仓库物化为不可变 Snapshot，用 AST 与离线 best-effort `go/types` 建立版本化 CodeIndex，再用纯 Go BM25 + Structural Retrieval 为受控 Agent 提供证据，最后校验源码 Citation。
 
-核心链路：
+## 架构设计
 
 ```text
-Web → Go API → MySQL → DB-backed Analysis Jobs → Worker
+Jobs
+  └─ execution ownership
 
-Repository → AnalysisRevision → immutable Snapshot → CodeIndexBuild → RetrievalBuild
-           → 5 read-only tools → bounded Agent → validated citations
+AnalysisPipeline
+  └─ product lifecycle
+
+Diagnosis
+  └─ freezes one reproducible execution
+
+Agent Runtime
+  └─ consumes immutable execution spec
+
+Evidence / Citation
+  └─ validates model output before report publication
 ```
+
+### 核心心智模型与链路
+
+1. **Pipeline**：`Repository` → `AnalysisRevision` → `Snapshot` → `CodeIndexBuild` → `RetrievalBuild` → `READY ResolvedLineage`
+2. **Execution**：`PENDING` → `claim` → `RUNNING / execution_started=false` → `MarkExecutionStarted` → `RUNNING / execution_started=true` → `Execute` → durable terminal outcome
+3. **Diagnosis**：`ResolvedLineage` → frozen `DiagnosisRun` → `DiagnosisExecutionSpec` → `AnalysisJob` execution
+4. **Agent**：`DiagnosisExecutionSpec` → `Provider` → `BuildToolRegistry` → bounded `Agent` → `ReportDraft` → `Evidence` → `Citation Validation` → `Validated Report`
+5. **Trace**：`DiagnosisRun` → `DiagnosisAttempt` → ordered `AgentStep`（仅为 attempt 维度的执行 trace，非 Event Sourcing 框架）
 
 ## 快速开始
 

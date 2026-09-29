@@ -56,6 +56,44 @@ Repository → AnalysisRevision → Diagnosis
 
 `AnalysisRevision` 通过 `(repository_id, exact commit_sha, pipeline_fingerprint)` 做自然身份。`READY` Revision 的三个内部资源必须全部 READY，并且属于同一 repository、commit 和 build lineage；READY 后不再原地替换资源 ID。FAILED Revision 只能通过显式 retry 回到 PREPARING。
 
+### 1.2 最终架构心智模型与五条主链路
+
+RepoLens v2.2 严格由以下五条主链路解释：
+
+```text
+Jobs
+  └─ execution ownership
+
+AnalysisPipeline
+  └─ product lifecycle
+
+Diagnosis
+  └─ freezes one reproducible execution
+
+Agent Runtime
+  └─ consumes immutable execution spec
+
+Evidence / Citation
+  └─ validates model output before report publication
+```
+
+1. **Pipeline**：`Repository` → `AnalysisRevision` → `Snapshot` → `CodeIndexBuild` → `RetrievalBuild` → `READY ResolvedLineage`
+2. **Execution**：`PENDING` → `claim` → `RUNNING / execution_started=false` → `MarkExecutionStarted` → `RUNNING / execution_started=true` → `Execute` → durable terminal outcome
+3. **Diagnosis**：`ResolvedLineage` → frozen `DiagnosisRun` → `DiagnosisExecutionSpec` → `AnalysisJob` execution
+4. **Agent**：`DiagnosisExecutionSpec` → `Provider` → `BuildToolRegistry` → bounded `Agent` → `ReportDraft` → `Evidence` → `Citation Validation` → `Validated Report`
+5. **Trace**：`DiagnosisRun` → `DiagnosisAttempt` → ordered `AgentStep`（Attempt 维度的执行 trace，非 Event Sourcing 框架）
+
+### 1.3 子系统 Ownership 职责表
+
+| 子系统 | 独占职责 |
+| :--- | :--- |
+| **Jobs** | Execution ownership、claim、lease、attempt start、retry、reaper、cancellation、terminal finalization resolution |
+| **AnalysisPipeline** | Analysis preparation、analysis retry、READY lineage resolution、product stage finalization ownership |
+| **Diagnosis** | Authorization、request idempotency、select validated lineage、freeze Provider identity、freeze Agent config、persist DiagnosisRun、schedule Diagnosis job、materialize DiagnosisExecutionSpec |
+| **Agent Runtime** | Consume DiagnosisExecutionSpec、build Provider、assemble read-only tools（`BuildToolRegistry`）、run bounded Agent loop、produce ReportDraft、invoke deterministic report finalization |
+| **Evidence** | Issue attempt-scoped evidence、validate citation identity、publish deterministic report evidence |
+| **Trace** | Persist ordered AgentStep、query by Attempt、query after sequence |
+
 ## 2. 核心子系统
 
 ### 2.1 API Server（`cmd/api`）
