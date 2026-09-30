@@ -113,7 +113,7 @@ RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开
 - Citation validation 证明源码一致性，不证明模型结论的逻辑正确性；secret redaction 是 best-effort。
 - Eval 数据集小且经过整理，Dev 与 frozen held-out 分离；Structural Retrieval 只有通过 promotion rule 才能成为生产策略。
 - v1.1 的 RabbitMQ、Outbox、Elasticsearch、Vector/RRF、SSE 和旧 Auth 仅存在于历史版本，不属于 v2.2 core。
-- v2.2 不实现自动 Snapshot/Index retention 或 GC；`make clean-data` 是破坏性的全量本地重置，请谨慎使用。
+- v2.2 不会自动删除仍被数据库引用的历史 Snapshot / RetrievalBuild，也不实现面向用户的 retention policy。Worker 会周期性清理超过 24 小时、且未被任何数据库 `materialized_path` / `artifact_path` 引用的 orphan execution / staging artifact。`make clean-data` 是破坏性的全量本地重置，请谨慎使用。
 
 ## 项目结构
 
