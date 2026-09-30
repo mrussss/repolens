@@ -619,7 +619,9 @@ func TestRealMySQL_BatchUndispatchedReturnContinuesPastLockedRow(t *testing.T) {
 	cfg.LeaseDuration = 30 * time.Second
 	cfg.PollInterval = 10 * time.Millisecond
 	cfg.ReapInterval = time.Hour
-	cfg.ShutdownCleanupTimeout = 10 * time.Millisecond
+	// Leave enough bounded time for the unlocked row to complete its own MySQL
+	// transaction while the first row's connection is waiting on the held lock.
+	cfg.ShutdownCleanupTimeout = 2 * time.Second
 	worker := jobs.NewWorker(gate, cfg)
 	var handlerCalls atomic.Int32
 	worker.RegisterHandler(jobs.JobTypeRunDiagnosis, jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error {
