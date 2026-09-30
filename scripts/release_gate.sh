@@ -5,7 +5,7 @@ echo "================================================================="
 echo "RepoLens Final Release Gate Validation"
 echo "================================================================="
 
-echo "[1/8] Checking code formatting..."
+echo "[1/10] Checking code formatting..."
 unformatted=$(gofmt -l cmd/ internal/ tests/)
 if [ -n "$unformatted" ]; then
     echo "ERROR: Unformatted files detected:"
@@ -14,29 +14,28 @@ if [ -n "$unformatted" ]; then
 fi
 echo "✓ Code formatting clean"
 
-echo "[2/8] Running go vet..."
+echo "[2/10] Running go vet..."
 go vet ./...
 echo "✓ go vet passed"
 
-echo "[3/8] Running all Go tests..."
-GOFLAGS=-mod=readonly go test ./...
-echo "✓ Unit tests passed"
+echo "[3/10] Running core tests..."
+GOFLAGS=-mod=readonly go test ./cmd/... ./internal/...
+echo "✓ Core tests passed"
 
-echo "[4/8] Running Go tests with race detector..."
-GOFLAGS=-mod=readonly go test -race ./...
-echo "✓ Race tests passed"
+echo "[4/10] Running core tests with race detector..."
+GOFLAGS=-mod=readonly go test -race ./cmd/... ./internal/...
+echo "✓ Core race tests passed"
 
-echo "[5/8] Running component integration tests..."
-GOFLAGS=-mod=readonly go test -v ./tests/integration/...
+echo "[5/10] Running component integration tests with race detector..."
+GOFLAGS=-mod=readonly go test -race ./tests/integration/...
 echo "✓ Component integration tests passed"
 
-echo "[6/8] Running real MySQL integration tests..."
-export REPOLENS_REQUIRE_REAL_INTEGRATION=1
-GOFLAGS=-mod=readonly go test -v -race ./tests/integration_real/...
-echo "✓ Real testcontainers integration tests passed (0 skips, all containers executed)"
+echo "[6/10] Running real MySQL integration tests with race detector..."
+REPOLENS_REQUIRE_REAL_INTEGRATION=1 GOFLAGS=-mod=readonly go test -race ./tests/integration_real/...
+echo "✓ Real MySQL integration tests passed (required mode, 0 skips)"
 
-echo "[7/10] Running the real-MySQL Golden Path..."
-GOFLAGS=-mod=readonly go test -v -race ./tests/e2e/...
+echo "[7/10] Running the required real-MySQL Golden Path with race detector..."
+REPOLENS_REQUIRE_REAL_INTEGRATION=1 GOFLAGS=-mod=readonly go test -race ./tests/e2e/...
 echo "✓ Golden Path passed"
 
 echo "[8/10] Building deterministic Web UI, running Web tests and eval..."

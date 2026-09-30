@@ -1,4 +1,4 @@
-.PHONY: all build web-build test test-race test-integration eval verify clean fmt lint
+.PHONY: all build web-build test test-race test-core test-core-race test-e2e test-integration eval verify clean fmt lint
 
 all: build
 
@@ -21,6 +21,17 @@ test:
 
 test-race:
 	GOFLAGS=-mod=readonly go test -race ./...
+
+test-core:
+	GOFLAGS=-mod=readonly go test ./cmd/... ./internal/...
+
+test-core-race:
+	GOFLAGS=-mod=readonly go test -race ./cmd/... ./internal/...
+
+test-e2e:
+	REPOLENS_REQUIRE_REAL_INTEGRATION=1 \
+	GOFLAGS=-mod=readonly \
+	go test ./tests/e2e/...
 
 test-integration:
 	GOFLAGS=-mod=readonly go test -v -race ./tests/integration/...
