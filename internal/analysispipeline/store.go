@@ -5,11 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	sqlite3 "github.com/mattn/go-sqlite3"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -126,14 +124,6 @@ func (s *Store) RetryPreparation(ctx context.Context, id string) (*revision.Anal
 		case <-timer.C:
 		}
 	}
-}
-
-func isSQLiteWriterContention(err error) bool {
-	var sqliteErr sqlite3.Error
-	if errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrBusy {
-		return true
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "database is locked")
 }
 
 func (s *Store) retryPreparationOnce(ctx context.Context, id string) (*revision.AnalysisRevision, error) {
