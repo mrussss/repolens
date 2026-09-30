@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -95,6 +97,46 @@ func createJobGorm(tx *gorm.DB, job *jobs.AnalysisJob) error {
 }
 
 func (s *Store) RetryPreparation(ctx context.Context, id string) (*revision.AnalysisRevision, error) {
+	maxAttempts := 1
+	isSQLite := s.db.Dialector.Name() == "sqlite"
+	if isSQLite {
+		maxAttempts = 8
+	}
+
+	for attempt := 0; ; attempt++ {
+		value, err := s.retryPreparationOnce(ctx, id)
+		if err == nil || !isSQLite || !isSQLiteWriterContention(err) || attempt+1 >= maxAttempts {
+			return value, err
+		}
+
+		delay := 5 * time.Millisecond << attempt
+		if delay > 40*time.Millisecond {
+			delay = 40 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isSQLiteWriterContention(err error) bool {
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrBusy {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "database is locked")
+}
+
+func (s *Store) retryPreparationOnce(ctx context.Context, id string) (*revision.AnalysisRevision, error) {
 	var value revision.AnalysisRevision
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).First(&value).Error; err != nil {
