@@ -377,7 +377,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 		result.Metadata.Model = providerConfig.Model
 		result.Metadata.BaseURLFingerprint = providerConfig.EndpointFingerprint
 		result.Metadata.AuthMode = providerConfig.AuthMode
-		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithGenerationOptions(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxSearchCalls, guardConfig.MaxRepeatCalls, 32*1024, guardConfig.MaxToolResultBytes, 1, guardConfig.MaxOutputTokens, providerTimeoutSeconds(), 0, 0.1, generationOptions.ReasoningEffort, "json_object")
+		result.Metadata.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithGenerationOptions(guardConfig.MaxSteps, guardConfig.MaxToolCalls, guardConfig.MaxSearchCalls, guardConfig.MaxRepeatCalls, 32*1024, guardConfig.MaxToolResultBytes, 1, guardConfig.MaxOutputTokens, providerTimeoutSeconds(), 0, 0.1, generationOptions.ReasoningEffort, generationOptions.ResponseFormat)
 		result.Metadata.MaxToolCalls = guardConfig.MaxToolCalls
 		result.Metadata.ToolBudget = guardConfig.MaxToolCalls
 		preflight, err := runProviderPreflight(ctx, providerConfig, guardConfig, generationOptions)
@@ -963,7 +963,7 @@ func runE2EOnce(ctx context.Context, input Input, workspace *productionWorkspace
 	evidenceStore := evidence.NewEvidenceStore(workspace.db)
 	evidenceIssuer := evidence.NewEvidenceIssuerWithStore(workspace.SnapshotStore, evidenceStore)
 	executor.WithEvidenceIssuer(evidenceIssuer)
-	run := buildAgentRun(input, workspace, config.Model, guardConfig, config.TimeoutSeconds, generationOptions.ReasoningEffort)
+	run := buildAgentRun(input, workspace, config.Model, guardConfig, config.TimeoutSeconds, generationOptions.ReasoningEffort, generationOptions.ResponseFormat)
 	attempt := &diagnosis.DiagnosisAttempt{ID: uuid.New().String()}
 	spec, err := diagnosis.BuildExecutionSpec(run)
 	if err != nil {
@@ -1341,7 +1341,7 @@ func searchInput(ctx context.Context, retriever retrieval.Retriever, input Input
 	return query, results, err
 }
 
-func buildAgentRun(input Input, workspace *productionWorkspace, model string, guardConfig agent.GuardConfig, providerTimeoutSeconds int, reasoningEffort string) *diagnosis.DiagnosisRun {
+func buildAgentRun(input Input, workspace *productionWorkspace, model string, guardConfig agent.GuardConfig, providerTimeoutSeconds int, reasoningEffort, responseFormat string) *diagnosis.DiagnosisRun {
 	run := &diagnosis.DiagnosisRun{
 		ID: uuid.New().String(), RepositoryID: input.CaseID, SnapshotID: input.CaseID,
 		CodeIndexBuildID: workspace.CodeIndexBuildID, RetrievalBuildID: workspace.RetrievalBuildID,
@@ -1358,7 +1358,7 @@ func buildAgentRun(input Input, workspace *productionWorkspace, model string, gu
 		run.MaxAgentRounds, run.MaxToolCalls, run.MaxSearchCalls, run.MaxRepeatCalls,
 		run.MaxEvidencePacketBytes, run.MaxToolResultBytes, run.FinalizationTurns,
 		run.MaxOutputTokens, run.ProviderTimeoutSeconds, run.ProviderRetryAttempts,
-		run.Temperature, run.ReasoningEffort, "json_object",
+		run.Temperature, run.ReasoningEffort, responseFormat,
 	)
 	return run
 }

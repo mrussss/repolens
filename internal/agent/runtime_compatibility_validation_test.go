@@ -63,6 +63,34 @@ func TestFC08CompatibleFrozenSpecReachesProviderWithJSONContract(t *testing.T) {
 	}
 }
 
+func TestFC08RealBenchNoneEffectiveFormatMatchesFrozenIdentity(t *testing.T) {
+	run := compatibleRuntimeDiagnosisRun("fc08-realbench-none")
+	run.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithGenerationOptions(
+		run.MaxAgentRounds, run.MaxToolCalls, run.MaxSearchCalls, run.MaxRepeatCalls,
+		run.MaxEvidencePacketBytes, run.MaxToolResultBytes, run.FinalizationTurns,
+		run.MaxOutputTokens, run.ProviderTimeoutSeconds, run.ProviderRetryAttempts,
+		run.Temperature, run.ReasoningEffort, "none",
+	)
+	spec, err := diagnosis.BuildExecutionSpec(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &runtimeGenerationProvider{}
+	factory := &runtimeProviderFactory{provider: provider}
+	executor := NewAgentRuntimeExecutorWithFactory(factory, nil, nil, nil, DefaultGuardConfig()).
+		WithGenerationOptions(GenerationOptions{ReasoningEffort: run.ReasoningEffort, ResponseFormat: nil})
+	result, err := executor.Execute(context.Background(), spec, &diagnosis.DiagnosisAttempt{ID: "fc08-realbench-none-attempt"})
+	if err != nil {
+		t.Fatalf("RealBench none execution rejected: %v", err)
+	}
+	if factory.builds != 1 || len(provider.requests) != 1 || result == nil || result.ProviderCalls != 1 {
+		t.Fatalf("RealBench none provider boundary: factory builds=%d requests=%d result=%+v", factory.builds, len(provider.requests), result)
+	}
+	if provider.requests[0].ResponseFormat != nil {
+		t.Fatalf("RealBench none request response_format = %+v, want nil", provider.requests[0].ResponseFormat)
+	}
+}
+
 func TestFC08NonJSONRuntimeOverrideFailsBeforeProviderFactory(t *testing.T) {
 	provider := &runtimeGenerationProvider{}
 	factory := &runtimeProviderFactory{provider: provider}

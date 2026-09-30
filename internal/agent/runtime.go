@@ -170,7 +170,8 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, spec diagnosis.Diagn
 		ResponseFormat:  &llm.ResponseFormat{Type: "json_object"},
 	}
 	if e.generation != nil {
-		// Compatibility validation only permits the frozen v2.2 JSON contract.
+		// Compatibility validation ties this override to the response format
+		// recorded by the frozen AgentConfigHash.
 		generation.ResponseFormat = e.generation.ResponseFormat
 	}
 	loop := NewAgentLoop(provider, registry, e.traceStore, guardCfg).WithGenerationOptions(generation)
@@ -267,6 +268,15 @@ func validateExecutionSpecCompatibility(spec diagnosis.DiagnosisExecutionSpec, g
 			"frozen diagnosis prompt or Agent version is not supported by this runtime", nil)
 	}
 
+	responseFormat := "json_object"
+	if generationOverride != nil {
+		if generationOverride.ResponseFormat == nil {
+			responseFormat = "none"
+		} else if generationOverride.ResponseFormat.Type != "json_object" {
+			return jobs.NewPermanentError(ErrCodeExecutionSpecConfigMismatch,
+				"runtime response format is not supported by the frozen execution contract", nil)
+		}
+	}
 	expectedHash := diagnosis.ComputeAgentConfigHashWithGenerationOptions(
 		spec.Budget.MaxAgentRounds,
 		spec.Budget.MaxToolCalls,
@@ -280,15 +290,11 @@ func validateExecutionSpecCompatibility(spec diagnosis.DiagnosisExecutionSpec, g
 		spec.Provider.RetryAttempts,
 		spec.Generation.Temperature,
 		spec.Generation.ReasoningEffort,
-		"json_object",
+		responseFormat,
 	)
 	if spec.Generation.AgentConfigHash == "" || spec.Generation.AgentConfigHash != expectedHash {
 		return jobs.NewPermanentError(ErrCodeExecutionSpecConfigMismatch,
 			"frozen diagnosis Agent configuration does not match this runtime", nil)
-	}
-	if generationOverride != nil && (generationOverride.ResponseFormat == nil || generationOverride.ResponseFormat.Type != "json_object") {
-		return jobs.NewPermanentError(ErrCodeExecutionSpecConfigMismatch,
-			"runtime response format is incompatible with the frozen v2.2 execution contract", nil)
 	}
 	return nil
 }

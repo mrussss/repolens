@@ -216,6 +216,25 @@ func TestConfiguredRealBenchGenerationOptions(t *testing.T) {
 	}
 }
 
+func TestRealBenchAgentRunHashesEffectiveResponseFormat(t *testing.T) {
+	guard := agent.DefaultGuardConfig()
+	run := buildAgentRun(Input{CaseID: "REAL-FC08", IssueTitle: "effective response format"},
+		&productionWorkspace{CodeIndexBuildID: 11, RetrievalBuildID: 12}, "validation-model", guard, 60, "low", "none")
+	want := diagnosis.ComputeAgentConfigHashWithGenerationOptions(
+		run.MaxAgentRounds, run.MaxToolCalls, run.MaxSearchCalls, run.MaxRepeatCalls,
+		run.MaxEvidencePacketBytes, run.MaxToolResultBytes, run.FinalizationTurns,
+		run.MaxOutputTokens, run.ProviderTimeoutSeconds, run.ProviderRetryAttempts,
+		run.Temperature, run.ReasoningEffort, "none",
+	)
+	if run.AgentConfigHash != want {
+		t.Fatalf("RealBench AgentConfigHash = %s, want effective response_format=none hash %s", run.AgentConfigHash, want)
+	}
+	spec := testRealBenchSpec(run)
+	if spec.Generation.AgentConfigHash != want {
+		t.Fatalf("frozen RealBench AgentConfigHash = %s, want %s", spec.Generation.AgentConfigHash, want)
+	}
+}
+
 func TestRealBenchGenerationOptionsReachProviderRequest(t *testing.T) {
 	provider := &providerSpy{}
 	loop := agent.NewAgentLoop(provider, agent.NewToolRegistry(), nil, agent.DefaultGuardConfig()).WithGenerationOptions((realBenchGenerationOptions{
