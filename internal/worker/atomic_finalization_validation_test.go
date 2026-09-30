@@ -295,9 +295,22 @@ func TestFC06ChangedClaimStopsWithoutStaleFinalization(t *testing.T) {
 }
 
 func TestFC06UnexpectedTerminalFinalizationStateConflictsWithoutOverwrite(t *testing.T) {
-	_, jobStore := setupTestEnvironment(t)
-	job := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "fc06-terminal-conflict", MaxAttempts: 3}
-	if err := jobStore.CreateJob(context.Background(), job); err != nil {
+	db, jobStore := setupTestEnvironment(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	run := &diagnosis.DiagnosisRun{
+		ID: "fc06-terminal-conflict", UserID: "validation-fc06-user", RepositoryID: "validation-fc06-repo",
+		SnapshotID: "validation-fc06-snapshot", IssueTitle: "FC-06 terminal conflict",
+		IdempotencyKey: "validation-fc06-terminal-conflict-key", IdempotencyRequestHash: "validation-fc06-terminal-conflict-hash",
+	}
+	if err := diagnosis.NewStore(db).Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	job, err := jobStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	handlerReturned := make(chan struct{})
@@ -311,7 +324,7 @@ func TestFC06UnexpectedTerminalFinalizationStateConflictsWithoutOverwrite(t *tes
 		close(handlerReturned)
 		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, errValidationFC06AfterCommit)
 	})
-	_, stopWorker := startValidationFC06Worker(t, jobStore, jobs.JobTypeBuildCodeIndex, handler)
+	_, stopWorker := startValidationFC06Worker(t, jobStore, jobs.JobTypeRunDiagnosis, handler)
 	awaitValidationFC06Handler(t, handlerReturned)
 	workerErr := stopWorker()
 	if workerErr == nil || !strings.Contains(workerErr.Error(), jobs.ErrorCodeAtomicFinalizationStateConflict) {
