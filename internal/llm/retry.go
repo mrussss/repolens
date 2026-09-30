@@ -68,6 +68,10 @@ func (p *RetryingProvider) Generate(ctx context.Context, req GenerateRequest) (G
 }
 
 func shouldRetryProvider(err error) bool {
+	var outcomeUnknown *OutcomeUnknownError
+	if errors.As(err, &outcomeUnknown) {
+		return false
+	}
 	var declared retryableProviderError
 	if errors.As(err, &declared) {
 		return declared.RetryableProviderError()

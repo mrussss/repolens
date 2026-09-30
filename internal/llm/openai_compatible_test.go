@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -185,6 +187,71 @@ func TestOpenAICompatibleBoundsAndRedactsProviderErrorBody(t *testing.T) {
 	}
 	if !strings.Contains(httpErr.Body, "[truncated]") {
 		t.Fatalf("bounded provider error body is missing truncation marker: %q", httpErr.Body[len(httpErr.Body)-32:])
+	}
+}
+
+func TestOpenAICompatibleMarksInterruptedSuccessBodyOutcomeUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "128")
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, `{"choices":[`); err != nil {
+			t.Errorf("write partial provider response: %v", err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack provider response: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	provider := NewOpenAICompatibleProviderWithAuthModeAndTimeout("", server.URL, "model", "none", 3*time.Second)
+	_, err := provider.Generate(context.Background(), GenerateRequest{})
+	var unknown *OutcomeUnknownError
+	if !errors.As(err, &unknown) || unknown.Cause == nil {
+		t.Fatalf("interrupted successful response error = %v, want OutcomeUnknownError with cause", err)
+	}
+}
+
+func TestRetryingProviderPreservesExplicit5xxWhenErrorBodyIsInterrupted(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", "128")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			if _, err := io.WriteString(w, `{"error":`); err != nil {
+				t.Errorf("write partial provider error response: %v", err)
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack provider error response: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{}}`)
+	}))
+	defer server.Close()
+
+	base := NewOpenAICompatibleProviderWithAuthModeAndTimeout("", server.URL, "model", "none", 3*time.Second)
+	if _, err := NewRetryingProvider(base, 1).Generate(context.Background(), GenerateRequest{}); err != nil {
+		t.Fatalf("provider retry after explicit HTTP 503: %v", err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("HTTP request count = %d, want 2 for one explicit 503 retry", requests.Load())
 	}
 }
 

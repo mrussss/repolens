@@ -14,6 +14,7 @@ import (
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/jobs"
+	"repolens/internal/llm"
 	"repolens/internal/platform/logger"
 )
 
@@ -271,13 +272,17 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			return h.cancelAttempt(ctx, job, run, attempt)
 		}
 		errorCode := ""
-		if errors.Is(execErr, agent.ErrModelOutputTruncated) {
+		var outcomeUnknown *llm.OutcomeUnknownError
+		if errors.As(execErr, &outcomeUnknown) {
+			errorCode = llm.OutcomeUnknownErrorCode
+			execErr = jobs.NewPermanentError(errorCode, "provider request outcome could not be confirmed; automatic replay is disabled", execErr)
+		} else if errors.Is(execErr, agent.ErrModelOutputTruncated) {
 			execErr = jobs.NewPermanentError(agent.ErrCodeModelOutputTruncated, "agent output was truncated before a tool call or structured report", execErr)
 			errorCode = agent.ErrCodeModelOutputTruncated
 		}
 		if progressErr, ok := execErr.(interface {
 			Progressed() bool
-		}); ok && progressErr.Progressed() && result != nil {
+		}); ok && progressErr.Progressed() && result != nil && errorCode != llm.OutcomeUnknownErrorCode {
 			execErr = jobs.NewPermanentError("PROVIDER_PROGRESS_ABORTED", "provider failed after agent progress; explicit diagnosis retry is required", execErr)
 			errorCode = "PROVIDER_PROGRESS_ABORTED"
 		}

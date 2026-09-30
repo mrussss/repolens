@@ -37,15 +37,32 @@ func TestRetryingProviderRetriesOnlyDeclaredTemporaryFailures(t *testing.T) {
 	}
 }
 
-func TestRetryingProviderRetriesServerErrorsButNotBadRequests(t *testing.T) {
+func TestRetryingProviderDoesNotReplayOutcomeUnknown(t *testing.T) {
+	provider := &outcomeUnknownProvider{}
+	_, err := NewRetryingProvider(provider, 3).Generate(context.Background(), GenerateRequest{})
+	var unknown *OutcomeUnknownError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("error = %v, want OutcomeUnknownError", err)
+	}
+	if provider.calls != 1 || ProviderAttempts(err) != 1 {
+		t.Fatalf("outcome-unknown provider calls/attempts = %d/%d, want 1/1", provider.calls, ProviderAttempts(err))
+	}
+}
+
+func TestRetryingProviderRetries429AndDocumentedServerErrorsButNotBadRequests(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
 		status    int
 		wantCalls int
 		wantError bool
 	}{
-		{name: "server error", status: 503, wantCalls: 2},
+		{name: "rate limited", status: 429, wantCalls: 2},
+		{name: "server error 500", status: 500, wantCalls: 2},
+		{name: "server error 502", status: 502, wantCalls: 2},
+		{name: "server error 503", status: 503, wantCalls: 2},
+		{name: "server error 504", status: 504, wantCalls: 2},
 		{name: "bad request", status: 400, wantCalls: 1, wantError: true},
+		{name: "out of range status", status: 600, wantCalls: 1, wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			provider := &statusRetryProvider{status: tt.status}
@@ -78,4 +95,11 @@ type errorProvider struct {
 func (p *errorProvider) Generate(context.Context, GenerateRequest) (GenerateResponse, error) {
 	p.calls++
 	return GenerateResponse{}, p.err
+}
+
+type outcomeUnknownProvider struct{ calls int }
+
+func (p *outcomeUnknownProvider) Generate(context.Context, GenerateRequest) (GenerateResponse, error) {
+	p.calls++
+	return GenerateResponse{}, &OutcomeUnknownError{Cause: errors.New("provider server error (503) response lost")}
 }

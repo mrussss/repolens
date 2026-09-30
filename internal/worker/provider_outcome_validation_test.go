@@ -22,9 +22,7 @@ import (
 
 const validationFC07Report = `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`
 
-// VALIDATION-ONLY: convert this observation to a desired-invariant regression
-// test during production hardening.
-func TestValidationFC07OutcomeUnknownReplaysDiagnosisJob(t *testing.T) {
+func TestFC07OutcomeUnknownStopsAutomaticReplayAndAllowsManualRetry(t *testing.T) {
 	db, jobStore := setupTestEnvironment(t)
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -33,11 +31,12 @@ func TestValidationFC07OutcomeUnknownReplaysDiagnosisJob(t *testing.T) {
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	var requests atomic.Int32
-	secondRequest := make(chan struct{})
+	firstRequest := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		switch n := requests.Add(1); n {
 		case 1:
+			close(firstRequest)
 			hijacker, ok := w.(http.Hijacker)
 			if !ok {
 				t.Errorf("test HTTP server does not support hijacking")
@@ -49,11 +48,7 @@ func TestValidationFC07OutcomeUnknownReplaysDiagnosisJob(t *testing.T) {
 				return
 			}
 			_ = conn.Close() // The provider request arrived; its response is lost.
-		case 2:
-			close(secondRequest)
-			writeValidationFC07Success(w)
 		default:
-			t.Errorf("unexpected provider request %d", n)
 			writeValidationFC07Success(w)
 		}
 	}))
@@ -76,11 +71,11 @@ func TestValidationFC07OutcomeUnknownReplaysDiagnosisJob(t *testing.T) {
 	t.Cleanup(func() { _ = stopWorker() })
 
 	select {
-	case <-secondRequest:
+	case <-firstRequest:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("second provider request was not observed; request count=%d", requests.Load())
+		t.Fatalf("first provider request was not observed; request count=%d", requests.Load())
 	}
-	if err := awaitValidationFC07RunSucceeded(diagnosisStore, run.ID); err != nil {
+	if err := awaitValidationFC07RunFailed(diagnosisStore, run.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := stopWorker(); err != nil {
@@ -95,20 +90,30 @@ func TestValidationFC07OutcomeUnknownReplaysDiagnosisJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests.Load() != 2 || savedJob.Status != jobs.StatusSucceeded || len(attempts) != 2 {
-		t.Fatalf("automatic retry evidence: provider requests=%d job=%s attempts=%d", requests.Load(), savedJob.Status, len(attempts))
+	if requests.Load() != 1 || savedJob.Status != jobs.StatusFailed || savedJob.LastErrorClass == nil || *savedJob.LastErrorClass != string(jobs.ErrorClassPermanent) ||
+		savedJob.LastErrorCode == nil || *savedJob.LastErrorCode != llm.OutcomeUnknownErrorCode || len(attempts) != 1 {
+		t.Fatalf("outcome-unknown evidence: provider requests=%d job=%+v attempts=%d", requests.Load(), savedJob, len(attempts))
 	}
 	first := attempts[0]
-	if first.Status != diagnosis.AttemptStatusFailedRetryable || first.ProviderCalls != 1 || first.PromptTokens != 0 || first.CompletionTokens != 0 || first.ToolCalls != 0 {
-		t.Fatalf("first post-dispatch attempt=%+v; want retryable, one provider call, zero usage and tools", first)
+	if first.Status != diagnosis.AttemptStatusFailedTerminal || first.ErrorCode != llm.OutcomeUnknownErrorCode || first.ProviderCalls != 1 || first.PromptTokens != 0 || first.CompletionTokens != 0 || first.ToolCalls != 0 {
+		t.Fatalf("post-dispatch attempt=%+v; want terminal PROVIDER_OUTCOME_UNKNOWN, one provider call, zero usage and tools", first)
 	}
-	if attempts[1].Status != diagnosis.AttemptStatusSucceeded {
-		t.Fatalf("automatic retry attempt status=%s, want SUCCEEDED", attempts[1].Status)
+	if !jobs.IsRetryableDiagnosisProviderFailure(jobs.ErrorClassPermanent, llm.OutcomeUnknownErrorCode) {
+		t.Fatal("PROVIDER_OUTCOME_UNKNOWN must allow an explicit diagnosis retry")
 	}
-	t.Logf("observation: first request reached fake upstream and lost its response; persisted attempt provider_calls=%d prompt_tokens=%d completion_tokens=%d tool_calls=%d; Diagnosis job automatically made request 2 and succeeded", first.ProviderCalls, first.PromptTokens, first.CompletionTokens, first.ToolCalls)
+	if err := jobStore.RetryDiagnosis(context.Background(), run.ID); err != nil {
+		t.Fatalf("explicit diagnosis retry after outcome unknown: %v", err)
+	}
+	retriedJob, err := jobStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil || retriedJob.Status != jobs.StatusPending || retriedJob.ExecutionGeneration != 2 {
+		t.Fatalf("manual retry job=%+v err=%v; want PENDING generation 2", retriedJob, err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("manual requeue unexpectedly made a provider request: requests=%d", requests.Load())
+	}
 }
 
-func TestValidationFC07Explicit429RemainsProviderRetryable(t *testing.T) {
+func TestFC07Explicit429RemainsProviderRetryable(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -177,19 +182,19 @@ func startValidationFC07Worker(store *jobs.Store, handler jobs.Handler) (*jobs.W
 	return workerRuntime, stop
 }
 
-func awaitValidationFC07RunSucceeded(store diagnosis.Store, runID string) error {
+func awaitValidationFC07RunFailed(store diagnosis.Store, runID string) error {
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		run, err := store.GetByID(context.Background(), runID)
-		if err == nil && run.Status == diagnosis.StatusSucceeded {
+		if err == nil && run.Status == diagnosis.StatusFailed {
 			return nil
 		}
 		select {
 		case <-deadline.C:
-			return fmt.Errorf("diagnosis did not succeed before timeout; last status=%v err=%v", run, err)
+			return fmt.Errorf("diagnosis did not fail before timeout; last status=%v err=%v", run, err)
 		case <-ticker.C:
 		}
 	}

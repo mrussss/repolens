@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	"repolens/internal/platform/redaction"
@@ -17,7 +20,29 @@ const (
 	MaxProviderResponseBytes     int64 = 16 << 20
 	maxProviderErrorBodyBytes          = 8 << 10
 	ProviderResponseTooLargeCode       = "PROVIDER_RESPONSE_TOO_LARGE"
+	OutcomeUnknownErrorCode            = "PROVIDER_OUTCOME_UNKNOWN"
 )
+
+// OutcomeUnknownError marks a provider request that may have been dispatched
+// but did not yield a complete response. Replaying it automatically could
+// repeat billable provider work.
+type OutcomeUnknownError struct {
+	Cause error
+}
+
+func (e *OutcomeUnknownError) Error() string {
+	if e == nil || e.Cause == nil {
+		return "provider outcome is unknown"
+	}
+	return fmt.Sprintf("provider outcome is unknown: %v", e.Cause)
+}
+
+func (e *OutcomeUnknownError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
 
 type OpenAICompatibleProvider struct {
 	apiKey           string
@@ -42,6 +67,7 @@ func (e *ProviderResponseTooLargeError) Permanent() bool   { return true }
 type HTTPError struct {
 	StatusCode int
 	Body       string
+	Cause      error
 }
 
 func (e *HTTPError) Error() string {
@@ -49,8 +75,10 @@ func (e *HTTPError) Error() string {
 }
 
 func (e *HTTPError) RetryableProviderError() bool {
-	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+	return e.StatusCode == http.StatusTooManyRequests || (e.StatusCode >= 500 && e.StatusCode <= 599)
 }
+
+func (e *HTTPError) Unwrap() error { return e.Cause }
 
 func NewOpenAICompatibleProvider(apiKey, baseURL, defaultModel string) *OpenAICompatibleProvider {
 	return NewOpenAICompatibleProviderWithAuthMode(apiKey, baseURL, defaultModel, "bearer")
@@ -148,19 +176,24 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return GenerateResponse{}, fmt.Errorf("llm http call failed: %w", err)
+		providerErr := fmt.Errorf("llm http call failed: %w", err)
+		if !isPreDispatchDialRefusal(err) {
+			return GenerateResponse{}, &OutcomeUnknownError{Cause: providerErr}
+		}
+		return GenerateResponse{}, providerErr
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBodyBytes+1))
-		if readErr != nil {
-			return GenerateResponse{}, fmt.Errorf("failed to read llm error response body: %w", readErr)
-		}
 		if int64(len(errorBody)) > maxProviderErrorBodyBytes {
 			errorBody = append(errorBody[:maxProviderErrorBodyBytes], []byte("...[truncated]")...)
 		}
-		return GenerateResponse{}, &HTTPError{StatusCode: resp.StatusCode, Body: redaction.RedactSecrets(string(errorBody))}
+		return GenerateResponse{}, &HTTPError{
+			StatusCode: resp.StatusCode,
+			Body:       redaction.RedactSecrets(string(errorBody)),
+			Cause:      readErr,
+		}
 	}
 	maxBytes := p.maxResponseBytes
 	if maxBytes <= 0 {
@@ -168,7 +201,7 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 	}
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
-		return GenerateResponse{}, fmt.Errorf("failed to read llm response body: %w", err)
+		return GenerateResponse{}, &OutcomeUnknownError{Cause: fmt.Errorf("failed to read llm response body after HTTP %d: %w", resp.StatusCode, err)}
 	}
 	if int64(len(respBytes)) > maxBytes {
 		return GenerateResponse{}, &ProviderResponseTooLargeError{LimitBytes: maxBytes}
@@ -195,6 +228,11 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 		CachedPromptTokens: openAIResp.Usage.PromptTokensDetails.CachedTokens,
 		ReasoningTokens:    openAIResp.Usage.CompletionTokensDetails.ReasoningTokens,
 	}, nil
+}
+
+func isPreDispatchDialRefusal(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial" && errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func normalizeAuthMode(mode string) string {

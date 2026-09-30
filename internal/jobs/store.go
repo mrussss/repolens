@@ -1116,7 +1116,7 @@ func IsRetryableDiagnosisProviderFailure(class ErrorClass, code string) bool {
 	// A provider failure after useful Agent progress is deliberately PERMANENT
 	// for automatic retries (to avoid replaying billable partial work), while
 	// the user may explicitly start a fresh execution generation.
-	if class == ErrorClassPermanent && (code == "PROVIDER_PROGRESS_ABORTED" || code == "CHECKPOINT_SAVE_FAILED" || code == "CHECKPOINT_VERSION_MISMATCH") {
+	if class == ErrorClassPermanent && (code == "PROVIDER_PROGRESS_ABORTED" || code == "PROVIDER_OUTCOME_UNKNOWN" || code == "CHECKPOINT_SAVE_FAILED" || code == "CHECKPOINT_VERSION_MISMATCH") {
 		return true
 	}
 	return class == ErrorClassRetryable && IsRetryableDiagnosisProviderError(code)

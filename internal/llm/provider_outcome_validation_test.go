@@ -10,9 +10,7 @@ import (
 	"time"
 )
 
-// VALIDATION-ONLY: convert this observation to a desired-invariant regression
-// test during production hardening.
-func TestValidationFC07ConnectionRefusedPreservesDialBoundary(t *testing.T) {
+func TestConnectionRefusedRemainsTypedPreDispatchFailure(t *testing.T) {
 	provider := NewOpenAICompatibleProviderWithAuthModeAndTimeout("", "http://provider.invalid", "validation-model", "none", time.Second)
 	t.Cleanup(provider.httpClient.CloseIdleConnections)
 	dialRefused := &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
@@ -30,5 +28,8 @@ func TestValidationFC07ConnectionRefusedPreservesDialBoundary(t *testing.T) {
 	if !errors.As(callErr, &opErr) || opErr.Op != "dial" || !errors.Is(callErr, syscall.ECONNREFUSED) {
 		t.Fatalf("provider stack did not preserve pre-dispatch dial refusal: %T %v", callErr, callErr)
 	}
-	t.Logf("observation: SAFE_RETRY_DISTINGUISHABLE=YES; errors.As recovered net.OpError.Op=%q and ECONNREFUSED through HTTP/provider wrapping", opErr.Op)
+	var unknown *OutcomeUnknownError
+	if errors.As(callErr, &unknown) {
+		t.Fatalf("typed pre-dispatch connection refusal was classified as outcome unknown: %v", callErr)
+	}
 }
