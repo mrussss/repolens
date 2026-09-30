@@ -74,6 +74,8 @@ type Worker struct {
 	mu                       sync.RWMutex
 	dispatchMu               sync.Mutex
 	dispatchStopped          bool
+	shutdownCtx              context.Context
+	shutdownCancel           context.CancelFunc
 	afterClaimBeforeDispatch func()
 	loopWG                   sync.WaitGroup
 	jobWG                    sync.WaitGroup
@@ -106,11 +108,14 @@ func NewWorker(store workerStore, cfg WorkerConfig) *Worker {
 	if cfg.ShutdownCleanupTimeout <= 0 {
 		cfg.ShutdownCleanupTimeout = 5 * time.Second
 	}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 
 	return &Worker{
 		store:              store,
 		cfg:                cfg,
 		handlers:           make(map[JobType]Handler),
+		shutdownCtx:        shutdownCtx,
+		shutdownCancel:     shutdownCancel,
 		stopCh:             make(chan struct{}),
 		active:             make(map[int64]context.CancelCauseFunc),
 		finalizationErrors: make(map[int64]error),
@@ -146,25 +151,32 @@ func (w *Worker) Stop() {
 // cancels remaining handlers with ErrWorkerShutdown and waits for bounded
 // cleanup. Jobs that do not finish remain RUNNING for lease recovery.
 func (w *Worker) StopGracefully(ctx context.Context) error {
-	w.dispatchMu.Lock()
-	w.dispatchStopped = true
-	w.stopOnce.Do(func() { close(w.stopCh) })
-	w.dispatchMu.Unlock()
+	w.requestStop()
 	loopsDone := waitGroupDone(&w.loopWG)
 	if err := waitForContext(ctx, loopsDone); err != nil {
 		w.cancelActive(ErrWorkerShutdown)
-		return w.waitForShutdownCleanup(loopsDone, err)
+		return err
 	}
 
 	jobsDone := waitGroupDone(&w.jobWG)
 	if err := waitForContext(ctx, jobsDone); err != nil {
 		w.cancelActive(ErrWorkerShutdown)
-		return w.waitForShutdownCleanup(jobsDone, err)
+		return err
 	}
 	if err := w.unresolvedFinalizationError(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (w *Worker) requestStop() {
+	w.dispatchMu.Lock()
+	w.dispatchStopped = true
+	w.stopOnce.Do(func() {
+		close(w.stopCh)
+		w.shutdownCancel()
+	})
+	w.dispatchMu.Unlock()
 }
 
 func waitGroupDone(wg *sync.WaitGroup) <-chan struct{} {
@@ -185,17 +197,6 @@ func waitForContext(ctx context.Context, done <-chan struct{}) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-}
-
-func (w *Worker) waitForShutdownCleanup(done <-chan struct{}, cause error) error {
-	timer := time.NewTimer(w.cfg.ShutdownCleanupTimeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return cause
-	case <-timer.C:
-		return fmt.Errorf("worker shutdown cleanup exceeded %s: %w", w.cfg.ShutdownCleanupTimeout, cause)
 	}
 }
 
@@ -331,76 +332,192 @@ func (w *Worker) claimLoop(ctx context.Context) {
 		if w.afterClaimBeforeDispatch != nil {
 			w.afterClaimBeforeDispatch()
 		}
-		for i, job := range jobs {
-			w.dispatchMu.Lock()
-			if w.dispatchStopped || ctx.Err() != nil {
-				w.dispatchMu.Unlock()
-				w.returnUndispatchedClaims(ctx, sem, jobs[i:])
-				return
-			}
-			attemptCount, err := w.startClaimedExecution(job)
-			if err != nil {
-				w.dispatchMu.Unlock()
-				if errors.Is(err, ErrOwnershipLost) {
-					<-sem
-					continue
-				}
-				logger.L(ctx).Error("unable to resolve execution-start transition", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
-				// startClaimedExecution only returns non-ownership errors when its
-				// retry context is cancelled; leave the claim for lease recovery.
-				<-sem
-				continue
-			}
-			job.AttemptCount = attemptCount
-			job.ExecutionStarted = true
-			w.jobWG.Add(1)
+		w.jobWG.Add(len(jobs))
+		for _, job := range jobs {
 			go func(j *AnalysisJob) {
 				defer func() {
 					<-sem
 					w.jobWG.Done()
 				}()
-				w.executeJob(ctx, j)
+				w.startAndDispatchClaim(ctx, j)
 			}(job)
-			w.dispatchMu.Unlock()
 		}
 	}
+}
+
+type executionStartResolution uint8
+
+const (
+	executionStartUnknown executionStartResolution = iota
+	executionStartNotStarted
+	executionStartStarted
+	executionStartOwnershipLost
+)
+
+// startAndDispatchClaim resolves the durable execution-start boundary before
+// allowing a handler to run. The final launch gate is separate from database
+// I/O, so shutdown never waits on a retry while holding dispatchMu.
+func (w *Worker) startAndDispatchClaim(parentCtx context.Context, job *AnalysisJob) {
+	state, attemptCount, err := w.startClaimedExecution(parentCtx, job)
+	switch state {
+	case executionStartOwnershipLost:
+		return
+	case executionStartUnknown:
+		logger.L(parentCtx).Error("unable to resolve execution-start state; leaving claim for lease recovery", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+		return
+	case executionStartNotStarted:
+		w.returnUndispatchedClaims(parentCtx, []*AnalysisJob{job})
+		return
+	case executionStartStarted:
+		job.AttemptCount = attemptCount
+		job.ExecutionStarted = true
+	default:
+		logger.L(parentCtx).Error("execution-start resolver returned invalid state", "job_id", job.ID, "state", state)
+		return
+	}
+
+	started := make(chan struct{})
+	w.dispatchMu.Lock()
+	if w.dispatchStopped || w.stopRequested(parentCtx) {
+		w.dispatchMu.Unlock()
+		// The attempt charge is durable. Leave this claim to lease recovery;
+		// returning it would incorrectly refund execution that has started.
+		return
+	}
+	// Publish the execution goroutine while holding the same gate used by
+	// requestStop. Once shutdown acquires dispatchMu, every accepted launch is
+	// already accounted for by this claim goroutine and jobWG.
+	go func() {
+		defer close(started)
+		w.executeJob(parentCtx, job)
+	}()
+	w.dispatchMu.Unlock()
+	<-started
 }
 
 // startClaimedExecution commits the attempt charge before a handler can be
-// launched. It retries ambiguous/transient store errors because the durable
-// transition is idempotent for the same live claim.
-func (w *Worker) startClaimedExecution(job *AnalysisJob) (int, error) {
+// launched. Ambiguous responses are reconciled from durable state. Retry and
+// resolver waits observe parent cancellation and graceful shutdown.
+func (w *Worker) startClaimedExecution(parentCtx context.Context, job *AnalysisJob) (executionStartResolution, int, error) {
 	for {
+		if w.stopRequested(parentCtx) {
+			return executionStartNotStarted, 0, nil
+		}
 		operationTimeout := w.undispatchedClaimOperationTimeout()
-		ctx, cancel := context.WithTimeout(context.Background(), operationTimeout)
-		attemptCount, err := w.store.MarkExecutionStarted(ctx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), job.ExecutionGeneration)
+		operationCtx, cancel := context.WithTimeout(parentCtx, operationTimeout)
+		stopCallback := context.AfterFunc(w.shutdownCtx, cancel)
+		attemptCount, err := w.store.MarkExecutionStarted(operationCtx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), job.ExecutionGeneration)
+		stopCallback()
 		cancel()
-		if err == nil || errors.Is(err, ErrOwnershipLost) {
-			return attemptCount, err
+		if err == nil {
+			return executionStartStarted, attemptCount, nil
 		}
-		logger.L(context.Background()).Error("error marking execution started; retrying claim-fenced transition", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
-		if renewErr := w.renewUndispatchedClaimLease(job, operationTimeout); renewErr != nil && !errors.Is(renewErr, ErrOwnershipLost) {
-			logger.L(context.Background()).Warn("error renewing claim while resolving execution-start transition", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", renewErr)
+		if errors.Is(err, ErrOwnershipLost) {
+			return executionStartOwnershipLost, 0, err
 		}
-		timer := time.NewTimer(w.cfg.PollInterval)
-		<-timer.C
+
+		state, durableAttemptCount, readErr := w.resolveExecutionStart(parentCtx, job)
+		switch state {
+		case executionStartStarted:
+			return executionStartStarted, durableAttemptCount, nil
+		case executionStartOwnershipLost:
+			return executionStartOwnershipLost, 0, errors.Join(err, readErr)
+		case executionStartUnknown:
+			return executionStartUnknown, 0, errors.Join(err, readErr)
+		case executionStartNotStarted:
+			if w.stopRequested(parentCtx) {
+				return executionStartNotStarted, 0, err
+			}
+		}
+
+		logger.L(parentCtx).Warn("execution start did not commit; retrying while claim remains unstarted", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+		renewCtx, renewCancel := context.WithTimeout(parentCtx, operationTimeout)
+		renewCallback := context.AfterFunc(w.shutdownCtx, renewCancel)
+		renewErr := w.store.RenewLease(renewCtx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), time.Now().UTC().Add(w.cfg.LeaseDuration))
+		renewCallback()
+		renewCancel()
+		if errors.Is(renewErr, ErrOwnershipLost) {
+			return executionStartOwnershipLost, 0, errors.Join(err, renewErr)
+		}
+		if renewErr != nil && !w.stopRequested(parentCtx) {
+			logger.L(parentCtx).Warn("error renewing claim while resolving execution start", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", renewErr)
+		}
+		if w.waitExecutionStartRetry(parentCtx) {
+			// The last durable read confirmed this live claim was unstarted, and
+			// this loop has not issued another start attempt since that read.
+			// Preserve that result through shutdown so it can be returned safely.
+			return executionStartNotStarted, durableAttemptCount, errors.Join(err, readErr)
+		}
 	}
 }
 
-func (w *Worker) returnUndispatchedClaims(parentCtx context.Context, sem chan struct{}, jobs []*AnalysisJob) {
+func (w *Worker) resolveExecutionStart(parentCtx context.Context, job *AnalysisJob) (executionStartResolution, int, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, w.undispatchedClaimOperationTimeout())
+	stopCallback := context.AfterFunc(w.shutdownCtx, cancel)
+	defer stopCallback()
+	defer cancel()
+	current, err := w.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		return executionStartUnknown, 0, err
+	}
+	if current == nil || current.ID != job.ID || current.Status != StatusRunning ||
+		current.WorkerID == nil || *current.WorkerID != w.cfg.WorkerID ||
+		current.ClaimToken == nil || *current.ClaimToken != w.undispatchedClaimToken(job) ||
+		current.ExecutionGeneration != job.ExecutionGeneration {
+		return executionStartOwnershipLost, 0, ErrOwnershipLost
+	}
+	if current.ExecutionStarted {
+		return executionStartStarted, current.AttemptCount, nil
+	}
+	return executionStartNotStarted, current.AttemptCount, nil
+}
+
+func (w *Worker) waitExecutionStartRetry(parentCtx context.Context) bool {
+	timer := time.NewTimer(w.cfg.PollInterval)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return false
+	case <-w.stopCh:
+		return true
+	case <-parentCtx.Done():
+		return true
+	}
+}
+
+func (w *Worker) stopRequested(parentCtx context.Context) bool {
+	select {
+	case <-w.stopCh:
+		return true
+	case <-parentCtx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Worker) returnUndispatchedClaims(parentCtx context.Context, jobs []*AnalysisJob) {
 	pending := append([]*AnalysisJob(nil), jobs...)
 	operationTimeout := w.undispatchedClaimOperationTimeout()
 	retryDelay := w.cfg.PollInterval
 	if retryDelay > operationTimeout {
 		retryDelay = operationTimeout
 	}
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), w.cfg.ShutdownCleanupTimeout)
+	defer cancelCleanup()
 
 	for len(pending) > 0 {
 		stillOwned := pending[:0]
 		for _, job := range pending {
-			err := w.renewUndispatchedClaimLease(job, operationTimeout)
+			if cleanupCtx.Err() != nil {
+				stillOwned = append(stillOwned, job)
+				continue
+			}
+			opCtx, opCancel := context.WithTimeout(cleanupCtx, operationTimeout)
+			err := w.store.RenewLease(opCtx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), time.Now().UTC().Add(w.cfg.LeaseDuration))
+			opCancel()
 			if err != nil {
-				logger.L(parentCtx).Error("error renewing undispatched job lease; return will verify claim ownership", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
+				logger.L(parentCtx).Warn("error renewing undispatched job lease; return will verify claim ownership", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
 			}
 			stillOwned = append(stillOwned, job)
 		}
@@ -408,18 +525,33 @@ func (w *Worker) returnUndispatchedClaims(parentCtx context.Context, sem chan st
 
 		stillPending := pending[:0]
 		for _, job := range pending {
-			err := w.returnUndispatchedClaim(job, operationTimeout)
+			if cleanupCtx.Err() != nil {
+				stillPending = append(stillPending, job)
+				continue
+			}
+			opCtx, opCancel := context.WithTimeout(cleanupCtx, operationTimeout)
+			err := w.store.ReturnUndispatchedClaim(opCtx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), job.ExecutionGeneration)
+			opCancel()
 			if err == nil || errors.Is(err, ErrOwnershipLost) {
-				<-sem
 				continue
 			}
 			logger.L(parentCtx).Error("error returning undispatched job claim; will retry after processing the batch", "job_id", job.ID, "worker_id", w.cfg.WorkerID, "error", err)
 			stillPending = append(stillPending, job)
 		}
 		pending = stillPending
+		if cleanupCtx.Err() != nil {
+			for _, job := range pending {
+				logger.L(parentCtx).Error("unable to return undispatched claim before cleanup deadline; leaving it for lease recovery", "job_id", job.ID, "worker_id", w.cfg.WorkerID)
+			}
+			return
+		}
 		if len(pending) > 0 {
 			timer := time.NewTimer(retryDelay)
-			<-timer.C
+			select {
+			case <-timer.C:
+			case <-cleanupCtx.Done():
+			}
+			timer.Stop()
 		}
 	}
 }
@@ -441,18 +573,6 @@ func (w *Worker) undispatchedClaimToken(job *AnalysisJob) string {
 		claimToken = *job.ClaimToken
 	}
 	return claimToken
-}
-
-func (w *Worker) renewUndispatchedClaimLease(job *AnalysisJob, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return w.store.RenewLease(ctx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), time.Now().UTC().Add(w.cfg.LeaseDuration))
-}
-
-func (w *Worker) returnUndispatchedClaim(job *AnalysisJob, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return w.store.ReturnUndispatchedClaim(ctx, job.ID, w.cfg.WorkerID, w.undispatchedClaimToken(job), job.ExecutionGeneration)
 }
 
 func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {

@@ -51,7 +51,7 @@ func newUndispatchedWorkerTestStore(t *testing.T) *Store {
 	return NewStoreWithDriver(db, "sqlite3")
 }
 
-func TestWorkerReturnsClaimedUndispatchedAttemptOnGracefulShutdown(t *testing.T) {
+func TestShutdownBeforeExecutionStartReturnsOrRecoversUndispatchedClaim(t *testing.T) {
 	store := newUndispatchedWorkerTestStore(t)
 	ctx := context.Background()
 	job := &AnalysisJob{
@@ -148,6 +148,276 @@ func TestWorkerReturnsClaimedUndispatchedAttemptOnGracefulShutdown(t *testing.T)
 	}
 	if got := actualExecutions.Load(); got != 1 || finished.Status != StatusSucceeded || finished.AttemptCount != 3 {
 		t.Fatalf("actual execution count=%d, final job=%+v; want one successful third attempt", got, finished)
+	}
+}
+
+var (
+	errPersistentExecutionStart = errors.New("injected persistent execution-start failure")
+	errAmbiguousExecutionStart  = errors.New("injected ambiguous execution-start response")
+)
+
+type persistentExecutionStartStore struct {
+	*Store
+	markCalls  atomic.Int32
+	markSignal chan struct{}
+	markOnce   sync.Once
+	readSignal chan struct{}
+	readOnce   sync.Once
+}
+
+func (s *persistentExecutionStartStore) MarkExecutionStarted(context.Context, int64, string, string, int) (int, error) {
+	s.markCalls.Add(1)
+	s.markOnce.Do(func() { close(s.markSignal) })
+	return 0, errPersistentExecutionStart
+}
+
+func (s *persistentExecutionStartStore) GetJobByID(ctx context.Context, id int64) (*AnalysisJob, error) {
+	job, err := s.Store.GetJobByID(ctx, id)
+	if err == nil {
+		s.readOnce.Do(func() { close(s.readSignal) })
+	}
+	return job, err
+}
+
+type ambiguousExecutionStartStore struct {
+	*Store
+	readObserved chan struct{}
+	allowRead    chan struct{}
+	readOnce     sync.Once
+}
+
+func (s *ambiguousExecutionStartStore) MarkExecutionStarted(ctx context.Context, id int64, workerID, token string, generation int) (int, error) {
+	count, err := s.Store.MarkExecutionStarted(ctx, id, workerID, token, generation)
+	if err != nil {
+		return count, err
+	}
+	return count, errAmbiguousExecutionStart
+}
+
+func (s *ambiguousExecutionStartStore) GetJobByID(ctx context.Context, id int64) (*AnalysisJob, error) {
+	job, err := s.Store.GetJobByID(ctx, id)
+	if err != nil || job == nil || !job.ExecutionStarted {
+		return job, err
+	}
+	s.readOnce.Do(func() { close(s.readObserved) })
+	select {
+	case <-s.allowRead:
+		return job, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+type failingUndispatchedReturnStore struct {
+	*Store
+	returnStarted chan struct{}
+	returnOnce    sync.Once
+}
+
+func (s *failingUndispatchedReturnStore) ReturnUndispatchedClaim(context.Context, int64, string, string, int) error {
+	s.returnOnce.Do(func() { close(s.returnStarted) })
+	return errPersistentExecutionStart
+}
+
+func TestStopGracefullyInterruptsPersistentExecutionStartFailure(t *testing.T) {
+	base := newUndispatchedWorkerTestStore(t)
+	job := &AnalysisJob{JobType: JobTypeRunDiagnosis, ResourceID: "persistent-execution-start", MaxAttempts: 3}
+	if err := base.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	store := &persistentExecutionStartStore{
+		Store: base, markSignal: make(chan struct{}), readSignal: make(chan struct{}),
+	}
+	cfg := DefaultWorkerConfig()
+	cfg.WorkerID = "persistent-start-worker"
+	cfg.Concurrency = 1
+	cfg.BatchSize = 1
+	cfg.PollInterval = time.Millisecond
+	cfg.LeaseDuration = time.Second
+	cfg.ShutdownCleanupTimeout = 100 * time.Millisecond
+	cfg.ReapInterval = time.Hour
+	worker := NewWorker(store, cfg)
+	var handlerCalls atomic.Int32
+	worker.RegisterHandler(JobTypeRunDiagnosis, HandlerFunc(func(context.Context, *AnalysisJob) error {
+		handlerCalls.Add(1)
+		return nil
+	}))
+	worker.Start(context.Background())
+	select {
+	case <-store.markSignal:
+	case <-time.After(5 * time.Second):
+		t.Fatal("execution-start operation was not attempted")
+	}
+	select {
+	case <-store.readSignal:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not reconcile the failed execution-start response")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := worker.StopGracefully(stopCtx); err != nil {
+		t.Fatalf("StopGracefully did not interrupt persistent execution-start failure: %v", err)
+	}
+	got, err := base.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := store.markCalls.Load(); calls == 0 {
+		t.Fatal("execution-start failure was not observed")
+	}
+	if handlerCalls.Load() != 0 || got.Status != StatusPending || got.AttemptCount != 0 || got.ExecutionStarted {
+		t.Fatalf("post-shutdown handler=%d job=%+v; want no handler and returned unstarted claim", handlerCalls.Load(), got)
+	}
+}
+
+func TestShutdownAfterAmbiguousExecutionStartDoesNotLaunchHandler(t *testing.T) {
+	base := newUndispatchedWorkerTestStore(t)
+	job := &AnalysisJob{JobType: JobTypeMaterializeSnapshot, ResourceID: "ambiguous-execution-start", MaxAttempts: 3}
+	if err := base.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	store := &ambiguousExecutionStartStore{
+		Store: base, readObserved: make(chan struct{}), allowRead: make(chan struct{}),
+	}
+	cfg := DefaultWorkerConfig()
+	cfg.WorkerID = "ambiguous-start-worker"
+	cfg.Concurrency = 1
+	cfg.BatchSize = 1
+	cfg.PollInterval = time.Millisecond
+	cfg.LeaseDuration = time.Second
+	cfg.ReapInterval = time.Hour
+	worker := NewWorker(store, cfg)
+	var handlerCalls atomic.Int32
+	worker.RegisterHandler(JobTypeMaterializeSnapshot, HandlerFunc(func(context.Context, *AnalysisJob) error {
+		handlerCalls.Add(1)
+		return nil
+	}))
+	worker.Start(context.Background())
+	select {
+	case <-store.readObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not reconcile the ambiguous execution-start response")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stopped := make(chan error, 1)
+	go func() { stopped <- worker.StopGracefully(stopCtx) }()
+	<-worker.stopCh
+	close(store.allowRead)
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("StopGracefully: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish shutdown after resolving durable start")
+	}
+
+	got, err := base.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handlerCalls.Load() != 0 || got.Status != StatusRunning || !got.ExecutionStarted || got.AttemptCount != 1 || got.WorkerID == nil || got.ClaimToken == nil {
+		t.Fatalf("shutdown after durable start handler=%d job=%+v; want unlaunched charged claim left for lease recovery", handlerCalls.Load(), got)
+	}
+	if _, err := base.db.Exec(`UPDATE analysis_jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.ReapExpiredJobs(context.Background(), 10); err != nil {
+		t.Fatalf("lease recovery after unlaunched durable start: %v", err)
+	}
+	recovered, err := base.GetJobByID(context.Background(), job.ID)
+	if err != nil || recovered.Status != StatusRetryWait || recovered.AttemptCount != 1 {
+		t.Fatalf("recovered started claim=%+v err=%v; want RETRY_WAIT with charged attempt preserved", recovered, err)
+	}
+}
+
+func TestUndispatchedReturnFailureDoesNotMakeShutdownUnbounded(t *testing.T) {
+	base := newUndispatchedWorkerTestStore(t)
+	job := &AnalysisJob{JobType: JobTypeMaterializeSnapshot, ResourceID: "failed-undispatched-return", MaxAttempts: 3}
+	if err := base.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	store := &failingUndispatchedReturnStore{Store: base, returnStarted: make(chan struct{})}
+	cfg := DefaultWorkerConfig()
+	cfg.WorkerID = "failed-return-worker"
+	cfg.Concurrency = 1
+	cfg.BatchSize = 1
+	cfg.PollInterval = 20 * time.Millisecond
+	cfg.LeaseDuration = time.Second
+	cfg.ShutdownCleanupTimeout = 80 * time.Millisecond
+	cfg.ReapInterval = time.Hour
+	worker := NewWorker(store, cfg)
+	var handlerCalls atomic.Int32
+	worker.RegisterHandler(JobTypeMaterializeSnapshot, HandlerFunc(func(context.Context, *AnalysisJob) error {
+		handlerCalls.Add(1)
+		return nil
+	}))
+	claimed := make(chan struct{})
+	allowDispatch := make(chan struct{})
+	worker.afterClaimBeforeDispatch = func() {
+		close(claimed)
+		<-allowDispatch
+	}
+	worker.Start(context.Background())
+	select {
+	case <-claimed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not claim job before shutdown")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer cancel()
+	startedAt := time.Now()
+	stopped := make(chan error, 1)
+	go func() { stopped <- worker.StopGracefully(stopCtx) }()
+	<-worker.stopCh
+	close(allowDispatch)
+	select {
+	case <-store.returnStarted:
+	case <-time.After(time.Second):
+		t.Fatal("best-effort undispatched return was not attempted")
+	}
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("StopGracefully = %v, want caller deadline exceeded", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed >= cfg.ShutdownCleanupTimeout {
+			t.Fatalf("StopGracefully exceeded caller context and waited for internal cleanup: elapsed=%s cleanup=%s", elapsed, cfg.ShutdownCleanupTimeout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("StopGracefully exceeded the caller deadline")
+	}
+
+	jobsDone := make(chan struct{})
+	go func() {
+		worker.jobWG.Wait()
+		close(jobsDone)
+	}()
+	select {
+	case <-jobsDone:
+	case <-time.After(time.Second):
+		t.Fatal("bounded undispatched cleanup did not finish")
+	}
+	got, err := base.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handlerCalls.Load() != 0 || got.Status != StatusRunning || got.ExecutionStarted || got.AttemptCount != 0 {
+		t.Fatalf("failed return state: handler=%d job=%+v; want unstarted claim left for recovery", handlerCalls.Load(), got)
+	}
+	if _, err := base.db.Exec(`UPDATE analysis_jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.ReapExpiredJobs(context.Background(), 10); err != nil {
+		t.Fatalf("lease recovery after bounded return failure: %v", err)
+	}
+	recovered, err := base.GetJobByID(context.Background(), job.ID)
+	if err != nil || recovered.Status != StatusPending || recovered.AttemptCount != 0 {
+		t.Fatalf("recovered undispatched claim=%+v err=%v; want PENDING with attempt uncharged", recovered, err)
 	}
 }
 
