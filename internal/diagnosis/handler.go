@@ -295,7 +295,8 @@ func (h *Handler) ListAttempts(c *gin.Context) {
 
 func (h *Handler) GetReport(c *gin.Context) {
 	id := c.Param("id")
-	if _, err := h.svc.Get(c.Request.Context(), id, c.GetString(string(logger.UserIDKey))); err != nil {
+	run, err := h.svc.Get(c.Request.Context(), id, c.GetString(string(logger.UserIDKey)))
+	if err != nil {
 		if errors.Is(err, ErrRunNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"code": "DIAGNOSIS_NOT_FOUND", "error": "diagnosis run not found"})
 			return
@@ -304,13 +305,22 @@ func (h *Handler) GetReport(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
 		return
 	}
-	report, err := h.reportStore.GetByRunID(c.Request.Context(), id)
+	if run.FinalAttemptID == "" {
+		c.JSON(http.StatusNotFound, gin.H{"code": "REPORT_NOT_FOUND", "error": "report not found"})
+		return
+	}
+	report, err := h.reportStore.GetByAttemptID(c.Request.Context(), run.FinalAttemptID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"code": "REPORT_NOT_FOUND", "error": "report not found"})
 			return
 		}
 		logger.L(c.Request.Context()).Error("failed to load diagnosis report", "diagnosis_id", id, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
+		return
+	}
+	if report == nil || report.DiagnosisRunID != run.ID {
+		logger.L(c.Request.Context()).Error("diagnosis report lineage mismatch", "diagnosis_id", run.ID, "final_attempt_id", run.FinalAttemptID)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL_ERROR", "error": "internal server error"})
 		return
 	}

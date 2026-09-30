@@ -247,10 +247,10 @@ func TestDiagnosisCreateRejectsExplicitZeroOrNegativeBuildIDs(t *testing.T) {
 	}
 }
 
-func TestDiagnosisReportAPIExposesInvalidStructuredReport(t *testing.T) {
+func TestGetReportStillReturnsCurrentInvalidFinalReport(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
 	ctx := context.Background()
-	run := &diagnosis.DiagnosisRun{ID: "run-api-invalid-report", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusFailed, IdempotencyKey: "api-invalid-report", IdempotencyRequestHash: "api-invalid-report"}
+	run := &diagnosis.DiagnosisRun{ID: "run-api-invalid-report", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusFailed, FinalAttemptID: "attempt-api-invalid", IdempotencyKey: "api-invalid-report", IdempotencyRequestHash: "api-invalid-report"}
 	if err := db.Create(run).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -282,6 +282,102 @@ func TestDiagnosisReportAPIExposesInvalidStructuredReport(t *testing.T) {
 	}
 }
 
+func TestGetReportDoesNotExposePreviousGenerationAfterManualRetry(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	ctx := context.Background()
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-report-manual-retry", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "issue", Status: diagnosis.StatusRunning, FinalAttemptID: "",
+		IdempotencyKey: "report-manual-retry", IdempotencyRequestHash: "report-manual-retry",
+	}
+	if err := db.Create(run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := evidence.NewReportStore(db).Create(ctx, &evidence.Report{
+		ID: "report-prior-generation", DiagnosisRunID: run.ID, AttemptID: "attempt-prior-generation",
+		RootCause: "prior generation", FindingsJSON: "[]", RecommendedChecksJSON: "[]",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := diagnosis.NewHandler(
+		newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db)),
+		evidence.NewReportStore(db), evidence.NewCitationStore(db), nil,
+	)
+	response := httptest.NewRecorder()
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(string(logger.UserIDKey), "user"); c.Next() })
+	router.GET("/diagnoses/:id/report", handler.GetReport)
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID+"/report", nil))
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"REPORT_NOT_FOUND"`) || strings.Contains(response.Body.String(), "prior generation") {
+		t.Fatalf("report after manual retry = %d %s; want no previous-generation report", response.Code, response.Body.String())
+	}
+}
+
+func TestGetReportReturnsCurrentFinalAttemptReport(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	ctx := context.Background()
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-report-current-final", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "issue", Status: diagnosis.StatusSucceeded, FinalAttemptID: "attempt-current-final",
+		IdempotencyKey: "report-current-final", IdempotencyRequestHash: "report-current-final",
+	}
+	if err := db.Create(run).Error; err != nil {
+		t.Fatal(err)
+	}
+	reports := evidence.NewReportStore(db)
+	for _, report := range []*evidence.Report{
+		{ID: "report-old-final", DiagnosisRunID: run.ID, AttemptID: "attempt-old-final", RootCause: "old report", FindingsJSON: "[]", RecommendedChecksJSON: "[]"},
+		{ID: "report-current-final", DiagnosisRunID: run.ID, AttemptID: run.FinalAttemptID, RootCause: "current report", FindingsJSON: "[]", RecommendedChecksJSON: "[]"},
+	} {
+		if err := reports.Create(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := diagnosis.NewHandler(
+		newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db)),
+		reports, evidence.NewCitationStore(db), nil,
+	)
+	response := httptest.NewRecorder()
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(string(logger.UserIDKey), "user"); c.Next() })
+	router.GET("/diagnoses/:id/report", handler.GetReport)
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID+"/report", nil))
+	var payload struct {
+		Report evidence.Report `json:"report"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || payload.Report.ID != "report-current-final" || payload.Report.AttemptID != run.FinalAttemptID || payload.Report.RootCause != "current report" {
+		t.Fatalf("current final report = %d %+v %s", response.Code, payload.Report, response.Body.String())
+	}
+}
+
+func TestGetReportRejectsMismatchedRunLineage(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	run := &diagnosis.DiagnosisRun{
+		ID: "run-report-lineage-owner", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot",
+		IssueTitle: "issue", Status: diagnosis.StatusSucceeded, FinalAttemptID: "attempt-mismatched-lineage",
+		IdempotencyKey: "report-lineage-owner", IdempotencyRequestHash: "report-lineage-owner",
+	}
+	if err := db.Create(run).Error; err != nil {
+		t.Fatal(err)
+	}
+	store := reportStoreStub{report: &evidence.Report{ID: "mismatched-report", DiagnosisRunID: "different-run", AttemptID: run.FinalAttemptID}}
+	handler := diagnosis.NewHandler(
+		newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db)),
+		store, citationStoreStub{}, nil,
+	)
+	response := httptest.NewRecorder()
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(string(logger.UserIDKey), "user"); c.Next() })
+	router.GET("/diagnoses/:id/report", handler.GetReport)
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/diagnoses/"+run.ID+"/report", nil))
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), `"INTERNAL_ERROR"`) {
+		t.Fatalf("mismatched report lineage = %d %s, want internal error", response.Code, response.Body.String())
+	}
+}
+
 func TestDiagnosisReportDistinguishesMissingRowsFromStoreFailures(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
@@ -295,7 +391,7 @@ func TestDiagnosisReportDistinguishesMissingRowsFromStoreFailures(t *testing.T) 
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			db := newDiagnosisHandlerTestDB(t)
-			run := &diagnosis.DiagnosisRun{ID: "run-report-store-errors", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusSucceeded, IdempotencyKey: "report-store-errors", IdempotencyRequestHash: "report-store-errors"}
+			run := &diagnosis.DiagnosisRun{ID: "run-report-store-errors", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusSucceeded, FinalAttemptID: "attempt-report-store-errors", IdempotencyKey: "report-store-errors", IdempotencyRequestHash: "report-store-errors"}
 			if err := db.Create(run).Error; err != nil {
 				t.Fatal(err)
 			}
@@ -437,7 +533,7 @@ func mustSQLDB(t *testing.T, db *gorm.DB) *sql.DB {
 func TestDiagnosisReportAPIExposesDegradedCitationReport(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
 	ctx := context.Background()
-	run := &diagnosis.DiagnosisRun{ID: "run-api-degraded-report", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusSucceeded, IdempotencyKey: "api-degraded-report", IdempotencyRequestHash: "api-degraded-report"}
+	run := &diagnosis.DiagnosisRun{ID: "run-api-degraded-report", UserID: "user", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", Status: diagnosis.StatusSucceeded, FinalAttemptID: "attempt-api-degraded", IdempotencyKey: "api-degraded-report", IdempotencyRequestHash: "api-degraded-report"}
 	if err := db.Create(run).Error; err != nil {
 		t.Fatal(err)
 	}
