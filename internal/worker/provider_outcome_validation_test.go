@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -114,6 +115,107 @@ func TestFC07OutcomeUnknownStopsAutomaticReplayAndAllowsManualRetry(t *testing.T
 	if requests.Load() != 1 {
 		t.Fatalf("manual requeue unexpectedly made a provider request: requests=%d", requests.Load())
 	}
+}
+
+func TestFC07OutcomeUnknownFinalizationFailureDoesNotReplayProvider(t *testing.T) {
+	db, jobStore := setupTestEnvironment(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	var requests atomic.Int32
+	firstRequest := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if requests.Add(1) == 1 {
+			close(firstRequest)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("test HTTP server does not support hijacking")
+				return
+			}
+			conn, _, hijackErr := hijacker.Hijack()
+			if hijackErr != nil {
+				t.Errorf("hijack first provider response: %v", hijackErr)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		writeValidationFC07Success(w)
+	}))
+	defer server.Close()
+
+	provider := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout("", server.URL, "validation-model", "none", 3*time.Second)
+	executor := agent.NewAgentRuntimeExecutor(provider, nil, nil, nil, agent.DefaultGuardConfig())
+	baseStore := diagnosis.NewStore(db)
+	faultStore := &failFirstDiagnosisFinalizer{Store: baseStore}
+	run := compatibleFC07Run("validation-fc07-finalize-outcome-unknown", server.URL, 0)
+	run.UserID = "validation-fc07-user"
+	run.RepositoryID = "validation-fc07-repo"
+	run.SnapshotID = "validation-fc07-snapshot"
+	run.IssueTitle = "FC-07 outcome unknown plus atomic finalization failure"
+	run.IdempotencyKey = "validation-fc07-finalize-outcome-unknown-key"
+	run.IdempotencyRequestHash = "validation-fc07-finalize-outcome-unknown-hash"
+	run.NormalizedBaseURL = server.URL
+	run.ModelName = "validation-model"
+	if err := baseStore.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	handler := agentDiagnosisHandler(faultStore, db, executor)
+	_, stopWorker := startValidationFC07Worker(jobStore, handler)
+	t.Cleanup(func() { _ = stopWorker() })
+
+	select {
+	case <-firstRequest:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("first provider request was not observed; request count=%d", requests.Load())
+	}
+	if err := awaitValidationFC07RunFailed(baseStore, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := stopWorker(); err != nil {
+		t.Fatalf("stop worker: %v", err)
+	}
+
+	savedJob, err := jobStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savedRun, err := baseStore.GetByID(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := baseStore.ListAttemptsByRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if faultStore.calls.Load() != 1 || requests.Load() != 1 || savedJob.Status != jobs.StatusFailed ||
+		savedJob.LastErrorClass == nil || *savedJob.LastErrorClass != string(jobs.ErrorClassPermanent) ||
+		savedJob.LastErrorCode == nil || *savedJob.LastErrorCode != llm.OutcomeUnknownErrorCode ||
+		savedJob.TerminalReason == nil || *savedJob.TerminalReason != jobs.TerminalReasonPermanent ||
+		savedJob.LastErrorMessage == nil || !strings.Contains(*savedJob.LastErrorMessage, "automatic replay is disabled") ||
+		savedRun.Status != diagnosis.StatusFailed || len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusFailedTerminal {
+		t.Fatalf("combined outcome-unknown finalization evidence: finalize calls=%d provider requests=%d job=%+v run=%s attempts=%+v",
+			faultStore.calls.Load(), requests.Load(), savedJob, savedRun.Status, attempts)
+	}
+	if !jobs.IsRetryableDiagnosisProviderFailure(jobs.ErrorClassPermanent, llm.OutcomeUnknownErrorCode) {
+		t.Fatal("PROVIDER_OUTCOME_UNKNOWN must still allow an explicit diagnosis retry")
+	}
+}
+
+type failFirstDiagnosisFinalizer struct {
+	diagnosis.Store
+	calls atomic.Int32
+}
+
+func (s *failFirstDiagnosisFinalizer) FinalizeDiagnosisFailure(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, class jobs.ErrorClass, code, message string, promptTokens, completionTokens, toolCalls int) error {
+	if s.calls.Add(1) == 1 {
+		return fmt.Errorf("injected transient failure before atomic commit")
+	}
+	return s.Store.FinalizeDiagnosisFailure(ctx, jobID, workerID, claimToken, generation, runID, attemptID, class, code, message, promptTokens, completionTokens, toolCalls)
 }
 
 func TestFC07Explicit429RemainsProviderRetryable(t *testing.T) {

@@ -681,6 +681,7 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	err := handler.Execute(jobCtx, job)
 	stopCancelPoll()
 	var atomicFinalizationErr *AtomicHandlerFinalizationError
+	var atomicFailurePolicy *AtomicHandlerFailurePolicy
 	if errors.As(err, &atomicFinalizationErr) {
 		resolution, resolutionErr := w.resolveAtomicHandlerFinalization(job, atomicFinalizationErr)
 		switch resolution {
@@ -691,6 +692,7 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 			log.Info("handler-owned atomic finalization confirmed from durable job", "status", atomicFinalizationErr.ExpectedStatus)
 			return
 		case atomicHandlerFinalizationSameClaimRunning:
+			atomicFailurePolicy = atomicFinalizationErr.FailurePolicy
 			err = atomicFinalizationErr.Cause
 			if err == nil {
 				err = atomicFinalizationErr
@@ -728,6 +730,7 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	}
 	if cause != nil {
 		err = cause
+		atomicFailurePolicy = nil
 	}
 	latency := time.Since(start)
 
@@ -746,6 +749,12 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 
 	// Handle failure or cancellation
 	errClass, errCode := ClassifyError(err)
+	messageOverride := ""
+	if atomicFailurePolicy != nil {
+		errClass = atomicFailurePolicy.ErrorClass
+		errCode = atomicFailurePolicy.ErrorCode
+		messageOverride = atomicFailurePolicy.ErrorMessage
+	}
 	if errClass == ErrorClassCancelled {
 		log.Info("job execution was cancelled", "error", err)
 		finish(func(ctx context.Context) error {
@@ -764,8 +773,15 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	isTerminal := (errClass == ErrorClassPermanent) || (job.AttemptCount >= job.MaxAttempts)
 	var termReason *TerminalReason
 	var nextRun time.Time
+	if atomicFailurePolicy != nil {
+		isTerminal = atomicFailurePolicy.Terminal
+		termReason = atomicFailurePolicy.TerminalReason
+		nextRun = atomicFailurePolicy.NextRunAt
+	}
 
-	if isTerminal {
+	if atomicFailurePolicy != nil {
+		log.Warn("atomic handler failure finalization is using its original failure policy", "terminal", isTerminal, "error_code", errCode)
+	} else if isTerminal {
 		if errClass == ErrorClassPermanent {
 			tr := TerminalReasonPermanent
 			termReason = &tr
@@ -781,6 +797,9 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	}
 
 	message := err.Error()
+	if atomicFailurePolicy != nil {
+		message = messageOverride
+	}
 	finish(func(ctx context.Context) error {
 		return w.store.ConditionalFinalizeFailure(ctx, job.ID, w.cfg.WorkerID, *job.ClaimToken,
 			errClass, errCode, message, termReason, isTerminal, nextRun)

@@ -146,8 +146,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				if errors.Is(finalizeErr, jobs.ErrOwnershipLost) {
 					return jobs.ErrOwnershipLost
 				}
-				return jobs.WrapAtomicHandlerFinalization(jobs.StatusFailed,
-					jobs.NewRetryableError("CHECKPOINT_VERSION_MISMATCH_FINALIZE_FAILED", "failed to finalize incompatible diagnosis checkpoint", finalizeErr))
+				return finalizeErr
 			}
 			result = executionResultFromCheckpoint(checkpoint)
 			if checkpoint.CheckpointKind == diagnosis.CheckpointKindFinalInvalid {
@@ -208,8 +207,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			if errors.Is(finalizeErr, jobs.ErrOwnershipLost) {
 				return jobs.ErrOwnershipLost
 			}
-			return jobs.WrapAtomicHandlerFinalization(jobs.StatusFailed,
-				jobs.NewRetryableError("CHECKPOINT_SAVE_FAILED_FINALIZE_FAILED", "failed to finalize diagnosis after checkpoint failure", finalizeErr))
+			return finalizeErr
 		}
 	}
 	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
@@ -259,8 +257,11 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			return jobs.ErrOwnershipLost
 		}
 		if finalizeErr != nil {
-			return jobs.WrapAtomicHandlerFinalization(jobs.StatusFailed,
-				jobs.NewRetryableError("ATOMIC_INVALID_FINALIZE_FAILED", "failed to atomically finalize invalid diagnosis report", finalizeErr))
+			reason := jobs.TerminalReasonPermanent
+			return jobs.WrapAtomicHandlerFailureFinalization(jobs.AtomicHandlerFailurePolicy{
+				ErrorClass: jobs.ErrorClassPermanent, ErrorCode: agent.ErrCodeInvalidStructuredReport,
+				ErrorMessage: message, TerminalReason: &reason, Terminal: true,
+			}, jobs.NewRetryableError("ATOMIC_INVALID_FINALIZE_FAILED", "failed to atomically finalize invalid diagnosis report", finalizeErr))
 		}
 		return jobs.ErrAlreadyFinalized
 	}
@@ -616,8 +617,14 @@ func (h *DiagnosisJobHandler) finalizeDiagnosisFailure(ctx context.Context, job 
 		if errors.Is(err, jobs.ErrOwnershipLost) {
 			return jobs.ErrOwnershipLost
 		}
-		return jobs.WrapAtomicHandlerFinalization(jobs.StatusFailed,
-			jobs.NewRetryableError("ATOMIC_FAILURE_FINALIZE_FAILED", "failed to atomically finalize diagnosis failure", err))
+		reason := jobs.TerminalReasonPermanent
+		if class != jobs.ErrorClassPermanent {
+			reason = jobs.TerminalReasonRetryableExhausted
+		}
+		return jobs.WrapAtomicHandlerFailureFinalization(jobs.AtomicHandlerFailurePolicy{
+			ErrorClass: class, ErrorCode: code, ErrorMessage: message,
+			TerminalReason: &reason, Terminal: true,
+		}, jobs.NewRetryableError("ATOMIC_FAILURE_FINALIZE_FAILED", "failed to atomically finalize diagnosis failure", err))
 	}
 	return jobs.ErrAlreadyFinalized
 }

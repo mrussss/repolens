@@ -22,6 +22,19 @@ const ErrorCodeAtomicFinalizationStateConflict = "ATOMIC_FINALIZATION_STATE_CONF
 type AtomicHandlerFinalizationError struct {
 	ExpectedStatus JobStatus
 	Cause          error
+	FailurePolicy  *AtomicHandlerFailurePolicy
+}
+
+// AtomicHandlerFailurePolicy preserves the failure semantics intended by a
+// handler-owned terminal transaction if the worker must perform fallback
+// terminalization after that transaction fails to commit.
+type AtomicHandlerFailurePolicy struct {
+	ErrorClass     ErrorClass
+	ErrorCode      string
+	ErrorMessage   string
+	TerminalReason *TerminalReason
+	Terminal       bool
+	NextRunAt      time.Time
 }
 
 func (e *AtomicHandlerFinalizationError) Error() string {
@@ -48,6 +61,23 @@ func WrapAtomicHandlerFinalization(expected JobStatus, cause error) error {
 		return cause
 	}
 	return &AtomicHandlerFinalizationError{ExpectedStatus: expected, Cause: cause}
+}
+
+// WrapAtomicHandlerFailureFinalization retains the original failure policy
+// while the worker reconciles an unsuccessful handler-owned transaction.
+func WrapAtomicHandlerFailureFinalization(policy AtomicHandlerFailurePolicy, cause error) error {
+	if cause == nil || errors.Is(cause, ErrOwnershipLost) || errors.Is(cause, ErrAlreadyFinalized) || errors.Is(cause, ErrCancellationRequested) {
+		return cause
+	}
+	if policy.TerminalReason != nil {
+		reason := *policy.TerminalReason
+		policy.TerminalReason = &reason
+	}
+	return &AtomicHandlerFinalizationError{
+		ExpectedStatus: StatusFailed,
+		Cause:          cause,
+		FailurePolicy:  &policy,
+	}
 }
 
 var ErrCancellationRequested = ErrUserCancellation
