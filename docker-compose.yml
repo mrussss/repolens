@@ -27,6 +27,7 @@ services:
     restart: unless-stopped
     environment:
       - ENV=development
+      - HTTP_BIND_ADDR=0.0.0.0
       - HTTP_PORT=8080
       - DB_DRIVER=mysql
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local

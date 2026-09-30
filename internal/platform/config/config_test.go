@@ -5,6 +5,18 @@ import (
 	"testing"
 )
 
+func TestHTTPBindAddrDefaultsToLoopbackAndHonorsOverride(t *testing.T) {
+	t.Setenv("HTTP_BIND_ADDR", "")
+	if got := Load().HTTPBindAddr; got != "127.0.0.1" {
+		t.Fatalf("default HTTP bind address = %q, want 127.0.0.1", got)
+	}
+
+	t.Setenv("HTTP_BIND_ADDR", "0.0.0.0")
+	if got := Load().HTTPBindAddr; got != "0.0.0.0" {
+		t.Fatalf("explicit HTTP bind address = %q, want 0.0.0.0", got)
+	}
+}
+
 func TestLoadUsesWritableLocalRuntimePathsByDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

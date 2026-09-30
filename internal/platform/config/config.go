@@ -17,6 +17,7 @@ const (
 
 type Config struct {
 	Env                     string
+	HTTPBindAddr            string
 	HTTPPort                string
 	DBDriver                string // "mysql" or "sqlite"
 	DSN                     string
@@ -50,6 +51,7 @@ func Load() *Config {
 	}
 	return &Config{
 		Env:                     getEnv("ENV", "development"),
+		HTTPBindAddr:            getEnv("HTTP_BIND_ADDR", "127.0.0.1"),
 		HTTPPort:                getEnv("HTTP_PORT", "8080"),
 		DBDriver:                getEnv("DB_DRIVER", "sqlite"),
 		DSN:                     getEnv("DB_DSN", "repolens.db"),

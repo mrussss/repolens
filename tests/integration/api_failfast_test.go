@@ -46,6 +46,7 @@ func TestAPI_FailFastOnPortCollision(t *testing.T) {
 	defer cancel()
 	cmdRun := exec.CommandContext(ctx, "../../bin/repolens-api")
 	cmdRun.Env = append(os.Environ(),
+		"HTTP_BIND_ADDR=127.0.0.1",
 		"HTTP_PORT="+portText,
 		"ENV=testing",
 		"DB_DRIVER=sqlite",

@@ -1,12 +1,44 @@
 package main
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"repolens/internal/platform/config"
 )
+
+func TestAPIHTTPListenerBindsConfiguredAddress(t *testing.T) {
+	tests := []struct {
+		name   string
+		bind   string
+		wantIP string
+	}{
+		{name: "direct binary default", bind: "", wantIP: "127.0.0.1"},
+		{name: "explicit address", bind: "127.0.0.2", wantIP: "127.0.0.2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HTTP_BIND_ADDR", tt.bind)
+			t.Setenv("HTTP_PORT", "0")
+			cfg := config.Load()
+			listener, err := net.Listen("tcp", apiHTTPListenAddr(cfg))
+			if err != nil {
+				t.Fatalf("listen on configured API address %q: %v", apiHTTPListenAddr(cfg), err)
+			}
+			defer listener.Close()
+			host, _, err := net.SplitHostPort(listener.Addr().String())
+			if err != nil {
+				t.Fatalf("split listener address %q: %v", listener.Addr(), err)
+			}
+			if host != tt.wantIP {
+				t.Fatalf("listener host = %q, want %q", host, tt.wantIP)
+			}
+		})
+	}
+}
 
 func TestLocalSecurityMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)

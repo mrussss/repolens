@@ -282,7 +282,7 @@ func run() error {
 	}
 
 	srv := &http.Server{
-		Addr:    ":" + cfg.HTTPPort,
+		Addr:    apiHTTPListenAddr(cfg),
 		Handler: router,
 	}
 
@@ -313,6 +313,10 @@ func run() error {
 	}
 
 	return nil
+}
+
+func apiHTTPListenAddr(cfg *config.Config) string {
+	return net.JoinHostPort(cfg.HTTPBindAddr, cfg.HTTPPort)
 }
 
 func localSecurityMiddleware() gin.HandlerFunc {
