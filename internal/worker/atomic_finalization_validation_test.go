@@ -21,12 +21,11 @@ import (
 )
 
 var errValidationFC06AfterCommit = errors.New("validation FC-06 injected error after durable commit")
+var errValidationFC06BeforeCommit = errors.New("validation FC-06 injected error before durable commit")
 
 const validationFC06WorkerID = "validation-fc06-worker"
 
-// VALIDATION-ONLY: convert these observations to desired-invariant regression
-// tests during production hardening.
-func TestValidationFC06SnapshotAtomicSuccessLeavesWorkerUnresolved(t *testing.T) {
+func TestFC06SnapshotAtomicSuccessReconcilesCommittedError(t *testing.T) {
 	db, jobStore := setupTestEnvironment(t)
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -63,7 +62,7 @@ func TestValidationFC06SnapshotAtomicSuccessLeavesWorkerUnresolved(t *testing.T)
 			return err
 		}
 		close(handlerReturned)
-		return errValidationFC06AfterCommit
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, errValidationFC06AfterCommit)
 	})
 	_, stopWorker := startValidationFC06Worker(t, jobStore, jobs.JobTypeMaterializeSnapshot, handler)
 	awaitValidationFC06Handler(t, handlerReturned)
@@ -89,15 +88,12 @@ func TestValidationFC06SnapshotAtomicSuccessLeavesWorkerUnresolved(t *testing.T)
 	if err != nil || nextJob.Status != jobs.StatusPending {
 		t.Fatalf("next code-index job=%+v err=%v; want PENDING", nextJob, err)
 	}
-	if workerErr == nil || !strings.Contains(workerErr.Error(), "unresolved terminal finalization") {
-		t.Fatalf("Worker StopGracefully error=%v; want unresolved finalization after successful handler-owned transaction", workerErr)
+	if workerErr != nil {
+		t.Fatalf("Worker StopGracefully error=%v; committed snapshot finalization should resolve successfully", workerErr)
 	}
-	t.Logf("observation: durable snapshot/revision/next-job transaction succeeded; current job=%s; Worker returned unresolved error: %v", job.Status, workerErr)
 }
 
-// VALIDATION-ONLY: convert this observation to a desired-invariant regression
-// test during production hardening.
-func TestValidationFC06DiagnosisSuccessLeavesWorkerUnresolved(t *testing.T) {
+func TestFC06DiagnosisSuccessReconcilesCommittedError(t *testing.T) {
 	db, jobStore := setupTestEnvironment(t)
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -137,7 +133,7 @@ func TestValidationFC06DiagnosisSuccessLeavesWorkerUnresolved(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return errValidationFC06AfterCommit
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, errValidationFC06AfterCommit)
 	})
 	_, stopWorker := startValidationFC06Worker(t, jobStore, jobs.JobTypeRunDiagnosis, handler)
 	awaitValidationFC06Handler(t, handlerReturned)
@@ -163,15 +159,12 @@ func TestValidationFC06DiagnosisSuccessLeavesWorkerUnresolved(t *testing.T) {
 		t.Fatalf("post-commit state: run=%s final_attempt=%s attempt=%s job=%s report=%+v",
 			savedRun.Status, savedRun.FinalAttemptID, attempts[0].Status, savedJob.Status, report)
 	}
-	if workerErr == nil || !strings.Contains(workerErr.Error(), "unresolved terminal finalization") {
-		t.Fatalf("Worker StopGracefully error=%v; want unresolved finalization after successful diagnosis transaction", workerErr)
+	if workerErr != nil {
+		t.Fatalf("Worker StopGracefully error=%v; committed diagnosis finalization should resolve successfully", workerErr)
 	}
-	t.Logf("observation: durable diagnosis/report/attempt/job transaction succeeded; Worker returned unresolved error: %v", workerErr)
 }
 
-// VALIDATION-ONLY: convert this observation to a desired-invariant regression
-// test during production hardening.
-func TestValidationFC06DiagnosisCancellationDoesNotLeaveWorkerUnresolved(t *testing.T) {
+func TestFC06DiagnosisCancellationReconcilesCommittedError(t *testing.T) {
 	db, jobStore := setupTestEnvironment(t)
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -209,7 +202,7 @@ func TestValidationFC06DiagnosisCancellationDoesNotLeaveWorkerUnresolved(t *test
 		if err != nil {
 			return err
 		}
-		return errValidationFC06AfterCommit
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusCancelled, errValidationFC06AfterCommit)
 	})
 	_, stopWorker := startValidationFC06Worker(t, validationFC06CancelPollStore{Store: jobStore}, jobs.JobTypeRunDiagnosis, handler)
 	awaitValidationFC06Handler(t, handlerReturned)
@@ -233,7 +226,104 @@ func TestValidationFC06DiagnosisCancellationDoesNotLeaveWorkerUnresolved(t *test
 	if workerErr != nil {
 		t.Fatalf("Worker StopGracefully error=%v; cancellation reconciliation should accept the durable CANCELLED state", workerErr)
 	}
-	t.Logf("observation: committed CANCELLED run/attempt/job retained cancel_requested; Worker unresolved finalization=false")
+}
+
+func TestFC06PreCommitAtomicFinalizationErrorUsesNormalFailurePath(t *testing.T) {
+	_, jobStore := setupTestEnvironment(t)
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "fc06-precommit-finalizer", MaxAttempts: 3}
+	if err := jobStore.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	handlerReturned := make(chan struct{})
+	handler := jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error {
+		close(handlerReturned)
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded,
+			jobs.NewRetryableError("ATOMIC_FINALIZE_FAILED", "injected pre-commit error", errValidationFC06BeforeCommit))
+	})
+	_, stopWorker := startValidationFC06Worker(t, jobStore, jobs.JobTypeBuildCodeIndex, handler)
+	awaitValidationFC06Handler(t, handlerReturned)
+	if err := stopWorker(); err != nil {
+		t.Fatalf("StopGracefully after ordinary pre-commit failure: %v", err)
+	}
+	saved, err := jobStore.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != jobs.StatusRetryWait || saved.LastErrorCode == nil || *saved.LastErrorCode != "ATOMIC_FINALIZE_FAILED" {
+		t.Fatalf("pre-commit state = status %s error_code=%v; want normal RETRY_WAIT handling", saved.Status, saved.LastErrorCode)
+	}
+}
+
+func TestFC06ChangedClaimStopsWithoutStaleFinalization(t *testing.T) {
+	db, jobStore := setupTestEnvironment(t)
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "fc06-changed-claim", MaxAttempts: 3}
+	if err := jobStore.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	handlerReturned := make(chan struct{})
+	handler := jobs.HandlerFunc(func(ctx context.Context, job *jobs.AnalysisJob) error {
+		result := db.Model(&jobs.AnalysisJob{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
+			"worker_id":            "fc06-replacement-worker",
+			"claim_token":          "fc06-replacement-token",
+			"execution_generation": job.ExecutionGeneration + 1,
+			"lease_until":          time.Now().UTC().Add(time.Minute),
+		})
+		if result.Error != nil {
+			close(handlerReturned)
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			close(handlerReturned)
+			return fmt.Errorf("replacement claim update affected %d rows", result.RowsAffected)
+		}
+		close(handlerReturned)
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, errValidationFC06AfterCommit)
+	})
+	_, stopWorker := startValidationFC06Worker(t, jobStore, jobs.JobTypeBuildCodeIndex, handler)
+	awaitValidationFC06Handler(t, handlerReturned)
+	if err := stopWorker(); err != nil {
+		t.Fatalf("StopGracefully after claim change: %v; stale claim must stop without finalization", err)
+	}
+	saved, err := jobStore.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != jobs.StatusRunning || saved.WorkerID == nil || *saved.WorkerID != "fc06-replacement-worker" ||
+		saved.ClaimToken == nil || *saved.ClaimToken != "fc06-replacement-token" || saved.ExecutionGeneration != job.ExecutionGeneration+1 {
+		t.Fatalf("replacement claim was modified by stale worker: %+v", saved)
+	}
+}
+
+func TestFC06UnexpectedTerminalFinalizationStateConflictsWithoutOverwrite(t *testing.T) {
+	_, jobStore := setupTestEnvironment(t)
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: "fc06-terminal-conflict", MaxAttempts: 3}
+	if err := jobStore.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	handlerReturned := make(chan struct{})
+	handler := jobs.HandlerFunc(func(ctx context.Context, job *jobs.AnalysisJob) error {
+		reason := jobs.TerminalReasonPermanent
+		if err := jobStore.ConditionalFinalizeFailure(ctx, job.ID, *job.WorkerID, *job.ClaimToken,
+			jobs.ErrorClassPermanent, "INJECTED_OTHER_TERMINAL", "preserve this durable failure", &reason, true, time.Time{}); err != nil {
+			close(handlerReturned)
+			return err
+		}
+		close(handlerReturned)
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, errValidationFC06AfterCommit)
+	})
+	_, stopWorker := startValidationFC06Worker(t, jobStore, jobs.JobTypeBuildCodeIndex, handler)
+	awaitValidationFC06Handler(t, handlerReturned)
+	workerErr := stopWorker()
+	if workerErr == nil || !strings.Contains(workerErr.Error(), jobs.ErrorCodeAtomicFinalizationStateConflict) {
+		t.Fatalf("StopGracefully error=%v; want %s conflict", workerErr, jobs.ErrorCodeAtomicFinalizationStateConflict)
+	}
+	saved, err := jobStore.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != jobs.StatusFailed || saved.LastErrorCode == nil || *saved.LastErrorCode != "INJECTED_OTHER_TERMINAL" {
+		t.Fatalf("durable terminal state overwritten: status=%s error_code=%v", saved.Status, saved.LastErrorCode)
+	}
 }
 
 type validationFC06WorkerStore interface {

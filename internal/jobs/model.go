@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -11,6 +12,43 @@ var ErrOwnershipLost = error(StopOwnershipLost)
 // ErrAlreadyFinalized tells the generic worker that a handler atomically
 // finalized both its business object and AnalysisJob already.
 var ErrAlreadyFinalized = errors.New("job already finalized")
+
+const ErrorCodeAtomicFinalizationStateConflict = "ATOMIC_FINALIZATION_STATE_CONFLICT"
+
+// AtomicHandlerFinalizationError marks an ambiguous result from a handler-owned
+// transaction that atomically finalized business state and its AnalysisJob.
+// Worker reconciles the durable Job before deciding whether generic
+// finalization is still appropriate.
+type AtomicHandlerFinalizationError struct {
+	ExpectedStatus JobStatus
+	Cause          error
+}
+
+func (e *AtomicHandlerFinalizationError) Error() string {
+	if e == nil {
+		return "atomic handler finalization failed"
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("atomic handler finalization expected %s", e.ExpectedStatus)
+	}
+	return fmt.Sprintf("atomic handler finalization expected %s: %v", e.ExpectedStatus, e.Cause)
+}
+
+func (e *AtomicHandlerFinalizationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+// WrapAtomicHandlerFinalization preserves ownership and cancellation
+// sentinels, while marking ordinary errors for durable-state reconciliation.
+func WrapAtomicHandlerFinalization(expected JobStatus, cause error) error {
+	if cause == nil || errors.Is(cause, ErrOwnershipLost) || errors.Is(cause, ErrAlreadyFinalized) || errors.Is(cause, ErrCancellationRequested) {
+		return cause
+	}
+	return &AtomicHandlerFinalizationError{ExpectedStatus: expected, Cause: cause}
+}
 
 var ErrCancellationRequested = ErrUserCancellation
 

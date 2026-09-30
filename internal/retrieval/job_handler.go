@@ -152,7 +152,7 @@ func (h *RetrievalJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	}
 	if finalizeErr != nil {
 		log.Error("failed updating retrieval build to READY", "build_id", rb.ID, "error", finalizeErr)
-		return finalizeErr
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, finalizeErr)
 	}
 	log.Info("retrieval build completed and published successfully",
 		"build_id", rb.ID,

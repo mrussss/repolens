@@ -130,7 +130,7 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	}
 	if saveErr != nil {
 		log.Error("failed persisting code index analysis result", "build_id", cib.ID, "error", saveErr)
-		return saveErr
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, saveErr)
 	}
 
 	// Non-revision builds retain the older follow-up stage creation path.

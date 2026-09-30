@@ -293,14 +293,12 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			ModulePath: r.Name, CommitSHA: commitSHA, ContentHash: contentHash,
 			FileCount: fileCount, TotalBytes: totalBytes, ReadyAt: now,
 		}); err != nil {
-			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
-			return err
+			return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, err)
 		}
 		stageFinalized = true
 	} else if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil {
 		if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
-			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
-			return err
+			return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, err)
 		}
 	} else if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
 		if err := finalizer.FinalizeMaterialization(ctx, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {

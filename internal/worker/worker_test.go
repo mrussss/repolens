@@ -254,7 +254,7 @@ func TestWorkerJobHandler_InvalidEvidenceDegradesButSucceeds(t *testing.T) {
 	}
 }
 
-func TestFinalizerRollbackClosesDurableCheckpointAttempt(t *testing.T) {
+func TestAtomicFinalizerErrorPreservesDurableCheckpointForRetry(t *testing.T) {
 	db, jobsStore := setupTestEnvironment(t)
 	ctx := context.Background()
 	baseStore := diagnosis.NewStore(db)
@@ -277,12 +277,16 @@ func TestFinalizerRollbackClosesDurableCheckpointAttempt(t *testing.T) {
 	if handlerErr == nil {
 		t.Fatal("expected injected finalizer error")
 	}
+	var atomicErr *jobs.AtomicHandlerFinalizationError
+	if !errors.As(handlerErr, &atomicErr) || atomicErr.ExpectedStatus != jobs.StatusSucceeded {
+		t.Fatalf("finalizer error = %v, want an atomic SUCCEEDED finalization error", handlerErr)
+	}
 	attempts, err := baseStore.ListAttemptsByRun(ctx, run.ID)
 	if err != nil || len(attempts) != 1 {
 		t.Fatalf("attempts=%+v err=%v", attempts, err)
 	}
-	if attempts[0].Status != diagnosis.AttemptStatusFailedRetryable || attempts[0].CheckpointKind != diagnosis.CheckpointKindFinalValid || attempts[0].ProviderCompletedAt == nil {
-		t.Fatalf("attempt after finalizer rollback = %+v; want closed retryable final checkpoint", attempts[0])
+	if attempts[0].Status != diagnosis.AttemptStatusRunning || attempts[0].CheckpointKind != diagnosis.CheckpointKindFinalValid || attempts[0].ProviderCompletedAt == nil {
+		t.Fatalf("attempt after ambiguous finalizer error = %+v; want RUNNING with its durable final checkpoint", attempts[0])
 	}
 	savedRun, err := baseStore.GetByID(ctx, run.ID)
 	if err != nil || savedRun.Status != diagnosis.StatusRunning {
@@ -291,6 +295,13 @@ func TestFinalizerRollbackClosesDurableCheckpointAttempt(t *testing.T) {
 	class, code := jobs.ClassifyError(handlerErr)
 	if err := jobsStore.ConditionalFinalizeFailure(ctx, claimed[0].ID, *claimed[0].WorkerID, *claimed[0].ClaimToken, class, code, "finalizer failed", nil, false, time.Now().UTC().Add(-time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	if err := baseStore.RecoverStaleAttempt(ctx, attempts[0].ID, run.ID, 0); err != nil {
+		t.Fatalf("reconcile abandoned pre-retry checkpoint attempt: %v", err)
+	}
+	abandoned, err := baseStore.GetAttempt(ctx, attempts[0].ID)
+	if err != nil || abandoned.Status != diagnosis.AttemptStatusAbandoned {
+		t.Fatalf("pre-retry attempt = %+v err=%v, want ABANDONED by stale-attempt recovery", abandoned, err)
 	}
 	savedJob, err := jobsStore.GetJobByID(ctx, claimed[0].ID)
 	if err != nil || savedJob.Status != jobs.StatusRetryWait {
@@ -354,7 +365,7 @@ func TestOwnershipLostFinalizerClosesStaleAttemptWithoutChangingWinningRun(t *te
 	}
 }
 
-func TestInvalidFinalReportCheckpointSurvivesFinalizerRollback(t *testing.T) {
+func TestInvalidFinalizationErrorPreservesCheckpointForRetry(t *testing.T) {
 	db, jobsStore := setupTestEnvironment(t)
 	ctx := context.Background()
 	baseStore := diagnosis.NewStore(db)
@@ -372,16 +383,24 @@ func TestInvalidFinalReportCheckpointSurvivesFinalizerRollback(t *testing.T) {
 	}
 	startClaimedJob(t, jobsStore, claimed[0], "worker-invalid-finalizer")
 	first := worker.NewDiagnosisJobHandler(invalidFinalizerFailingStore{GormStore: baseStore}, reportStore, evidence.NewCitationStore(db), nil, invalidReportExecutor{})
-	if err := first.Execute(ctx, claimed[0]); err == nil {
+	firstErr := first.Execute(ctx, claimed[0])
+	if firstErr == nil {
 		t.Fatal("expected invalid finalizer rollback")
 	}
+	var atomicErr *jobs.AtomicHandlerFinalizationError
+	if !errors.As(firstErr, &atomicErr) || atomicErr.ExpectedStatus != jobs.StatusFailed {
+		t.Fatalf("invalid finalizer error = %v, want an atomic FAILED finalization error", firstErr)
+	}
 	attempts, err := baseStore.ListAttemptsByRun(ctx, run.ID)
-	if err != nil || len(attempts) != 1 || attempts[0].CheckpointKind != diagnosis.CheckpointKindFinalInvalid || attempts[0].Status != diagnosis.AttemptStatusFailedRetryable {
+	if err != nil || len(attempts) != 1 || attempts[0].CheckpointKind != diagnosis.CheckpointKindFinalInvalid || attempts[0].Status != diagnosis.AttemptStatusRunning {
 		t.Fatalf("invalid checkpoint attempt = %+v err=%v", attempts, err)
 	}
 	class, code := jobs.ClassifyError(jobs.NewRetryableError("ATOMIC_INVALID_FINALIZE_FAILED", "injected", nil))
 	if err := jobsStore.ConditionalFinalizeFailure(ctx, claimed[0].ID, *claimed[0].WorkerID, *claimed[0].ClaimToken, class, code, "retry finalizer", nil, false, time.Now().UTC().Add(-time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	if err := baseStore.RecoverStaleAttempt(ctx, attempts[0].ID, run.ID, 0); err != nil {
+		t.Fatalf("reconcile abandoned invalid-checkpoint attempt: %v", err)
 	}
 	retryClaim, err := jobsStore.ClaimJobs(ctx, "worker-invalid-finalizer-retry", 1, time.Minute)
 	if err != nil || len(retryClaim) != 1 {
@@ -408,6 +427,9 @@ func TestInvalidFinalReportCheckpointSurvivesFinalizerRollback(t *testing.T) {
 	attempts, err = baseStore.ListAttemptsByRun(ctx, run.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if attempts[0].Status != diagnosis.AttemptStatusAbandoned {
+		t.Fatalf("historical ambiguous attempt = %+v, want ABANDONED after recovery", attempts[0])
 	}
 	for _, attempt := range attempts {
 		if attempt.Status == diagnosis.AttemptStatusRunning {

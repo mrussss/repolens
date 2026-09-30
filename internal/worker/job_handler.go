@@ -139,7 +139,14 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 				if finalizeErr == nil || errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
 					return jobs.ErrAlreadyFinalized
 				}
-				return jobs.NewRetryableError("CHECKPOINT_VERSION_MISMATCH_FINALIZE_FAILED", "failed to finalize incompatible diagnosis checkpoint", finalizeErr)
+				if errors.Is(finalizeErr, jobs.ErrCancellationRequested) {
+					return h.cancelAttempt(ctx, job, run, attempt)
+				}
+				if errors.Is(finalizeErr, jobs.ErrOwnershipLost) {
+					return jobs.ErrOwnershipLost
+				}
+				return jobs.WrapAtomicHandlerFinalization(jobs.StatusFailed,
+					jobs.NewRetryableError("CHECKPOINT_VERSION_MISMATCH_FINALIZE_FAILED", "failed to finalize incompatible diagnosis checkpoint", finalizeErr))
 			}
 			result = executionResultFromCheckpoint(checkpoint)
 			if checkpoint.CheckpointKind == diagnosis.CheckpointKindFinalInvalid {
@@ -190,9 +197,18 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			cancelFinalize()
 			if finalizeErr != nil && !errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
 				log.Error("failed to terminalize diagnosis after checkpoint failure", "error", finalizeErr)
-				return jobs.NewRetryableError("CHECKPOINT_SAVE_FAILED_FINALIZE_FAILED", "failed to finalize diagnosis after checkpoint failure", finalizeErr)
 			}
-			return jobs.ErrAlreadyFinalized
+			if finalizeErr == nil || errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
+				return jobs.ErrAlreadyFinalized
+			}
+			if errors.Is(finalizeErr, jobs.ErrCancellationRequested) {
+				return h.cancelAttempt(ctx, job, run, attempt)
+			}
+			if errors.Is(finalizeErr, jobs.ErrOwnershipLost) {
+				return jobs.ErrOwnershipLost
+			}
+			return jobs.WrapAtomicHandlerFinalization(jobs.StatusFailed,
+				jobs.NewRetryableError("CHECKPOINT_SAVE_FAILED_FINALIZE_FAILED", "failed to finalize diagnosis after checkpoint failure", finalizeErr))
 		}
 	}
 	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
@@ -238,8 +254,12 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		if errors.Is(finalizeErr, jobs.ErrCancellationRequested) {
 			return h.cancelAttempt(ctx, job, run, attempt)
 		}
+		if errors.Is(finalizeErr, jobs.ErrOwnershipLost) {
+			return jobs.ErrOwnershipLost
+		}
 		if finalizeErr != nil {
-			return h.handleFinalizerFailure(ctx, job, run, attempt, "ATOMIC_INVALID_FINALIZE_FAILED", finalizeErr)
+			return jobs.WrapAtomicHandlerFinalization(jobs.StatusFailed,
+				jobs.NewRetryableError("ATOMIC_INVALID_FINALIZE_FAILED", "failed to atomically finalize invalid diagnosis report", finalizeErr))
 		}
 		return jobs.ErrAlreadyFinalized
 	}
@@ -385,8 +405,12 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		if errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
 			return jobs.ErrAlreadyFinalized
 		}
+		if errors.Is(finalizeErr, jobs.ErrOwnershipLost) {
+			return jobs.ErrOwnershipLost
+		}
 		if finalizeErr != nil {
-			return h.handleFinalizerFailure(ctx, job, run, attempt, "ATOMIC_FINALIZE_FAILED", finalizeErr)
+			return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded,
+				jobs.NewRetryableError("ATOMIC_FINALIZE_FAILED", "failed to atomically finalize diagnosis success", finalizeErr))
 		}
 	}
 
@@ -561,7 +585,7 @@ func (h *DiagnosisJobHandler) cancelAttempt(ctx context.Context, job *jobs.Analy
 		return jobs.ErrOwnershipLost
 	}
 	if err := h.diagnosisStore.FinalizeCancellation(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken, run.ID, attempt.ID); err != nil {
-		return err
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusCancelled, err)
 	}
 	return jobs.ErrAlreadyFinalized
 }
@@ -584,7 +608,11 @@ func (h *DiagnosisJobHandler) finalizeDiagnosisFailure(ctx context.Context, job 
 		return h.cancelAttempt(ctx, job, run, attempt)
 	}
 	if err != nil {
-		return jobs.NewRetryableError("ATOMIC_FAILURE_FINALIZE_FAILED", "failed to atomically finalize diagnosis failure", err)
+		if errors.Is(err, jobs.ErrOwnershipLost) {
+			return jobs.ErrOwnershipLost
+		}
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusFailed,
+			jobs.NewRetryableError("ATOMIC_FAILURE_FINALIZE_FAILED", "failed to atomically finalize diagnosis failure", err))
 	}
 	return jobs.ErrAlreadyFinalized
 }
@@ -603,22 +631,6 @@ func (h *DiagnosisJobHandler) finalizeRetryableAttempt(ctx context.Context, job 
 	defer cancel()
 	return h.diagnosisStore.FinalizeRetryableAttempt(finalizeCtx, job.ID, *job.WorkerID, *job.ClaimToken,
 		job.ExecutionGeneration, run.ID, attempt.ID, code, message, promptTokens, completionTokens, toolCalls)
-}
-
-func (h *DiagnosisJobHandler) handleFinalizerFailure(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, code string, cause error) error {
-	if errors.Is(cause, jobs.ErrAlreadyFinalized) || errors.Is(cause, jobs.ErrOwnershipLost) {
-		return cause
-	}
-	if errors.Is(cause, jobs.ErrCancellationRequested) || errors.Is(context.Cause(ctx), jobs.ErrUserCancellation) {
-		return h.cancelAttempt(ctx, job, run, attempt)
-	}
-	if err := h.finalizeRetryableAttempt(ctx, job, run, attempt, code, cause.Error(), nil); err != nil {
-		if errors.Is(err, jobs.ErrCancellationRequested) {
-			return h.cancelAttempt(ctx, job, run, attempt)
-		}
-		return jobs.NewRetryableError(code, "diagnosis finalization failed and the attempt could not be closed", errors.Join(cause, err))
-	}
-	return jobs.NewRetryableError(code, "diagnosis finalization failed", cause)
 }
 
 func executionCounts(result *ExecutionResult) (int, int, int) {

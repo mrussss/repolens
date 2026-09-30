@@ -680,6 +680,45 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 	start := time.Now()
 	err := handler.Execute(jobCtx, job)
 	stopCancelPoll()
+	var atomicFinalizationErr *AtomicHandlerFinalizationError
+	if errors.As(err, &atomicFinalizationErr) {
+		resolution, resolutionErr := w.resolveAtomicHandlerFinalization(job, atomicFinalizationErr)
+		switch resolution {
+		case atomicHandlerFinalizationAccepted:
+			w.clearFinalizationError(job.ID)
+			cancelJob(context.Canceled)
+			renewer.Stop()
+			log.Info("handler-owned atomic finalization confirmed from durable job", "status", atomicFinalizationErr.ExpectedStatus)
+			return
+		case atomicHandlerFinalizationSameClaimRunning:
+			err = atomicFinalizationErr.Cause
+			if err == nil {
+				err = atomicFinalizationErr
+			}
+			log.Warn("handler-owned atomic finalization did not commit; continuing normal error handling", "error", err)
+		case atomicHandlerFinalizationOwnershipLost:
+			w.clearFinalizationError(job.ID)
+			cancelJob(context.Canceled)
+			renewer.Stop()
+			log.Warn("handler-owned atomic finalization stopped after ownership loss", "error", resolutionErr)
+			return
+		case atomicHandlerFinalizationStateConflict:
+			conflictErr := fmt.Errorf("%s: expected %s, durable job is %s: %w",
+				ErrorCodeAtomicFinalizationStateConflict, atomicFinalizationErr.ExpectedStatus, durableJobStatusFromError(resolutionErr), resolutionErr)
+			w.recordFinalizationError(job.ID, conflictErr)
+			cancelJob(context.Canceled)
+			renewer.Stop()
+			log.Error("handler-owned atomic finalization conflicts with durable terminal state", "error_code", ErrorCodeAtomicFinalizationStateConflict, "error", conflictErr)
+			return
+		default:
+			unresolvedErr := fmt.Errorf("handler-owned atomic finalization could not be reconciled: %w", resolutionErr)
+			w.recordFinalizationError(job.ID, unresolvedErr)
+			cancelJob(context.Canceled)
+			renewer.Stop()
+			log.Error("handler-owned atomic finalization remains unresolved", "error", unresolvedErr)
+			return
+		}
+	}
 	cause := context.Cause(jobCtx)
 	if errors.Is(cause, ErrWorkerShutdown) {
 		cancelJob(context.Canceled)
@@ -746,6 +785,61 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 		return w.store.ConditionalFinalizeFailure(ctx, job.ID, w.cfg.WorkerID, *job.ClaimToken,
 			errClass, errCode, message, termReason, isTerminal, nextRun)
 	}, failureFinalizationExpected(errClass, errCode, termReason, isTerminal))
+}
+
+type atomicHandlerFinalizationResolution uint8
+
+const (
+	atomicHandlerFinalizationUnresolved atomicHandlerFinalizationResolution = iota
+	atomicHandlerFinalizationAccepted
+	atomicHandlerFinalizationSameClaimRunning
+	atomicHandlerFinalizationOwnershipLost
+	atomicHandlerFinalizationStateConflict
+)
+
+type atomicHandlerFinalizationConflictError struct {
+	status JobStatus
+}
+
+func (e *atomicHandlerFinalizationConflictError) Error() string {
+	return string(e.status)
+}
+
+func durableJobStatusFromError(err error) JobStatus {
+	var conflict *atomicHandlerFinalizationConflictError
+	if errors.As(err, &conflict) {
+		return conflict.status
+	}
+	return "UNKNOWN"
+}
+
+func (w *Worker) resolveAtomicHandlerFinalization(claim *AnalysisJob, finalizationErr *AtomicHandlerFinalizationError) (atomicHandlerFinalizationResolution, error) {
+	if claim == nil || finalizationErr == nil {
+		return atomicHandlerFinalizationUnresolved, errors.New("missing claim or atomic finalization error")
+	}
+	readCtx, cancel := context.WithTimeout(context.Background(), w.finalizationOperationTimeout())
+	current, err := w.store.GetJobByID(readCtx, claim.ID)
+	cancel()
+	if errors.Is(err, sql.ErrNoRows) {
+		return atomicHandlerFinalizationOwnershipLost, ErrOwnershipLost
+	}
+	if err != nil {
+		return atomicHandlerFinalizationUnresolved, fmt.Errorf("read durable job after handler finalization error: %w", err)
+	}
+	if !sameExecutionClaim(claim, current, w.cfg.WorkerID) {
+		return atomicHandlerFinalizationOwnershipLost, ErrOwnershipLost
+	}
+	if isTerminalJobStatus(finalizationErr.ExpectedStatus) && current.Status == finalizationErr.ExpectedStatus {
+		return atomicHandlerFinalizationAccepted, nil
+	}
+	if current.Status == StatusRunning && current.ExecutionStarted {
+		return atomicHandlerFinalizationSameClaimRunning, nil
+	}
+	return atomicHandlerFinalizationStateConflict, &atomicHandlerFinalizationConflictError{status: current.Status}
+}
+
+func isTerminalJobStatus(status JobStatus) bool {
+	return status == StatusSucceeded || status == StatusFailed || status == StatusCancelled
 }
 
 func (w *Worker) resolveFinalization(ctx context.Context, claim *AnalysisJob, finalize func(context.Context) error, expected func(*AnalysisJob) bool) error {
