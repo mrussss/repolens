@@ -4,15 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// VALIDATION-ONLY: convert these observations to desired-invariant regression
-// tests during production hardening.
-func TestValidationFC13BusinessRowsAffectedZeroStillFailsJob(t *testing.T) {
+func TestFC13BusinessUnexpectedTerminalStateRollsBack(t *testing.T) {
 	db, store := setupValidationFC13Store(t)
 	defer db.Close()
 	ctx := context.Background()
@@ -24,9 +23,10 @@ func TestValidationFC13BusinessRowsAffectedZeroStillFailsJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	job, workerID, claimToken := claimValidationFC13StageJob(t, ctx, store, snapshotID)
-	if err := store.ConditionalFinalizeFailure(ctx, job.ID, workerID, claimToken, ErrorClassPermanent,
-		"VALIDATION_FC13", "injected terminal failure", terminalReasonPointer(TerminalReasonPermanent), true, time.Time{}); err != nil {
-		t.Fatalf("ConditionalFinalizeFailure: %v", err)
+	err := store.ConditionalFinalizeFailure(ctx, job.ID, workerID, claimToken, ErrorClassPermanent,
+		"FC13", "injected terminal failure", terminalReasonPointer(TerminalReasonPermanent), true, time.Time{})
+	if err == nil || !strings.Contains(err.Error(), ErrorCodeAtomicFinalizationStateConflict) {
+		t.Fatalf("ConditionalFinalizeFailure error = %v, want %s conflict", err, ErrorCodeAtomicFinalizationStateConflict)
 	}
 
 	savedJob, err := store.GetJobByID(ctx, job.ID)
@@ -40,15 +40,12 @@ func TestValidationFC13BusinessRowsAffectedZeroStillFailsJob(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT status FROM analysis_revisions WHERE snapshot_id = ?`, snapshotID).Scan(&revisionStatus); err != nil {
 		t.Fatal(err)
 	}
-	if savedJob.Status != StatusFailed || snapshotStatus != "READY" || revisionStatus != "FAILED" {
-		t.Fatalf("whole transaction observation: job=%s snapshot=%s revision=%s; want FAILED/READY/FAILED", savedJob.Status, snapshotStatus, revisionStatus)
+	if savedJob.Status != StatusRunning || snapshotStatus != "READY" || revisionStatus != "PREPARING" {
+		t.Fatalf("whole transaction rollback: job=%s snapshot=%s revision=%s; want RUNNING/READY/PREPARING", savedJob.Status, snapshotStatus, revisionStatus)
 	}
-	t.Logf("observation: transaction committed Job FAILED while business snapshot UPDATE affected zero rows and READY state remained; revision=%s", revisionStatus)
 }
 
-// VALIDATION-ONLY: convert this observation to a desired-invariant regression
-// test during production hardening.
-func TestValidationFC13RevisionRowsAffectedZeroStillFailsJob(t *testing.T) {
+func TestFC13RevisionUnexpectedTerminalStateRollsBackBusinessFailure(t *testing.T) {
 	db, store := setupValidationFC13Store(t)
 	defer db.Close()
 	ctx := context.Background()
@@ -60,9 +57,10 @@ func TestValidationFC13RevisionRowsAffectedZeroStillFailsJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	job, workerID, claimToken := claimValidationFC13StageJob(t, ctx, store, snapshotID)
-	if err := store.ConditionalFinalizeFailure(ctx, job.ID, workerID, claimToken, ErrorClassPermanent,
-		"VALIDATION_FC13", "injected terminal failure", terminalReasonPointer(TerminalReasonPermanent), true, time.Time{}); err != nil {
-		t.Fatalf("ConditionalFinalizeFailure: %v", err)
+	err := store.ConditionalFinalizeFailure(ctx, job.ID, workerID, claimToken, ErrorClassPermanent,
+		"FC13", "injected terminal failure", terminalReasonPointer(TerminalReasonPermanent), true, time.Time{})
+	if err == nil || !strings.Contains(err.Error(), ErrorCodeAtomicFinalizationStateConflict) {
+		t.Fatalf("ConditionalFinalizeFailure error = %v, want %s conflict", err, ErrorCodeAtomicFinalizationStateConflict)
 	}
 
 	savedJob, err := store.GetJobByID(ctx, job.ID)
@@ -76,10 +74,60 @@ func TestValidationFC13RevisionRowsAffectedZeroStillFailsJob(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT status, stage FROM analysis_revisions WHERE snapshot_id = ?`, snapshotID).Scan(&revisionStatus, &revisionStage); err != nil {
 		t.Fatal(err)
 	}
-	if savedJob.Status != StatusFailed || snapshotStatus != "FAILED" || revisionStatus != "READY" || revisionStage != "READY" {
-		t.Fatalf("whole transaction observation: job=%s snapshot=%s revision=%s/%s; want FAILED/FAILED/READY/READY", savedJob.Status, snapshotStatus, revisionStatus, revisionStage)
+	if savedJob.Status != StatusRunning || snapshotStatus != "MATERIALIZING" || revisionStatus != "READY" || revisionStage != "READY" {
+		t.Fatalf("whole transaction rollback: job=%s snapshot=%s revision=%s/%s; want RUNNING/MATERIALIZING/READY/READY", savedJob.Status, snapshotStatus, revisionStatus, revisionStage)
 	}
-	t.Logf("observation: transaction committed Job FAILED and snapshot FAILED while incompatible revision UPDATE affected zero rows; revision remained %s/%s", revisionStatus, revisionStage)
+}
+
+func TestFC13AlreadyFailedBusinessAndRevisionAreIdempotent(t *testing.T) {
+	db, store := setupValidationFC13Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	const snapshotID = "fc13-already-failed"
+	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, status) VALUES (?, 'FAILED')`, snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO analysis_revisions(id, snapshot_id, status, stage, version) VALUES (?, ?, 'FAILED', 'MATERIALIZING', 2)`, "fc13-already-failed-revision", snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	job, workerID, claimToken := claimValidationFC13StageJob(t, ctx, store, snapshotID)
+	if err := store.ConditionalFinalizeFailure(ctx, job.ID, workerID, claimToken, ErrorClassPermanent,
+		"FC13", "injected terminal failure", terminalReasonPointer(TerminalReasonPermanent), true, time.Time{}); err != nil {
+		t.Fatalf("already failed terminal objects should be idempotent: %v", err)
+	}
+	savedJob, err := store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if savedJob.Status != StatusFailed {
+		t.Fatalf("job status = %s, want FAILED", savedJob.Status)
+	}
+}
+
+func TestFC13MissingRevisionRowRemainsNoop(t *testing.T) {
+	db, store := setupValidationFC13Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	const snapshotID = "fc13-no-revision"
+	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, status) VALUES (?, 'MATERIALIZING')`, snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	job, workerID, claimToken := claimValidationFC13StageJob(t, ctx, store, snapshotID)
+	if err := store.ConditionalFinalizeFailure(ctx, job.ID, workerID, claimToken, ErrorClassPermanent,
+		"FC13", "injected terminal failure", terminalReasonPointer(TerminalReasonPermanent), true, time.Time{}); err != nil {
+		t.Fatalf("missing legacy revision row should retain no-op behavior: %v", err)
+	}
+	savedJob, err := store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshotStatus string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM repository_snapshots WHERE id = ?`, snapshotID).Scan(&snapshotStatus); err != nil {
+		t.Fatal(err)
+	}
+	if savedJob.Status != StatusFailed || snapshotStatus != "FAILED" {
+		t.Fatalf("legacy no-revision completion: job=%s snapshot=%s, want FAILED/FAILED", savedJob.Status, snapshotStatus)
+	}
 }
 
 func setupValidationFC13Store(t *testing.T) (*sql.DB, *Store) {

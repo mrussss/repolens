@@ -554,14 +554,19 @@ func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, rea
 		code = errorCode
 	}
 	var query string
+	var businessTableName string
 	switch jobType {
 	case JobTypeMaterializeSnapshot:
+		businessTableName = "repository_snapshots"
 		query = `UPDATE repository_snapshots SET status = 'FAILED', error_code = ? WHERE id = ? AND status IN ('CREATED', 'MATERIALIZING')`
 	case JobTypeBuildCodeIndex:
+		businessTableName = "code_index_builds"
 		query = `UPDATE code_index_builds SET status = 'FAILED', error_code = ? WHERE id = ? AND status IN ('CREATED', 'BUILDING')`
 	case JobTypeBuildRetrieval:
+		businessTableName = "retrieval_builds"
 		query = `UPDATE retrieval_builds SET status = 'FAILED', error_code = ? WHERE id = ? AND status IN ('CREATED', 'BUILDING')`
 	case JobTypeRunDiagnosis:
+		businessTableName = "diagnosis_runs"
 		query = `UPDATE diagnosis_runs SET status = 'FAILED', version = version + 1 WHERE id = ? AND status IN ('QUEUED', 'RUNNING')`
 	default:
 		return fmt.Errorf("unsupported job type %s during terminal failure", jobType)
@@ -570,8 +575,27 @@ func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, rea
 	if jobType == JobTypeRunDiagnosis {
 		args = []interface{}{resourceID}
 	}
-	if _, err := tx.ExecContext(ctx, query, args...); err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") {
-		return fmt.Errorf("failed terminal business transition for %s/%s: %w", jobType, resourceID, err)
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			// Keep low-level job-store fixtures that intentionally omit product
+			// tables usable. Production schemas always include the business table.
+		} else {
+			return fmt.Errorf("failed terminal business transition for %s/%s: %w", jobType, resourceID, err)
+		}
+	} else {
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed reading terminal business transition result for %s/%s: %w", jobType, resourceID, err)
+		}
+		if rowsAffected == 0 {
+			var status string
+			readErr := tx.QueryRowContext(ctx, `SELECT status FROM `+businessTableName+` WHERE id = ?`, resourceID).Scan(&status)
+			if readErr != nil || status != "FAILED" {
+				return fmt.Errorf("%s: terminal business transition for %s/%s found state %q: %v",
+					ErrorCodeAtomicFinalizationStateConflict, jobType, resourceID, status, readErr)
+			}
+		}
 	}
 	if jobType == JobTypeRunDiagnosis {
 		attemptStatus := "FAILED_TERMINAL"
@@ -621,10 +645,46 @@ func (s *Store) failAnalysisRevisionTx(ctx context.Context, tx *sql.Tx, jobType 
 	query := `UPDATE analysis_revisions
 		SET status = 'FAILED', stage = ?, error_code = ?, error_message = ?,
 		    version = version + 1, updated_at = ?
-		WHERE status = 'PREPARING' AND ` + predicate
-	_, err := tx.ExecContext(ctx, query, stage, errorCode, errorMessage, time.Now().UTC(), resourceID)
-	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+		WHERE status = 'PREPARING' AND stage = ? AND ` + predicate
+	result, err := tx.ExecContext(ctx, query, stage, errorCode, errorMessage, time.Now().UTC(), stage, resourceID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return nil
+		}
 		return fmt.Errorf("failed terminal analysis revision transition for %s/%s: %w", jobType, resourceID, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed reading terminal analysis revision result for %s/%s: %w", jobType, resourceID, err)
+	}
+	if rowsAffected != 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT status, stage FROM analysis_revisions WHERE `+predicate, resourceID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return nil
+		}
+		return fmt.Errorf("failed verifying terminal analysis revision transition for %s/%s: %w", jobType, resourceID, err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		found = true
+		var status, currentStage string
+		if err := rows.Scan(&status, &currentStage); err != nil {
+			return fmt.Errorf("failed scanning terminal analysis revision for %s/%s: %w", jobType, resourceID, err)
+		}
+		if status != "FAILED" || currentStage != stage {
+			return fmt.Errorf("%s: terminal analysis revision transition for %s/%s found state %s/%s, want FAILED/%s",
+				ErrorCodeAtomicFinalizationStateConflict, jobType, resourceID, status, currentStage, stage)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed verifying terminal analysis revision rows for %s/%s: %w", jobType, resourceID, err)
+	}
+	if !found {
+		return nil
 	}
 	return nil
 }
