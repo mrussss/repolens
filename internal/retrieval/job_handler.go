@@ -22,10 +22,14 @@ const maxBM25SymbolSourceBytes = 64 * 1024
 // RetrievalJobHandler processes BUILD_RETRIEVAL jobs.
 type RetrievalJobHandler struct {
 	ciStore       codeintelstore.Store
-	publisher     *artifact.Publisher
+	publisher     retrievalArtifactPublisher
 	snapshotStore snapshot.Store
 	storeFS       snapshotstore.SnapshotStore
 	finalizer     *analysispipeline.Finalizer
+}
+
+type retrievalArtifactPublisher interface {
+	Publish(buildID int64, executionGeneration int64, claimToken string, strategy string, idx *bm25.Index) (string, string, error)
 }
 
 func (h *RetrievalJobHandler) WithFinalizer(finalizer *analysispipeline.Finalizer) *RetrievalJobHandler {

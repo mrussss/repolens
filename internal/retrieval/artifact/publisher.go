@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,7 +28,14 @@ type Manifest struct {
 
 // Publisher handles atomic directory construction, verification, and promotion.
 type Publisher struct {
-	baseDir string
+	baseDir       string
+	openIndexFile func(string, int, os.FileMode) (indexFile, error)
+}
+
+type indexFile interface {
+	io.Writer
+	Sync() error
+	Close() error
 }
 
 // NewPublisher creates an artifact publisher with the given base index storage path.
@@ -59,24 +67,35 @@ func (p *Publisher) Publish(buildID int64, executionGeneration int64, claimToken
 	finalDir := filepath.Join(p.baseDir, fmt.Sprintf("%d", buildID), fmt.Sprintf("gen-%d", executionGeneration), claimKey)
 
 	defer func() {
-		// Clean up tmpDir on error
 		if err != nil {
-			_ = os.RemoveAll(tmpDir)
+			if cleanupErr := os.RemoveAll(tmpDir); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed cleaning temporary artifact directory: %w", cleanupErr))
+			}
 		}
 	}()
 
 	// 1. Write BM25 index
 	indexPath := filepath.Join(tmpDir, "index.json")
-	indexFile, err := os.OpenFile(indexPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	indexFile, err := p.createIndexFile(indexPath)
 	if err != nil {
 		return "", "", fmt.Errorf("failed creating index file: %w", err)
 	}
 	if err := idx.Save(indexFile); err != nil {
-		_ = indexFile.Close()
+		if closeErr := indexFile.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed closing index file after save error: %w", closeErr))
+		}
 		return "", "", fmt.Errorf("failed saving index: %w", err)
 	}
-	_ = indexFile.Sync()
-	_ = indexFile.Close()
+	if err := indexFile.Sync(); err != nil {
+		closeErr := indexFile.Close()
+		if closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed closing index file after sync error: %w", closeErr))
+		}
+		return "", "", fmt.Errorf("failed syncing index file: %w", err)
+	}
+	if err := indexFile.Close(); err != nil {
+		return "", "", fmt.Errorf("failed closing index file: %w", err)
+	}
 
 	// 2. Compute SHA256 of index file
 	h := sha256.New()
@@ -118,6 +137,13 @@ func (p *Publisher) Publish(buildID int64, executionGeneration int64, claimToken
 	}
 
 	return finalDir, hashStr, nil
+}
+
+func (p *Publisher) createIndexFile(path string) (indexFile, error) {
+	if p.openIndexFile != nil {
+		return p.openIndexFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	}
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 }
 
 // LoadIndex loads a published BM25 index from its final artifact directory.
