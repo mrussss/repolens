@@ -12,11 +12,7 @@ import (
 	"testing"
 	"time"
 
-	tc "github.com/testcontainers/testcontainers-go"
-	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
-	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 
 	"repolens/internal/analysispipeline"
 	codeintelmodel "repolens/internal/codeintel/model"
@@ -30,57 +26,17 @@ import (
 )
 
 func setupRealMySQL(t *testing.T, migrationDir ...string) (*gorm.DB, *jobs.Store, func()) {
-	ctx := context.Background()
-
-	mysqlContainer, err := tcmysql.RunContainer(ctx,
-		tc.WithImage("mysql:8.0"),
-		tcmysql.WithDatabase("repolens_test"),
-		tcmysql.WithUsername("testuser"),
-		tcmysql.WithPassword("testpass"),
-	)
-	if err != nil {
-		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
-			t.Fatalf("FAILED: real MySQL testcontainers required by release gate but failed to start: %v", err)
-		}
-		t.Skipf("Skipping real MySQL testcontainers test (Docker not available: %v)", err)
-		return nil, nil, nil
-	}
-
-	connStr, err := mysqlContainer.ConnectionString(ctx, "charset=utf8mb4&parseTime=True&loc=Local")
-	if err != nil {
-		_ = mysqlContainer.Terminate(ctx)
-		t.Fatalf("failed to get connection string: %v", err)
-	}
-
-	db, err := gorm.Open(gormmysql.Open(connStr), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	if err != nil {
-		_ = mysqlContainer.Terminate(ctx)
-		t.Fatalf("failed to open real MySQL connection: %v", err)
-	}
-
-	sqlDB, err := db.DB()
-	if err != nil {
-		_ = mysqlContainer.Terminate(ctx)
-		t.Fatalf("failed getting sql.DB: %v", err)
-	}
+	db, sqlDB, cleanup := setupRealMySQLDatabase(t)
 
 	migrationsPath := filepath.Join("..", "..", "migrations")
 	if len(migrationDir) > 0 {
 		migrationsPath = migrationDir[0]
 	}
 	if err := mysql.ApplyMigrations(&mysql.DB{GormDB: db, SqlDB: sqlDB}, migrationsPath); err != nil {
-		_ = mysqlContainer.Terminate(ctx)
 		t.Fatalf("failed to apply authoritative MySQL migrations: %v", err)
 	}
 
 	jobsStore := jobs.NewStore(sqlDB)
-
-	cleanup := func() {
-		_ = mysqlContainer.Terminate(context.Background())
-	}
-
 	return db, jobsStore, cleanup
 }
 
@@ -159,34 +115,8 @@ func TestRealMySQL_WorkerRetriesTransientTerminalFinalization(t *testing.T) {
 }
 
 func TestRealMySQL_Migration009ResumesAfterPartialDDL(t *testing.T) {
-	ctx := context.Background()
-	container, err := tcmysql.RunContainer(ctx,
-		tc.WithImage("mysql:8.0"),
-		tcmysql.WithDatabase("repolens_migration_test"),
-		tcmysql.WithUsername("testuser"),
-		tcmysql.WithPassword("testpass"),
-	)
-	if err != nil {
-		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
-			t.Fatalf("FAILED: real MySQL migration recovery test required but container failed to start: %v", err)
-		}
-		t.Skipf("Skipping real MySQL migration recovery test (Docker not available: %v)", err)
-	}
-	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
-
-	connStr, err := container.ConnectionString(ctx, "charset=utf8mb4&parseTime=True&loc=Local")
-	if err != nil {
-		t.Fatalf("get MySQL connection string: %v", err)
-	}
-	db, err := gorm.Open(gormmysql.Open(connStr), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open MySQL: %v", err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatalf("get SQL connection: %v", err)
-	}
-	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, sqlDB, cleanup := setupRealMySQLDatabase(t)
+	defer cleanup()
 	migrationDB := &mysql.DB{GormDB: db, SqlDB: sqlDB}
 
 	// Bring the database to the schema immediately before 009, then simulate a
@@ -278,34 +208,8 @@ func TestRealMySQL_Migration009ResumesAfterPartialDDL(t *testing.T) {
 }
 
 func TestRealMySQL_Migration013ResumesAndScopesSnapshotIdentityByRevision(t *testing.T) {
-	ctx := context.Background()
-	container, err := tcmysql.RunContainer(ctx,
-		tc.WithImage("mysql:8.0"),
-		tcmysql.WithDatabase("repolens_snapshot_migration_test"),
-		tcmysql.WithUsername("testuser"),
-		tcmysql.WithPassword("testpass"),
-	)
-	if err != nil {
-		if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "1" {
-			t.Fatalf("FAILED: real MySQL migration recovery test required but container failed to start: %v", err)
-		}
-		t.Skipf("Skipping real MySQL migration recovery test (Docker not available: %v)", err)
-	}
-	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
-
-	connStr, err := container.ConnectionString(ctx, "charset=utf8mb4&parseTime=True&loc=Local")
-	if err != nil {
-		t.Fatalf("get MySQL connection string: %v", err)
-	}
-	db, err := gorm.Open(gormmysql.Open(connStr), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open MySQL: %v", err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatalf("get SQL connection: %v", err)
-	}
-	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, sqlDB, cleanup := setupRealMySQLDatabase(t)
+	defer cleanup()
 	migrationDB := &mysql.DB{GormDB: db, SqlDB: sqlDB}
 
 	allMigrations := filepath.Join("..", "..", "migrations")
