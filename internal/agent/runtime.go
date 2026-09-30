@@ -15,6 +15,11 @@ import (
 	"repolens/internal/trace"
 )
 
+const (
+	ErrCodeExecutionSpecVersionUnsupported = "EXECUTION_SPEC_VERSION_UNSUPPORTED"
+	ErrCodeExecutionSpecConfigMismatch     = "EXECUTION_SPEC_CONFIG_MISMATCH"
+)
+
 type ExecutionResult struct {
 	Report             *evidence.DiagnosisReportData
 	ReportDraft        *evidence.ReportDraft
@@ -113,6 +118,10 @@ func (e *AgentRuntimeExecutor) WithGenerationOptions(options GenerationOptions) 
 }
 
 func (e *AgentRuntimeExecutor) Execute(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*ExecutionResult, error) {
+	if err := validateExecutionSpecCompatibility(spec, e.generation); err != nil {
+		return nil, err
+	}
+
 	provider := e.provider
 	if e.providerFactory != nil {
 		var err error
@@ -161,8 +170,7 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, spec diagnosis.Diagn
 		ResponseFormat:  &llm.ResponseFormat{Type: "json_object"},
 	}
 	if e.generation != nil {
-		// RealBench may override response_format, but reasoning_effort is
-		// always read from the immutable DiagnosisRun configuration snapshot.
+		// Compatibility validation only permits the frozen v2.2 JSON contract.
 		generation.ResponseFormat = e.generation.ResponseFormat
 	}
 	loop := NewAgentLoop(provider, registry, e.traceStore, guardCfg).WithGenerationOptions(generation)
@@ -251,4 +259,36 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, spec diagnosis.Diagn
 		FinalizationReason: res.FinalizationReason,
 		Retryable:          false,
 	}, nil
+}
+
+func validateExecutionSpecCompatibility(spec diagnosis.DiagnosisExecutionSpec, generationOverride *GenerationOptions) error {
+	if spec.Generation.PromptVersion != diagnosis.CurrentPromptVersion || spec.Generation.AgentVersion != diagnosis.CurrentAgentVersion {
+		return jobs.NewPermanentError(ErrCodeExecutionSpecVersionUnsupported,
+			"frozen diagnosis prompt or Agent version is not supported by this runtime", nil)
+	}
+
+	expectedHash := diagnosis.ComputeAgentConfigHashWithGenerationOptions(
+		spec.Budget.MaxAgentRounds,
+		spec.Budget.MaxToolCalls,
+		spec.Budget.MaxSearchCalls,
+		spec.Budget.MaxRepeatCalls,
+		spec.Budget.MaxEvidencePacketBytes,
+		spec.Budget.MaxToolResultBytes,
+		spec.Budget.FinalizationTurns,
+		spec.Generation.MaxOutputTokens,
+		spec.Provider.TimeoutSeconds,
+		spec.Provider.RetryAttempts,
+		spec.Generation.Temperature,
+		spec.Generation.ReasoningEffort,
+		"json_object",
+	)
+	if spec.Generation.AgentConfigHash == "" || spec.Generation.AgentConfigHash != expectedHash {
+		return jobs.NewPermanentError(ErrCodeExecutionSpecConfigMismatch,
+			"frozen diagnosis Agent configuration does not match this runtime", nil)
+	}
+	if generationOverride != nil && (generationOverride.ResponseFormat == nil || generationOverride.ResponseFormat.Type != "json_object") {
+		return jobs.NewPermanentError(ErrCodeExecutionSpecConfigMismatch,
+			"runtime response format is incompatible with the frozen v2.2 execution contract", nil)
+	}
+	return nil
 }

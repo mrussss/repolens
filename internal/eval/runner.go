@@ -14,6 +14,7 @@ import (
 	"repolens/internal/diagnosis"
 	"repolens/internal/evidence"
 	"repolens/internal/llm"
+	"repolens/internal/platform/config"
 	"repolens/internal/platform/snapshotstore"
 	"repolens/internal/retrieval"
 )
@@ -151,15 +152,34 @@ func (r *Runner) RunEndToEndDiagnosisEval(ctx context.Context, provider llm.Prov
 		hit5, hit10, rr := CalculateRetrievalMetrics(searchRes, c.RelevantFiles)
 
 		// 2. Execute full Agent Loop with Tool Calling
+		guard := agent.DefaultGuardConfig()
 		diagRun := &diagnosis.DiagnosisRun{
-			ID:               uuid.New().String(),
-			RepositoryID:     c.RepositoryName,
-			SnapshotID:       c.SnapshotSHA,
-			IssueTitle:       c.IssueTitle,
-			IssueDescription: c.IssueDescription,
-			ErrorLog:         c.ErrorLog,
-			Status:           diagnosis.StatusRunning,
+			ID:                     uuid.New().String(),
+			RepositoryID:           c.RepositoryName,
+			SnapshotID:             c.SnapshotSHA,
+			IssueTitle:             c.IssueTitle,
+			IssueDescription:       c.IssueDescription,
+			ErrorLog:               c.ErrorLog,
+			Status:                 diagnosis.StatusRunning,
+			PromptVersion:          diagnosis.CurrentPromptVersion,
+			AgentVersion:           diagnosis.CurrentAgentVersion,
+			Temperature:            0.1,
+			MaxAgentRounds:         guard.MaxSteps,
+			MaxToolCalls:           guard.MaxToolCalls,
+			MaxSearchCalls:         guard.MaxSearchCalls,
+			MaxRepeatCalls:         guard.MaxRepeatCalls,
+			MaxEvidencePacketBytes: 32 * 1024,
+			MaxToolResultBytes:     guard.MaxToolResultBytes,
+			FinalizationTurns:      1,
+			MaxOutputTokens:        guard.MaxOutputTokens,
+			ProviderTimeoutSeconds: config.DefaultProviderTimeoutSeconds,
 		}
+		diagRun.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithGenerationOptions(
+			diagRun.MaxAgentRounds, diagRun.MaxToolCalls, diagRun.MaxSearchCalls, diagRun.MaxRepeatCalls,
+			diagRun.MaxEvidencePacketBytes, diagRun.MaxToolResultBytes, diagRun.FinalizationTurns,
+			diagRun.MaxOutputTokens, diagRun.ProviderTimeoutSeconds, diagRun.ProviderRetryAttempts,
+			diagRun.Temperature, diagRun.ReasoningEffort, "json_object",
+		)
 		attempt := &diagnosis.DiagnosisAttempt{
 			ID:             uuid.New().String(),
 			DiagnosisRunID: diagRun.ID,

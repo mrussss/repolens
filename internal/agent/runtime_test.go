@@ -14,7 +14,48 @@ type runtimeGenerationProvider struct {
 }
 
 func testExecutionSpec(run *diagnosis.DiagnosisRun) diagnosis.DiagnosisExecutionSpec {
-	spec, err := diagnosis.BuildExecutionSpec(run)
+	frozen := *run
+	guard := DefaultGuardConfig()
+	if frozen.PromptVersion == "" {
+		frozen.PromptVersion = diagnosis.CurrentPromptVersion
+	}
+	if frozen.AgentVersion == "" {
+		frozen.AgentVersion = diagnosis.CurrentAgentVersion
+	}
+	if frozen.MaxAgentRounds == 0 {
+		frozen.MaxAgentRounds = guard.MaxSteps
+	}
+	if frozen.MaxToolCalls == 0 {
+		frozen.MaxToolCalls = guard.MaxToolCalls
+	}
+	if frozen.MaxSearchCalls == 0 {
+		frozen.MaxSearchCalls = guard.MaxSearchCalls
+	}
+	if frozen.MaxRepeatCalls == 0 {
+		frozen.MaxRepeatCalls = guard.MaxRepeatCalls
+	}
+	if frozen.MaxEvidencePacketBytes == 0 {
+		frozen.MaxEvidencePacketBytes = 32 * 1024
+	}
+	if frozen.MaxToolResultBytes == 0 {
+		frozen.MaxToolResultBytes = guard.MaxToolResultBytes
+	}
+	if frozen.FinalizationTurns == 0 {
+		frozen.FinalizationTurns = 1
+	}
+	if frozen.MaxOutputTokens == 0 {
+		frozen.MaxOutputTokens = guard.MaxOutputTokens
+	}
+	if frozen.ProviderTimeoutSeconds == 0 {
+		frozen.ProviderTimeoutSeconds = 60
+	}
+	frozen.AgentConfigHash = diagnosis.ComputeAgentConfigHashWithGenerationOptions(
+		frozen.MaxAgentRounds, frozen.MaxToolCalls, frozen.MaxSearchCalls, frozen.MaxRepeatCalls,
+		frozen.MaxEvidencePacketBytes, frozen.MaxToolResultBytes, frozen.FinalizationTurns,
+		frozen.MaxOutputTokens, frozen.ProviderTimeoutSeconds, frozen.ProviderRetryAttempts,
+		frozen.Temperature, frozen.ReasoningEffort, "json_object",
+	)
+	spec, err := diagnosis.BuildExecutionSpec(&frozen)
 	if err != nil {
 		panic(err)
 	}
@@ -68,21 +109,17 @@ func TestRuntimeUsesFrozenGenerationBudgetAndInitialRetrieval(t *testing.T) {
 	provider := &runtimeGenerationProvider{}
 	retriever := &assemblyRetriever{}
 	executor := NewAgentRuntimeExecutor(provider, retriever, nil, nil, DefaultGuardConfig())
-	spec := diagnosis.DiagnosisExecutionSpec{RunID: "run-runtime-spec"}
+	spec := testExecutionSpec(&diagnosis.DiagnosisRun{
+		ID: "run-runtime-spec", Temperature: 0.25, ReasoningEffort: "low", MaxOutputTokens: 1024,
+		MaxAgentRounds: 3, MaxToolCalls: 4, MaxSearchCalls: 2, MaxRepeatCalls: 1,
+		MaxToolResultBytes: 8192,
+	})
 	spec.Lineage.RepositoryID = "repo"
 	spec.Lineage.SnapshotID = "snapshot"
 	spec.Lineage.CodeIndexBuildID = 17
 	spec.Lineage.RetrievalBuildID = 23
 	spec.Issue.Title = "crash"
 	spec.Issue.Description = "handler failure"
-	spec.Generation.ReasoningEffort = "low"
-	spec.Generation.Temperature = 0.25
-	spec.Generation.MaxOutputTokens = 1024
-	spec.Budget.MaxAgentRounds = 3
-	spec.Budget.MaxToolCalls = 4
-	spec.Budget.MaxSearchCalls = 2
-	spec.Budget.MaxRepeatCalls = 1
-	spec.Budget.MaxToolResultBytes = 8192
 	result, err := executor.Execute(context.Background(), spec, &diagnosis.DiagnosisAttempt{ID: "attempt-runtime-spec"})
 	if err != nil {
 		t.Fatal(err)

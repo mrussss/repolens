@@ -165,7 +165,8 @@ func TestGoldenPathRevisionDiagnosisReport(t *testing.T) {
 		ProviderSource: func() diagnosis.ProviderMetadata {
 			return diagnosis.ProviderMetadata{
 				IsConfigured: true, ModelName: "scripted-golden-path",
-				AgentConfigHash: "golden-path-config", Temperature: 0.1,
+				PromptVersion: diagnosis.CurrentPromptVersion, AgentVersion: diagnosis.CurrentAgentVersion,
+				Temperature: 0.1,
 			}
 		},
 	})
