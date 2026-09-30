@@ -833,17 +833,17 @@ func TestStore_TerminalStageFailureSynchronizesAnalysisRevision(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 	for _, ddl := range []string{
-		`CREATE TABLE code_index_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
+		`CREATE TABLE code_index_builds (id TEXT PRIMARY KEY, analysis_revision_id TEXT NOT NULL DEFAULT '', snapshot_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, error_code TEXT)`,
 		`CREATE TABLE analysis_revisions (id TEXT PRIMARY KEY, snapshot_id TEXT, code_index_build_id TEXT, retrieval_build_id TEXT, status TEXT NOT NULL, stage TEXT NOT NULL, error_code TEXT, error_message TEXT, version INTEGER NOT NULL, updated_at DATETIME)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := db.Exec(`INSERT INTO code_index_builds (id, status) VALUES ('build-terminal', 'BUILDING')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO code_index_builds (id, analysis_revision_id, snapshot_id, status) VALUES ('build-terminal', 'revision-terminal', 'snapshot-terminal', 'BUILDING')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO analysis_revisions (id, code_index_build_id, status, stage, version) VALUES ('revision-terminal', 'build-terminal', 'PREPARING', 'BUILDING_CODE_INDEX', 2)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO analysis_revisions (id, snapshot_id, code_index_build_id, status, stage, version) VALUES ('revision-terminal', 'snapshot-terminal', 'build-terminal', 'PREPARING', 'BUILDING_CODE_INDEX', 2)`); err != nil {
 		t.Fatal(err)
 	}
 

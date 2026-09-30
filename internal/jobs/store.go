@@ -624,69 +624,146 @@ func (s *Store) failBusinessTx(ctx context.Context, tx *sql.Tx, jobID int64, rea
 }
 
 // failAnalysisRevisionTx keeps the product-facing pipeline state in sync with
-// a terminal stage job failure. Older isolated job-store tests do not create
-// the v2.2 revision table, so that schema omission remains harmless here.
+// a terminal stage job failure. The business resource's revision ID is the
+// source of truth: empty IDs retain legacy behavior, while a populated ID must
+// resolve to the exact revision and lineage in this transaction.
 func (s *Store) failAnalysisRevisionTx(ctx context.Context, tx *sql.Tx, jobType JobType, resourceID, errorCode, errorMessage string) error {
-	var predicate string
 	var stage string
 	switch jobType {
 	case JobTypeMaterializeSnapshot:
-		predicate = "snapshot_id = ?"
 		stage = "MATERIALIZING"
 	case JobTypeBuildCodeIndex:
-		predicate = "code_index_build_id = ?"
 		stage = "BUILDING_CODE_INDEX"
 	case JobTypeBuildRetrieval:
-		predicate = "retrieval_build_id = ?"
 		stage = "BUILDING_RETRIEVAL"
 	default:
 		return nil
 	}
-	query := `UPDATE analysis_revisions
+	identity, revisionAware, err := readRevisionResourceIdentityTx(ctx, tx, jobType, resourceID)
+	if err != nil {
+		return err
+	}
+	if !revisionAware {
+		return nil
+	}
+
+	revision, err := loadAnalysisRevisionTx(ctx, tx, identity.revisionID)
+	if err != nil {
+		return revisionStateConflict(jobType, resourceID, "linked revision is missing or unreadable", err)
+	}
+	if err := validateRevisionResourceLink(jobType, resourceID, identity, revision); err != nil {
+		return err
+	}
+
+	result, err := tx.ExecContext(ctx, `UPDATE analysis_revisions
 		SET status = 'FAILED', stage = ?, error_code = ?, error_message = ?,
 		    version = version + 1, updated_at = ?
-		WHERE status = 'PREPARING' AND stage = ? AND ` + predicate
-	result, err := tx.ExecContext(ctx, query, stage, errorCode, errorMessage, time.Now().UTC(), stage, resourceID)
+		WHERE id = ? AND status = 'PREPARING' AND stage = ?`,
+		stage, errorCode, errorMessage, time.Now().UTC(), identity.revisionID, stage)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
-			return nil
-		}
 		return fmt.Errorf("failed terminal analysis revision transition for %s/%s: %w", jobType, resourceID, err)
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("failed reading terminal analysis revision result for %s/%s: %w", jobType, resourceID, err)
 	}
-	if rowsAffected != 0 {
+	if rowsAffected == 1 {
 		return nil
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT status, stage FROM analysis_revisions WHERE `+predicate, resourceID)
+
+	current, err := loadAnalysisRevisionTx(ctx, tx, identity.revisionID)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
-			return nil
-		}
-		return fmt.Errorf("failed verifying terminal analysis revision transition for %s/%s: %w", jobType, resourceID, err)
+		return revisionStateConflict(jobType, resourceID, "linked revision disappeared during failure transition", err)
 	}
-	defer rows.Close()
-	found := false
-	for rows.Next() {
-		found = true
-		var status, currentStage string
-		if err := rows.Scan(&status, &currentStage); err != nil {
-			return fmt.Errorf("failed scanning terminal analysis revision for %s/%s: %w", jobType, resourceID, err)
-		}
-		if status != "FAILED" || currentStage != stage {
-			return fmt.Errorf("%s: terminal analysis revision transition for %s/%s found state %s/%s, want FAILED/%s",
-				ErrorCodeAtomicFinalizationStateConflict, jobType, resourceID, status, currentStage, stage)
-		}
+	if err := validateRevisionResourceLink(jobType, resourceID, identity, current); err != nil {
+		return err
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed verifying terminal analysis revision rows for %s/%s: %w", jobType, resourceID, err)
-	}
-	if !found {
+	if current.status == "FAILED" && current.stage == stage {
 		return nil
+	}
+	return revisionStateConflict(jobType, resourceID,
+		fmt.Sprintf("linked revision is %s/%s, want PREPARING/%s or FAILED/%s", current.status, current.stage, stage, stage), nil)
+}
+
+type revisionResourceIdentity struct {
+	revisionID       string
+	snapshotID       string
+	codeIndexBuildID string
+	retrievalBuildID string
+}
+
+type analysisRevisionState struct {
+	snapshotID       sql.NullString
+	codeIndexBuildID sql.NullString
+	retrievalBuildID sql.NullString
+	status           string
+	stage            string
+}
+
+func readRevisionResourceIdentityTx(ctx context.Context, tx *sql.Tx, jobType JobType, resourceID string) (revisionResourceIdentity, bool, error) {
+	var identity revisionResourceIdentity
+	var err error
+	switch jobType {
+	case JobTypeMaterializeSnapshot:
+		err = tx.QueryRowContext(ctx, `SELECT COALESCE(analysis_revision_id, ''), id FROM repository_snapshots WHERE id = ?`, resourceID).
+			Scan(&identity.revisionID, &identity.snapshotID)
+	case JobTypeBuildCodeIndex:
+		err = tx.QueryRowContext(ctx, `SELECT COALESCE(analysis_revision_id, ''), snapshot_id FROM code_index_builds WHERE id = ?`, resourceID).
+			Scan(&identity.revisionID, &identity.snapshotID)
+		identity.codeIndexBuildID = resourceID
+	case JobTypeBuildRetrieval:
+		err = tx.QueryRowContext(ctx, `SELECT COALESCE(analysis_revision_id, ''), code_index_build_id FROM retrieval_builds WHERE id = ?`, resourceID).
+			Scan(&identity.revisionID, &identity.codeIndexBuildID)
+		identity.retrievalBuildID = resourceID
+	default:
+		return identity, false, nil
+	}
+	if err != nil {
+		lower := strings.ToLower(err.Error())
+		if strings.Contains(lower, "no such table") || strings.Contains(lower, "doesn't exist") || strings.Contains(lower, "no such column") || strings.Contains(lower, "unknown column") {
+			// Older isolated job-store schemas intentionally have no revision
+			// linkage columns. Treat those as legacy compatibility fixtures.
+			return revisionResourceIdentity{}, false, nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return identity, false, revisionStateConflict(jobType, resourceID, "business resource disappeared before revision validation", err)
+		}
+		return identity, false, fmt.Errorf("failed reading revision identity for %s/%s: %w", jobType, resourceID, err)
+	}
+	return identity, identity.revisionID != "", nil
+}
+
+func loadAnalysisRevisionTx(ctx context.Context, tx *sql.Tx, revisionID string) (analysisRevisionState, error) {
+	var revision analysisRevisionState
+	err := tx.QueryRowContext(ctx, `SELECT snapshot_id, code_index_build_id, retrieval_build_id, status, stage
+		FROM analysis_revisions WHERE id = ?`, revisionID).Scan(
+		&revision.snapshotID, &revision.codeIndexBuildID, &revision.retrievalBuildID, &revision.status, &revision.stage)
+	return revision, err
+}
+
+func validateRevisionResourceLink(jobType JobType, resourceID string, identity revisionResourceIdentity, revision analysisRevisionState) error {
+	valid := false
+	switch jobType {
+	case JobTypeMaterializeSnapshot:
+		valid = revision.snapshotID.Valid && revision.snapshotID.String == identity.snapshotID
+	case JobTypeBuildCodeIndex:
+		valid = revision.snapshotID.Valid && revision.snapshotID.String == identity.snapshotID &&
+			revision.codeIndexBuildID.Valid && revision.codeIndexBuildID.String == identity.codeIndexBuildID
+	case JobTypeBuildRetrieval:
+		valid = revision.codeIndexBuildID.Valid && revision.codeIndexBuildID.String == identity.codeIndexBuildID &&
+			revision.retrievalBuildID.Valid && revision.retrievalBuildID.String == identity.retrievalBuildID
+	}
+	if !valid {
+		return revisionStateConflict(jobType, resourceID, "linked revision does not point back to the business resource lineage", nil)
 	}
 	return nil
+}
+
+func revisionStateConflict(jobType JobType, resourceID, detail string, cause error) error {
+	if cause != nil {
+		return fmt.Errorf("%s: revision-aware resource %s/%s: %s: %w", ErrorCodeAtomicFinalizationStateConflict, jobType, resourceID, detail, cause)
+	}
+	return fmt.Errorf("%s: revision-aware resource %s/%s: %s", ErrorCodeAtomicFinalizationStateConflict, jobType, resourceID, detail)
 }
 
 // ConditionalFinalizeFailure records failure details outside an external transaction.

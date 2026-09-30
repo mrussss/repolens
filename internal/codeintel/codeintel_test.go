@@ -525,7 +525,7 @@ func TestQueuedCodeIndexJobFailsClosedWhenLegacyTagNamesAreUnavailable(t *testin
 	if err := db.Create(&revision.AnalysisRevision{
 		ID: revisionID, RepositoryID: "repo-build-tags", SourceRef: "main",
 		CommitSHA: "0123456789012345678901234567890123456789", PipelineVersion: "v2.2",
-		PipelineFingerprint: "fingerprint-missing-build-tags", Status: revision.StatusPreparing,
+		PipelineFingerprint: "fingerprint-missing-build-tags", SnapshotID: "snap-legacy-build-tags", Status: revision.StatusPreparing,
 		Stage: revision.StageBuildingCode, ExecutionGeneration: 1, Version: 1,
 	}).Error; err != nil {
 		t.Fatal(err)

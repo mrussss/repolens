@@ -16,7 +16,7 @@ func TestFC13BusinessUnexpectedTerminalStateRollsBack(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 	const snapshotID = "validation-fc13-business-ready"
-	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, status) VALUES (?, 'READY')`, snapshotID); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, analysis_revision_id, status) VALUES (?, ?, 'READY')`, snapshotID, "validation-fc13-revision-business"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO analysis_revisions(id, snapshot_id, status, stage, version) VALUES (?, ?, 'PREPARING', 'MATERIALIZING', 1)`, "validation-fc13-revision-business", snapshotID); err != nil {
@@ -50,7 +50,7 @@ func TestFC13RevisionUnexpectedTerminalStateRollsBackBusinessFailure(t *testing.
 	defer db.Close()
 	ctx := context.Background()
 	const snapshotID = "validation-fc13-revision-ready"
-	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, status) VALUES (?, 'MATERIALIZING')`, snapshotID); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, analysis_revision_id, status) VALUES (?, ?, 'MATERIALIZING')`, snapshotID, "validation-fc13-revision-incompatible"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO analysis_revisions(id, snapshot_id, status, stage, version) VALUES (?, ?, 'READY', 'READY', 3)`, "validation-fc13-revision-incompatible", snapshotID); err != nil {
@@ -84,7 +84,7 @@ func TestFC13AlreadyFailedBusinessAndRevisionAreIdempotent(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 	const snapshotID = "fc13-already-failed"
-	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, status) VALUES (?, 'FAILED')`, snapshotID); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, analysis_revision_id, status) VALUES (?, ?, 'FAILED')`, snapshotID, "fc13-already-failed-revision"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO analysis_revisions(id, snapshot_id, status, stage, version) VALUES (?, ?, 'FAILED', 'MATERIALIZING', 2)`, "fc13-already-failed-revision", snapshotID); err != nil {
@@ -109,7 +109,7 @@ func TestFC13MissingRevisionRowRemainsNoop(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 	const snapshotID = "fc13-no-revision"
-	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, status) VALUES (?, 'MATERIALIZING')`, snapshotID); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, analysis_revision_id, status) VALUES (?, '', 'MATERIALIZING')`, snapshotID); err != nil {
 		t.Fatal(err)
 	}
 	job, workerID, claimToken := claimValidationFC13StageJob(t, ctx, store, snapshotID)
@@ -127,6 +127,65 @@ func TestFC13MissingRevisionRowRemainsNoop(t *testing.T) {
 	}
 	if savedJob.Status != StatusFailed || snapshotStatus != "FAILED" {
 		t.Fatalf("legacy no-revision completion: job=%s snapshot=%s, want FAILED/FAILED", savedJob.Status, snapshotStatus)
+	}
+}
+
+func TestFC13RevisionAwareResourceMissingRevisionRollsBack(t *testing.T) {
+	db, store := setupValidationFC13Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	const snapshotID = "fc13-revision-aware-missing"
+	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, analysis_revision_id, status) VALUES (?, 'missing-revision', 'MATERIALIZING')`, snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	job, workerID, claimToken := claimValidationFC13StageJob(t, ctx, store, snapshotID)
+	err := store.ConditionalFinalizeFailure(ctx, job.ID, workerID, claimToken, ErrorClassPermanent,
+		"FC13", "injected terminal failure", terminalReasonPointer(TerminalReasonPermanent), true, time.Time{})
+	if err == nil || !strings.Contains(err.Error(), ErrorCodeAtomicFinalizationStateConflict) {
+		t.Fatalf("revision-aware missing revision error = %v, want invariant conflict", err)
+	}
+	assertFC13SnapshotFailureRolledBack(t, ctx, db, store, job.ID, snapshotID, "MATERIALIZING")
+}
+
+func TestFC13RevisionAwareResourceMismatchedRevisionRollsBack(t *testing.T) {
+	db, store := setupValidationFC13Store(t)
+	defer db.Close()
+	ctx := context.Background()
+	const snapshotID = "fc13-revision-aware-mismatch"
+	if _, err := db.ExecContext(ctx, `INSERT INTO repository_snapshots(id, analysis_revision_id, status) VALUES (?, 'revision-A', 'MATERIALIZING')`, snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO analysis_revisions(id, snapshot_id, status, stage, version) VALUES ('revision-A', 'another-snapshot', 'PREPARING', 'MATERIALIZING', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	job, workerID, claimToken := claimValidationFC13StageJob(t, ctx, store, snapshotID)
+	err := store.ConditionalFinalizeFailure(ctx, job.ID, workerID, claimToken, ErrorClassPermanent,
+		"FC13", "injected terminal failure", terminalReasonPointer(TerminalReasonPermanent), true, time.Time{})
+	if err == nil || !strings.Contains(err.Error(), ErrorCodeAtomicFinalizationStateConflict) {
+		t.Fatalf("revision-aware mismatched revision error = %v, want invariant conflict", err)
+	}
+	assertFC13SnapshotFailureRolledBack(t, ctx, db, store, job.ID, snapshotID, "MATERIALIZING")
+	var revisionStatus, revisionStage string
+	if err := db.QueryRowContext(ctx, `SELECT status, stage FROM analysis_revisions WHERE id = 'revision-A'`).Scan(&revisionStatus, &revisionStage); err != nil {
+		t.Fatal(err)
+	}
+	if revisionStatus != "PREPARING" || revisionStage != "MATERIALIZING" {
+		t.Fatalf("mismatched revision changed during rollback: %s/%s", revisionStatus, revisionStage)
+	}
+}
+
+func assertFC13SnapshotFailureRolledBack(t *testing.T, ctx context.Context, db *sql.DB, store *Store, jobID int64, snapshotID, wantSnapshotStatus string) {
+	t.Helper()
+	savedJob, err := store.GetJobByID(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshotStatus string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM repository_snapshots WHERE id = ?`, snapshotID).Scan(&snapshotStatus); err != nil {
+		t.Fatal(err)
+	}
+	if savedJob.Status != StatusRunning || snapshotStatus != wantSnapshotStatus {
+		t.Fatalf("whole transaction rollback: job=%s snapshot=%s; want RUNNING/%s", savedJob.Status, snapshotStatus, wantSnapshotStatus)
 	}
 }
 
@@ -149,9 +208,9 @@ func setupValidationFC13Store(t *testing.T) (*sql.DB, *Store) {
 			finished_at DATETIME, execution_started BOOLEAN NOT NULL DEFAULT 0,
 			UNIQUE(job_type, resource_id)
 		)`,
-		`CREATE TABLE repository_snapshots (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
+		`CREATE TABLE repository_snapshots (id TEXT PRIMARY KEY, analysis_revision_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, error_code TEXT)`,
 		`CREATE TABLE analysis_revisions (
-			id TEXT PRIMARY KEY, snapshot_id TEXT, status TEXT NOT NULL, stage TEXT NOT NULL,
+			id TEXT PRIMARY KEY, snapshot_id TEXT, code_index_build_id TEXT, retrieval_build_id TEXT, status TEXT NOT NULL, stage TEXT NOT NULL,
 			error_code TEXT, error_message TEXT, version INTEGER NOT NULL, updated_at DATETIME
 		)`,
 	}
