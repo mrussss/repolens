@@ -1,7 +1,10 @@
 package mysql
 
 import (
+	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,62 @@ import (
 
 	"repolens/internal/snapshot"
 )
+
+func TestProductionMigrationDDLHasResumableSchemaChecks(t *testing.T) {
+	dir := filepath.Join("..", "..", "..", "migrations")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := map[string]bool{
+		"009_v2_2_rc_recovery.sql":                true,
+		"012_v2_2_code_index_build_tags.sql":      true,
+		"013_v2_2_revision_snapshot_identity.sql": true,
+		"016_v2_2_execution_start_boundary.sql":   true,
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || custom[entry.Name()] {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		for _, statement := range splitMigrationStatements(string(contents)) {
+			upper := strings.ToUpper(strings.TrimSpace(statement))
+			switch {
+			case strings.HasPrefix(upper, "CREATE TABLE"):
+				body, err := createTableBody(statement)
+				if err != nil {
+					t.Errorf("%s CREATE TABLE: %v", entry.Name(), err)
+					continue
+				}
+				if _, _, err := parseCreateTableBody(body); err != nil {
+					t.Errorf("%s CREATE TABLE schema: %v", entry.Name(), err)
+				}
+			case strings.HasPrefix(upper, "ALTER TABLE"):
+				body := regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+`).ReplaceAllString(strings.TrimSpace(statement), "")
+				_, rest, err := takeSQLIdentifier(body)
+				if err != nil {
+					t.Errorf("%s ALTER TABLE: %v", entry.Name(), err)
+					continue
+				}
+				for _, clause := range splitSQLTopLevel(rest, ',') {
+					clause = strings.TrimSpace(clause)
+					if !migrationAddColumnPattern.MatchString(clause) && !migrationAddIndexPattern.MatchString(clause) &&
+						!migrationModifyColumnPattern.MatchString(clause) && !migrationAlterDefaultPattern.MatchString(clause) {
+						t.Errorf("%s has no resumable schema check for %q", entry.Name(), clause)
+					}
+				}
+			default:
+				if strings.HasPrefix(upper, "UPDATE ") {
+					continue
+				}
+				t.Errorf("%s has unsupported production migration statement %q", entry.Name(), statement)
+			}
+		}
+	}
+}
 
 // legacyRepositorySnapshot models the SQLite schema before analysis-revision
 // scoped snapshot identities: its revision ID was nullable and repo+commit was

@@ -2,6 +2,7 @@ package worker_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,141 @@ import (
 )
 
 const validationFC07Report = `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`
+
+func TestVC001CancelPollFailureDoesNotReplayProvider(t *testing.T) {
+	db, jobStore := setupTestEnvironment(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	baseDiagnosisStore := diagnosis.NewStore(db)
+	diagnosisStore := &failFirstDiagnosisFinalizer{
+		Store: baseDiagnosisStore, firstFailureObserved: make(chan struct{}), allowFirstFailure: make(chan struct{}),
+	}
+	provider := &gatedOutcomeUnknownProvider{entered: make(chan struct{}), release: make(chan struct{})}
+	executor := agent.NewAgentRuntimeExecutor(provider, nil, nil, nil, agent.DefaultGuardConfig())
+	run := compatibleFC07Run("vc001-cancel-poll-outcome-unknown", "http://provider.invalid", 0)
+	run.UserID = "vc001-user"
+	run.RepositoryID = "vc001-repo"
+	run.SnapshotID = "vc001-snapshot"
+	run.IssueTitle = "post-dispatch provider outcome is unknown"
+	run.IdempotencyKey = "vc001-provider-outcome-key"
+	run.IdempotencyRequestHash = "vc001-provider-outcome-hash"
+	if err := baseDiagnosisStore.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &vc001CancelPollFailureStore{
+		Store: jobStore, pollObserved: make(chan struct{}), failureFinalized: make(chan struct{}),
+	}
+	cfg := jobs.DefaultWorkerConfig()
+	cfg.WorkerID = "vc001-worker"
+	cfg.Concurrency = 1
+	cfg.BatchSize = 1
+	cfg.PollInterval = 5 * time.Millisecond
+	cfg.LeaseDuration = 5 * time.Second
+	cfg.ReapInterval = time.Hour
+	workerRuntime := jobs.NewWorker(store, cfg)
+	workerRuntime.RegisterHandler(jobs.JobTypeRunDiagnosis, agentDiagnosisHandler(diagnosisStore, db, executor))
+	workerRuntime.Start(context.Background())
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = workerRuntime.StopGracefully(stopCtx)
+	})
+
+	select {
+	case <-provider.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fake provider was not called")
+	}
+	claimed, err := jobStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.Status != jobs.StatusRunning || claimed.ClaimToken == nil || claimed.WorkerID == nil || claimed.MaxAttempts <= 1 || !claimed.ExecutionStarted {
+		t.Fatalf("provider started without a valid RUNNING claim and retry budget: %+v", claimed)
+	}
+	select {
+	case <-store.pollObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel poll fault was not injected")
+	}
+	close(provider.release)
+	select {
+	case <-diagnosisStore.firstFailureObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FinalizeDiagnosisFailure fault was not injected")
+	}
+	beforeRecovery, err := jobStore.GetJobByID(context.Background(), claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeRecovery.Status != jobs.StatusRunning || beforeRecovery.ClaimToken == nil || *beforeRecovery.ClaimToken != *claimed.ClaimToken ||
+		beforeRecovery.WorkerID == nil || *beforeRecovery.WorkerID != *claimed.WorkerID {
+		t.Fatalf("pre-commit failure changed the active claim: %+v", beforeRecovery)
+	}
+	close(diagnosisStore.allowFirstFailure)
+	select {
+	case <-store.failureFinalized:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not finalize the reconciled provider failure")
+	}
+
+	savedJob, err := jobStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.requests.Load(); got != 1 {
+		t.Fatalf("provider request count=%d; want exactly one after cancel poll and finalization faults", got)
+	}
+	if diagnosisStore.calls.Load() != 1 {
+		t.Fatalf("FinalizeDiagnosisFailure calls=%d; want one injected pre-commit failure", diagnosisStore.calls.Load())
+	}
+	if savedJob.Status != jobs.StatusFailed || savedJob.LastErrorClass == nil || *savedJob.LastErrorClass != string(jobs.ErrorClassPermanent) ||
+		savedJob.LastErrorCode == nil || *savedJob.LastErrorCode != llm.OutcomeUnknownErrorCode ||
+		savedJob.TerminalReason == nil || *savedJob.TerminalReason != jobs.TerminalReasonPermanent {
+		t.Fatalf("job after reconciliation=%+v; want terminal PERMANENT/PROVIDER_OUTCOME_UNKNOWN", savedJob)
+	}
+}
+
+type gatedOutcomeUnknownProvider struct {
+	requests atomic.Int32
+	entered  chan struct{}
+	release  chan struct{}
+}
+
+func (p *gatedOutcomeUnknownProvider) Generate(context.Context, llm.GenerateRequest) (llm.GenerateResponse, error) {
+	p.requests.Add(1)
+	close(p.entered)
+	<-p.release
+	return llm.GenerateResponse{}, &llm.OutcomeUnknownError{Cause: errors.New("provider accepted request but response was lost")}
+}
+
+type vc001CancelPollFailureStore struct {
+	*jobs.Store
+	pollObserved     chan struct{}
+	failureFinalized chan struct{}
+	pollCalls        atomic.Int32
+}
+
+func (s *vc001CancelPollFailureStore) IsCancelRequested(context.Context, int64, string, string) (bool, error) {
+	if s.pollCalls.Add(1) == 1 {
+		close(s.pollObserved)
+		return false, errors.New("injected transient cancel-poll database error")
+	}
+	return false, errors.New("unexpected additional cancel poll")
+}
+
+func (s *vc001CancelPollFailureStore) ConditionalFinalizeFailure(ctx context.Context, id int64, workerID, claimToken string, class jobs.ErrorClass, code, message string, reason *jobs.TerminalReason, terminal bool, nextRun time.Time) error {
+	err := s.Store.ConditionalFinalizeFailure(ctx, id, workerID, claimToken, class, code, message, reason, terminal, nextRun)
+	if err == nil {
+		close(s.failureFinalized)
+	}
+	return err
+}
 
 func TestFC07OutcomeUnknownStopsAutomaticReplayAndAllowsManualRetry(t *testing.T) {
 	db, jobStore := setupTestEnvironment(t)
@@ -208,11 +344,17 @@ func TestFC07OutcomeUnknownFinalizationFailureDoesNotReplayProvider(t *testing.T
 
 type failFirstDiagnosisFinalizer struct {
 	diagnosis.Store
-	calls atomic.Int32
+	calls                atomic.Int32
+	firstFailureObserved chan struct{}
+	allowFirstFailure    chan struct{}
 }
 
 func (s *failFirstDiagnosisFinalizer) FinalizeDiagnosisFailure(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, class jobs.ErrorClass, code, message string, promptTokens, completionTokens, toolCalls int) error {
 	if s.calls.Add(1) == 1 {
+		if s.firstFailureObserved != nil {
+			close(s.firstFailureObserved)
+			<-s.allowFirstFailure
+		}
 		return fmt.Errorf("injected transient failure before atomic commit")
 	}
 	return s.Store.FinalizeDiagnosisFailure(ctx, jobID, workerID, claimToken, generation, runID, attemptID, class, code, message, promptTokens, completionTokens, toolCalls)

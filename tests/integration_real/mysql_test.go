@@ -357,6 +357,107 @@ func TestRealMySQL_ExecutionStartMigrationUpgradeAndBoundary(t *testing.T) {
 	}
 }
 
+func TestVC003MigrationResumeAfterDDLCommitBeforeLedger(t *testing.T) {
+	db, sqlDB, cleanup := setupRealMySQLDatabase(t)
+	defer cleanup()
+	migrationDB := &mysql.DB{GormDB: db, SqlDB: sqlDB}
+	allMigrations := filepath.Join("..", "..", "migrations")
+	pre016Dir := t.TempDir()
+	entries, err := os.ReadDir(allMigrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= "016_v2_2_execution_start_boundary.sql" {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(allMigrations, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(pre016Dir, entry.Name()), contents, 0o600); err != nil {
+			t.Fatalf("copy %s: %v", entry.Name(), err)
+		}
+	}
+	if err := mysql.ApplyMigrations(migrationDB, pre016Dir); err != nil {
+		t.Fatalf("apply migrations before 016: %v", err)
+	}
+
+	// The trigger deterministically fails only the 016 ledger insert, after
+	// MySQL has committed the migration's ALTER TABLE and backfill.
+	if err := db.Exec(`CREATE TRIGGER fail_vc003_ledger BEFORE INSERT ON schema_migrations
+		FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'injected VC003 ledger insert failure'`).Error; err != nil {
+		t.Fatalf("create migration ledger fault trigger: %v", err)
+	}
+	err = mysql.ApplyMigrations(migrationDB, allMigrations)
+	if err == nil || !strings.Contains(err.Error(), "injected VC003 ledger insert failure") {
+		t.Fatalf("first migration run error=%v; want injected ledger insert failure", err)
+	}
+	var columnCount int
+	if err := db.Raw(`SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'analysis_jobs' AND COLUMN_NAME = 'execution_started'`).Scan(&columnCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	var ledgerCount int
+	if err := db.Raw(`SELECT COUNT(*) FROM schema_migrations WHERE version = '016_v2_2_execution_start_boundary.sql'`).Scan(&ledgerCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if columnCount != 1 || ledgerCount != 0 {
+		t.Fatalf("after injected ledger failure: execution_started columns=%d ledger rows=%d; want 1 and 0", columnCount, ledgerCount)
+	}
+	if err := db.Exec(`DROP TRIGGER fail_vc003_ledger`).Error; err != nil {
+		t.Fatalf("remove migration ledger fault trigger: %v", err)
+	}
+	if err := mysql.ApplyMigrations(migrationDB, allMigrations); err != nil {
+		t.Fatalf("restart and resume migration 016: %v", err)
+	}
+	if err := db.Raw(`SELECT COUNT(*) FROM schema_migrations WHERE version = '016_v2_2_execution_start_boundary.sql'`).Scan(&ledgerCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ledgerCount != 1 {
+		t.Fatalf("resumed migration ledger rows=%d; want 1", ledgerCount)
+	}
+}
+
+func TestVC003MigrationSchemaConflict(t *testing.T) {
+	db, sqlDB, cleanup := setupRealMySQLDatabase(t)
+	defer cleanup()
+	migrationDB := &mysql.DB{GormDB: db, SqlDB: sqlDB}
+	allMigrations := filepath.Join("..", "..", "migrations")
+	pre016Dir := t.TempDir()
+	entries, err := os.ReadDir(allMigrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= "016_v2_2_execution_start_boundary.sql" {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(allMigrations, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(pre016Dir, entry.Name()), contents, 0o600); err != nil {
+			t.Fatalf("copy %s: %v", entry.Name(), err)
+		}
+	}
+	if err := mysql.ApplyMigrations(migrationDB, pre016Dir); err != nil {
+		t.Fatalf("apply migrations before 016: %v", err)
+	}
+	if err := db.Exec(`ALTER TABLE analysis_jobs ADD COLUMN execution_started VARCHAR(12) NULL DEFAULT NULL`).Error; err != nil {
+		t.Fatalf("seed incompatible execution_started column: %v", err)
+	}
+	if err := mysql.ApplyMigrations(migrationDB, allMigrations); err == nil || !strings.Contains(err.Error(), "migration schema conflict") {
+		t.Fatalf("migration error=%v; want fail-closed migration schema conflict", err)
+	}
+	var ledgerCount int
+	if err := db.Raw(`SELECT COUNT(*) FROM schema_migrations WHERE version = '016_v2_2_execution_start_boundary.sql'`).Scan(&ledgerCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ledgerCount != 0 {
+		t.Fatalf("schema-conflicting migration ledger rows=%d; want 0", ledgerCount)
+	}
+}
+
 func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
 	db, jobsStore, cleanup := setupRealMySQL(t)
 	if db == nil {

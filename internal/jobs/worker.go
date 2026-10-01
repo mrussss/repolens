@@ -722,15 +722,17 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 		}
 	}
 	cause := context.Cause(jobCtx)
-	if errors.Is(cause, ErrWorkerShutdown) {
+	if errors.Is(cause, ErrWorkerShutdown) && !preserveProviderOutcomeUnknownPolicy(atomicFailurePolicy) {
 		cancelJob(context.Canceled)
 		renewer.Stop()
 		log.Info("job execution stopped for worker shutdown; lease recovery will resume it")
 		return
 	}
 	if cause != nil {
-		err = cause
-		atomicFailurePolicy = nil
+		if errors.Is(cause, ErrOwnershipLost) || !preserveProviderOutcomeUnknownPolicy(atomicFailurePolicy) {
+			err = cause
+			atomicFailurePolicy = nil
+		}
 	}
 	latency := time.Since(start)
 
@@ -804,6 +806,10 @@ func (w *Worker) executeJob(parentCtx context.Context, job *AnalysisJob) {
 		return w.store.ConditionalFinalizeFailure(ctx, job.ID, w.cfg.WorkerID, *job.ClaimToken,
 			errClass, errCode, message, termReason, isTerminal, nextRun)
 	}, failureFinalizationExpected(errClass, errCode, termReason, isTerminal))
+}
+
+func preserveProviderOutcomeUnknownPolicy(policy *AtomicHandlerFailurePolicy) bool {
+	return policy != nil && policy.ErrorClass == ErrorClassPermanent && policy.ErrorCode == "PROVIDER_OUTCOME_UNKNOWN"
 }
 
 type atomicHandlerFinalizationResolution uint8

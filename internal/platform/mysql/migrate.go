@@ -164,32 +164,11 @@ func ApplyMigrations(db *DB, dir string) error {
 			}
 			continue
 		}
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return err
+		if err := applyResumableMigration(ctx, conn, version, string(contents)); err != nil {
+			return fmt.Errorf("apply migration %s: %w", version, err)
 		}
-		var sqlLines []string
-		for _, line := range strings.Split(string(contents), "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
-				sqlLines = append(sqlLines, line)
-			}
-		}
-		for _, statement := range strings.Split(strings.Join(sqlLines, "\n"), ";") {
-			statement = strings.TrimSpace(statement)
-			if statement == "" {
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				_ = tx.Rollback()
-				return fmt.Errorf("apply %s: %w", version, err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, CURRENT_TIMESTAMP(3))`, version); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
+		if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, CURRENT_TIMESTAMP(3))`, version); err != nil {
+			return fmt.Errorf("record migration %s: %w", version, err)
 		}
 	}
 	return nil
@@ -213,7 +192,8 @@ func applyExecutionStartMigration016(ctx context.Context, conn *sql.Conn) error 
 		return fmt.Errorf("inspect analysis_jobs.execution_started: %w", err)
 	}
 	if !strings.EqualFold(columnType, "tinyint(1)") || !strings.EqualFold(nullable, "NO") || !defaultValue.Valid || defaultValue.String != "0" {
-		return fmt.Errorf("analysis_jobs.execution_started has incompatible definition: type=%s nullable=%s default=%v", columnType, nullable, defaultValue)
+		return schemaConflict("016_v2_2_execution_start_boundary.sql", "analysis_jobs.execution_started",
+			fmt.Sprintf("type=%s nullable=%s default=%v", columnType, nullable, defaultValue), "type=tinyint(1) nullable=NO default=0")
 	}
 	// Before this migration, a RUNNING row had already incremented its attempt
 	// count at claim time. Preserve that legacy accounting as a started attempt.
@@ -228,15 +208,22 @@ func applyRevisionSnapshotIdentityMigration013(ctx context.Context, conn *sql.Co
 	var defaultValue sql.NullString
 	err := conn.QueryRowContext(ctx, `SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'repository_snapshots' AND COLUMN_NAME = 'analysis_revision_id'`).Scan(&columnType, &nullable, &defaultValue)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return schemaConflict("013_v2_2_revision_snapshot_identity.sql", "repository_snapshots.analysis_revision_id", "column is missing", "varchar(36)")
+		}
 		return fmt.Errorf("inspect repository_snapshots.analysis_revision_id: %w", err)
 	}
 	if !strings.EqualFold(columnType, "varchar(36)") {
-		return fmt.Errorf("repository_snapshots.analysis_revision_id has incompatible type %s", columnType)
+		return schemaConflict("013_v2_2_revision_snapshot_identity.sql", "repository_snapshots.analysis_revision_id", columnType, "varchar(36)")
 	}
 	if _, err := conn.ExecContext(ctx, `UPDATE repository_snapshots SET analysis_revision_id = '' WHERE analysis_revision_id IS NULL`); err != nil {
 		return fmt.Errorf("normalize legacy empty snapshot revision identities: %w", err)
 	}
 	if !strings.EqualFold(nullable, "NO") || !defaultValue.Valid || strings.Trim(defaultValue.String, "'") != "" {
+		if !strings.EqualFold(nullable, "YES") || defaultValue.Valid {
+			return schemaConflict("013_v2_2_revision_snapshot_identity.sql", "repository_snapshots.analysis_revision_id",
+				fmt.Sprintf("nullable=%s default=%v", nullable, defaultValue), "nullable=YES default=NULL or nullable=NO default=''")
+		}
 		if _, err := conn.ExecContext(ctx, `ALTER TABLE repository_snapshots MODIFY COLUMN analysis_revision_id VARCHAR(36) NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("make snapshot revision identity non-null: %w", err)
 		}
@@ -258,12 +245,13 @@ func ensureMigration013Index(ctx context.Context, conn *sql.Conn, name string, u
 	}
 	if exists {
 		if (nonUnique == 0) != unique || !sameStrings(columns, wantColumns) {
-			return fmt.Errorf("index %s has incompatible definition: unique=%t columns=%v", name, nonUnique == 0, columns)
+			return schemaConflict("013_v2_2_revision_snapshot_identity.sql", "repository_snapshots."+name,
+				fmt.Sprintf("unique=%t columns=%v", nonUnique == 0, columns), fmt.Sprintf("unique=%t columns=%v", unique, wantColumns))
 		}
 		return nil
 	}
 	if !unique {
-		return fmt.Errorf("cannot create unexpected non-unique migration index %s", name)
+		return schemaConflict("013_v2_2_revision_snapshot_identity.sql", "repository_snapshots."+name, "index is missing", "a migration-created unique index")
 	}
 	if _, err := conn.ExecContext(ctx, `CREATE UNIQUE INDEX uq_snapshot_repo_commit_revision ON repository_snapshots (repository_id, commit_sha, analysis_revision_id)`); err != nil {
 		return fmt.Errorf("create revision-scoped snapshot identity index: %w", err)
@@ -288,7 +276,8 @@ func dropMigration013LegacyIndex(ctx context.Context, conn *sql.Conn) error {
 		return nil
 	}
 	if nonUnique != 0 || !sameStrings(columns, []string{"repository_id", "commit_sha"}) {
-		return fmt.Errorf("legacy index %s has unexpected definition: unique=%t columns=%v", name, nonUnique == 0, columns)
+		return schemaConflict("013_v2_2_revision_snapshot_identity.sql", "repository_snapshots."+name,
+			fmt.Sprintf("unique=%t columns=%v", nonUnique == 0, columns), "unique=true columns=[repository_id commit_sha]")
 	}
 	if _, err := conn.ExecContext(ctx, `DROP INDEX uq_snapshot_repo_commit ON repository_snapshots`); err != nil {
 		return fmt.Errorf("drop legacy snapshot identity index: %w", err)
@@ -335,14 +324,19 @@ func sameStrings(got, want []string) bool {
 }
 
 func applyBuildTagsMigration012(ctx context.Context, conn *sql.Conn) error {
-	var count int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'code_index_builds' AND COLUMN_NAME = 'build_tags_json'`).Scan(&count); err != nil {
-		return fmt.Errorf("inspect code_index_builds.build_tags_json: %w", err)
-	}
-	if count == 0 {
+	got, err := inspectMigrationColumn(ctx, conn, "code_index_builds", "build_tags_json")
+	if err == sql.ErrNoRows {
 		if _, err := conn.ExecContext(ctx, `ALTER TABLE code_index_builds ADD COLUMN build_tags_json TEXT NULL`); err != nil {
 			return fmt.Errorf("add code_index_builds.build_tags_json: %w", err)
 		}
+		got, err = inspectMigrationColumn(ctx, conn, "code_index_builds", "build_tags_json")
+	}
+	want, _ := parseMigrationColumnDefinition("TEXT NULL")
+	if err != nil {
+		return fmt.Errorf("inspect code_index_builds.build_tags_json: %w", err)
+	}
+	if !columnDefinitionMatches(got, want) {
+		return schemaConflict("012_v2_2_code_index_build_tags.sql", "code_index_builds.build_tags_json", got.String(), want.String())
 	}
 	if _, err := conn.ExecContext(ctx, `UPDATE code_index_builds SET build_tags_json = '[]' WHERE build_tags_json IS NULL OR build_tags_json = ''`); err != nil {
 		return fmt.Errorf("initialize code index build tags: %w", err)
@@ -417,7 +411,9 @@ func ensureMigration009Column(ctx context.Context, conn *sql.Conn, want migratio
 		}
 	}
 	if !migration009TypeMatches(columnType, want.columnType) || !strings.EqualFold(nullable, want.nullable) || !migration009DefaultMatches(defaultValue, want.defaultVal) {
-		return fmt.Errorf("diagnosis_attempts.%s has incompatible definition (type=%s nullable=%s)", want.name, columnType, nullable)
+		return schemaConflict("009_v2_2_rc_recovery.sql", "diagnosis_attempts."+want.name,
+			fmt.Sprintf("type=%s nullable=%s default=%v", columnType, nullable, defaultValue),
+			fmt.Sprintf("type=%s nullable=%s default=%v", want.columnType, want.nullable, want.defaultVal))
 	}
 	return nil
 }
@@ -465,7 +461,8 @@ func ensureMigration009AttemptIndex(ctx context.Context, conn *sql.Conn) error {
 	want := []string{"diagnosis_run_id", "execution_generation", "attempt_no"}
 	if len(columns) > 0 {
 		if !unique || strings.Join(columns, ",") != strings.Join(want, ",") {
-			return fmt.Errorf("index uq_attempt_run_generation_no exists with an incompatible definition")
+			return schemaConflict("009_v2_2_rc_recovery.sql", "diagnosis_attempts.uq_attempt_run_generation_no",
+				fmt.Sprintf("unique=%t columns=%v", unique, columns), fmt.Sprintf("unique=true columns=%v", want))
 		}
 		return nil
 	}
