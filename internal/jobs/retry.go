@@ -17,6 +17,12 @@ type CategorizedError struct {
 	Cause   error
 }
 
+// HTTPStatusError exposes a definite HTTP response status without coupling
+// jobs to a particular provider implementation package.
+type HTTPStatusError interface {
+	HTTPStatusCode() int
+}
+
 func (e *CategorizedError) Error() string {
 	if e.Cause != nil {
 		return e.Message + ": " + e.Cause.Error()
@@ -79,6 +85,10 @@ func ClassifyError(err error) (ErrorClass, string) {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ErrorClassRetryable, "CONTEXT_DEADLINE_EXCEEDED"
+	}
+	var statusErr HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return HTTPStatusToErrorClass(statusErr.HTTPStatusCode())
 	}
 
 	errStr := strings.ToLower(err.Error())

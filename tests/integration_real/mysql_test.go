@@ -458,6 +458,80 @@ func TestVC003MigrationSchemaConflict(t *testing.T) {
 	}
 }
 
+func TestMigrationRejectsMissingRequiredAutoIncrement(t *testing.T) {
+	db, sqlDB, cleanup := setupRealMySQLDatabase(t)
+	defer cleanup()
+	migrationDB := &mysql.DB{GormDB: db, SqlDB: sqlDB}
+	migrationDir := migration001OnlyDirectory(t)
+	if err := mysql.ApplyMigrations(migrationDB, migrationDir); err != nil {
+		t.Fatalf("create baseline schema with migration 001: %v", err)
+	}
+	if err := db.Exec(`ALTER TABLE analysis_jobs MODIFY COLUMN id BIGINT NOT NULL`).Error; err != nil {
+		t.Fatalf("remove required AUTO_INCREMENT from analysis_jobs.id: %v", err)
+	}
+	if err := db.Exec(`DELETE FROM schema_migrations WHERE version = '001_v2_initial_schema.sql'`).Error; err != nil {
+		t.Fatalf("remove migration 001 ledger row to simulate DDL/ledger crash: %v", err)
+	}
+
+	err := mysql.ApplyMigrations(migrationDB, migrationDir)
+	if err == nil || !strings.Contains(err.Error(), "migration schema conflict") {
+		t.Fatalf("ApplyMigrations error=%v; want migration schema conflict for missing AUTO_INCREMENT", err)
+	}
+	var migrationRows int
+	if err := db.Raw(`SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationRows).Error; err != nil {
+		t.Fatalf("count migration ledger rows after schema conflict: %v", err)
+	}
+	if migrationRows != 0 {
+		t.Fatalf("schema-conflicting migration ledger rows=%d; want zero, with no later migration recorded", migrationRows)
+	}
+}
+
+func TestMigrationResumeAcceptsRequiredAutoIncrementBeforeLedger(t *testing.T) {
+	db, sqlDB, cleanup := setupRealMySQLDatabase(t)
+	defer cleanup()
+	migrationDB := &mysql.DB{GormDB: db, SqlDB: sqlDB}
+	migrationDir := migration001OnlyDirectory(t)
+	if err := mysql.ApplyMigrations(migrationDB, migrationDir); err != nil {
+		t.Fatalf("create baseline schema with migration 001: %v", err)
+	}
+	if err := db.Exec(`DELETE FROM schema_migrations WHERE version = '001_v2_initial_schema.sql'`).Error; err != nil {
+		t.Fatalf("remove migration 001 ledger row to simulate DDL/ledger crash: %v", err)
+	}
+
+	var extra string
+	if err := db.Raw(`SELECT EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'analysis_jobs' AND COLUMN_NAME = 'id'`).Scan(&extra).Error; err != nil {
+		t.Fatalf("inspect required AUTO_INCREMENT before restart: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(extra), "auto_increment") {
+		t.Fatalf("analysis_jobs.id EXTRA=%q; want auto_increment before restart", extra)
+	}
+	if err := mysql.ApplyMigrations(migrationDB, migrationDir); err != nil {
+		t.Fatalf("resume migration 001 after DDL commit and before ledger write: %v", err)
+	}
+	var ledgerRows int
+	if err := db.Raw(`SELECT COUNT(*) FROM schema_migrations WHERE version = '001_v2_initial_schema.sql'`).Scan(&ledgerRows).Error; err != nil {
+		t.Fatalf("inspect resumed migration ledger: %v", err)
+	}
+	if ledgerRows != 1 {
+		t.Fatalf("resumed migration 001 ledger rows=%d; want one", ledgerRows)
+	}
+}
+
+func migration001OnlyDirectory(t *testing.T) string {
+	t.Helper()
+	const version = "001_v2_initial_schema.sql"
+	source := filepath.Join("..", "..", "migrations", version)
+	contents, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read migration 001: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, version), contents, 0o600); err != nil {
+		t.Fatalf("prepare isolated migration directory: %v", err)
+	}
+	return dir
+}
+
 func TestRealMySQL_DiagnosisIdempotencyAndJob(t *testing.T) {
 	db, jobsStore, cleanup := setupRealMySQL(t)
 	if db == nil {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -216,6 +217,68 @@ func TestOpenAICompatibleMarksInterruptedSuccessBodyOutcomeUnknown(t *testing.T)
 	var unknown *OutcomeUnknownError
 	if !errors.As(err, &unknown) || unknown.Cause == nil {
 		t.Fatalf("interrupted successful response error = %v, want OutcomeUnknownError with cause", err)
+	}
+}
+
+func TestOpenAICompatibleProviderMalformed2xxIsOutcomeUnknown(t *testing.T) {
+	const malformed = `{"choices":[`
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(malformed)))
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, malformed); err != nil {
+			t.Errorf("write complete malformed provider envelope: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	provider := NewRetryingProvider(NewOpenAICompatibleProviderWithAuthModeAndTimeout("", server.URL, "model", "none", 3*time.Second), 2)
+	_, err := provider.Generate(context.Background(), GenerateRequest{})
+	var unknown *OutcomeUnknownError
+	if !errors.As(err, &unknown) || unknown.Cause == nil {
+		t.Fatalf("malformed 2xx envelope error=%v, want OutcomeUnknownError with cause", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("malformed 2xx provider requests=%d; want one (including internal retry policy)", got)
+	}
+}
+
+func TestOpenAICompatibleProviderUnusable2xxEnvelopeIsOutcomeUnknown(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "provider error envelope", body: `{"error":{"message":"rejected"}}`},
+		{name: "empty choices", body: `{"choices":[]}`},
+		{name: "missing message", body: `{"choices":[{}]}`},
+		{name: "null message", body: `{"choices":[{"message":null}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Length", strconv.Itoa(len(tt.body)))
+				w.WriteHeader(http.StatusOK)
+				if _, err := io.WriteString(w, tt.body); err != nil {
+					t.Errorf("write complete invalid provider envelope: %v", err)
+				}
+			}))
+			defer server.Close()
+
+			provider := NewRetryingProvider(NewOpenAICompatibleProviderWithAuthModeAndTimeout("", server.URL, "model", "none", 3*time.Second), 2)
+			_, err := provider.Generate(context.Background(), GenerateRequest{})
+			var unknown *OutcomeUnknownError
+			if !errors.As(err, &unknown) || unknown.Cause == nil {
+				t.Fatalf("invalid 2xx envelope error=%v, want OutcomeUnknownError with cause", err)
+			}
+			if got := requests.Load(); got != 1 {
+				t.Fatalf("invalid 2xx provider requests=%d; want one", got)
+			}
+		})
 	}
 }
 

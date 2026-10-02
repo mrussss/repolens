@@ -9,9 +9,10 @@ import (
 )
 
 type migrationColumnDefinition struct {
-	typeName     string
-	nullable     bool
-	defaultValue sql.NullString
+	typeName      string
+	nullable      bool
+	defaultValue  sql.NullString
+	autoIncrement bool
 }
 
 type migrationIndexDefinition struct {
@@ -24,6 +25,7 @@ type migrationSchemaColumn struct {
 	columnType   string
 	nullable     string
 	defaultValue sql.NullString
+	extra        string
 }
 
 var (
@@ -405,14 +407,17 @@ func parseMigrationColumnDefinition(definition string) (migrationColumnDefinitio
 			defaultValue = sql.NullString{String: normalizeDefault(value), Valid: true}
 		}
 	}
-	return migrationColumnDefinition{typeName: typeName, nullable: nullable, defaultValue: defaultValue}, nil
+	return migrationColumnDefinition{
+		typeName: typeName, nullable: nullable, defaultValue: defaultValue,
+		autoIncrement: strings.Contains(upper, "AUTO_INCREMENT"),
+	}, nil
 }
 
 func inspectMigrationColumn(ctx context.Context, conn *sql.Conn, table, column string) (migrationSchemaColumn, error) {
 	var got migrationSchemaColumn
-	err := conn.QueryRowContext(ctx, `SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT FROM information_schema.COLUMNS
+	err := conn.QueryRowContext(ctx, `SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`, table, column).
-		Scan(&got.columnType, &got.nullable, &got.defaultValue)
+		Scan(&got.columnType, &got.nullable, &got.defaultValue, &got.extra)
 	if err != nil {
 		return migrationSchemaColumn{}, err
 	}
@@ -429,6 +434,9 @@ func columnDefinitionMatches(got migrationSchemaColumn, want migrationColumnDefi
 	if normalizeColumnType(got.columnType) != want.typeName || !strings.EqualFold(got.nullable, nullableText(want.nullable)) {
 		return false
 	}
+	if want.autoIncrement != hasAutoIncrement(got.extra) && want.autoIncrement {
+		return false
+	}
 	if got.defaultValue.Valid != want.defaultValue.Valid {
 		return false
 	}
@@ -436,11 +444,20 @@ func columnDefinitionMatches(got migrationSchemaColumn, want migrationColumnDefi
 }
 
 func (d migrationSchemaColumn) String() string {
-	return fmt.Sprintf("type=%s nullable=%s default=%s", normalizeColumnType(d.columnType), strings.ToUpper(d.nullable), nullString(d.defaultValue))
+	return fmt.Sprintf("type=%s nullable=%s default=%s auto_increment=%t", normalizeColumnType(d.columnType), strings.ToUpper(d.nullable), nullString(d.defaultValue), hasAutoIncrement(d.extra))
 }
 
 func (d migrationColumnDefinition) String() string {
-	return fmt.Sprintf("type=%s nullable=%s default=%s", d.typeName, nullableText(d.nullable), nullString(d.defaultValue))
+	return fmt.Sprintf("type=%s nullable=%s default=%s auto_increment=%t", d.typeName, nullableText(d.nullable), nullString(d.defaultValue), d.autoIncrement)
+}
+
+func hasAutoIncrement(extra string) bool {
+	for _, attribute := range strings.Fields(strings.ToLower(extra)) {
+		if attribute == "auto_increment" {
+			return true
+		}
+	}
+	return false
 }
 
 func nullString(value sql.NullString) string {

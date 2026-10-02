@@ -78,6 +78,8 @@ func (e *HTTPError) RetryableProviderError() bool {
 	return e.StatusCode == http.StatusTooManyRequests || (e.StatusCode >= 500 && e.StatusCode <= 599)
 }
 
+func (e *HTTPError) HTTPStatusCode() int { return e.StatusCode }
+
 func (e *HTTPError) Unwrap() error { return e.Cause }
 
 func NewOpenAICompatibleProvider(apiKey, baseURL, defaultModel string) *OpenAICompatibleProvider {
@@ -122,8 +124,8 @@ type openAIRequest struct {
 
 type openAIResponse struct {
 	Choices []struct {
-		Message      Message `json:"message"`
-		FinishReason string  `json:"finish_reason"`
+		Message      *Message `json:"message"`
+		FinishReason string   `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens        int `json:"prompt_tokens"`
@@ -209,19 +211,22 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 
 	var openAIResp openAIResponse
 	if err := json.Unmarshal(respBytes, &openAIResp); err != nil {
-		return GenerateResponse{}, fmt.Errorf("failed to unmarshal llm response: %w", err)
+		return GenerateResponse{}, &OutcomeUnknownError{Cause: fmt.Errorf("failed to decode provider response envelope after HTTP %d: %w", resp.StatusCode, err)}
 	}
 
 	if openAIResp.Error != nil {
-		return GenerateResponse{}, fmt.Errorf("llm provider error: %s", redaction.RedactSecrets(openAIResp.Error.Message))
+		return GenerateResponse{}, &OutcomeUnknownError{Cause: fmt.Errorf("provider returned an error envelope after HTTP %d: %s", resp.StatusCode, redaction.RedactSecrets(openAIResp.Error.Message))}
 	}
 	if len(openAIResp.Choices) == 0 {
-		return GenerateResponse{}, fmt.Errorf("empty choices from llm provider")
+		return GenerateResponse{}, &OutcomeUnknownError{Cause: fmt.Errorf("provider response envelope after HTTP %d has no choices", resp.StatusCode)}
 	}
 
 	choice := openAIResp.Choices[0]
+	if choice.Message == nil {
+		return GenerateResponse{}, &OutcomeUnknownError{Cause: fmt.Errorf("provider response envelope after HTTP %d has no message", resp.StatusCode)}
+	}
 	return GenerateResponse{
-		Message:            choice.Message,
+		Message:            *choice.Message,
 		FinishReason:       choice.FinishReason,
 		PromptTokens:       openAIResp.Usage.PromptTokens,
 		CompletionTokens:   openAIResp.Usage.CompletionTokens,

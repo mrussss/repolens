@@ -70,6 +70,25 @@ func TestProductionMigrationDDLHasResumableSchemaChecks(t *testing.T) {
 	}
 }
 
+func TestMigrationColumnDefinitionTracksAutoIncrementRequirement(t *testing.T) {
+	want, err := parseMigrationColumnDefinition("BIGINT PRIMARY KEY AUTO_INCREMENT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !want.autoIncrement {
+		t.Fatal("migration definition did not preserve AUTO_INCREMENT requirement")
+	}
+	if !columnDefinitionMatches(migrationSchemaColumn{columnType: "bigint", nullable: "NO", extra: "auto_increment"}, want) {
+		t.Fatal("matching AUTO_INCREMENT schema was rejected")
+	}
+	if columnDefinitionMatches(migrationSchemaColumn{columnType: "bigint", nullable: "NO"}, want) {
+		t.Fatal("schema missing required AUTO_INCREMENT was accepted")
+	}
+	if !hasAutoIncrement("DEFAULT_GENERATED auto_increment") || hasAutoIncrement("DEFAULT_GENERATED") {
+		t.Fatal("actual EXTRA AUTO_INCREMENT parsing is not case-insensitive and attribute-specific")
+	}
+}
+
 // legacyRepositorySnapshot models the SQLite schema before analysis-revision
 // scoped snapshot identities: its revision ID was nullable and repo+commit was
 // the only uniqueness boundary.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -391,6 +392,97 @@ func TestFC07Explicit429RemainsProviderRetryable(t *testing.T) {
 		t.Fatalf("429 retry evidence: HTTP requests=%d runtime provider calls=%d usage=%d/%d", requests.Load(), result.ProviderCalls, result.PromptTokens, result.CompletionTokens)
 	}
 	t.Logf("observation: explicit HTTP 429 was recognized and retried; requests=%d runtime provider_calls=%d", requests.Load(), result.ProviderCalls)
+}
+
+func TestMalformed2xxProviderResponseDoesNotReplayJob(t *testing.T) {
+	runProviderHTTPFailureJobTest(t, http.StatusOK, `{"choices":[`, 2, llm.OutcomeUnknownErrorCode, jobs.ErrorClassPermanent)
+}
+
+func TestHTTP400ProviderResponseDoesNotReplayJob(t *testing.T) {
+	runProviderHTTPFailureJobTest(t, http.StatusBadRequest, `{}`, 0, "HTTP_400_BAD_REQUEST", jobs.ErrorClassPermanent)
+}
+
+func runProviderHTTPFailureJobTest(t *testing.T, status int, body string, providerRetries int, wantCode string, wantClass jobs.ErrorClass) {
+	t.Helper()
+	db, jobStore := setupTestEnvironment(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	var requests atomic.Int32
+	firstRequest := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if requests.Add(1) == 1 {
+			close(firstRequest)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(status)
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("write HTTP %d provider response: %v", status, err)
+		}
+	}))
+	defer server.Close()
+
+	provider := llm.NewOpenAICompatibleProviderWithAuthModeAndTimeout("", server.URL, "validation-model", "none", 3*time.Second)
+	executor := agent.NewAgentRuntimeExecutor(llm.NewRetryingProvider(provider, providerRetries), nil, nil, nil, agent.DefaultGuardConfig())
+	diagnosisStore := diagnosis.NewStore(db)
+	run := compatibleFC07Run(fmt.Sprintf("provider-http-%d-%d", status, time.Now().UnixNano()), server.URL, providerRetries)
+	run.UserID = "provider-http-user"
+	run.RepositoryID = "provider-http-repo"
+	run.SnapshotID = "provider-http-snapshot"
+	run.IssueTitle = fmt.Sprintf("provider HTTP %d classification", status)
+	run.IdempotencyKey = fmt.Sprintf("provider-http-key-%d-%d", status, time.Now().UnixNano())
+	run.IdempotencyRequestHash = "provider-http-request-hash"
+	run.NormalizedBaseURL = server.URL
+	run.ModelName = "validation-model"
+	if err := diagnosisStore.Create(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	createdJob, err := jobStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if createdJob.MaxAttempts <= 1 {
+		t.Fatalf("diagnosis job retry budget=%d, want greater than one", createdJob.MaxAttempts)
+	}
+
+	handler := agentDiagnosisHandler(diagnosisStore, db, executor)
+	_, stopWorker := startValidationFC07Worker(jobStore, handler)
+	t.Cleanup(func() { _ = stopWorker() })
+	select {
+	case <-firstRequest:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("HTTP %d provider request was not observed", status)
+	}
+	if err := awaitValidationFC07RunFailed(diagnosisStore, run.ID); err != nil {
+		t.Fatalf("HTTP %d diagnosis outcome: %v", status, err)
+	}
+	if err := stopWorker(); err != nil {
+		t.Fatalf("stop worker after HTTP %d failure: %v", status, err)
+	}
+
+	savedJob, err := jobStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := diagnosisStore.ListAttemptsByRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("HTTP %d provider requests=%d; want exactly one", status, got)
+	}
+	if savedJob.Status != jobs.StatusFailed || savedJob.LastErrorClass == nil || *savedJob.LastErrorClass != string(wantClass) ||
+		savedJob.LastErrorCode == nil || *savedJob.LastErrorCode != wantCode || savedJob.Status == jobs.StatusRetryWait {
+		t.Fatalf("HTTP %d final job=%+v; want FAILED/%s/%s and no RETRY_WAIT", status, savedJob, wantClass, wantCode)
+	}
+	if len(attempts) != 1 || attempts[0].Status != diagnosis.AttemptStatusFailedTerminal || attempts[0].ErrorCode != wantCode {
+		t.Fatalf("HTTP %d diagnosis attempts=%+v; want one terminal attempt with code %s", status, attempts, wantCode)
+	}
 }
 
 func agentDiagnosisHandler(store diagnosis.Store, db *gorm.DB, executor agent.Executor) jobs.Handler {

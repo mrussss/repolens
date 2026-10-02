@@ -233,21 +233,36 @@ func TestAcceptedCancellationWinsOverSuccessFinalization(t *testing.T) {
 }
 
 func TestHTTPStatusClassification(t *testing.T) {
-	c429, _ := jobs.HTTPStatusToErrorClass(http.StatusTooManyRequests)
-	if c429 != jobs.ErrorClassRetryable {
-		t.Errorf("429 should be retryable")
+	tests := []struct {
+		status int
+		class  jobs.ErrorClass
+		code   string
+	}{
+		{http.StatusBadRequest, jobs.ErrorClassPermanent, "HTTP_400_BAD_REQUEST"},
+		{http.StatusUnauthorized, jobs.ErrorClassPermanent, "HTTP_AUTH_FAILURE"},
+		{http.StatusForbidden, jobs.ErrorClassPermanent, "HTTP_AUTH_FAILURE"},
+		{http.StatusNotFound, jobs.ErrorClassPermanent, "HTTP_404_NOT_FOUND"},
+		{http.StatusTooManyRequests, jobs.ErrorClassRetryable, "HTTP_429_RATE_LIMITED"},
+		{http.StatusInternalServerError, jobs.ErrorClassRetryable, "HTTP_5XX_SERVER_ERROR"},
+		{http.StatusServiceUnavailable, jobs.ErrorClassRetryable, "HTTP_5XX_SERVER_ERROR"},
 	}
-
-	c500, _ := jobs.HTTPStatusToErrorClass(http.StatusInternalServerError)
-	if c500 != jobs.ErrorClassRetryable {
-		t.Errorf("500 should be retryable")
+	for _, tt := range tests {
+		t.Run(fmt.Sprint(tt.status), func(t *testing.T) {
+			class, code := jobs.ClassifyError(neutralHTTPStatusError{status: tt.status})
+			if class != tt.class || code != tt.code {
+				t.Fatalf("ClassifyError(HTTP %d, body={})=(%s,%s); want (%s,%s)", tt.status, class, code, tt.class, tt.code)
+			}
+		})
 	}
-
-	c400, _ := jobs.HTTPStatusToErrorClass(http.StatusBadRequest)
-	if c400 != jobs.ErrorClassPermanent {
-		t.Errorf("400 should be permanent")
+	if class, code := jobs.ClassifyError(jobs.NewPermanentError("EXPLICIT", "deliberate policy", neutralHTTPStatusError{status: http.StatusServiceUnavailable})); class != jobs.ErrorClassPermanent || code != "EXPLICIT" {
+		t.Fatalf("explicit CategorizedError=(%s,%s), want (PERMANENT,EXPLICIT)", class, code)
 	}
 }
+
+type neutralHTTPStatusError struct{ status int }
+
+func (e neutralHTTPStatusError) Error() string       { return "{}" }
+func (e neutralHTTPStatusError) HTTPStatusCode() int { return e.status }
 
 func TestCalculateBackoff(t *testing.T) {
 	b1 := jobs.CalculateBackoff(1, time.Second, time.Minute)
