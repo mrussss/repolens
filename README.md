@@ -77,30 +77,26 @@ GET       /diagnoses/:id/steps
 
 Diagnosis 的业务状态只有 `QUEUED`、`RUNNING`、`SUCCEEDED`、`FAILED`、`CANCELLED`；执行层的 retry 只存在于 AnalysisJob 的 `RETRY_WAIT`。
 
+## 文档
+
+- [架构说明](docs/architecture.md)：当前子系统职责与数据链路。
+- [状态机](docs/state-machines.md)：Pipeline、Job、Diagnosis 和 Attempt 状态转换。
+- [失败语义](docs/failure-semantics.md) 与 [Provider 执行语义](docs/provider-execution-semantics.md)：重试、lease recovery 和未知 Provider 结果。
+- [测试与验证](docs/testing.md) 和 [本地部署](docs/deployment.md)：CI、Release Gate 和 Compose 使用方法。
+- [Agent Runtime](docs/agent-runtime.md) 与 [Retrieval 评测](docs/retrieval-eval.md)：专项开发说明。
+- 历史记录归档在 [`docs/history/README.md`](docs/history/README.md)；当前 ADR 保留在 [`docs/adr/`](docs/adr/)。
+
 ## 验证
 
-```bash
-gofmt -l cmd internal tests
-go vet ./...
-go test ./...
-go test -race ./...
-cd web && npm ci && npm run build
-cd .. && go run ./cmd/eval
-docker compose config
-```
-
-若本机有 Docker，可执行：
+开发验证顺序、CI 覆盖范围和 Release Gate 内容见[测试与验证指南](docs/testing.md)。权威验证入口是 `./scripts/release_gate.sh`。
 
 ```bash
-REPOLENS_REQUIRE_REAL_INTEGRATION=1 go test ./tests/integration_real/...
-docker compose build
+./scripts/release_gate.sh
 ```
 
-完整 release gate：`./scripts/release_gate.sh`。
+历史 v2.2 RC 检查记录见 [`docs/history/freezes/v2.2-rc-release-checklist.md`](docs/history/freezes/v2.2-rc-release-checklist.md)。Provider 设置页的 Test Connection 会执行 production Agent 请求形状的兼容性探测（小型 `max_tokens`、`reasoning_effort`、`response_format=json_object` 和 tools），不会把 API Key 或 Provider 原始响应写入日志、trace 或 artifact。
 
-v2.2 RC 封板清单见 [`docs/v2.2-rc-release-checklist.md`](docs/v2.2-rc-release-checklist.md)。Provider 设置页的 Test Connection 会执行 production Agent 请求形状的兼容性探测（小型 `max_tokens`、`reasoning_effort`、`response_format=json_object` 和 tools），不会把 API Key 或 Provider 原始响应写入日志、trace 或 artifact。
-
-RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开仓库，Hit@5 `7/10`、Hit@10 `9/10`、MRR `0.724`。这是小规模 external benchmark，不是 production accuracy；完整方法、per-case rank 和 AnalysisQuality 见 [`docs/realbench/results/v2-baseline.md`](docs/realbench/results/v2-baseline.md)。真实 Provider Agent E2E 只记录选定 case 的证据和失败边界，见 [`docs/realbench/results/v2-agent-e2e.md`](docs/realbench/results/v2-agent-e2e.md)。
+RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开仓库，Hit@5 `7/10`、Hit@10 `9/10`、MRR `0.724`。这是小规模 external benchmark，不是 production accuracy；完整方法、per-case rank 和 AnalysisQuality 见 [`docs/history/benchmarks/realbench/v2-baseline.md`](docs/history/benchmarks/realbench/v2-baseline.md)。真实 Provider Agent E2E 只记录选定 case 的证据和失败边界，见 [`docs/history/benchmarks/realbench/v2-agent-e2e.md`](docs/history/benchmarks/realbench/v2-agent-e2e.md)。
 
 ## 范围与限制
 

@@ -31,7 +31,7 @@ export REPOLENS_REALBENCH_AUTH_MODE=bearer  # 或 none
 go run ./cmd/realbench run --all --e2e
 ```
 
-真实 Agent E2E 的 pilot 记录见 [`results/v1-agent-e2e.md`](results/v1-agent-e2e.md)。其中的 API Key 只通过运行环境传入，不写入命令示例、Git 或 benchmark artifact；Retrieval 正式 baseline 仍见 [`results/v1-baseline.md`](results/v1-baseline.md)。
+真实 Agent E2E 的 pilot 记录见 [`../history/benchmarks/realbench/v1-agent-e2e.md`](../history/benchmarks/realbench/v1-agent-e2e.md)。其中的 API Key 只通过运行环境传入，不写入命令示例、Git 或 benchmark artifact；Retrieval 正式 baseline 仍见 [`../history/benchmarks/realbench/v1-baseline.md`](../history/benchmarks/realbench/v1-baseline.md)。
 
 ## RealBench v2
 
@@ -42,6 +42,6 @@ go run ./cmd/realbench validate --dataset v2
 go run ./cmd/realbench run --dataset v2 --all
 ```
 
-不传 `--dataset` 仍运行 v1，保持既有命令兼容。v2 离线 baseline 和真实 Provider E2E 证据分别见 [`results/v2-baseline.md`](results/v2-baseline.md) 与 [`results/v2-agent-e2e.md`](results/v2-agent-e2e.md)。
+不传 `--dataset` 仍运行 v1，保持既有命令兼容。v2 离线 baseline 和真实 Provider E2E 证据分别见 [`../history/benchmarks/realbench/v2-baseline.md`](../history/benchmarks/realbench/v2-baseline.md) 与 [`../history/benchmarks/realbench/v2-agent-e2e.md`](../history/benchmarks/realbench/v2-agent-e2e.md)。
 
 `realbench-v1` 是第一版 pilot external benchmark，由 3 个真实 Go 项目历史 Bug 组成，用于验证完整外部评测链路，不代表大规模真实世界泛化结论；v2 同样是小规模外部历史 Bug 证据，不是 production accuracy 声明。

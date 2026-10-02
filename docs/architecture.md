@@ -87,9 +87,11 @@ Evidence / Citation
 
 | 子系统 | 独占职责 |
 | :--- | :--- |
-| **Jobs** | Execution ownership、claim、lease、attempt start、retry、reaper、cancellation、terminal finalization resolution |
-| **AnalysisPipeline** | Analysis preparation、analysis retry、READY lineage resolution、product stage finalization ownership |
-| **Diagnosis** | Authorization、request idempotency、select validated lineage、freeze Provider identity、freeze Agent config、persist DiagnosisRun、schedule Diagnosis job、materialize DiagnosisExecutionSpec |
+| **AnalysisPipeline** | Product stage lifecycle：Revision preparation/retry、Snapshot/CodeIndex/Retrieval stage advancement、READY lineage resolution 与 stage finalization ownership |
+| **Worker** | Job execution lifecycle：claim、lease renewal、execution start、handler dispatch 与 graceful recovery coordination |
+| **Jobs** | Durable execution state、retry scheduling、lease recovery、generation and claim-token fencing、cancellation 与 job terminal resolution |
+| **DiagnosisExecutionSpec** | Freeze lineage、Provider identity/options、Agent version/configuration and budgets used by one Diagnosis execution; define Provider and Agent compatibility |
+| **Diagnosis** | Authorization、request idempotency、select validated lineage、persist DiagnosisRun、schedule Diagnosis job、materialize DiagnosisExecutionSpec |
 | **Agent Runtime** | Consume DiagnosisExecutionSpec、build Provider、assemble read-only tools（`BuildToolRegistry`）、run bounded Agent loop、produce ReportDraft、invoke deterministic report finalization |
 | **Evidence** | Issue attempt-scoped evidence、validate citation identity、publish deterministic report evidence |
 | **Trace** | Persist ordered AgentStep、query by Attempt、query after sequence |
