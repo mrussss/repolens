@@ -16,7 +16,11 @@ RUN apk add --no-cache git
 COPY go.mod go.sum ./
 RUN GOPROXY=https://goproxy.cn,direct go mod download
 
-COPY . .
+# Copy only source required to build production binaries.
+# Local RealBench artifacts/cache can be several GB; keep them out of this stage.
+COPY cmd ./cmd
+COPY internal ./internal
+COPY contracts ./contracts
 
 # The production Compose profile uses MySQL. Disable cgo so the Alpine image
 # does not depend on musl-specific sqlite3 headers; SQLite remains available

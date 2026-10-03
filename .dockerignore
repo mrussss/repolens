@@ -1,6 +1,49 @@
+# Git
 .git
 .gitignore
-web/node_modules
-web/dist
+.github
+
+# Local generated data / caches
+.cache/
+artifacts/
+data/
+tmp/
+
+# Frontend dependencies / outputs
+node_modules/
+web/node_modules/
+web/dist/
+dist/
+
+# Build outputs / local binaries
+bin/
+repolens-api
+repolens-worker
+repolens-relay
+repolens-eval
+
+# Databases
 *.db
-tmp
+*.db-journal
+*.sqlite
+
+# Local environment / secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Logs / coverage
+*.log
+*.out
+coverage.txt
+coverage.html
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
