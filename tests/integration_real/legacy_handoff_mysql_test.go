@@ -2,11 +2,16 @@ package integration_real
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 
 	"repolens/internal/codeintel"
 	codeintelmodel "repolens/internal/codeintel/model"
@@ -218,6 +223,199 @@ func TestRealMySQL_LegacyCodeIndexHandoffIsAtomic(t *testing.T) {
 	if job := waitForRealLegacyJobStatus(t, jobsStore, childBuildJobID(t, jobsStore, jobs.JobTypeBuildRetrieval, retrievalJobResource), jobs.StatusSucceeded); job.Status != jobs.StatusSucceeded {
 		t.Fatalf("BUILD_RETRIEVAL Job status after no-op test handler=%s; want SUCCEEDED", job.Status)
 	}
+}
+
+func TestRealMySQL_LegacyNullCodeIndexBuildCompletesHandoff(t *testing.T) {
+	if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "" {
+		t.Skip("skipping real MySQL legacy NULL compatibility test (set REPOLENS_REQUIRE_REAL_INTEGRATION=1)")
+	}
+	db, jobsStore, cleanup := setupRealMySQL(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	const repoID = "repo-mysql-legacy-null-codeindex"
+	repoStore := repo.NewStore(db)
+	if err := repoStore.Create(ctx, &repo.Repository{
+		ID: repoID, UserID: "user-mysql-legacy-null", Name: "example.com/legacy-null",
+		GitURL: "https://github.com/example/legacy-null", DefaultRef: "main", Status: repo.StatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type legacyCase struct {
+		name   string
+		status codeintelmodel.BuildStatus
+	}
+	cases := []legacyCase{
+		{name: "created", status: codeintelmodel.BuildStatusCreated},
+		{name: "building", status: codeintelmodel.BuildStatusBuilding},
+	}
+	snapshotStore := snapshot.NewStore(db)
+	ciStore := codeintelstore.NewStore(db)
+	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	type queuedBuild struct {
+		name       string
+		buildID    int64
+		resourceID string
+		jobID      int64
+	}
+	queued := make([]queuedBuild, 0, len(cases))
+	for index, testCase := range cases {
+		snapshotID := "snap-mysql-legacy-null-" + testCase.name
+		modulePath := "example.com/legacy-null-" + testCase.name
+		sourceDir, err := storeFS.EnsureDir(repoID, snapshotID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sourceDir, "go.mod"), []byte("module "+modulePath+"\n\ngo 1.22\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sourceDir, "main.go"), []byte("package main\n\nfunc Hello() {}\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		readyAt := time.Now().UTC()
+		if err := snapshotStore.Create(ctx, &snapshot.RepositorySnapshot{
+			ID: snapshotID, RepositoryID: repoID, CommitSHA: strings.Repeat(fmt.Sprintf("%x", index+1), 40),
+			Ref: "main", MaterializedPath: sourceDir, ContentHash: strings.Repeat("a", 64),
+			Status: snapshot.StatusReady, ReadyAt: &readyAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Insert through SQL to reproduce rows created before migration 002 added
+		// the nullable analysis_revision_id column.
+		buildID := insertMySQLCodeIndexBuild(t, db, snapshotID, modulePath, testCase.status, nil)
+		var revisionID sql.NullString
+		var storedStatus codeintelmodel.BuildStatus
+		if err := db.Raw("SELECT analysis_revision_id, status FROM code_index_builds WHERE id = ?", buildID).Row().Scan(&revisionID, &storedStatus); err != nil {
+			t.Fatalf("read historical CodeIndexBuild row: %v", err)
+		}
+		if revisionID.Valid || storedStatus != testCase.status {
+			t.Fatalf("initial CodeIndexBuild revision=%+v status=%s; want SQL NULL and %s", revisionID, storedStatus, testCase.status)
+		}
+		loadedBuild, err := ciStore.GetByID(ctx, buildID)
+		if err != nil || loadedBuild.AnalysisRevisionID != "" {
+			t.Fatalf("Gorm legacy CodeIndexBuild=%+v err=%v; want empty Go revision ID for SQL NULL", loadedBuild, err)
+		}
+		resourceID := strconv.FormatInt(buildID, 10)
+		parentJob := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: resourceID, MaxAttempts: 3}
+		if err := jobsStore.CreateJob(ctx, parentJob); err != nil {
+			t.Fatal(err)
+		}
+		queued = append(queued, queuedBuild{name: testCase.name, buildID: buildID, resourceID: resourceID, jobID: parentJob.ID})
+	}
+
+	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapshotStore, storeFS, codeintel.NewAnalyzer())
+	worker := startLegacyHandoffWorker(t, jobsStore, jobs.JobTypeBuildCodeIndex, handler)
+	worker.RegisterHandler(jobs.JobTypeBuildRetrieval, jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error { return nil }))
+	for _, item := range queued {
+		parentJob := waitForRealLegacyJobStatus(t, jobsStore, item.jobID, jobs.StatusSucceeded)
+		if parentJob.TerminalReason != nil && *parentJob.TerminalReason == jobs.TerminalReasonRetryableExhausted {
+			t.Fatalf("%s parent Job unexpectedly exhausted retries: %+v", item.name, parentJob)
+		}
+		if parentJob.LastErrorCode != nil && *parentJob.LastErrorCode == "RETRIEVAL_HANDOFF_FAILED" {
+			t.Fatalf("%s parent Job retained RETRIEVAL_HANDOFF_FAILED: %+v", item.name, parentJob)
+		}
+		build, err := ciStore.GetByID(ctx, item.buildID)
+		if err != nil || build.Status != codeintelmodel.BuildStatusReady || build.SymbolCount == 0 || build.AnalysisRevisionID != "" {
+			t.Fatalf("%s legacy CodeIndexBuild after Worker=%+v err=%v; want READY with symbols and legacy Go identity", item.name, build, err)
+		}
+		var stillNull bool
+		if err := db.Raw("SELECT analysis_revision_id IS NULL FROM code_index_builds WHERE id = ?", item.buildID).Scan(&stillNull).Error; err != nil || !stillNull {
+			t.Fatalf("%s CodeIndexBuild analysis_revision_id lost SQL NULL: null=%t err=%v", item.name, stillNull, err)
+		}
+		var retrievalBuildCount, retrievalJobCount int64
+		if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("code_index_build_id = ?", item.buildID).Count(&retrievalBuildCount).Error; err != nil {
+			t.Fatal(err)
+		}
+		retrieval, err := ciStore.GetRetrievalBuildByCodeIndexBuild(ctx, item.buildID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retrievalResourceID := strconv.FormatInt(retrieval.ID, 10)
+		if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildRetrieval, retrievalResourceID).Count(&retrievalJobCount).Error; err != nil {
+			t.Fatal(err)
+		}
+		if retrievalBuildCount != 1 || retrievalJobCount != 1 {
+			t.Fatalf("%s handoff created RetrievalBuilds=%d BUILD_RETRIEVAL jobs=%d; want exactly one each", item.name, retrievalBuildCount, retrievalJobCount)
+		}
+		waitForRealLegacyJobStatus(t, jobsStore, childBuildJobID(t, jobsStore, jobs.JobTypeBuildRetrieval, retrievalResourceID), jobs.StatusSucceeded)
+	}
+}
+
+func TestRealMySQL_LegacyCodeIndexFinalizerRejectsRevisionIdentity(t *testing.T) {
+	if os.Getenv("REPOLENS_REQUIRE_REAL_INTEGRATION") == "" {
+		t.Skip("skipping real MySQL legacy Revision isolation test (set REPOLENS_REQUIRE_REAL_INTEGRATION=1)")
+	}
+	db, jobsStore, cleanup := setupRealMySQL(t)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	const (
+		snapshotID = "snap-mysql-revision-isolation"
+		modulePath = "example.com/revision-isolation"
+		workerID   = "legacy-finalizer-isolation-worker"
+		claimToken = "legacy-finalizer-isolation-claim"
+	)
+	revisionID := "c7d03c1f-2abc-47d1-bc7e-f6db40d874ed"
+	buildID := insertMySQLCodeIndexBuild(t, db, snapshotID, modulePath, codeintelmodel.BuildStatusBuilding, &revisionID)
+	resourceID := strconv.FormatInt(buildID, 10)
+	parentJob := &jobs.AnalysisJob{JobType: jobs.JobTypeBuildCodeIndex, ResourceID: resourceID, MaxAttempts: 3}
+	if err := jobsStore.CreateJob(ctx, parentJob); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", parentJob.ID).Updates(map[string]interface{}{
+		"status": jobs.StatusRunning, "worker_id": workerID, "claim_token": claimToken,
+		"execution_started": true, "lease_until": time.Now().UTC().Add(time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	ciStore := codeintelstore.NewStore(db)
+	err := ciStore.FinalizeLegacyCodeIndexSuccessWithRetrievalHandoff(ctx, parentJob.ID, workerID, claimToken, buildID, &codeintelmodel.AnalysisResult{})
+	if err == nil {
+		t.Fatal("legacy finalizer accepted a CodeIndexBuild with a non-empty Revision identity")
+	}
+	build, err := ciStore.GetByID(ctx, buildID)
+	if err != nil || build.AnalysisRevisionID != revisionID || build.Status != codeintelmodel.BuildStatusBuilding {
+		t.Fatalf("Revision CodeIndexBuild after legacy finalizer=%+v err=%v; want unchanged BUILDING Revision row", build, err)
+	}
+	job, err := jobsStore.GetJobByID(ctx, parentJob.ID)
+	if err != nil || job.Status != jobs.StatusRunning {
+		t.Fatalf("Revision BUILD_CODE_INDEX Job after legacy finalizer=%+v err=%v; want RUNNING", job, err)
+	}
+	var retrievalBuildCount int64
+	if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("code_index_build_id = ?", buildID).Count(&retrievalBuildCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retrievalBuildCount != 0 {
+		t.Fatalf("Revision row incorrectly created %d legacy RetrievalBuilds", retrievalBuildCount)
+	}
+}
+
+func insertMySQLCodeIndexBuild(t *testing.T, db *gorm.DB, snapshotID, modulePath string, status codeintelmodel.BuildStatus, revisionID *string) int64 {
+	t.Helper()
+	buildContext := codeintelmodel.DefaultBuildContext()
+	var revisionValue any
+	if revisionID != nil {
+		revisionValue = *revisionID
+	}
+	result := db.Exec(`INSERT INTO code_index_builds (
+		snapshot_id, analysis_revision_id, parser_version, analyzer_version,
+		symbol_schema_version, build_context_hash, module_path, goos, goarch,
+		build_tags_hash, build_tags_json, status
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		snapshotID, revisionValue, codeintelmodel.CurrentParserVersion, codeintelmodel.CurrentAnalyzerVersion,
+		codeintelmodel.CurrentSymbolSchemaVersion, buildContext.BuildContextHash(), modulePath,
+		buildContext.GOOS, buildContext.GOARCH, buildContext.BuildTagsHash(), "[]", status,
+	)
+	if result.Error != nil {
+		t.Fatalf("insert CodeIndexBuild row directly: %v", result.Error)
+	}
+	var build codeintelmodel.CodeIndexBuild
+	if err := db.Where("snapshot_id = ? AND parser_version = ? AND analyzer_version = ? AND symbol_schema_version = ? AND build_context_hash = ?",
+		snapshotID, codeintelmodel.CurrentParserVersion, codeintelmodel.CurrentAnalyzerVersion,
+		codeintelmodel.CurrentSymbolSchemaVersion, buildContext.BuildContextHash()).First(&build).Error; err != nil {
+		t.Fatalf("reload manually inserted CodeIndexBuild: %v", err)
+	}
+	return build.ID
 }
 
 type legacyHandoffTestCloner struct {

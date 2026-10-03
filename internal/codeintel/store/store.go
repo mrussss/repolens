@@ -402,7 +402,7 @@ func (s *GormStore) FinalizeLegacyCodeIndexSuccessWithRetrievalHandoff(ctx conte
 			return err
 		}
 		var build model.CodeIndexBuild
-		if err := tx.Where("id = ? AND analysis_revision_id = '' AND status = ?", buildID, model.BuildStatusBuilding).First(&build).Error; err != nil {
+		if err := tx.Where("id = ? AND (analysis_revision_id = '' OR analysis_revision_id IS NULL) AND status = ?", buildID, model.BuildStatusBuilding).First(&build).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return fmt.Errorf("legacy code index build %d is not BUILDING", buildID)
 			}
