@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"repolens/internal/codeintel/model"
 	"repolens/internal/jobs"
@@ -29,6 +31,8 @@ type Store interface {
 	SaveAnalysisResult(ctx context.Context, buildID int64, result *model.AnalysisResult) error
 	FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, result *model.AnalysisResult) error
 	FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, revisionID string, result *model.AnalysisResult) error
+	FinalizeLegacyCodeIndexSuccessWithRetrievalHandoff(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, result *model.AnalysisResult) error
+	FinalizeLegacySnapshotSuccessWithCodeIndexHandoff(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error
 	MarkBuildBuilding(ctx context.Context, buildID int64) error
 	ListSymbols(ctx context.Context, buildID int64, query string, limit int) ([]*model.Symbol, error)
 	ListAllSymbols(ctx context.Context, buildID int64) ([]*model.Symbol, error)
@@ -59,70 +63,116 @@ func NewStore(db *gorm.DB) *GormStore {
 }
 
 func (s *GormStore) GetOrCreateBuild(ctx context.Context, snapshotID, modulePath string, bc model.BuildContext) (*model.CodeIndexBuild, bool, error) {
-	ctxHash := bc.BuildContextHash()
+	contextHash := bc.BuildContextHash()
+	if existing, err := s.getBuildByIdentity(ctx, snapshotID, contextHash); err == nil {
+		if err := s.ensureAnalysisJob(ctx, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(existing.ID, 10), 1, time.Now().UTC()); err != nil {
+			return nil, false, err
+		}
+		return existing, false, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, err
+	}
+
+	var build *model.CodeIndexBuild
+	var created bool
+	now := time.Now().UTC()
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var txErr error
+		build, created, txErr = s.createBuildTx(tx, snapshotID, modulePath, bc, 1, now)
+		return txErr
+	})
+	if err == nil {
+		return build, created, nil
+	}
+
+	// A concurrent request may have won the unique build identity. Reuse it
+	// only after its corresponding Job is present as well.
+	winner, lookupErr := s.getBuildByIdentity(ctx, snapshotID, bc.BuildContextHash())
+	if lookupErr != nil {
+		return nil, false, err
+	}
+	if ensureErr := s.ensureAnalysisJob(ctx, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(winner.ID, 10), 1, now); ensureErr != nil {
+		return nil, false, ensureErr
+	}
+	return winner, false, nil
+}
+
+func (s *GormStore) getOrCreateBuildTx(tx *gorm.DB, snapshotID, modulePath string, bc model.BuildContext, generation int, createdAt time.Time) (*model.CodeIndexBuild, bool, error) {
+	contextHash := bc.BuildContextHash()
+	var build model.CodeIndexBuild
+	err := tx.Where(
+		"snapshot_id = ? AND parser_version = ? AND analyzer_version = ? AND symbol_schema_version = ? AND build_context_hash = ?",
+		snapshotID, model.CurrentParserVersion, model.CurrentAnalyzerVersion, model.CurrentSymbolSchemaVersion, contextHash,
+	).First(&build).Error
+	if err == nil {
+		if err := ensureAnalysisJobTx(tx, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(build.ID, 10), generation, createdAt); err != nil {
+			return nil, false, err
+		}
+		return &build, false, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, err
+	}
+	return s.createBuildTx(tx, snapshotID, modulePath, bc, generation, createdAt)
+}
+
+func (s *GormStore) createBuildTx(tx *gorm.DB, snapshotID, modulePath string, bc model.BuildContext, generation int, createdAt time.Time) (*model.CodeIndexBuild, bool, error) {
+	contextHash := bc.BuildContextHash()
+	var build model.CodeIndexBuild
 	buildTags := append([]string{}, bc.BuildTags...)
 	tagsJSON, err := json.Marshal(buildTags)
 	if err != nil {
 		return nil, false, fmt.Errorf("encode code index build tags: %w", err)
 	}
-	var existing model.CodeIndexBuild
-
-	err = s.db.WithContext(ctx).Where(
-		"snapshot_id = ? AND parser_version = ? AND analyzer_version = ? AND symbol_schema_version = ? AND build_context_hash = ?",
-		snapshotID, model.CurrentParserVersion, model.CurrentAnalyzerVersion, model.CurrentSymbolSchemaVersion, ctxHash,
-	).First(&existing).Error
-
-	if err == nil {
-		return &existing, false, nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, false, err
-	}
-
-	// Create new build + AnalysisJob transactionally
-	build := &model.CodeIndexBuild{
+	build = model.CodeIndexBuild{
 		SnapshotID:          snapshotID,
 		ParserVersion:       model.CurrentParserVersion,
 		AnalyzerVersion:     model.CurrentAnalyzerVersion,
 		SymbolSchemaVersion: model.CurrentSymbolSchemaVersion,
-		BuildContextHash:    ctxHash,
+		BuildContextHash:    contextHash,
 		ModulePath:          modulePath,
 		GOOS:                bc.GOOS,
 		GOARCH:              bc.GOARCH,
 		BuildTagsHash:       bc.BuildTagsHash(),
 		BuildTagsJSON:       string(tagsJSON),
 		Status:              model.BuildStatusCreated,
-		CreatedAt:           time.Now().UTC(),
+		CreatedAt:           createdAt,
 	}
+	if err := tx.Create(&build).Error; err != nil {
+		return nil, false, err
+	}
+	if err := ensureAnalysisJobTx(tx, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(build.ID, 10), generation, createdAt); err != nil {
+		return nil, false, err
+	}
+	return &build, true, nil
+}
 
-	txErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(build).Error; err != nil {
-			return err
-		}
-
-		// Insert corresponding AnalysisJob
-		job := &jobs.AnalysisJob{
-			JobType:             jobs.JobTypeBuildCodeIndex,
-			ResourceID:          fmt.Sprintf("%d", build.ID),
-			Status:              jobs.StatusPending,
-			ExecutionGeneration: 1,
-			AttemptCount:        0,
-			MaxAttempts:         3,
-			NextRunAt:           time.Now().UTC(),
-		}
-		return tx.Create(job).Error
+func (s *GormStore) ensureAnalysisJob(ctx context.Context, jobType jobs.JobType, resourceID string, generation int, nextRunAt time.Time) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return ensureAnalysisJobTx(tx, jobType, resourceID, generation, nextRunAt)
 	})
+}
 
-	if txErr != nil {
-		// A concurrent request may have won the unique build identity between
-		// our initial read and insert. Treat that winner as an idempotent reuse.
-		if winner, lookupErr := s.getBuildByIdentity(ctx, snapshotID, ctxHash); lookupErr == nil {
-			return winner, false, nil
-		}
-		return nil, false, txErr
+func ensureAnalysisJobTx(tx *gorm.DB, jobType jobs.JobType, resourceID string, generation int, nextRunAt time.Time) error {
+	var existing jobs.AnalysisJob
+	err := tx.Where("job_type = ? AND resource_id = ?", jobType, resourceID).First(&existing).Error
+	if err == nil {
+		return nil
 	}
-
-	return build, true, nil
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if generation < 1 {
+		generation = 1
+	}
+	return tx.Create(&jobs.AnalysisJob{
+		JobType:             jobType,
+		ResourceID:          resourceID,
+		Status:              jobs.StatusPending,
+		ExecutionGeneration: generation,
+		MaxAttempts:         3,
+		NextRunAt:           nextRunAt,
+	}).Error
 }
 
 func (s *GormStore) getBuildByIdentity(ctx context.Context, snapshotID, contextHash string) (*model.CodeIndexBuild, error) {
@@ -294,6 +344,42 @@ func relatedTestKey(targetHash, testHash string) string {
 	return targetHash + "\x00" + testHash
 }
 
+// FinalizeLegacySnapshotSuccessWithCodeIndexHandoff keeps the legacy Snapshot
+// publication, CodeIndexBuild identity, downstream Job, and current Job
+// success in one claim-fenced transaction.
+func (s *GormStore) FinalizeLegacySnapshotSuccessWithCodeIndexHandoff(ctx context.Context, jobID int64, workerID, claimToken, snapshotID, materializedPath, modulePath, commitSHA, contentHash string, fileCount int, totalBytes int64, readyAt time.Time) error {
+	if materializedPath == "" || commitSHA == "" || commitSHA == "pending" || contentHash == "" {
+		return fmt.Errorf("snapshot %s cannot become READY without exact commit and content hash", snapshotID)
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		owned, err := requireOwnedPipelineJobTx(tx, jobID, workerID, claimToken, jobs.JobTypeMaterializeSnapshot, snapshotID)
+		if err != nil {
+			return err
+		}
+		result := tx.Model(&snapshot.RepositorySnapshot{}).
+			Where("id = ? AND status = ? AND analysis_revision_id = ''", snapshotID, snapshot.StatusMaterializing).
+			Updates(map[string]interface{}{
+				"materialized_path": materializedPath,
+				"commit_sha":        commitSHA,
+				"content_hash":      contentHash,
+				"file_count":        fileCount,
+				"total_bytes":       totalBytes,
+				"status":            snapshot.StatusReady,
+				"ready_at":          readyAt,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("legacy snapshot %s materialization finalize conflict", snapshotID)
+		}
+		if _, _, err := s.getOrCreateBuildTx(tx, snapshotID, modulePath, model.DefaultBuildContext(), owned.ExecutionGeneration, readyAt); err != nil {
+			return fmt.Errorf("create legacy CodeIndexBuild handoff: %w", err)
+		}
+		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
+	})
+}
+
 func (s *GormStore) FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, res *model.AnalysisResult) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := requireOwnedJob(tx, jobID, workerID, claimToken); err != nil {
@@ -301,6 +387,32 @@ func (s *GormStore) FinalizeCodeIndexSuccess(ctx context.Context, jobID int64, w
 		}
 		if err := s.saveAnalysisResultTx(tx, buildID, res); err != nil {
 			return err
+		}
+		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
+	})
+}
+
+// FinalizeLegacyCodeIndexSuccessWithRetrievalHandoff atomically persists a
+// legacy analysis result, creates or reuses its RetrievalBuild and Job, and
+// completes the claimed BUILD_CODE_INDEX Job.
+func (s *GormStore) FinalizeLegacyCodeIndexSuccessWithRetrievalHandoff(ctx context.Context, jobID int64, workerID, claimToken string, buildID int64, res *model.AnalysisResult) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		owned, err := requireOwnedPipelineJobTx(tx, jobID, workerID, claimToken, jobs.JobTypeBuildCodeIndex, strconv.FormatInt(buildID, 10))
+		if err != nil {
+			return err
+		}
+		var build model.CodeIndexBuild
+		if err := tx.Where("id = ? AND analysis_revision_id = '' AND status = ?", buildID, model.BuildStatusBuilding).First(&build).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("legacy code index build %d is not BUILDING", buildID)
+			}
+			return err
+		}
+		if err := s.saveAnalysisResultTx(tx, buildID, res); err != nil {
+			return err
+		}
+		if _, _, err := s.getOrCreateRetrievalBuildTx(tx, buildID, "BM25", owned.ExecutionGeneration, time.Now().UTC()); err != nil {
+			return fmt.Errorf("create legacy RetrievalBuild handoff: %w", err)
 		}
 		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
 	})
@@ -493,22 +605,71 @@ func (s *GormStore) ListRelatedTests(ctx context.Context, buildID int64, symbolK
 
 // RetrievalBuild implementation
 func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuildID int64, strategy string) (*model.RetrievalBuild, bool, error) {
-	configHash := "config-v2.2"
+	const configHash = "config-v2.2"
 	var existing model.RetrievalBuild
-
 	err := s.db.WithContext(ctx).Where(
 		"code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?",
 		codeIndexBuildID, strategy, model.CurrentRetrievalVersion, model.CurrentTokenizerVersion, configHash,
 	).First(&existing).Error
-
 	if err == nil {
+		if err := s.ensureAnalysisJob(ctx, jobs.JobTypeBuildRetrieval, strconv.FormatInt(existing.ID, 10), 1, time.Now().UTC()); err != nil {
+			return nil, false, err
+		}
 		return &existing, false, nil
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, false, err
 	}
 
-	build := &model.RetrievalBuild{
+	var build *model.RetrievalBuild
+	var created bool
+	now := time.Now().UTC()
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var txErr error
+		build, created, txErr = s.createRetrievalBuildTx(tx, codeIndexBuildID, strategy, 1, now)
+		return txErr
+	})
+	if err == nil {
+		return build, created, nil
+	}
+
+	var winner model.RetrievalBuild
+	lookupErr := s.db.WithContext(ctx).Where(
+		"code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?",
+		codeIndexBuildID, strategy, model.CurrentRetrievalVersion, model.CurrentTokenizerVersion, "config-v2.2",
+	).First(&winner).Error
+	if lookupErr != nil {
+		return nil, false, err
+	}
+	if ensureErr := s.ensureAnalysisJob(ctx, jobs.JobTypeBuildRetrieval, strconv.FormatInt(winner.ID, 10), 1, now); ensureErr != nil {
+		return nil, false, ensureErr
+	}
+	return &winner, false, nil
+}
+
+func (s *GormStore) getOrCreateRetrievalBuildTx(tx *gorm.DB, codeIndexBuildID int64, strategy string, generation int, createdAt time.Time) (*model.RetrievalBuild, bool, error) {
+	const configHash = "config-v2.2"
+	var build model.RetrievalBuild
+	err := tx.Where(
+		"code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?",
+		codeIndexBuildID, strategy, model.CurrentRetrievalVersion, model.CurrentTokenizerVersion, configHash,
+	).First(&build).Error
+	if err == nil {
+		if err := ensureAnalysisJobTx(tx, jobs.JobTypeBuildRetrieval, strconv.FormatInt(build.ID, 10), generation, createdAt); err != nil {
+			return nil, false, err
+		}
+		return &build, false, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, err
+	}
+	return s.createRetrievalBuildTx(tx, codeIndexBuildID, strategy, generation, createdAt)
+}
+
+func (s *GormStore) createRetrievalBuildTx(tx *gorm.DB, codeIndexBuildID int64, strategy string, generation int, createdAt time.Time) (*model.RetrievalBuild, bool, error) {
+	const configHash = "config-v2.2"
+	var build model.RetrievalBuild
+	build = model.RetrievalBuild{
 		CodeIndexBuildID: codeIndexBuildID,
 		Strategy:         strategy,
 		RetrievalVersion: model.CurrentRetrievalVersion,
@@ -517,41 +678,15 @@ func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuil
 		ArtifactPath:     "",
 		ArtifactHash:     "",
 		Status:           model.BuildStatusCreated,
-		CreatedAt:        time.Now().UTC(),
+		CreatedAt:        createdAt,
 	}
-
-	txErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(build).Error; err != nil {
-			return err
-		}
-
-		job := &jobs.AnalysisJob{
-			JobType:             jobs.JobTypeBuildRetrieval,
-			ResourceID:          fmt.Sprintf("%d", build.ID),
-			Status:              jobs.StatusPending,
-			ExecutionGeneration: 1,
-			AttemptCount:        0,
-			MaxAttempts:         3,
-			NextRunAt:           time.Now().UTC(),
-		}
-		return tx.Create(job).Error
-	})
-
-	if txErr != nil {
-		// Retrieval builds have the same composite unique identity; reread the
-		// winner if another request inserted it after our first lookup.
-		var winner model.RetrievalBuild
-		lookupErr := s.db.WithContext(ctx).Where(
-			"code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?",
-			codeIndexBuildID, strategy, model.CurrentRetrievalVersion, model.CurrentTokenizerVersion, configHash,
-		).First(&winner).Error
-		if lookupErr == nil {
-			return &winner, false, nil
-		}
-		return nil, false, txErr
+	if err := tx.Create(&build).Error; err != nil {
+		return nil, false, err
 	}
-
-	return build, true, nil
+	if err := ensureAnalysisJobTx(tx, jobs.JobTypeBuildRetrieval, strconv.FormatInt(build.ID, 10), generation, createdAt); err != nil {
+		return nil, false, err
+	}
+	return &build, true, nil
 }
 
 func (s *GormStore) GetRetrievalBuildByID(ctx context.Context, id int64) (*model.RetrievalBuild, error) {
@@ -679,6 +814,21 @@ func requireOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) erro
 		return err
 	}
 	return nil
+}
+
+func requireOwnedPipelineJobTx(tx *gorm.DB, jobID int64, workerID, claimToken string, jobType jobs.JobType, resourceID string) (*jobs.AnalysisJob, error) {
+	var job jobs.AnalysisJob
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"id = ? AND job_type = ? AND resource_id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_started = ? AND cancel_requested = ?",
+		jobID, jobType, resourceID, jobs.StatusRunning, workerID, claimToken, true, false,
+	).First(&job).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, jobs.ErrOwnershipLost
+		}
+		return nil, err
+	}
+	return &job, nil
 }
 
 func finalizeOwnedJob(tx *gorm.DB, jobID int64, workerID, claimToken string) error {

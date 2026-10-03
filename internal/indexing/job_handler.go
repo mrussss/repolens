@@ -289,7 +289,22 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 		return jobs.NewRetryableError("SNAPSHOT_SEAL_FAILED", err.Error(), err)
 	}
 	stageFinalized := false
-	if h.finalizer != nil && job.WorkerID != nil && job.ClaimToken != nil && snap.AnalysisRevisionID != "" {
+	legacyHandoffFinalized := false
+	if h.codeIntelStore != nil && snap.AnalysisRevisionID == "" && job.WorkerID != nil && job.ClaimToken != nil {
+		err := h.codeIntelStore.FinalizeLegacySnapshotSuccessWithCodeIndexHandoff(
+			ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, r.Name,
+			commitSHA, contentHash, fileCount, totalBytes, now,
+		)
+		if err != nil {
+			if errors.Is(err, jobs.ErrOwnershipLost) || errors.Is(err, jobs.ErrCancellationRequested) {
+				return err
+			}
+			return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded,
+				jobs.NewRetryableError("CODE_INDEX_HANDOFF_FAILED", "legacy snapshot finalization and CodeIndex handoff transaction failed", err))
+		}
+		legacyHandoffFinalized = true
+	}
+	if !legacyHandoffFinalized && h.finalizer != nil && job.WorkerID != nil && job.ClaimToken != nil && snap.AnalysisRevisionID != "" {
 		if err := h.finalizer.FinalizeSnapshot(ctx, analysispipeline.SnapshotStageResult{
 			Ownership:  analysispipeline.JobOwnership{JobID: job.ID, WorkerID: *job.WorkerID, ClaimToken: *job.ClaimToken},
 			RevisionID: snap.AnalysisRevisionID, SnapshotID: snap.ID, MaterializedPath: targetDir,
@@ -299,17 +314,19 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 			return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, err)
 		}
 		stageFinalized = true
-	} else if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil {
-		if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
-			return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, err)
-		}
-	} else if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
-		if err := finalizer.FinalizeMaterialization(ctx, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
-			h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
+	} else if !legacyHandoffFinalized {
+		if finalizer, ok := h.snapshotStore.(snapshot.ClaimedMaterializationFinalizer); ok && job.WorkerID != nil && job.ClaimToken != nil {
+			if err := finalizer.FinalizeSnapshotSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+				return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, err)
+			}
+		} else if finalizer, ok := h.snapshotStore.(snapshot.MaterializationFinalizer); ok {
+			if err := finalizer.FinalizeMaterialization(ctx, snap.ID, targetDir, commitSHA, contentHash, fileCount, totalBytes, now); err != nil {
+				h.failIfTerminal(ctx, job, snap.ID, "SNAPSHOT_FINALIZE_FAILED")
+				return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
+			}
+		} else if err := h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusReady, &now); err != nil {
 			return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
 		}
-	} else if err := h.snapshotStore.UpdateStatus(ctx, snap.ID, snapshot.StatusMaterializing, snapshot.StatusReady, &now); err != nil {
-		return jobs.NewRetryableError("SNAPSHOT_FINALIZE_FAILED", err.Error(), err)
 	}
 	if h.finalizer == nil && !stageFinalized && h.revisionStore != nil && snap.AnalysisRevisionID != "" {
 		if err := h.revisionStore.MarkSnapshotReady(ctx, snap.AnalysisRevisionID, snap.ID); err != nil {
@@ -318,7 +335,7 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 
 	// Auto-chain BUILD_CODE_INDEX job if codeIntelStore is wired
-	if h.codeIntelStore != nil && !stageFinalized && snap.AnalysisRevisionID == "" {
+	if h.codeIntelStore != nil && !stageFinalized && !legacyHandoffFinalized && snap.AnalysisRevisionID == "" {
 		if err := h.createLegacyCodeIndexHandoff(ctx, snap); err != nil {
 			return err
 		}

@@ -95,6 +95,7 @@ func TestCodeIndexRetrievalHandoffFailureIsVisibleAndRetryIsIdempotent(t *testin
 	workerConfig.MaxBackoff = time.Minute
 	worker := jobs.NewWorker(jobsStore, workerConfig)
 	worker.RegisterHandler(jobs.JobTypeBuildCodeIndex, handler)
+	worker.RegisterHandler(jobs.JobTypeBuildRetrieval, jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error { return nil }))
 	worker.Start(context.Background())
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -130,6 +131,119 @@ func TestCodeIndexRetrievalHandoffFailureIsVisibleAndRetryIsIdempotent(t *testin
 	if retrievalBuilds != 1 || retrievalJobs != 1 {
 		t.Fatalf("retrieval retry created builds=%d jobs=%d; want exactly one each", retrievalBuilds, retrievalJobs)
 	}
+	retrievalBuild, err := baseStore.GetRetrievalBuildByCodeIndexBuild(ctx, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForLegacyHandoffJobStatus(t, jobsStore, jobs.JobTypeBuildRetrieval, strconv.FormatInt(retrievalBuild.ID, 10), jobs.StatusSucceeded)
+}
+
+func TestLegacyCodeIndexHandoffFailureKeepsJobRetryableAndCreatesOneRetrievalBuild(t *testing.T) {
+	db, jobsStore, ciStore, snapStore := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	const (
+		repoID     = "repo-legacy-codeindex-atomic"
+		snapshotID = "snap-legacy-codeindex-atomic"
+	)
+	storeFS := snapshotstore.NewLocalSnapshotStore(t.TempDir())
+	sourceDir, err := storeFS.EnsureDir(repoID, snapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "go.mod"), []byte("module example.com/legacy-atomic\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "main.go"), []byte("package main\n\nfunc Hello() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := snapStore.Create(ctx, &snapshot.RepositorySnapshot{
+		ID: snapshotID, RepositoryID: repoID, CommitSHA: "0123456789abcdef0123456789abcdef01234567",
+		Ref: "main", MaterializedPath: sourceDir, Status: snapshot.StatusReady, ReadyAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	build, created, err := ciStore.GetOrCreateBuild(ctx, snapshotID, "example.com/legacy-atomic", codeintelmodel.DefaultBuildContext())
+	if err != nil || !created || build.Status != codeintelmodel.BuildStatusCreated {
+		t.Fatalf("initial CodeIndexBuild=%+v created=%t err=%v; want CREATED", build, created, err)
+	}
+	parentJobID := strconv.FormatInt(build.ID, 10)
+	if err := db.Exec(`CREATE TRIGGER fail_legacy_retrieval_insert BEFORE INSERT ON retrieval_builds
+		BEGIN SELECT RAISE(FAIL, 'injected RetrievalBuild create failure'); END`).Error; err != nil {
+		t.Fatalf("create handoff failure trigger: %v", err)
+	}
+	handler := codeintel.NewCodeIndexJobHandler(ciStore, snapStore, storeFS, codeintel.NewAnalyzer())
+	workerCfg := jobs.DefaultWorkerConfig()
+	workerCfg.WorkerID = "legacy-codeindex-atomic-worker"
+	workerCfg.Concurrency = 1
+	workerCfg.BatchSize = 1
+	workerCfg.PollInterval = 5 * time.Millisecond
+	workerCfg.LeaseDuration = 5 * time.Second
+	workerCfg.ReapInterval = time.Hour
+	workerCfg.BaseBackoff = time.Minute
+	workerCfg.MaxBackoff = time.Minute
+	worker := jobs.NewWorker(jobsStore, workerCfg)
+	worker.RegisterHandler(jobs.JobTypeBuildCodeIndex, handler)
+	worker.RegisterHandler(jobs.JobTypeBuildRetrieval, jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error { return nil }))
+	worker.Start(ctx)
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := worker.StopGracefully(stopCtx); err != nil {
+			t.Errorf("stop legacy CodeIndex worker: %v", err)
+		}
+	})
+
+	failedJob := waitForLegacyHandoffJobStatus(t, jobsStore, jobs.JobTypeBuildCodeIndex, parentJobID, jobs.StatusRetryWait)
+	if failedJob.Status == jobs.StatusSucceeded || failedJob.LastErrorCode == nil || *failedJob.LastErrorCode != "RETRIEVAL_HANDOFF_FAILED" {
+		t.Fatalf("first handoff failure job=%+v; want retryable non-success", failedJob)
+	}
+	building, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil || building.Status != codeintelmodel.BuildStatusBuilding {
+		t.Fatalf("CodeIndexBuild after rolled-back handoff=%+v err=%v; want BUILDING", building, err)
+	}
+	symbols, err := ciStore.ListAllSymbols(ctx, build.ID)
+	if err != nil || len(symbols) != 0 {
+		t.Fatalf("analysis rows after rolled-back handoff=%d err=%v; want zero symbols", len(symbols), err)
+	}
+	var retrievalBuilds, retrievalJobs int64
+	if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("code_index_build_id = ?", build.ID).Count(&retrievalBuilds).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id IN (SELECT CAST(id AS TEXT) FROM retrieval_builds WHERE code_index_build_id = ?)", jobs.JobTypeBuildRetrieval, build.ID).Count(&retrievalJobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retrievalBuilds != 0 || retrievalJobs != 0 {
+		t.Fatalf("failed transaction left RetrievalBuilds=%d BUILD_RETRIEVAL jobs=%d; want zero", retrievalBuilds, retrievalJobs)
+	}
+	if err := db.Exec("DROP TRIGGER fail_legacy_retrieval_insert").Error; err != nil {
+		t.Fatalf("drop handoff failure trigger: %v", err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id = ?", jobs.JobTypeBuildCodeIndex, parentJobID).Update("next_run_at", time.Now().UTC().Add(-time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+	succeededJob := waitForLegacyHandoffJobStatus(t, jobsStore, jobs.JobTypeBuildCodeIndex, parentJobID, jobs.StatusSucceeded)
+	readyBuild, err := ciStore.GetByID(ctx, build.ID)
+	if err != nil || readyBuild.Status != codeintelmodel.BuildStatusReady || readyBuild.SymbolCount == 0 {
+		t.Fatalf("CodeIndexBuild after retry=%+v err=%v; want READY with persisted symbols", readyBuild, err)
+	}
+	if succeededJob.Status != jobs.StatusSucceeded {
+		t.Fatalf("BUILD_CODE_INDEX Job after retry=%s; want SUCCEEDED", succeededJob.Status)
+	}
+	if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("code_index_build_id = ?", build.ID).Count(&retrievalBuilds).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id IN (SELECT CAST(id AS TEXT) FROM retrieval_builds WHERE code_index_build_id = ?)", jobs.JobTypeBuildRetrieval, build.ID).Count(&retrievalJobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retrievalBuilds != 1 || retrievalJobs != 1 {
+		t.Fatalf("successful retry created RetrievalBuilds=%d BUILD_RETRIEVAL jobs=%d; want exactly one each", retrievalBuilds, retrievalJobs)
+	}
+	retrievalBuild, err := ciStore.GetRetrievalBuildByCodeIndexBuild(ctx, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForLegacyHandoffJobStatus(t, jobsStore, jobs.JobTypeBuildRetrieval, strconv.FormatInt(retrievalBuild.ID, 10), jobs.StatusSucceeded)
 }
 
 func waitForLegacyHandoffJobStatus(t *testing.T, store *jobs.Store, jobType jobs.JobType, resourceID string, want jobs.JobStatus) *jobs.AnalysisJob {

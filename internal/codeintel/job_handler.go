@@ -118,7 +118,6 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	}
 
 	var saveErr error
-	stageFinalized := false
 	if cib.AnalysisRevisionID != "" {
 		if h.finalizer == nil {
 			return fmt.Errorf("analysis pipeline finalizer is not configured")
@@ -127,20 +126,15 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			Ownership:  analysispipeline.JobOwnership{JobID: job.ID, WorkerID: *job.WorkerID, ClaimToken: *job.ClaimToken},
 			RevisionID: cib.AnalysisRevisionID, CodeIndexBuildID: cib.ID, AnalysisResult: analysisRes,
 		})
-		stageFinalized = saveErr == nil
 	} else {
-		saveErr = h.store.FinalizeCodeIndexSuccess(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, analysisRes)
+		saveErr = h.store.FinalizeLegacyCodeIndexSuccessWithRetrievalHandoff(ctx, job.ID, *job.WorkerID, *job.ClaimToken, cib.ID, analysisRes)
 	}
 	if saveErr != nil {
 		log.Error("failed persisting code index analysis result", "build_id", cib.ID, "error", saveErr)
-		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, saveErr)
-	}
-
-	// Non-revision builds retain the older follow-up stage creation path.
-	if !stageFinalized && cib.AnalysisRevisionID == "" {
-		if err := h.createLegacyRetrievalHandoff(ctx, cib.ID); err != nil {
-			return err
+		if cib.AnalysisRevisionID == "" && !errors.Is(saveErr, jobs.ErrOwnershipLost) && !errors.Is(saveErr, jobs.ErrCancellationRequested) {
+			saveErr = jobs.NewRetryableError("RETRIEVAL_HANDOFF_FAILED", "legacy CodeIndex finalization and Retrieval handoff transaction failed", saveErr)
 		}
+		return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded, saveErr)
 	}
 
 	log.Info("code index build completed successfully",

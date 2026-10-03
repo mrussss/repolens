@@ -251,6 +251,157 @@ func TestSnapshotHandoffFailurePropagatesAndRetryCreatesOneCodeIndexBuild(t *tes
 	}
 }
 
+func TestLegacySnapshotHandoffFailureKeepsJobRetryableAndCreatesOneCodeIndex(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "legacy_snapshot_atomic_handoff.db?_busy_timeout=5000&_journal_mode=WAL")), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mysql.AutoMigrate(db); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const (
+		repoID     = "repo-legacy-snapshot-atomic"
+		snapshotID = "snap-legacy-snapshot-atomic"
+		commitSHA  = "0123456789abcdef0123456789abcdef01234567"
+	)
+	repoStore := repo.NewStore(db)
+	if err := repoStore.Create(ctx, &repo.Repository{
+		ID: repoID, UserID: "user-legacy-atomic", Name: "example.com/legacy-atomic",
+		GitURL: "https://github.com/example/legacy-atomic", DefaultRef: "main", Status: repo.StatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshotStore := snapshot.NewStore(db)
+	if err := snapshotStore.Create(ctx, &snapshot.RepositorySnapshot{
+		ID: snapshotID, RepositoryID: repoID, Ref: "main", CommitSHA: commitSHA, Status: snapshot.StatusMaterializing,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jobsStore := jobs.NewStoreWithDriver(sqlDB, "sqlite3")
+	parentJob := &jobs.AnalysisJob{JobType: jobs.JobTypeMaterializeSnapshot, ResourceID: snapshotID, MaxAttempts: 3}
+	if err := jobsStore.CreateJob(ctx, parentJob); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`CREATE TRIGGER fail_legacy_code_index_insert BEFORE INSERT ON code_index_builds
+		BEGIN SELECT RAISE(FAIL, 'injected CodeIndexBuild create failure'); END`).Error; err != nil {
+		t.Fatalf("create handoff failure trigger: %v", err)
+	}
+	baseDir := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.Walk(baseDir, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if info.IsDir() {
+				return os.Chmod(path, 0755)
+			}
+			return os.Chmod(path, 0644)
+		})
+	})
+	storeFS := snapshotstore.NewLocalSnapshotStore(baseDir)
+	ciStore := codeintelstore.NewStore(db)
+	handler := indexing.NewSnapshotJobHandler(
+		repoStore, snapshotStore, nil, storeFS, &fixtureCloner{commitSHA: commitSHA},
+		indexing.NewFileFilter(512), indexing.NewCodeChunker(5, 2), nil,
+	).WithCodeIntelStore(ciStore)
+	workerCfg := jobs.DefaultWorkerConfig()
+	workerCfg.WorkerID = "legacy-snapshot-atomic-worker"
+	workerCfg.Concurrency = 1
+	workerCfg.BatchSize = 1
+	workerCfg.PollInterval = 5 * time.Millisecond
+	workerCfg.LeaseDuration = 5 * time.Second
+	workerCfg.ReapInterval = time.Hour
+	workerCfg.BaseBackoff = time.Minute
+	workerCfg.MaxBackoff = time.Minute
+	worker := jobs.NewWorker(jobsStore, workerCfg)
+	worker.RegisterHandler(jobs.JobTypeMaterializeSnapshot, handler)
+	worker.RegisterHandler(jobs.JobTypeBuildCodeIndex, jobs.HandlerFunc(func(context.Context, *jobs.AnalysisJob) error { return nil }))
+	worker.Start(ctx)
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := worker.StopGracefully(stopCtx); err != nil {
+			t.Errorf("stop legacy snapshot worker: %v", err)
+		}
+	})
+
+	failedJob := waitForLegacySnapshotJobStatus(t, jobsStore, parentJob.ID, jobs.StatusRetryWait)
+	if failedJob.Status == jobs.StatusSucceeded || failedJob.LastErrorCode == nil || *failedJob.LastErrorCode != "CODE_INDEX_HANDOFF_FAILED" {
+		t.Fatalf("first handoff failure job=%+v; want retryable non-success", failedJob)
+	}
+	snapAfterFailure, err := snapshotStore.GetByID(ctx, snapshotID)
+	if err != nil || snapAfterFailure.Status != snapshot.StatusMaterializing {
+		t.Fatalf("snapshot after rolled-back handoff=%+v err=%v; want MATERIALIZING", snapAfterFailure, err)
+	}
+	var codeIndexBuilds, codeIndexJobs int64
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("snapshot_id = ?", snapshotID).Count(&codeIndexBuilds).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id IN (SELECT CAST(id AS TEXT) FROM code_index_builds WHERE snapshot_id = ?)", jobs.JobTypeBuildCodeIndex, snapshotID).Count(&codeIndexJobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if codeIndexBuilds != 0 || codeIndexJobs != 0 {
+		t.Fatalf("failed transaction left CodeIndexBuilds=%d BUILD_CODE_INDEX jobs=%d; want zero", codeIndexBuilds, codeIndexJobs)
+	}
+	if err := db.Exec("DROP TRIGGER fail_legacy_code_index_insert").Error; err != nil {
+		t.Fatalf("drop handoff failure trigger: %v", err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("id = ?", parentJob.ID).Update("next_run_at", time.Now().UTC().Add(-time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+	succeededJob := waitForLegacySnapshotJobStatus(t, jobsStore, parentJob.ID, jobs.StatusSucceeded)
+	finalSnapshot, err := snapshotStore.GetByID(ctx, snapshotID)
+	if err != nil || finalSnapshot.Status != snapshot.StatusReady || finalSnapshot.MaterializedPath == "" {
+		t.Fatalf("snapshot after retry=%+v err=%v; want READY with materialized path", finalSnapshot, err)
+	}
+	if succeededJob.Status != jobs.StatusSucceeded {
+		t.Fatalf("Snapshot Job after retry=%s; want SUCCEEDED", succeededJob.Status)
+	}
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("snapshot_id = ?", snapshotID).Count(&codeIndexBuilds).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id IN (SELECT CAST(id AS TEXT) FROM code_index_builds WHERE snapshot_id = ?)", jobs.JobTypeBuildCodeIndex, snapshotID).Count(&codeIndexJobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if codeIndexBuilds != 1 || codeIndexJobs != 1 {
+		t.Fatalf("successful retry created CodeIndexBuilds=%d BUILD_CODE_INDEX jobs=%d; want exactly one each", codeIndexBuilds, codeIndexJobs)
+	}
+	childJob, err := jobsStore.GetJobByResource(ctx, jobs.JobTypeBuildCodeIndex, fmt.Sprintf("%d", buildIDForSnapshot(t, ciStore, snapshotID)))
+	if err != nil {
+		t.Fatalf("load downstream BUILD_CODE_INDEX Job: %v", err)
+	}
+	waitForLegacySnapshotJobStatus(t, jobsStore, childJob.ID, jobs.StatusSucceeded)
+}
+
+func buildIDForSnapshot(t *testing.T, store codeintelstore.Store, snapshotID string) int64 {
+	t.Helper()
+	build, err := store.GetBySnapshot(context.Background(), snapshotID)
+	if err != nil {
+		t.Fatalf("load CodeIndexBuild for snapshot %s: %v", snapshotID, err)
+	}
+	return build.ID
+}
+
+func waitForLegacySnapshotJobStatus(t *testing.T, store *jobs.Store, jobID int64, want jobs.JobStatus) *jobs.AnalysisJob {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		job, err := store.GetJobByID(context.Background(), jobID)
+		if err == nil && job.Status == want {
+			return job
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	job, err := store.GetJobByID(context.Background(), jobID)
+	t.Fatalf("Snapshot Job status=%+v err=%v; want %s", job, err, want)
+	return nil
+}
+
 type mockSnapshotStore struct {
 	snapshot.Store
 	lastStatus snapshot.SnapshotStatus
