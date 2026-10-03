@@ -235,7 +235,10 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 	}, nil
 }
 
-func definitelyPreDispatch(err error) bool {
+// IsDefinitelyPreDispatch reports provider transport failures known to happen
+// before an HTTP request could reach the provider. Keep this classification
+// narrow because a false positive can cause an unsafe automatic replay.
+func IsDefinitelyPreDispatch(err error) bool {
 	var opErr *net.OpError
 	if !errors.As(err, &opErr) || opErr.Op != "dial" {
 		return false
@@ -246,6 +249,8 @@ func definitelyPreDispatch(err error) bool {
 	var dnsErr *net.DNSError
 	return errors.As(opErr.Err, &dnsErr)
 }
+
+func definitelyPreDispatch(err error) bool { return IsDefinitelyPreDispatch(err) }
 
 func normalizeAuthMode(mode string) string {
 	if mode == "none" {

@@ -46,6 +46,12 @@ type Store interface {
 	GetLatestFinalCheckpoint(ctx context.Context, runID string, executionGeneration int) (*DiagnosisAttempt, error)
 	ListAttemptsByRun(ctx context.Context, runID string) ([]DiagnosisAttempt, error)
 	StartAttempt(ctx context.Context, runID string, attempt *DiagnosisAttempt) error
+	StartAttemptWithClaim(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID string, attempt *DiagnosisAttempt) error
+	BeginProviderDispatch(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) error
+	CheckProviderDispatchAuthority(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) error
+	ProviderDispatchSucceeded(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) error
+	ProviderDispatchFailedDefinitely(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) (bool, error)
+	UpdateAttemptCheckpointWithClaim(ctx context.Context, jobID int64, workerID, claimToken string, generation, attemptNo int, runID, attemptID string, checkpoint AttemptCheckpoint, withDraft bool) error
 	UpdateAttemptHeartbeat(ctx context.Context, attemptID string, heartbeatAt time.Time) error
 	CloseAttempt(ctx context.Context, runID, attemptID string, generation int, newStatus AttemptStatus, errCode, errMsg string, retryable bool) error
 	FinalizeSuccess(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, citations []evidence.Citation, promptTokens, completionTokens, toolCalls int) error
@@ -110,6 +116,177 @@ func (s *GormStore) StartAttempt(ctx context.Context, runID string, attempt *Dia
 		}
 		return ErrAttemptAlreadyExists
 	})
+}
+
+// StartAttemptWithClaim creates the Attempt and transitions its DiagnosisRun
+// only while the live AnalysisJob lease still belongs to the caller.
+func (s *GormStore) StartAttemptWithClaim(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID string, attempt *DiagnosisAttempt) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		job, err := lockLiveDiagnosisJobTx(ctx, tx, jobID, workerID, claimToken, generation, runID)
+		if err != nil {
+			return err
+		}
+		wantAttemptNo := job.AttemptCount
+		if wantAttemptNo <= 0 {
+			wantAttemptNo = 1
+		}
+		if attempt == nil || attempt.DiagnosisRunID != runID || attempt.ExecutionGeneration != generation || attempt.AttemptNo != wantAttemptNo || attempt.WorkerID != workerID {
+			return jobs.ErrOwnershipLost
+		}
+		var run DiagnosisRun
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&run, "id = ?", runID).Error; err != nil {
+			return err
+		}
+		if run.CancelRequested {
+			return jobs.ErrCancellationRequested
+		}
+		if run.Status == StatusQueued {
+			res := tx.Model(&DiagnosisRun{}).Where("id = ? AND status = ? AND cancel_requested = ?", runID, StatusQueued, false).
+				Updates(map[string]interface{}{"status": StatusRunning, "version": gorm.Expr("version + 1")})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return ErrClaimConflict
+			}
+		} else if run.Status != StatusRunning {
+			return fmt.Errorf("diagnosis %s cannot start from %s", runID, run.Status)
+		}
+		if attempt.StartedAt.IsZero() {
+			attempt.StartedAt = time.Now().UTC()
+		}
+		if attempt.HeartbeatAt.IsZero() {
+			attempt.HeartbeatAt = attempt.StartedAt
+		}
+		if attempt.DeadlineAt.IsZero() {
+			attempt.DeadlineAt = attempt.StartedAt.Add(30 * time.Minute)
+		}
+		attempt.Status = AttemptStatusRunning
+		attempt.CheckpointKind = CheckpointKindNone
+		return tx.Create(attempt).Error
+	})
+}
+
+func lockLiveDiagnosisJobTx(ctx context.Context, tx *gorm.DB, jobID int64, workerID, claimToken string, generation int, runID string) (*jobs.AnalysisJob, error) {
+	var job jobs.AnalysisJob
+	err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND job_type = ? AND resource_id = ? AND status = ? AND worker_id = ? AND claim_token = ? AND execution_generation = ? AND execution_started = ? AND cancel_requested = ?",
+			jobID, jobs.JobTypeRunDiagnosis, runID, jobs.StatusRunning, workerID, claimToken, generation, true, false).
+		First(&job).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		var current jobs.AnalysisJob
+		if lookupErr := tx.First(&current, "id = ?", jobID).Error; lookupErr == nil {
+			if current.Status == jobs.StatusSucceeded || current.Status == jobs.StatusFailed || current.Status == jobs.StatusCancelled {
+				return nil, jobs.ErrAlreadyFinalized
+			}
+			if current.Status == jobs.StatusRunning && current.JobType == jobs.JobTypeRunDiagnosis && current.ResourceID == runID &&
+				current.WorkerID != nil && *current.WorkerID == workerID && current.ClaimToken != nil && *current.ClaimToken == claimToken &&
+				current.ExecutionGeneration == generation && current.ExecutionStarted && current.CancelRequested {
+				return nil, jobs.ErrCancellationRequested
+			}
+		}
+		return nil, jobs.ErrOwnershipLost
+	}
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	if job.LeaseUntil == nil || !job.LeaseUntil.After(now) {
+		return nil, jobs.ErrOwnershipLost
+	}
+	return &job, nil
+}
+
+func lockLiveDiagnosisExecutionTx(ctx context.Context, tx *gorm.DB, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) (*jobs.AnalysisJob, *DiagnosisRun, *DiagnosisAttempt, error) {
+	job, run, attempt, err := lockDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, generation, runID, attemptID, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if job.LeaseUntil == nil || !job.LeaseUntil.After(time.Now().UTC()) {
+		return nil, nil, nil, jobs.ErrOwnershipLost
+	}
+	if attempt.AttemptNo != attemptNo {
+		return nil, nil, nil, jobs.ErrOwnershipLost
+	}
+	return job, run, attempt, nil
+}
+
+// BeginProviderDispatch durably marks a possibly side-effecting provider
+// request before the caller is allowed to invoke the provider.
+func (s *GormStore) BeginProviderDispatch(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		_, _, attempt, err := lockLiveDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, generation, runID, attemptID, attemptNo)
+		if err != nil {
+			return err
+		}
+		if attempt.Status != AttemptStatusRunning {
+			return ErrAttemptNotRunning
+		}
+		return tx.Model(&DiagnosisAttempt{}).Where("id = ? AND status = ?", attemptID, AttemptStatusRunning).
+			Update("provider_dispatch_unresolved", true).Error
+	})
+}
+
+// CheckProviderDispatchAuthority is a second live ownership check after the
+// durable marker commit and immediately before the external provider call.
+func (s *GormStore) CheckProviderDispatchAuthority(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		_, _, attempt, err := lockLiveDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, generation, runID, attemptID, attemptNo)
+		if err != nil {
+			return err
+		}
+		if !attempt.ProviderDispatchUnresolved {
+			return jobs.ErrOwnershipLost
+		}
+		return nil
+	})
+}
+
+func (s *GormStore) ProviderDispatchSucceeded(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		_, _, attempt, err := lockLiveDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, generation, runID, attemptID, attemptNo)
+		if err != nil {
+			return err
+		}
+		if !attempt.ProviderDispatchUnresolved {
+			return jobs.ErrOwnershipLost
+		}
+		if attempt.ProviderDispatchSuccessSeen {
+			return nil
+		}
+		result := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND status = ? AND provider_dispatch_unresolved = ?", attemptID, AttemptStatusRunning, true).
+			Update("provider_dispatch_success_seen", true)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return jobs.ErrOwnershipLost
+		}
+		return nil
+	})
+}
+
+// ProviderDispatchFailedDefinitely resolves the marker only if this attempt
+// has never received a successful provider response that is still uncheckpointed.
+func (s *GormStore) ProviderDispatchFailedDefinitely(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) (bool, error) {
+	resolved := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		_, _, attempt, err := lockLiveDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, generation, runID, attemptID, attemptNo)
+		if err != nil {
+			return err
+		}
+		if attempt.ProviderDispatchSuccessSeen {
+			return nil
+		}
+		result := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND status = ? AND provider_dispatch_success_seen = ?", attemptID, AttemptStatusRunning, false).
+			Update("provider_dispatch_unresolved", false)
+		if result.Error != nil {
+			return result.Error
+		}
+		resolved = result.RowsAffected == 1
+		return nil
+	})
+	return resolved, err
 }
 
 func lockDiagnosisExecutionTx(ctx context.Context, tx *gorm.DB, jobID int64, workerID, claimToken string, expectedGeneration int, runID, attemptID string, cancellation bool) (*jobs.AnalysisJob, *DiagnosisRun, *DiagnosisAttempt, error) {
@@ -711,6 +888,20 @@ func (s *GormStore) UpdateAttemptCheckpointWithDraft(ctx context.Context, attemp
 }
 
 func (s *GormStore) updateAttemptCheckpoint(ctx context.Context, attemptID string, checkpoint AttemptCheckpoint, withDraft bool) error {
+	updates := checkpointUpdates(checkpoint, withDraft)
+	result := s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).
+		Where("id = ? AND execution_generation = ? AND status = ?", attemptID, checkpoint.ExecutionGeneration, AttemptStatusRunning).
+		Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrAttemptNotRunning
+	}
+	return nil
+}
+
+func checkpointUpdates(checkpoint AttemptCheckpoint, withDraft bool) map[string]interface{} {
 	if checkpoint.ExecutionGeneration <= 0 {
 		checkpoint.ExecutionGeneration = 1
 	}
@@ -743,17 +934,37 @@ func (s *GormStore) updateAttemptCheckpoint(ctx context.Context, attemptID strin
 	}
 	if checkpoint.Kind == CheckpointKindFinalValid || checkpoint.Kind == CheckpointKindFinalInvalid {
 		updates["provider_completed_at"] = time.Now().UTC()
+		updates["provider_dispatch_unresolved"] = false
+		updates["provider_dispatch_success_seen"] = false
 	}
-	result := s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).
-		Where("id = ? AND execution_generation = ? AND status = ?", attemptID, checkpoint.ExecutionGeneration, AttemptStatusRunning).
-		Updates(updates)
-	if result.Error != nil {
-		return result.Error
+	return updates
+}
+
+// UpdateAttemptCheckpointWithClaim is the production checkpoint writer. The
+// Job claim and live lease fence the checkpoint in the same transaction; only
+// final replay-safe checkpoints resolve a durable dispatch marker.
+func (s *GormStore) UpdateAttemptCheckpointWithClaim(ctx context.Context, jobID int64, workerID, claimToken string, generation, attemptNo int, runID, attemptID string, checkpoint AttemptCheckpoint, withDraft bool) error {
+	if checkpoint.ExecutionGeneration <= 0 {
+		checkpoint.ExecutionGeneration = generation
 	}
-	if result.RowsAffected != 1 {
-		return ErrAttemptNotRunning
+	if checkpoint.ExecutionGeneration != generation {
+		return jobs.ErrOwnershipLost
 	}
-	return nil
+	updates := checkpointUpdates(checkpoint, withDraft)
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		_, _, attempt, err := lockLiveDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, generation, runID, attemptID, attemptNo)
+		if err != nil {
+			return err
+		}
+		result := tx.Model(&DiagnosisAttempt{}).Where("id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ? AND status = ?", attemptID, runID, generation, attempt.AttemptNo, AttemptStatusRunning).Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return jobs.ErrOwnershipLost
+		}
+		return nil
+	})
 }
 
 func truncateCheckpointMessage(message string) string {

@@ -79,6 +79,10 @@ func (s checkpointFailingStore) UpdateAttemptCheckpointWithDraft(context.Context
 	return errors.New("checkpoint storage unavailable")
 }
 
+func (s checkpointFailingStore) UpdateAttemptCheckpointWithClaim(context.Context, int64, string, string, int, int, string, string, diagnosis.AttemptCheckpoint, bool) error {
+	return errors.New("checkpoint storage unavailable")
+}
+
 func (e *checkpointCountingExecutor) Execute(context.Context, diagnosis.DiagnosisExecutionSpec, *diagnosis.DiagnosisAttempt) (*worker.ExecutionResult, error) {
 	e.calls++
 	return nil, errors.New("provider should not be called when a checkpoint exists")

@@ -71,10 +71,10 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		return jobs.NewPermanentError("EXECUTION_SPEC_INVALID", "diagnosis execution spec could not be built", err)
 	}
 
-	workerID := "worker"
-	if job.WorkerID != nil {
-		workerID = *job.WorkerID
+	if job.WorkerID == nil || job.ClaimToken == nil {
+		return jobs.ErrOwnershipLost
 	}
+	workerID := *job.WorkerID
 	executionGeneration := job.ExecutionGeneration
 	if executionGeneration <= 0 {
 		executionGeneration = 1
@@ -96,7 +96,13 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		DeadlineAt:          now.Add(30 * time.Minute),
 	}
 
-	if err := h.diagnosisStore.StartAttempt(ctx, run.ID, attempt); err != nil {
+	if err := h.diagnosisStore.StartAttemptWithClaim(ctx, job.ID, workerID, *job.ClaimToken, executionGeneration, run.ID, attempt); err != nil {
+		if errors.Is(err, jobs.ErrOwnershipLost) || errors.Is(err, jobs.ErrAlreadyFinalized) {
+			return err
+		}
+		if errors.Is(err, jobs.ErrCancellationRequested) {
+			return err
+		}
 		return jobs.NewRetryableError("START_ATTEMPT_FAILED", err.Error(), err)
 	}
 	// Keep Attempt liveness independent of Provider latency. RecoverySweeper
@@ -164,7 +170,11 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		}
 	}
 	if result == nil {
-		result, execErr = h.executor.Execute(ctx, spec, attempt)
+		executionCtx := llm.WithProviderDispatchGuard(ctx, diagnosisProviderDispatchGuard{
+			store: h.diagnosisStore, jobID: job.ID, workerID: workerID, claimToken: *job.ClaimToken,
+			generation: executionGeneration, runID: run.ID, attemptID: attempt.ID, attemptNo: attemptNo,
+		})
+		result, execErr = h.executor.Execute(executionCtx, spec, attempt)
 	}
 	// A result that claims to be structured must satisfy the same complete
 	// contract used by evidence classification. This guard also protects
@@ -180,6 +190,27 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			result.StructuredReport = false
 			result.ParseError = validationErr.Error()
 			execErr = fmt.Errorf("%w: %v", agent.ErrInvalidStructuredReport, validationErr)
+		}
+	}
+	if execErr != nil || result == nil || result.Report == nil {
+		stateCtx, cancelState := context.WithTimeout(context.Background(), 10*time.Second)
+		persistedAttempt, stateErr := h.diagnosisStore.GetAttempt(stateCtx, attempt.ID)
+		cancelState()
+		if stateErr != nil {
+			cause := execErr
+			if cause == nil {
+				cause = errors.New("executor returned no report")
+			}
+			execErr = &llm.OutcomeUnknownError{Cause: fmt.Errorf("could not verify durable provider dispatch state: %w", errors.Join(cause, stateErr))}
+		} else if persistedAttempt.ProviderDispatchUnresolved {
+			cause := execErr
+			if cause == nil {
+				cause = errors.New("executor returned no report after provider dispatch")
+			}
+			var outcomeUnknown *llm.OutcomeUnknownError
+			if !errors.As(cause, &outcomeUnknown) && !errors.Is(cause, agent.ErrInvalidStructuredReport) {
+				execErr = &llm.OutcomeUnknownError{Cause: cause}
+			}
 		}
 	}
 	var outcomeUnknown *llm.OutcomeUnknownError
@@ -198,7 +229,7 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		case execErr == nil:
 			checkpointKind = diagnosis.CheckpointKindFinalValid
 		}
-		if checkpointErr := h.saveAttemptCheckpoint(attempt, run, result, checkpointKind, checkpointErrorCode, checkpointErrorMessage); checkpointErr != nil {
+		if checkpointErr := h.saveAttemptCheckpoint(job, attempt, run, result, checkpointKind, checkpointErrorCode, checkpointErrorMessage); checkpointErr != nil {
 			log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
 			failureCode := "CHECKPOINT_SAVE_FAILED"
 			failureMessage := "provider checkpoint could not be persisted; explicit diagnosis retry is required"
@@ -504,7 +535,7 @@ func resolveCheckpointDraft(ctx context.Context, issuer evidence.EvidenceIssuer,
 	return report
 }
 
-func (h *DiagnosisJobHandler) saveAttemptCheckpoint(attempt *diagnosis.DiagnosisAttempt, run *diagnosis.DiagnosisRun, result *ExecutionResult, kind diagnosis.CheckpointKind, errorCode, errorMessage string) error {
+func (h *DiagnosisJobHandler) saveAttemptCheckpoint(job *jobs.AnalysisJob, attempt *diagnosis.DiagnosisAttempt, run *diagnosis.DiagnosisRun, result *ExecutionResult, kind diagnosis.CheckpointKind, errorCode, errorMessage string) error {
 	if attempt == nil || run == nil || result == nil {
 		return nil
 	}
@@ -538,17 +569,11 @@ func (h *DiagnosisJobHandler) saveAttemptCheckpoint(attempt *diagnosis.Diagnosis
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if store, ok := h.diagnosisStore.(interface {
-		UpdateAttemptCheckpointWithDraft(context.Context, string, diagnosis.AttemptCheckpoint) error
-	}); ok {
-		return store.UpdateAttemptCheckpointWithDraft(ctx, attempt.ID, checkpoint)
+	if job == nil || job.WorkerID == nil || job.ClaimToken == nil {
+		return jobs.ErrOwnershipLost
 	}
-	if store, ok := h.diagnosisStore.(interface {
-		UpdateAttemptCheckpoint(context.Context, string, diagnosis.AttemptCheckpoint) error
-	}); ok {
-		return store.UpdateAttemptCheckpoint(ctx, attempt.ID, checkpoint)
-	}
-	return nil
+	return h.diagnosisStore.UpdateAttemptCheckpointWithClaim(ctx, job.ID, *job.WorkerID, *job.ClaimToken,
+		attempt.ExecutionGeneration, attempt.AttemptNo, run.ID, attempt.ID, checkpoint, true)
 }
 
 func safeStructuredParseMessage(message string) string {

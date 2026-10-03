@@ -133,6 +133,9 @@ func (e *AgentRuntimeExecutor) Execute(ctx context.Context, spec diagnosis.Diagn
 	if provider == nil {
 		return nil, fmt.Errorf("no provider configured")
 	}
+	if dispatchGuard := llm.ProviderDispatchGuardFromContext(ctx); dispatchGuard != nil {
+		provider = llm.GuardProvider(provider, dispatchGuard)
+	}
 
 	registry, err := BuildToolRegistry(ToolDependencies{
 		Retriever: e.retriever, CodeIntelStore: e.ciStore,

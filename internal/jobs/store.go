@@ -1063,9 +1063,10 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 }
 
 func diagnosisOutcomeUnknownMarker(ctx context.Context, tx *sql.Tx, expired expiredJob) (attemptID, message string, found bool, err error) {
-	err = tx.QueryRowContext(ctx, `SELECT id, checkpoint_error_message FROM diagnosis_attempts
+	err = tx.QueryRowContext(ctx, `SELECT id, COALESCE(checkpoint_error_message, '') FROM diagnosis_attempts
 		WHERE diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ?
-		  AND status IN ('RUNNING', 'ABANDONED') AND checkpoint_error_code = 'PROVIDER_OUTCOME_UNKNOWN'
+		  AND status IN ('RUNNING', 'ABANDONED')
+		  AND (checkpoint_error_code = 'PROVIDER_OUTCOME_UNKNOWN' OR provider_dispatch_unresolved = TRUE)
 		LIMIT 1`, expired.resourceID, expired.executionGeneration, expired.attemptCount).Scan(&attemptID, &message)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", false, nil
@@ -1081,7 +1082,8 @@ func (s *Store) failExpiredDiagnosisOutcomeUnknownTx(ctx context.Context, tx *sq
 		SET status = 'FAILED_TERMINAL', finished_at = ?, error_code = 'PROVIDER_OUTCOME_UNKNOWN',
 		    error_message = ?, retryable = FALSE
 		WHERE id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ?
-		  AND status IN ('RUNNING', 'ABANDONED') AND checkpoint_error_code = 'PROVIDER_OUTCOME_UNKNOWN'`,
+		  AND status IN ('RUNNING', 'ABANDONED')
+		  AND (checkpoint_error_code = 'PROVIDER_OUTCOME_UNKNOWN' OR provider_dispatch_unresolved = TRUE)`,
 		now, message, attemptID, expired.resourceID, expired.executionGeneration, expired.attemptCount)
 	if err != nil {
 		return fmt.Errorf("failed terminalizing ambiguous diagnosis attempt for %s: %w", expired.resourceID, err)
