@@ -987,6 +987,19 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 			reapedCount++
 			continue
 		}
+		if ej.jobType == JobTypeRunDiagnosis {
+			attemptID, message, found, markerErr := diagnosisOutcomeUnknownMarker(ctx, tx, ej)
+			if markerErr != nil {
+				return 0, fmt.Errorf("failed checking provider outcome marker for diagnosis %s: %w", ej.resourceID, markerErr)
+			}
+			if found {
+				if err := s.failExpiredDiagnosisOutcomeUnknownTx(ctx, tx, ej, attemptID, message, now); err != nil {
+					return 0, err
+				}
+				reapedCount++
+				continue
+			}
+		}
 		if ej.attemptCount < ej.maxAttempts {
 			// Schedule retry
 			backoff := CalculateBackoff(ej.attemptCount, time.Second, time.Minute)
@@ -1047,6 +1060,63 @@ func (s *Store) ReapExpiredJobs(ctx context.Context, batchSize int) (int, error)
 		return 0, err
 	}
 	return reapedCount, nil
+}
+
+func diagnosisOutcomeUnknownMarker(ctx context.Context, tx *sql.Tx, expired expiredJob) (attemptID, message string, found bool, err error) {
+	err = tx.QueryRowContext(ctx, `SELECT id, checkpoint_error_message FROM diagnosis_attempts
+		WHERE diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ?
+		  AND status IN ('RUNNING', 'ABANDONED') AND checkpoint_error_code = 'PROVIDER_OUTCOME_UNKNOWN'
+		LIMIT 1`, expired.resourceID, expired.executionGeneration, expired.attemptCount).Scan(&attemptID, &message)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	return attemptID, message, err == nil, err
+}
+
+func (s *Store) failExpiredDiagnosisOutcomeUnknownTx(ctx context.Context, tx *sql.Tx, expired expiredJob, attemptID, message string, now time.Time) error {
+	if message == "" {
+		message = "provider request outcome could not be confirmed; automatic replay is disabled"
+	}
+	attemptResult, err := tx.ExecContext(ctx, `UPDATE diagnosis_attempts
+		SET status = 'FAILED_TERMINAL', finished_at = ?, error_code = 'PROVIDER_OUTCOME_UNKNOWN',
+		    error_message = ?, retryable = FALSE
+		WHERE id = ? AND diagnosis_run_id = ? AND execution_generation = ? AND attempt_no = ?
+		  AND status IN ('RUNNING', 'ABANDONED') AND checkpoint_error_code = 'PROVIDER_OUTCOME_UNKNOWN'`,
+		now, message, attemptID, expired.resourceID, expired.executionGeneration, expired.attemptCount)
+	if err != nil {
+		return fmt.Errorf("failed terminalizing ambiguous diagnosis attempt for %s: %w", expired.resourceID, err)
+	}
+	if affected, err := attemptResult.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return fmt.Errorf("ambiguous diagnosis attempt for %s changed before reaper terminalization", expired.resourceID)
+	}
+	runResult, err := tx.ExecContext(ctx, `UPDATE diagnosis_runs
+		SET status = 'FAILED', final_attempt_id = ?, version = version + 1
+		WHERE id = ? AND status = 'RUNNING' AND cancel_requested = FALSE`, attemptID, expired.resourceID)
+	if err != nil {
+		return fmt.Errorf("failed terminalizing ambiguous diagnosis run %s: %w", expired.resourceID, err)
+	}
+	if affected, err := runResult.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return fmt.Errorf("ambiguous diagnosis run %s changed before reaper terminalization", expired.resourceID)
+	}
+	jobResult, err := tx.ExecContext(ctx, `UPDATE analysis_jobs
+		SET status = 'FAILED', terminal_reason = 'PERMANENT',
+		    last_error_class = 'PERMANENT', last_error_code = 'PROVIDER_OUTCOME_UNKNOWN',
+		    last_error_message = ?, finished_at = ?, updated_at = ?
+		WHERE id = ? AND status = 'RUNNING' AND execution_started = TRUE`,
+		message, now, now, expired.id)
+	if err != nil {
+		return fmt.Errorf("failed terminalizing ambiguous diagnosis job %d: %w", expired.id, err)
+	}
+	if affected, err := jobResult.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return fmt.Errorf("ambiguous diagnosis job %d changed before reaper terminalization", expired.id)
+	}
+	return nil
 }
 
 func (s *Store) cancelExpiredDiagnosisTx(ctx context.Context, tx *sql.Tx, expired expiredJob, now time.Time) error {

@@ -182,18 +182,32 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			execErr = fmt.Errorf("%w: %v", agent.ErrInvalidStructuredReport, validationErr)
 		}
 	}
+	var outcomeUnknown *llm.OutcomeUnknownError
+	providerOutcomeUnknown := errors.As(execErr, &outcomeUnknown)
 	if result != nil {
 		checkpointKind := diagnosis.CheckpointKindPartialProviderFailure
+		checkpointErrorCode := ""
+		checkpointErrorMessage := ""
+		if providerOutcomeUnknown {
+			checkpointErrorCode = llm.OutcomeUnknownErrorCode
+			checkpointErrorMessage = "provider request outcome could not be confirmed; automatic replay is disabled"
+		}
 		switch {
 		case errors.Is(execErr, agent.ErrInvalidStructuredReport):
 			checkpointKind = diagnosis.CheckpointKindFinalInvalid
 		case execErr == nil:
 			checkpointKind = diagnosis.CheckpointKindFinalValid
 		}
-		if checkpointErr := h.saveAttemptCheckpoint(attempt, run, result, checkpointKind); checkpointErr != nil {
+		if checkpointErr := h.saveAttemptCheckpoint(attempt, run, result, checkpointKind, checkpointErrorCode, checkpointErrorMessage); checkpointErr != nil {
 			log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
+			failureCode := "CHECKPOINT_SAVE_FAILED"
+			failureMessage := "provider checkpoint could not be persisted; explicit diagnosis retry is required"
+			if providerOutcomeUnknown {
+				failureCode = llm.OutcomeUnknownErrorCode
+				failureMessage = "provider request outcome could not be confirmed; automatic replay is disabled"
+			}
 			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 10*time.Second)
-			finalizeErr := h.finalizeDiagnosisFailure(finalizeCtx, job, run, attempt, jobs.ErrorClassPermanent, "CHECKPOINT_SAVE_FAILED", "provider checkpoint could not be persisted; explicit diagnosis retry is required", result)
+			finalizeErr := h.finalizeDiagnosisFailure(finalizeCtx, job, run, attempt, jobs.ErrorClassPermanent, failureCode, failureMessage, result)
 			cancelFinalize()
 			if finalizeErr != nil && !errors.Is(finalizeErr, jobs.ErrAlreadyFinalized) {
 				log.Error("failed to terminalize diagnosis after checkpoint failure", "error", finalizeErr)
@@ -210,7 +224,8 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			return finalizeErr
 		}
 	}
-	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
+	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrOwnershipLost) ||
+		(errors.Is(cause, jobs.ErrWorkerShutdown) && !providerOutcomeUnknown) {
 		return cause
 	} else if errors.Is(cause, jobs.ErrUserCancellation) || run.CancelRequested || job.CancelRequested {
 		return h.cancelAttempt(ctx, job, run, attempt)
@@ -267,14 +282,8 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	}
 	if execErr != nil {
 		log.Error("agent execution failed", "error", execErr)
-		if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
-			return cause
-		} else if errors.Is(cause, jobs.ErrUserCancellation) || run.CancelRequested || job.CancelRequested {
-			return h.cancelAttempt(ctx, job, run, attempt)
-		}
 		errorCode := ""
-		var outcomeUnknown *llm.OutcomeUnknownError
-		if errors.As(execErr, &outcomeUnknown) {
+		if providerOutcomeUnknown {
 			errorCode = llm.OutcomeUnknownErrorCode
 			execErr = jobs.NewPermanentError(errorCode, "provider request outcome could not be confirmed; automatic replay is disabled", execErr)
 		} else if errors.Is(execErr, agent.ErrModelOutputTruncated) {
@@ -305,10 +314,16 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		if errClass == jobs.ErrorClassCancelled && errors.Is(execErr, jobs.ErrUserCancellation) {
 			return h.cancelAttempt(ctx, job, run, attempt)
 		}
+		if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrOwnershipLost) ||
+			(errors.Is(cause, jobs.ErrWorkerShutdown) && !providerOutcomeUnknown) {
+			return cause
+		} else if errors.Is(cause, jobs.ErrUserCancellation) || run.CancelRequested || job.CancelRequested {
+			return h.cancelAttempt(ctx, job, run, attempt)
+		}
 		isTerminal := (errClass == jobs.ErrorClassPermanent) || (job.AttemptCount >= job.MaxAttempts)
 		counts := result
 		if isTerminal {
-			return h.finalizeDiagnosisFailure(ctx, job, run, attempt, errClass, errCode, execErr.Error(), counts)
+			return h.finalizeDiagnosisFailureWithShutdownOutcome(ctx, job, run, attempt, errClass, errCode, execErr.Error(), counts, providerOutcomeUnknown)
 		}
 		if err := h.finalizeRetryableAttempt(ctx, job, run, attempt, errCode, execErr.Error(), counts); err != nil {
 			if errors.Is(err, jobs.ErrCancellationRequested) {
@@ -489,7 +504,7 @@ func resolveCheckpointDraft(ctx context.Context, issuer evidence.EvidenceIssuer,
 	return report
 }
 
-func (h *DiagnosisJobHandler) saveAttemptCheckpoint(attempt *diagnosis.DiagnosisAttempt, run *diagnosis.DiagnosisRun, result *ExecutionResult, kind diagnosis.CheckpointKind) error {
+func (h *DiagnosisJobHandler) saveAttemptCheckpoint(attempt *diagnosis.DiagnosisAttempt, run *diagnosis.DiagnosisRun, result *ExecutionResult, kind diagnosis.CheckpointKind, errorCode, errorMessage string) error {
 	if attempt == nil || run == nil || result == nil {
 		return nil
 	}
@@ -512,6 +527,8 @@ func (h *DiagnosisJobHandler) saveAttemptCheckpoint(attempt *diagnosis.Diagnosis
 		AgentRounds:         result.AgentRounds,
 		SearchCalls:         result.SearchCalls,
 		ProviderCalls:       result.ProviderCalls,
+		ErrorCode:           errorCode,
+		ErrorMessage:        errorMessage,
 		FinalizationReason:  result.FinalizationReason,
 		FinishReason:        result.FinishReason,
 	}
@@ -597,7 +614,12 @@ func (h *DiagnosisJobHandler) cancelAttempt(ctx context.Context, job *jobs.Analy
 }
 
 func (h *DiagnosisJobHandler) finalizeDiagnosisFailure(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, class jobs.ErrorClass, code, message string, result *ExecutionResult) error {
-	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrWorkerShutdown) || errors.Is(cause, jobs.ErrOwnershipLost) {
+	return h.finalizeDiagnosisFailureWithShutdownOutcome(ctx, job, run, attempt, class, code, message, result, false)
+}
+
+func (h *DiagnosisJobHandler) finalizeDiagnosisFailureWithShutdownOutcome(ctx context.Context, job *jobs.AnalysisJob, run *diagnosis.DiagnosisRun, attempt *diagnosis.DiagnosisAttempt, class jobs.ErrorClass, code, message string, result *ExecutionResult, allowShutdown bool) error {
+	if cause := context.Cause(ctx); errors.Is(cause, jobs.ErrOwnershipLost) ||
+		(errors.Is(cause, jobs.ErrWorkerShutdown) && !allowShutdown) {
 		return cause
 	} else if errors.Is(cause, jobs.ErrUserCancellation) || (job != nil && job.CancelRequested) || (run != nil && run.CancelRequested) {
 		return h.cancelAttempt(ctx, job, run, attempt)

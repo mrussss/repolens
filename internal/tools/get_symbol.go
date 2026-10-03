@@ -26,7 +26,7 @@ func (t *GetSymbolTool) Name() string {
 }
 
 func (t *GetSymbolTool) Description() string {
-	return "Retrieves authoritative symbol definitions, signature, canonical receiver, and AST location by symbol name or key hash."
+	return "Retrieves one authoritative Symbol by exact identity. An ambiguous name returns candidates; retry with symbol_id, qualified_name, or symbol_key_hash."
 }
 
 func (t *GetSymbolTool) Definition() llm.ToolDefinition {
@@ -40,14 +40,26 @@ func (t *GetSymbolTool) Definition() llm.ToolDefinition {
 				"properties": map[string]interface{}{
 					"name": map[string]interface{}{
 						"type":        "string",
-						"description": "Symbol name (e.g. ProcessOrder, ValidateToken)",
+						"description": "Exact unqualified Symbol name (legacy input name)",
+					},
+					"symbol_name": map[string]interface{}{
+						"type":        "string",
+						"description": "Exact unqualified Symbol name",
 					},
 					"symbol_key_hash": map[string]interface{}{
 						"type":        "string",
-						"description": "Deterministic SHA256 symbol key hash (optional)",
+						"description": "Exact deterministic SHA256 Symbol key hash",
+					},
+					"symbol_id": map[string]interface{}{
+						"type":        "integer",
+						"minimum":     1,
+						"description": "Exact Symbol primary key ID",
+					},
+					"qualified_name": map[string]interface{}{
+						"type":        "string",
+						"description": "Exact qualified Symbol name",
 					},
 				},
-				"required": []string{"name"},
 			},
 		},
 	}
@@ -55,7 +67,10 @@ func (t *GetSymbolTool) Definition() llm.ToolDefinition {
 
 type getSymbolArgs struct {
 	Name          string `json:"name"`
+	SymbolName    string `json:"symbol_name"`
 	SymbolKeyHash string `json:"symbol_key_hash"`
+	SymbolID      *int64 `json:"symbol_id"`
+	QualifiedName string `json:"qualified_name"`
 }
 
 func (t *GetSymbolTool) Execute(ctx context.Context, argsJSON string) (string, error) {
@@ -68,24 +83,19 @@ func (t *GetSymbolTool) Execute(ctx context.Context, argsJSON string) (string, e
 		return "Code intelligence symbol index is not available for this run.", nil
 	}
 
-	if args.SymbolKeyHash != "" {
-		sym, err := t.ciStore.GetSymbolByHash(ctx, t.buildID, args.SymbolKeyHash)
-		if err == nil && sym != nil {
-			outBytes, _ := json.MarshalIndent(sym, "", "  ")
-			return string(outBytes), nil
-		}
+	name := args.Name
+	if name == "" {
+		name = args.SymbolName
 	}
-
-	symbols, err := t.ciStore.ListSymbols(ctx, t.buildID, args.Name, 5)
+	symbol, failure, err := resolveSymbol(ctx, t.ciStore, t.buildID, args.SymbolKeyHash, args.SymbolID, args.QualifiedName, name)
 	if err != nil {
-		return "", fmt.Errorf("failed fetching symbols: %w", err)
+		return "", fmt.Errorf("failed resolving symbol identity: %w", err)
+	}
+	if failure != nil {
+		return symbolResolutionFailureJSON(failure), nil
 	}
 
-	if len(symbols) == 0 {
-		return fmt.Sprintf("No symbol matching %q found in the index.", args.Name), nil
-	}
-
-	outBytes, err := json.MarshalIndent(symbols, "", "  ")
+	outBytes, err := json.MarshalIndent(symbol, "", "  ")
 	if err != nil {
 		return "", err
 	}

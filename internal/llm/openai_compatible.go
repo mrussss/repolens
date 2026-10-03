@@ -179,7 +179,7 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
 		providerErr := fmt.Errorf("llm http call failed: %w", err)
-		if !isPreDispatchDialRefusal(err) {
+		if !definitelyPreDispatch(err) {
 			return GenerateResponse{}, &OutcomeUnknownError{Cause: providerErr}
 		}
 		return GenerateResponse{}, providerErr
@@ -235,9 +235,16 @@ func (p *OpenAICompatibleProvider) Generate(ctx context.Context, req GenerateReq
 	}, nil
 }
 
-func isPreDispatchDialRefusal(err error) bool {
+func definitelyPreDispatch(err error) bool {
 	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "dial" && errors.Is(err, syscall.ECONNREFUSED)
+	if !errors.As(err, &opErr) || opErr.Op != "dial" {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	return errors.As(opErr.Err, &dnsErr)
 }
 
 func normalizeAuthMode(mode string) string {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,6 +58,93 @@ func startCodeIndexJob(t *testing.T, store *jobs.Store, job *jobs.AnalysisJob, w
 	}
 	job.AttemptCount = attempt
 	job.ExecutionStarted = true
+}
+
+type failFirstRetrievalHandoffStore struct {
+	codeintelstore.Store
+	calls atomic.Int32
+}
+
+func (s *failFirstRetrievalHandoffStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuildID int64, strategy string) (*codeintelmodel.RetrievalBuild, bool, error) {
+	if s.calls.Add(1) == 1 {
+		return nil, false, errors.New("injected transient RetrievalBuild creation failure")
+	}
+	return s.Store.GetOrCreateRetrievalBuild(ctx, codeIndexBuildID, strategy)
+}
+
+func TestCodeIndexRetrievalHandoffFailureIsVisibleAndRetryIsIdempotent(t *testing.T) {
+	db, jobsStore, baseStore, _ := setupCodeIntelTestDB(t)
+	ctx := context.Background()
+	build, _, err := baseStore.GetOrCreateBuild(ctx, "snap-retrieval-handoff-retry", "example.com/handoff", codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("id = ?", build.ID).Update("status", codeintelmodel.BuildStatusReady).Error; err != nil {
+		t.Fatal(err)
+	}
+	failingStore := &failFirstRetrievalHandoffStore{Store: baseStore}
+	handler := codeintel.NewCodeIndexJobHandler(failingStore, nil, nil, nil)
+	workerConfig := jobs.DefaultWorkerConfig()
+	workerConfig.WorkerID = "legacy-retrieval-handoff-worker"
+	workerConfig.Concurrency = 1
+	workerConfig.BatchSize = 1
+	workerConfig.PollInterval = 5 * time.Millisecond
+	workerConfig.LeaseDuration = 5 * time.Second
+	workerConfig.ReapInterval = time.Hour
+	workerConfig.BaseBackoff = time.Minute
+	workerConfig.MaxBackoff = time.Minute
+	worker := jobs.NewWorker(jobsStore, workerConfig)
+	worker.RegisterHandler(jobs.JobTypeBuildCodeIndex, handler)
+	worker.Start(context.Background())
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := worker.StopGracefully(stopCtx); err != nil {
+			t.Errorf("stop legacy handoff worker: %v", err)
+		}
+	}()
+
+	jobID := strconv.FormatInt(build.ID, 10)
+	firstRetryWait := waitForLegacyHandoffJobStatus(t, jobsStore, jobs.JobTypeBuildCodeIndex, jobID, jobs.StatusRetryWait)
+	if firstRetryWait.Status == jobs.StatusSucceeded || failingStore.calls.Load() != 1 {
+		t.Fatalf("handoff failure job=%+v calls=%d; failure must not report success", firstRetryWait, failingStore.calls.Load())
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE analysis_jobs SET next_run_at = datetime('now', '-1 second') WHERE id = ?`, firstRetryWait.ID); err != nil {
+		t.Fatal(err)
+	}
+	succeeded := waitForLegacyHandoffJobStatus(t, jobsStore, jobs.JobTypeBuildCodeIndex, jobID, jobs.StatusSucceeded)
+	if succeeded.Status != jobs.StatusSucceeded || failingStore.calls.Load() != 2 {
+		t.Fatalf("handoff retry job=%+v calls=%d; want successful second handoff", succeeded, failingStore.calls.Load())
+	}
+	var retrievalBuilds, retrievalJobs int64
+	if err := db.Model(&codeintelmodel.RetrievalBuild{}).Where("code_index_build_id = ?", build.ID).Count(&retrievalBuilds).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id IN (SELECT CAST(id AS TEXT) FROM retrieval_builds WHERE code_index_build_id = ?)", jobs.JobTypeBuildRetrieval, build.ID).Count(&retrievalJobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retrievalBuilds != 1 || retrievalJobs != 1 {
+		t.Fatalf("retrieval retry created builds=%d jobs=%d; want exactly one each", retrievalBuilds, retrievalJobs)
+	}
+}
+
+func waitForLegacyHandoffJobStatus(t *testing.T, store *jobs.Store, jobType jobs.JobType, resourceID string, want jobs.JobStatus) *jobs.AnalysisJob {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		job, err := store.GetJobByResource(context.Background(), jobType, resourceID)
+		if err == nil && job.Status == want {
+			return job
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	job, err := store.GetJobByResource(context.Background(), jobType, resourceID)
+	t.Fatalf("job status=%+v err=%v; want %s", job, err, want)
+	return nil
 }
 
 func TestAnalyzerUsesSnapshotManifestFileUniverse(t *testing.T) {

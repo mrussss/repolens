@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,6 +209,111 @@ func TestCodeIntelHTTP_EndToEndEndpoints(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected HTTP 202 for retrieval build creation, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSymbolHTTPIdentityUsesURLIDAndValidatesBuild(t *testing.T) {
+	router, ciStore, _, db, _ := setupHandlerTestServer(t)
+	ctx := context.Background()
+	buildA, _, err := ciStore.GetOrCreateBuild(ctx, "snap-symbol-api-a", "example.com/api", codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildB, _, err := ciStore.GetOrCreateBuild(ctx, "snap-symbol-api-b", "example.com/api", codeintelmodel.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	symbolA := &codeintelmodel.Symbol{CodeIndexBuildID: buildA.ID, SymbolKeyHash: "api-hash-a", ModulePath: "example.com/api", PackagePath: "pkg/a", PackageName: "a", Kind: codeintelmodel.SymbolKindFunction, Name: "A", QualifiedName: "A", FilePath: "pkg/a/a.go"}
+	symbolB := &codeintelmodel.Symbol{CodeIndexBuildID: buildA.ID, SymbolKeyHash: "api-hash-b", ModulePath: "example.com/api", PackagePath: "pkg/b", PackageName: "b", Kind: codeintelmodel.SymbolKindFunction, Name: "B", QualifiedName: "B", FilePath: "pkg/b/b.go"}
+	symbolOtherBuild := &codeintelmodel.Symbol{CodeIndexBuildID: buildB.ID, SymbolKeyHash: "api-hash-other", ModulePath: "example.com/api", PackagePath: "pkg/other", PackageName: "other", Kind: codeintelmodel.SymbolKindFunction, Name: "Other", QualifiedName: "Other", FilePath: "pkg/other/other.go"}
+	for _, symbol := range []*codeintelmodel.Symbol{symbolA, symbolB, symbolOtherBuild} {
+		if err := db.Create(symbol).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	fromA, toB := symbolA.ID, symbolB.ID
+	referenceA := &codeintelmodel.SymbolRelation{
+		CodeIndexBuildID: buildA.ID, FromSymbolID: &fromA, ToSymbolID: &toB,
+		FromSymbolKeyHash: symbolA.SymbolKeyHash, ToSymbolKeyHash: symbolB.SymbolKeyHash,
+		RelationType: codeintelmodel.RelationTypeReference, ResolutionKind: codeintelmodel.ResolutionKindSemantic,
+		ReasonCode: "API_REFERENCE", FilePath: "pkg/a/a.go", TargetName: "B",
+	}
+	testA := &codeintelmodel.SymbolRelation{
+		CodeIndexBuildID: buildA.ID, FromSymbolID: &fromA,
+		FromSymbolKeyHash: symbolA.SymbolKeyHash, ToSymbolKeyHash: "test-hash-a",
+		RelationType: codeintelmodel.RelationTypeTestRelation, ResolutionKind: codeintelmodel.ResolutionKindSemantic,
+		ReasonCode: "API_TEST", FilePath: "pkg/a/a_test.go", TargetName: "TestA",
+	}
+	testB := &codeintelmodel.SymbolRelation{
+		CodeIndexBuildID: buildA.ID, FromSymbolID: &toB,
+		FromSymbolKeyHash: symbolB.SymbolKeyHash, ToSymbolKeyHash: "test-hash-b",
+		RelationType: codeintelmodel.RelationTypeTestRelation, ResolutionKind: codeintelmodel.ResolutionKindSemantic,
+		ReasonCode: "API_TEST", FilePath: "pkg/b/b_test.go", TargetName: "TestB",
+	}
+	for _, relation := range []*codeintelmodel.SymbolRelation{referenceA, testA, testB} {
+		if err := db.Create(relation).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		req, err := http.NewRequest(http.MethodGet, path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		router.ServeHTTP(response, req)
+		return response
+	}
+
+	got := request("/api/v1/symbols/" + strconv.FormatInt(symbolA.ID, 10))
+	if got.Code != http.StatusOK {
+		t.Fatalf("GetSymbol status=%d body=%s", got.Code, got.Body.String())
+	}
+	var fetched codeintelmodel.Symbol
+	if err := json.Unmarshal(got.Body.Bytes(), &fetched); err != nil || fetched.ID != symbolA.ID || fetched.SymbolKeyHash != symbolA.SymbolKeyHash || fetched.QualifiedName != symbolA.QualifiedName {
+		t.Fatalf("GetSymbol payload=%s err=%v", got.Body.String(), err)
+	}
+	if got := request("/api/v1/symbols/not-a-number"); got.Code != http.StatusBadRequest {
+		t.Fatalf("invalid symbol id status=%d body=%s; want 400", got.Code, got.Body.String())
+	}
+	if got := request("/api/v1/symbols/0"); got.Code != http.StatusBadRequest {
+		t.Fatalf("zero symbol id status=%d body=%s; want 400", got.Code, got.Body.String())
+	}
+	if got := request("/api/v1/symbols/999999"); got.Code != http.StatusNotFound {
+		t.Fatalf("missing symbol status=%d body=%s; want 404", got.Code, got.Body.String())
+	}
+
+	base := "/api/v1/symbols/" + strconv.FormatInt(symbolA.ID, 10)
+	if got := request(base + "/references?code_index_build_id=" + strconv.FormatInt(buildA.ID, 10) + "&symbol_key_hash=" + symbolB.SymbolKeyHash); got.Code != http.StatusBadRequest || !strings.Contains(got.Body.String(), "SYMBOL_IDENTITY_MISMATCH") {
+		t.Fatalf("URL/query identity mismatch status=%d body=%s; want 400 SYMBOL_IDENTITY_MISMATCH", got.Code, got.Body.String())
+	}
+	if got := request(base + "/references?code_index_build_id=not-a-number"); got.Code != http.StatusBadRequest {
+		t.Fatalf("invalid references build id status=%d body=%s; want 400", got.Code, got.Body.String())
+	}
+	if got := request(base + "/references?code_index_build_id=" + strconv.FormatInt(buildB.ID, 10)); got.Code != http.StatusBadRequest || !strings.Contains(got.Body.String(), "SYMBOL_BUILD_MISMATCH") {
+		t.Fatalf("references build mismatch status=%d body=%s; want 400 SYMBOL_BUILD_MISMATCH", got.Code, got.Body.String())
+	}
+	if got := request(base + "/tests?code_index_build_id=not-a-number"); got.Code != http.StatusBadRequest {
+		t.Fatalf("invalid tests build id status=%d body=%s; want 400", got.Code, got.Body.String())
+	}
+	if got := request(base + "/tests?code_index_build_id=" + strconv.FormatInt(buildB.ID, 10)); got.Code != http.StatusBadRequest || !strings.Contains(got.Body.String(), "SYMBOL_BUILD_MISMATCH") {
+		t.Fatalf("tests build mismatch status=%d body=%s; want 400 SYMBOL_BUILD_MISMATCH", got.Code, got.Body.String())
+	}
+	if got := request(base + "/tests?symbol_key_hash=" + symbolB.SymbolKeyHash); got.Code != http.StatusBadRequest || !strings.Contains(got.Body.String(), "SYMBOL_IDENTITY_MISMATCH") {
+		t.Fatalf("tests URL/query identity mismatch status=%d body=%s; want 400 SYMBOL_IDENTITY_MISMATCH", got.Code, got.Body.String())
+	}
+	got = request(base + "/references")
+	if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), "API_REFERENCE") {
+		t.Fatalf("references did not use URL Symbol identity: status=%d body=%s", got.Code, got.Body.String())
+	}
+	got = request(base + "/tests")
+	if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), "test-hash-a") || strings.Contains(got.Body.String(), "test-hash-b") {
+		t.Fatalf("tests did not use URL Symbol identity: status=%d body=%s", got.Code, got.Body.String())
+	}
+	got = request("/api/v1/symbols/" + strconv.FormatInt(symbolB.ID, 10) + "/tests")
+	if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), "test-hash-b") || strings.Contains(got.Body.String(), "test-hash-a") {
+		t.Fatalf("tests for Symbol B did not use URL identity: status=%d body=%s", got.Code, got.Body.String())
 	}
 }
 

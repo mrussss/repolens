@@ -252,6 +252,27 @@ func TestFC07OutcomeUnknownStopsAutomaticReplayAndAllowsManualRetry(t *testing.T
 	if requests.Load() != 1 {
 		t.Fatalf("manual requeue unexpectedly made a provider request: requests=%d", requests.Load())
 	}
+	_, stopSecondWorker := startValidationFC07Worker(jobStore, handler)
+	if err := awaitValidationFC07RunSucceeded(diagnosisStore, run.ID); err != nil {
+		_ = stopSecondWorker()
+		t.Fatalf("diagnosis after explicit RetryDiagnosis: %v", err)
+	}
+	if err := stopSecondWorker(); err != nil {
+		t.Fatalf("stop worker after explicit retry: %v", err)
+	}
+	retriedJob, err = jobStore.GetJobByResource(context.Background(), jobs.JobTypeRunDiagnosis, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts, err = diagnosisStore.ListAttemptsByRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 2 || retriedJob.Status != jobs.StatusSucceeded || retriedJob.ExecutionGeneration != 2 || len(attempts) != 2 ||
+		attempts[0].ExecutionGeneration != 1 || attempts[0].ErrorCode != llm.OutcomeUnknownErrorCode ||
+		attempts[1].ExecutionGeneration != 2 || attempts[1].Status != diagnosis.AttemptStatusSucceeded {
+		t.Fatalf("explicit retry state: requests=%d job=%+v attempts=%+v", requests.Load(), retriedJob, attempts)
+	}
 }
 
 func TestFC07OutcomeUnknownFinalizationFailureDoesNotReplayProvider(t *testing.T) {
@@ -555,6 +576,24 @@ func awaitValidationFC07RunFailed(store diagnosis.Store, runID string) error {
 		select {
 		case <-deadline.C:
 			return fmt.Errorf("diagnosis did not fail before timeout; last status=%v err=%v", run, err)
+		case <-ticker.C:
+		}
+	}
+}
+
+func awaitValidationFC07RunSucceeded(store diagnosis.Store, runID string) error {
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		run, err := store.GetByID(context.Background(), runID)
+		if err == nil && run.Status == diagnosis.StatusSucceeded {
+			return nil
+		}
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("diagnosis did not succeed before timeout; last status=%v err=%v", run, err)
 		case <-ticker.C:
 		}
 	}

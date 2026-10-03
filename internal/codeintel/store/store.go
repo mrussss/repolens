@@ -18,6 +18,7 @@ import (
 var (
 	ErrBuildNotFound        = errors.New("code index build not found")
 	ErrBuildLineageMismatch = errors.New("build lineage mismatch: artifacts do not belong to the same snapshot chain")
+	ErrSymbolNotFound       = errors.New("code symbol not found")
 )
 
 // Store defines database operations for CodeIndexBuild and related entities.
@@ -31,6 +32,7 @@ type Store interface {
 	MarkBuildBuilding(ctx context.Context, buildID int64) error
 	ListSymbols(ctx context.Context, buildID int64, query string, limit int) ([]*model.Symbol, error)
 	ListAllSymbols(ctx context.Context, buildID int64) ([]*model.Symbol, error)
+	GetSymbolByID(ctx context.Context, id int64) (*model.Symbol, error)
 	GetSymbolByHash(ctx context.Context, buildID int64, symbolKeyHash string) (*model.Symbol, error)
 	ListRelationsForSymbol(ctx context.Context, buildID int64, symbolID int64) ([]*model.SymbolRelation, error)
 	ListRelatedTests(ctx context.Context, buildID int64, symbolKeyHash string) ([]*model.SymbolRelation, error)
@@ -443,6 +445,17 @@ func (s *GormStore) ListAllSymbols(ctx context.Context, buildID int64) ([]*model
 		return nil, err
 	}
 	return symbols, nil
+}
+
+func (s *GormStore) GetSymbolByID(ctx context.Context, id int64) (*model.Symbol, error) {
+	var symbol model.Symbol
+	if err := s.db.WithContext(ctx).First(&symbol, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrSymbolNotFound
+		}
+		return nil, err
+	}
+	return &symbol, nil
 }
 
 func (s *GormStore) GetSymbolByHash(ctx context.Context, buildID int64, symbolKeyHash string) (*model.Symbol, error) {

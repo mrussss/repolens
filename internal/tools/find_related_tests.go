@@ -26,7 +26,7 @@ func (t *FindRelatedTestsTool) Name() string {
 }
 
 func (t *FindRelatedTestsTool) Description() string {
-	return "Discovers test functions, test files, and test relations linked to a production symbol."
+	return "Discovers tests linked to an exact Symbol identity. If symbol_name is ambiguous, choose a candidate and retry with symbol_id, qualified_name, or symbol_key_hash."
 }
 
 func (t *FindRelatedTestsTool) Definition() llm.ToolDefinition {
@@ -38,16 +38,24 @@ func (t *FindRelatedTestsTool) Definition() llm.ToolDefinition {
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"symbol_id": map[string]interface{}{
+						"type":        "integer",
+						"minimum":     1,
+						"description": "Exact Symbol primary key ID",
+					},
+					"qualified_name": map[string]interface{}{
+						"type":        "string",
+						"description": "Exact qualified Symbol name",
+					},
 					"symbol_name": map[string]interface{}{
 						"type":        "string",
-						"description": "Production symbol name (e.g. ProcessOrder)",
+						"description": "Exact unqualified Symbol name; ambiguous names return candidates",
 					},
 					"symbol_key_hash": map[string]interface{}{
 						"type":        "string",
 						"description": "Symbol key hash if known",
 					},
 				},
-				"required": []string{"symbol_name"},
 			},
 		},
 	}
@@ -56,6 +64,8 @@ func (t *FindRelatedTestsTool) Definition() llm.ToolDefinition {
 type findRelatedTestsArgs struct {
 	SymbolName    string `json:"symbol_name"`
 	SymbolKeyHash string `json:"symbol_key_hash"`
+	QualifiedName string `json:"qualified_name"`
+	SymbolID      *int64 `json:"symbol_id"`
 }
 
 func (t *FindRelatedTestsTool) Execute(ctx context.Context, argsJSON string) (string, error) {
@@ -68,16 +78,15 @@ func (t *FindRelatedTestsTool) Execute(ctx context.Context, argsJSON string) (st
 		return "Related tests index is not available for this run.", nil
 	}
 
-	keyHash := args.SymbolKeyHash
-	if keyHash == "" {
-		symbols, err := t.ciStore.ListSymbols(ctx, t.buildID, args.SymbolName, 1)
-		if err != nil || len(symbols) == 0 {
-			return fmt.Sprintf("Symbol %q not found to discover related tests.", args.SymbolName), nil
-		}
-		keyHash = symbols[0].SymbolKeyHash
+	symbol, failure, err := resolveSymbol(ctx, t.ciStore, t.buildID, args.SymbolKeyHash, args.SymbolID, args.QualifiedName, args.SymbolName)
+	if err != nil {
+		return "", fmt.Errorf("failed resolving symbol identity: %w", err)
+	}
+	if failure != nil {
+		return symbolResolutionFailureJSON(failure), nil
 	}
 
-	tests, err := t.ciStore.ListRelatedTests(ctx, t.buildID, keyHash)
+	tests, err := t.ciStore.ListRelatedTests(ctx, t.buildID, symbol.SymbolKeyHash)
 	if err != nil {
 		return "", fmt.Errorf("failed fetching related tests: %w", err)
 	}

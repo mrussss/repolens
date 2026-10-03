@@ -176,29 +176,43 @@ func (h *Handler) ListSymbols(c *gin.Context) {
 
 // GetSymbol handles GET /api/v1/symbols/:id
 func (h *Handler) GetSymbol(c *gin.Context) {
-	idStr := c.Param("id")
-	_, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid symbol id"})
+	id, ok := parsePositivePathID(c)
+	if !ok {
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "symbol details", "id": idStr})
+	symbol, ok := h.loadSymbolForHTTP(c, id)
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, symbol)
 }
 
 // GetSymbolReferences handles GET /api/v1/symbols/:id/references
 func (h *Handler) GetSymbolReferences(c *gin.Context) {
-	idStr := c.Param("id")
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid symbol id"})
+	id, ok := parsePositivePathID(c)
+	if !ok {
 		return
 	}
-
-	cibIDStr := c.Query("code_index_build_id")
-	cibID, _ := strconv.ParseInt(cibIDStr, 10, 64)
-
-	rels, err := h.ciStore.ListRelationsForSymbol(c.Request.Context(), cibID, id)
+	symbol, ok := h.loadSymbolForHTTP(c, id)
+	if !ok {
+		return
+	}
+	cibID, provided, ok := parseOptionalPositiveQueryID(c, "code_index_build_id")
+	if !ok {
+		return
+	}
+	if provided && cibID != symbol.CodeIndexBuildID {
+		writeSymbolBadRequest(c, "SYMBOL_BUILD_MISMATCH", "symbol does not belong to the requested code_index_build_id")
+		return
+	}
+	if keyHash := c.Query("symbol_key_hash"); keyHash != "" && keyHash != symbol.SymbolKeyHash {
+		writeSymbolBadRequest(c, "SYMBOL_IDENTITY_MISMATCH", "symbol_key_hash does not match the Symbol identified by the URL")
+		return
+	}
+	if !provided {
+		cibID = symbol.CodeIndexBuildID
+	}
+	rels, err := h.ciStore.ListRelationsForSymbol(c.Request.Context(), cibID, symbol.ID)
 	if err != nil {
 		writeCodeIntelInternalError(c, "CODE_REFERENCE_LIST_FAILED", "failed to list symbol references", err)
 		return
@@ -209,17 +223,93 @@ func (h *Handler) GetSymbolReferences(c *gin.Context) {
 
 // GetSymbolTests handles GET /api/v1/symbols/:id/tests
 func (h *Handler) GetSymbolTests(c *gin.Context) {
-	keyHash := c.Query("symbol_key_hash")
-	cibIDStr := c.Query("code_index_build_id")
-	cibID, _ := strconv.ParseInt(cibIDStr, 10, 64)
-
-	tests, err := h.ciStore.ListRelatedTests(c.Request.Context(), cibID, keyHash)
+	id, ok := parsePositivePathID(c)
+	if !ok {
+		return
+	}
+	symbol, ok := h.loadSymbolForHTTP(c, id)
+	if !ok {
+		return
+	}
+	cibID, provided, ok := parseOptionalPositiveQueryID(c, "code_index_build_id")
+	if !ok {
+		return
+	}
+	if provided && cibID != symbol.CodeIndexBuildID {
+		writeSymbolBadRequest(c, "SYMBOL_BUILD_MISMATCH", "symbol does not belong to the requested code_index_build_id")
+		return
+	}
+	if keyHash := c.Query("symbol_key_hash"); keyHash != "" && keyHash != symbol.SymbolKeyHash {
+		writeSymbolBadRequest(c, "SYMBOL_IDENTITY_MISMATCH", "symbol_key_hash does not match the Symbol identified by the URL")
+		return
+	}
+	if !provided {
+		cibID = symbol.CodeIndexBuildID
+	}
+	tests, err := h.ciStore.ListRelatedTests(c.Request.Context(), cibID, symbol.SymbolKeyHash)
 	if err != nil {
 		writeCodeIntelInternalError(c, "CODE_TEST_LIST_FAILED", "failed to list related tests", err)
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"related_tests": tests, "total": len(tests)})
+}
+
+func (h *Handler) loadSymbolForHTTP(c *gin.Context, id int64) (*model.Symbol, bool) {
+	symbol, err := h.ciStore.GetSymbolByID(c.Request.Context(), id)
+	if errors.Is(err, store.ErrSymbolNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"code": "CODE_SYMBOL_NOT_FOUND", "error": "code symbol not found"})
+		return nil, false
+	}
+	if err != nil {
+		writeCodeIntelInternalError(c, "CODE_SYMBOL_LOOKUP_FAILED", "failed to load code symbol", err)
+		return nil, false
+	}
+	return symbol, true
+}
+
+func parsePositivePathID(c *gin.Context) (int64, bool) {
+	value := c.Param("id")
+	id, err := parsePositiveDecimalID(value)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_SYMBOL_ID", "error": "symbol id must be a positive integer"})
+		return 0, false
+	}
+	return id, true
+}
+
+func parseOptionalPositiveQueryID(c *gin.Context, name string) (int64, bool, bool) {
+	value, exists := c.GetQuery(name)
+	if !exists {
+		return 0, false, true
+	}
+	id, err := parsePositiveDecimalID(value)
+	if err != nil {
+		code := "INVALID_CODE_INDEX_BUILD_ID"
+		c.JSON(http.StatusBadRequest, gin.H{"code": code, "error": name + " must be a positive integer"})
+		return 0, true, false
+	}
+	return id, true, true
+}
+
+func parsePositiveDecimalID(value string) (int64, error) {
+	if value == "" {
+		return 0, strconv.ErrSyntax
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, strconv.ErrSyntax
+		}
+	}
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, strconv.ErrSyntax
+	}
+	return id, nil
+}
+
+func writeSymbolBadRequest(c *gin.Context, code, message string) {
+	c.JSON(http.StatusBadRequest, gin.H{"code": code, "error": message})
 }
 
 // TriggerRetrievalBuild handles POST /api/v1/code-index-builds/:id/retrieval-builds

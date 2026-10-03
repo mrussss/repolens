@@ -64,6 +64,9 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		return fmt.Errorf("failed fetching code index build %d: %w", buildID, err)
 	}
 	if cib.Status == model.BuildStatusReady {
+		if cib.AnalysisRevisionID == "" {
+			return h.createLegacyRetrievalHandoff(ctx, cib.ID)
+		}
 		return nil
 	}
 
@@ -134,8 +137,10 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 	}
 
 	// Non-revision builds retain the older follow-up stage creation path.
-	if !stageFinalized {
-		_, _, _ = h.store.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
+	if !stageFinalized && cib.AnalysisRevisionID == "" {
+		if err := h.createLegacyRetrievalHandoff(ctx, cib.ID); err != nil {
+			return err
+		}
 	}
 
 	log.Info("code index build completed successfully",
@@ -145,6 +150,13 @@ func (h *CodeIndexJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		"quality_parsed_pct", fmt.Sprintf("%.1f%%", float64(analysisRes.Quality.FilesParsed)/float64(max(1, analysisRes.Quality.FilesTotal))*100),
 	)
 
+	return nil
+}
+
+func (h *CodeIndexJobHandler) createLegacyRetrievalHandoff(ctx context.Context, codeIndexBuildID int64) error {
+	if _, _, err := h.store.GetOrCreateRetrievalBuild(ctx, codeIndexBuildID, "BM25"); err != nil {
+		return jobs.NewRetryableError("RETRIEVAL_HANDOFF_FAILED", "CodeIndexBuild is READY but automatic RetrievalBuild creation failed", err)
+	}
 	return nil
 }
 

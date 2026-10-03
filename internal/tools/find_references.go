@@ -26,7 +26,7 @@ func (t *FindReferencesTool) Name() string {
 }
 
 func (t *FindReferencesTool) Description() string {
-	return "Finds cross-package callers, candidate call expressions, and references to a symbol."
+	return "Finds callers and references by exact symbol identity. If symbol_name is ambiguous, choose a candidate and retry with symbol_id, qualified_name, or symbol_key_hash."
 }
 
 func (t *FindReferencesTool) Definition() llm.ToolDefinition {
@@ -38,24 +38,34 @@ func (t *FindReferencesTool) Definition() llm.ToolDefinition {
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"symbol_key_hash": map[string]interface{}{
+						"type":        "string",
+						"description": "Exact deterministic Symbol identity hash",
+					},
+					"qualified_name": map[string]interface{}{
+						"type":        "string",
+						"description": "Exact qualified Symbol name",
+					},
 					"symbol_name": map[string]interface{}{
 						"type":        "string",
-						"description": "Symbol name to look up references for",
+						"description": "Exact unqualified Symbol name; ambiguous names return candidates",
 					},
 					"symbol_id": map[string]interface{}{
 						"type":        "integer",
-						"description": "Symbol primary key ID if known",
+						"minimum":     1,
+						"description": "Exact Symbol primary key ID",
 					},
 				},
-				"required": []string{"symbol_name"},
 			},
 		},
 	}
 }
 
 type findReferencesArgs struct {
-	SymbolName string `json:"symbol_name"`
-	SymbolID   int64  `json:"symbol_id"`
+	SymbolKeyHash string `json:"symbol_key_hash"`
+	QualifiedName string `json:"qualified_name"`
+	SymbolName    string `json:"symbol_name"`
+	SymbolID      *int64 `json:"symbol_id"`
 }
 
 func (t *FindReferencesTool) Execute(ctx context.Context, argsJSON string) (string, error) {
@@ -68,22 +78,21 @@ func (t *FindReferencesTool) Execute(ctx context.Context, argsJSON string) (stri
 		return "Code intelligence relations graph is not available for this run.", nil
 	}
 
-	symID := args.SymbolID
-	if symID <= 0 {
-		symbols, err := t.ciStore.ListSymbols(ctx, t.buildID, args.SymbolName, 1)
-		if err != nil || len(symbols) == 0 {
-			return fmt.Sprintf("Symbol %q not found to look up references.", args.SymbolName), nil
-		}
-		symID = symbols[0].ID
+	symbol, failure, err := resolveSymbol(ctx, t.ciStore, t.buildID, args.SymbolKeyHash, args.SymbolID, args.QualifiedName, args.SymbolName)
+	if err != nil {
+		return "", fmt.Errorf("failed resolving symbol identity: %w", err)
+	}
+	if failure != nil {
+		return symbolResolutionFailureJSON(failure), nil
 	}
 
-	rels, err := t.ciStore.ListRelationsForSymbol(ctx, t.buildID, symID)
+	rels, err := t.ciStore.ListRelationsForSymbol(ctx, t.buildID, symbol.ID)
 	if err != nil {
 		return "", fmt.Errorf("failed fetching references: %w", err)
 	}
 
 	if len(rels) == 0 {
-		return fmt.Sprintf("No references or callers found for symbol ID %d.", symID), nil
+		return fmt.Sprintf("No references or callers found for symbol ID %d.", symbol.ID), nil
 	}
 
 	outBytes, err := json.MarshalIndent(rels, "", "  ")

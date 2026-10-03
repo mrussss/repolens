@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"repolens/internal/diagnosis"
@@ -30,6 +31,40 @@ func (p *generationOptionsProvider) Generate(_ context.Context, request llm.Gene
 		Message:      llm.Message{Role: llm.RoleAssistant, Content: `{"conclusion_kind":"ROOT_CAUSE","summary":"summary","root_cause":"root cause","findings":[{"title":"finding","reasoning":"reasoning"}]}`},
 		FinishReason: "stop",
 	}, nil
+}
+
+type failingTraceStore struct {
+	calls atomic.Int32
+}
+
+func (s *failingTraceStore) Create(context.Context, *trace.AgentStep) error {
+	s.calls.Add(1)
+	return errors.New("injected trace persistence failure")
+}
+
+func (*failingTraceStore) ListByAttempt(context.Context, string) ([]trace.AgentStep, error) {
+	return nil, nil
+}
+
+func (*failingTraceStore) ListAfterSeq(context.Context, string, int) ([]trace.AgentStep, error) {
+	return nil, nil
+}
+
+func TestAgentLoopTracePersistenceFailureIsBestEffort(t *testing.T) {
+	provider := &generationOptionsProvider{}
+	traceStore := &failingTraceStore{}
+	loop := NewAgentLoop(provider, NewToolRegistry(), traceStore, DefaultGuardConfig())
+	run := &diagnosis.DiagnosisRun{ID: "run-trace-failure", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue"}
+	result, err := loop.Run(context.Background(), testExecutionSpec(run), &diagnosis.DiagnosisAttempt{ID: "attempt-trace-failure"})
+	if err != nil || result == nil || !result.StructuredReport {
+		t.Fatalf("trace persistence failure changed Agent execution: result=%+v err=%v", result, err)
+	}
+	if traceStore.calls.Load() < 2 {
+		t.Fatalf("trace writes attempted=%d; want THINKING and FINAL_OUTPUT attempts", traceStore.calls.Load())
+	}
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider calls=%d after trace persistence failure; want one", len(provider.requests))
+	}
 }
 
 func TestProviderPromptContainsOnlyRedactedPersistedDiagnosisInput(t *testing.T) {

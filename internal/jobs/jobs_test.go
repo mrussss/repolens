@@ -504,6 +504,68 @@ func TestStore_StartedExpiredClaimUsesNormalExhaustion(t *testing.T) {
 	}
 }
 
+func TestReaperTerminalizesDurableProviderOutcomeUnknownCheckpoint(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.Exec(`CREATE TABLE diagnosis_runs (
+		id TEXT PRIMARY KEY, status TEXT NOT NULL, cancel_requested BOOLEAN NOT NULL DEFAULT 0,
+		final_attempt_id TEXT, version INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE diagnosis_attempts (
+		id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL,
+		attempt_no INTEGER NOT NULL, status TEXT NOT NULL, checkpoint_error_code TEXT,
+		checkpoint_error_message TEXT, error_code TEXT, error_message TEXT, retryable BOOLEAN,
+		finished_at DATETIME
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO diagnosis_runs (id, status, version) VALUES ('unknown-run', 'RUNNING', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	store := jobs.NewStoreWithDriver(db, "sqlite3")
+	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "unknown-run", MaxAttempts: 3}
+	if err := store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimJobs(ctx, "unknown-worker", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimJobs = %+v, %v", claimed, err)
+	}
+	markExecutionStarted(t, store, claimed[0], "unknown-worker")
+	if _, err := db.Exec(`INSERT INTO diagnosis_attempts (
+		id, diagnosis_run_id, execution_generation, attempt_no, status,
+		checkpoint_error_code, checkpoint_error_message
+	) VALUES ('unknown-attempt', 'unknown-run', 1, 1, 'RUNNING', 'PROVIDER_OUTCOME_UNKNOWN', 'provider response was lost')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE analysis_jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	reaped, err := store.ReapExpiredJobs(ctx, 10)
+	if err != nil || reaped != 1 {
+		t.Fatalf("ReapExpiredJobs = %d, %v; want one terminalized job", reaped, err)
+	}
+	saved, err := store.GetJobByID(ctx, job.ID)
+	if err != nil || saved.Status != jobs.StatusFailed || saved.LastErrorClass == nil || *saved.LastErrorClass != string(jobs.ErrorClassPermanent) ||
+		saved.LastErrorCode == nil || *saved.LastErrorCode != "PROVIDER_OUTCOME_UNKNOWN" || saved.TerminalReason == nil || *saved.TerminalReason != jobs.TerminalReasonPermanent {
+		t.Fatalf("reaped ambiguous job = %+v err=%v", saved, err)
+	}
+	var runStatus, finalAttemptID, attemptStatus, attemptErrorCode string
+	if err := db.QueryRow(`SELECT status, final_attempt_id FROM diagnosis_runs WHERE id='unknown-run'`).Scan(&runStatus, &finalAttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status, error_code FROM diagnosis_attempts WHERE id='unknown-attempt'`).Scan(&attemptStatus, &attemptErrorCode); err != nil {
+		t.Fatal(err)
+	}
+	if runStatus != "FAILED" || finalAttemptID != "unknown-attempt" || attemptStatus != "FAILED_TERMINAL" || attemptErrorCode != "PROVIDER_OUTCOME_UNKNOWN" {
+		t.Fatalf("reaped ambiguous run=%s final_attempt=%s attempt=%s error=%s", runStatus, finalAttemptID, attemptStatus, attemptErrorCode)
+	}
+}
+
 func TestStore_ReturnUndispatchedClaimRacesExecutionStartWithSingleWinner(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		t.Run(fmt.Sprintf("iteration-%02d", i), func(t *testing.T) {
@@ -675,7 +737,7 @@ func TestStore_ReaperSynchronizesBusinessTerminalState(t *testing.T) {
 		`CREATE TABLE code_index_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
 		`CREATE TABLE retrieval_builds (id TEXT PRIMARY KEY, status TEXT NOT NULL, error_code TEXT)`,
 		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, final_attempt_id TEXT, version INTEGER NOT NULL)`,
-		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, error_code TEXT, error_message TEXT, created_at DATETIME)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, checkpoint_error_code TEXT, checkpoint_error_message TEXT, finished_at DATETIME, error_code TEXT, error_message TEXT, retryable BOOLEAN, created_at DATETIME)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)
@@ -752,7 +814,7 @@ func TestStore_ReaperCancellationTakesPriorityOverRetryAndExhaustion(t *testing.
 	ctx := context.Background()
 	for _, ddl := range []string{
 		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, cancel_requested BOOLEAN NOT NULL DEFAULT 0, final_attempt_id TEXT, version INTEGER NOT NULL)`,
-		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, error_code TEXT, error_message TEXT, created_at DATETIME)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, checkpoint_error_code TEXT, checkpoint_error_message TEXT, finished_at DATETIME, error_code TEXT, error_message TEXT, retryable BOOLEAN, created_at DATETIME)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)
@@ -1134,7 +1196,7 @@ func TestWorkerRuntime_UserCancellationStillCancelsJob(t *testing.T) {
 	job := &jobs.AnalysisJob{JobType: jobs.JobTypeRunDiagnosis, ResourceID: "diag-user-cancel-1"}
 	for _, ddl := range []string{
 		`CREATE TABLE diagnosis_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, cancel_requested BOOLEAN NOT NULL DEFAULT 0, final_attempt_id TEXT, version INTEGER NOT NULL)`,
-		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, finished_at DATETIME, created_at DATETIME)`,
+		`CREATE TABLE diagnosis_attempts (id TEXT PRIMARY KEY, diagnosis_run_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL, checkpoint_error_code TEXT, checkpoint_error_message TEXT, finished_at DATETIME, created_at DATETIME)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatalf("create diagnosis cancellation fixture: %v", err)

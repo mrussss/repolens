@@ -177,7 +177,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 		agentRounds++
 		providerCalls++
 		seq++
-		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "", "")
+		l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeThinking, "", "", "", "STARTED", 0, 0, 0, "", "")
 		temperature := spec.Generation.Temperature
 		resp, err := l.provider.Generate(ctx, l.generateRequest(messages, toolsDef, &temperature))
 		latency := time.Since(startGen).Milliseconds()
@@ -188,7 +188,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 			}
 			// Record error step
 			seq++
-			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+RedactSecrets(err.Error()), "")
+			l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "LLM_ERROR: "+RedactSecrets(err.Error()), "")
 			partial := &LoopResult{
 				PromptTokens: totalPromptTokens, CompletionTokens: totalCompletionTokens,
 				CachedPromptTokens: totalCachedPromptTokens, ReasoningTokens: totalReasoningTokens,
@@ -212,7 +212,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 		if isTruncatedResponse(resp, l.guardCfg.MaxOutputTokens) {
 			truncationErr := modelOutputTruncatedError(resp, l.guardCfg.MaxOutputTokens)
 			seq++
-			_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, resp.PromptTokens, resp.CompletionTokens, ErrCodeModelOutputTruncated, resp.FinishReason)
+			l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, resp.PromptTokens, resp.CompletionTokens, ErrCodeModelOutputTruncated, resp.FinishReason)
 			return &LoopResult{
 				PromptTokens:       totalPromptTokens,
 				CompletionTokens:   totalCompletionTokens,
@@ -244,13 +244,13 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 				toolNames = append(toolNames, tc.Function.Name)
 				if err := guard.RecordToolCall(tc.Function.Name, tc.Function.Arguments); err != nil {
 					seq++
-					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+RedactSecrets(err.Error()), resp.FinishReason)
+					l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeError, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "FAILED", 0, resp.PromptTokens, resp.CompletionTokens, "GUARD_LIMIT: "+RedactSecrets(err.Error()), resp.FinishReason)
 					return l.finalizeOnly(ctx, spec, attempt, appendBudgetResults(messages, resp.Message.ToolCalls, callIndex, "tool budget exhausted"), "TOOL_BUDGET", totalPromptTokens, totalCompletionTokens, totalCachedPromptTokens, totalReasoningTokens, toolCallsCount, searchCalls, toolNames, agentRounds, seq)
 				}
 
 				// Record tool call step
 				seq++
-				_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolCall, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "", resp.FinishReason)
+				l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeToolCall, tc.Function.Name, RedactSecrets(tc.Function.Arguments), "", "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "", resp.FinishReason)
 
 				// Execute tool
 				t, err := l.registry.Get(tc.Function.Name)
@@ -281,7 +281,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 					toolResult = boundToolResult(tc.Function.Name, toolResult, maxToolResultBytes)
 
 					seq++
-					_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeToolResult, tc.Function.Name, "", toolResult, "COMPLETED", toolExecLatency, 0, 0, "", resp.FinishReason)
+					l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeToolResult, tc.Function.Name, "", toolResult, "COMPLETED", toolExecLatency, 0, 0, "", resp.FinishReason)
 				}
 
 				messages = append(messages, llm.Message{
@@ -296,7 +296,7 @@ func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSp
 		// Final response received
 		finalText := resp.Message.Content
 		seq++
-		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "", resp.FinishReason)
+		l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "", resp.FinishReason)
 
 		reportData, err := parseReportJSON(finalText)
 		structuredReport := err == nil
@@ -390,7 +390,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, spec diagnosis.DiagnosisEx
 	resp, err := l.provider.Generate(ctx, l.generateRequest(finalMessages, nil, &temperature))
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
-		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason, "")
+		l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, 0, 0, "FINALIZATION_"+reason, "")
 		return &LoopResult{
 			PromptTokens: promptTokens, CompletionTokens: completionTokens,
 			CachedPromptTokens: cachedTokens, ReasoningTokens: reasoningTokens,
@@ -401,7 +401,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, spec diagnosis.DiagnosisEx
 	}
 	if isTruncatedResponse(resp, l.guardCfg.MaxOutputTokens) {
 		truncationErr := modelOutputTruncatedError(resp, l.guardCfg.MaxOutputTokens)
-		_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, resp.PromptTokens, resp.CompletionTokens, ErrCodeModelOutputTruncated, resp.FinishReason)
+		l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeError, "", "", "", "FAILED", latency, resp.PromptTokens, resp.CompletionTokens, ErrCodeModelOutputTruncated, resp.FinishReason)
 		return &LoopResult{
 			PromptTokens:       promptTokens + resp.PromptTokens,
 			CompletionTokens:   completionTokens + resp.CompletionTokens,
@@ -423,7 +423,7 @@ func (l *AgentLoop) finalizeOnly(ctx context.Context, spec diagnosis.DiagnosisEx
 		providerCalls = rounds + resp.ProviderAttempts
 	}
 	finalText := resp.Message.Content
-	_ = l.recordStep(ctx, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason, resp.FinishReason)
+	l.recordStepBestEffort(ctx, spec.RunID, attempt.ID, seq, trace.StepTypeFinalOutput, "", "", RedactSecrets(finalText), "COMPLETED", latency, resp.PromptTokens, resp.CompletionTokens, "FINALIZATION_"+reason, resp.FinishReason)
 	report, parseErr := parseReportJSON(finalText)
 	if parseErr != nil {
 		return &LoopResult{
@@ -484,6 +484,12 @@ func (l *AgentLoop) recordStep(ctx context.Context, attemptID string, seq int, s
 		CreatedAt:         time.Now(),
 	}
 	return l.traceStore.Create(ctx, step)
+}
+
+func (l *AgentLoop) recordStepBestEffort(ctx context.Context, runID, attemptID string, seq int, stepType trace.StepType, toolName, args, result, status string, latency int64, inTok, outTok int, errCode, finishReason string) {
+	if err := l.recordStep(ctx, attemptID, seq, stepType, toolName, args, result, status, latency, inTok, outTok, errCode, finishReason); err != nil {
+		logger.L(ctx).Warn("agent trace persistence failed", "run_id", runID, "attempt_id", attemptID, "step_type", stepType, "error", err)
+	}
 }
 
 func parseReportJSON(raw string) (*evidence.ReportDraft, error) {

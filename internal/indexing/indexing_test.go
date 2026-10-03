@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,8 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	codeintelmodel "repolens/internal/codeintel/model"
+	codeintelstore "repolens/internal/codeintel/store"
 	"repolens/internal/indexing"
 	"repolens/internal/jobs"
 	"repolens/internal/platform/mysql"
@@ -167,8 +170,85 @@ type mockRepoStore struct {
 func (m *mockRepoStore) GetByID(ctx context.Context, id string) (*repo.Repository, error) {
 	return &repo.Repository{
 		ID:     id,
+		Name:   "example.com/test-repo",
 		GitURL: "https://github.com/repolens/test-repo",
 	}, nil
+}
+
+type failFirstCodeIndexHandoffStore struct {
+	codeintelstore.Store
+	calls int
+}
+
+func (s *failFirstCodeIndexHandoffStore) GetOrCreateBuild(ctx context.Context, snapshotID, modulePath string, bc codeintelmodel.BuildContext) (*codeintelmodel.CodeIndexBuild, bool, error) {
+	s.calls++
+	if s.calls == 1 {
+		return nil, false, fmt.Errorf("injected transient CodeIndexBuild creation failure")
+	}
+	return s.Store.GetOrCreateBuild(ctx, snapshotID, modulePath, bc)
+}
+
+func TestSnapshotHandoffFailurePropagatesAndRetryCreatesOneCodeIndexBuild(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "snapshot_handoff.db?_busy_timeout=5000&_journal_mode=WAL")), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mysql.AutoMigrate(db); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	baseCodeIntelStore := codeintelstore.NewStore(db)
+	failingCodeIntelStore := &failFirstCodeIndexHandoffStore{Store: baseCodeIntelStore}
+	const commitSHA = "0123456789abcdef0123456789abcdef01234567"
+	recorder := &materializationRecorder{snap: &snapshot.RepositorySnapshot{
+		ID: "snap-handoff-retry", RepositoryID: "repo-handoff-retry", Ref: "main",
+		CommitSHA: commitSHA, Status: snapshot.StatusMaterializing,
+	}}
+	basePath := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return os.Chmod(path, 0755)
+			}
+			return os.Chmod(path, 0644)
+		})
+	})
+	storeFS := snapshotstore.NewLocalSnapshotStore(basePath)
+	handler := indexing.NewSnapshotJobHandler(
+		&mockRepoStore{}, recorder, nil, storeFS,
+		&fixtureCloner{commitSHA: commitSHA}, indexing.NewFileFilter(512), indexing.NewCodeChunker(5, 2), nil,
+	).WithCodeIntelStore(failingCodeIntelStore)
+	job := &jobs.AnalysisJob{ID: 31, ResourceID: recorder.snap.ID, AttemptCount: 1, MaxAttempts: 3}
+
+	firstErr := handler.Execute(ctx, job)
+	if firstErr == nil {
+		t.Fatal("CodeIndexBuild handoff failure was silently reported as success")
+	}
+	if class, _ := jobs.ClassifyError(firstErr); class != jobs.ErrorClassRetryable {
+		t.Fatalf("handoff failure class=%s err=%v; want retryable", class, firstErr)
+	}
+	if recorder.snap.Status != snapshot.StatusReady {
+		t.Fatalf("parent Snapshot status=%s after handoff error; want READY", recorder.snap.Status)
+	}
+	if err := handler.Execute(ctx, job); err != nil {
+		t.Fatalf("retry of READY Snapshot did not resume handoff: %v", err)
+	}
+	if failingCodeIntelStore.calls != 2 {
+		t.Fatalf("CodeIndexBuild handoff calls=%d; want injected failure plus one retry", failingCodeIntelStore.calls)
+	}
+	var builds, buildJobs int64
+	if err := db.Model(&codeintelmodel.CodeIndexBuild{}).Where("snapshot_id = ?", recorder.snap.ID).Count(&builds).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ? AND resource_id IN (SELECT CAST(id AS TEXT) FROM code_index_builds WHERE snapshot_id = ?)", jobs.JobTypeBuildCodeIndex, recorder.snap.ID).Count(&buildJobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if builds != 1 || buildJobs != 1 {
+		t.Fatalf("retry created CodeIndexBuild rows=%d jobs=%d; want exactly one each", builds, buildJobs)
+	}
 }
 
 type mockSnapshotStore struct {

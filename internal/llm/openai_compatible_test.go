@@ -220,6 +220,81 @@ func TestOpenAICompatibleMarksInterruptedSuccessBodyOutcomeUnknown(t *testing.T)
 	}
 }
 
+func TestOpenAICompatibleMarksConnectionResetAfterDispatchOutcomeUnknown(t *testing.T) {
+	requestReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(requestReceived)
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("test HTTP server does not support hijacking")
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack dispatched request connection: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	provider := NewOpenAICompatibleProviderWithAuthModeAndTimeout("", server.URL, "model", "none", time.Second)
+	defer provider.httpClient.CloseIdleConnections()
+	_, err := provider.Generate(context.Background(), GenerateRequest{Messages: []Message{{Role: RoleUser, Content: "probe"}}})
+	select {
+	case <-requestReceived:
+	default:
+		t.Fatal("provider request was not dispatched before the connection reset")
+	}
+	var unknown *OutcomeUnknownError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("post-dispatch connection reset error=%v, want OutcomeUnknownError", err)
+	}
+}
+
+func TestOpenAICompatibleMarksCancellationAfterDispatchOutcomeUnknown(t *testing.T) {
+	requestReceived := make(chan struct{})
+	requestCancelled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(requestReceived)
+		<-r.Context().Done()
+		close(requestCancelled)
+	}))
+	defer server.Close()
+
+	provider := NewOpenAICompatibleProviderWithAuthModeAndTimeout("", server.URL, "model", "none", time.Second)
+	defer provider.httpClient.CloseIdleConnections()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := provider.Generate(ctx, GenerateRequest{Messages: []Message{{Role: RoleUser, Content: "probe"}}})
+		done <- err
+	}()
+	select {
+	case <-requestReceived:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("provider request was not dispatched before cancellation")
+	}
+	cancel()
+	select {
+	case <-requestCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe cancellation of the dispatched request")
+	}
+	select {
+	case err := <-done:
+		var unknown *OutcomeUnknownError
+		if !errors.As(err, &unknown) {
+			t.Fatalf("post-dispatch cancellation error=%v, want OutcomeUnknownError", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider call did not return after cancellation")
+	}
+}
+
 func TestOpenAICompatibleProviderMalformed2xxIsOutcomeUnknown(t *testing.T) {
 	const malformed = `{"choices":[`
 	var requests atomic.Int32

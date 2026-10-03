@@ -116,6 +116,9 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 				return jobs.NewRetryableError("REVISION_STAGE_UPDATE_FAILED", err.Error(), err)
 			}
 		}
+		if h.codeIntelStore != nil && snap.AnalysisRevisionID == "" {
+			return h.createLegacyCodeIndexHandoff(ctx, snap)
+		}
 		return nil
 	}
 	if snap.Status == snapshot.StatusCreated {
@@ -315,11 +318,24 @@ func (h *SnapshotJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob)
 	}
 
 	// Auto-chain BUILD_CODE_INDEX job if codeIntelStore is wired
-	if h.codeIntelStore != nil && !stageFinalized {
-		_, _, _ = h.codeIntelStore.GetOrCreateBuild(ctx, snap.ID, r.Name, codeintelmodel.DefaultBuildContext())
+	if h.codeIntelStore != nil && !stageFinalized && snap.AnalysisRevisionID == "" {
+		if err := h.createLegacyCodeIndexHandoff(ctx, snap); err != nil {
+			return err
+		}
 	}
 
 	log.Info("snapshot materialization completed successfully", "chunks", len(allChunks), "docs", docCount)
+	return nil
+}
+
+func (h *SnapshotJobHandler) createLegacyCodeIndexHandoff(ctx context.Context, snap *snapshot.RepositorySnapshot) error {
+	repository, err := h.repoStore.GetByID(ctx, snap.RepositoryID)
+	if err != nil {
+		return jobs.NewRetryableError("CODE_INDEX_HANDOFF_FAILED", "failed to load repository for automatic code index handoff", err)
+	}
+	if _, _, err := h.codeIntelStore.GetOrCreateBuild(ctx, snap.ID, repository.Name, codeintelmodel.DefaultBuildContext()); err != nil {
+		return jobs.NewRetryableError("CODE_INDEX_HANDOFF_FAILED", "snapshot is READY but automatic code index build creation failed", err)
+	}
 	return nil
 }
 
