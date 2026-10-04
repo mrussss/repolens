@@ -60,21 +60,11 @@ func (r *BenchmarkRunner) EvaluateBM25(idx *bm25.Index, testCases []TestCase) St
 		results := idx.Search(tc.Query, 10)
 		latencies = append(latencies, float64(time.Since(start).Microseconds())/1000.0)
 
-		foundRank := 0
-		foundFiles := make(map[string]bool)
-
+		relevance := newRelevance(tc)
 		for _, res := range results {
-			if tc.ExpectedSymbol != "" && res.Document.SymbolName == tc.ExpectedSymbol {
-				if foundRank == 0 {
-					foundRank = res.Rank
-				}
-			}
-			for _, expF := range tc.ExpectedFiles {
-				if res.Document.FilePath == expF {
-					foundFiles[expF] = true
-				}
-			}
+			relevance.observe(res.Document, res.Rank)
 		}
+		foundRank := relevance.rank
 
 		if foundRank == 1 {
 			hit1++
@@ -88,12 +78,7 @@ func (r *BenchmarkRunner) EvaluateBM25(idx *bm25.Index, testCases []TestCase) St
 			reciprocalRanks = append(reciprocalRanks, 0.0)
 		}
 
-		recall := 0.0
-		if len(tc.ExpectedFiles) > 0 {
-			recall = float64(len(foundFiles)) / float64(len(tc.ExpectedFiles))
-		} else if foundRank > 0 && foundRank <= 5 {
-			recall = 1.0
-		}
+		recall := relevance.recall()
 		perCaseRecall[tc.ID] = recall
 		recalls = append(recalls, recall)
 	}
@@ -129,21 +114,11 @@ func (r *BenchmarkRunner) EvaluateStructural(ctx context.Context, engine *struct
 		results := engine.Search(ctx, tc.Query, 10)
 		latencies = append(latencies, float64(time.Since(start).Microseconds())/1000.0)
 
-		foundRank := 0
-		foundFiles := make(map[string]bool)
-
+		relevance := newRelevance(tc)
 		for _, res := range results {
-			if tc.ExpectedSymbol != "" && res.Document.SymbolName == tc.ExpectedSymbol {
-				if foundRank == 0 {
-					foundRank = res.FinalRank
-				}
-			}
-			for _, expF := range tc.ExpectedFiles {
-				if res.Document.FilePath == expF {
-					foundFiles[expF] = true
-				}
-			}
+			relevance.observe(res.Document, res.FinalRank)
 		}
+		foundRank := relevance.rank
 
 		if foundRank == 1 {
 			hit1++
@@ -157,12 +132,7 @@ func (r *BenchmarkRunner) EvaluateStructural(ctx context.Context, engine *struct
 			reciprocalRanks = append(reciprocalRanks, 0.0)
 		}
 
-		recall := 0.0
-		if len(tc.ExpectedFiles) > 0 {
-			recall = float64(len(foundFiles)) / float64(len(tc.ExpectedFiles))
-		} else if foundRank > 0 && foundRank <= 5 {
-			recall = 1.0
-		}
+		recall := relevance.recall()
 		perCaseRecall[tc.ID] = recall
 		recalls = append(recalls, recall)
 	}
@@ -254,4 +224,46 @@ func calcP95(vals []float64) float64 {
 	sort.Float64s(vals)
 	idx := int(float64(len(vals)-1) * 0.95)
 	return vals[idx]
+}
+
+// Symbols and files are alternative relevant evidence targets. When both are
+// present, either match contributes to rank; file recall measures unique files.
+// This mirrors benchmark cases where supporting files accompany a target symbol.
+type caseRelevance struct {
+	symbol string
+	files  map[string]bool
+	rank   int
+}
+
+func newRelevance(tc TestCase) *caseRelevance {
+	r := &caseRelevance{symbol: tc.ExpectedSymbol, files: make(map[string]bool)}
+	for _, file := range tc.ExpectedFiles {
+		r.files[file] = false
+	}
+	return r
+}
+func (r *caseRelevance) observe(doc bm25.Document, rank int) {
+	_, fileMatch := r.files[doc.FilePath]
+	if fileMatch {
+		r.files[doc.FilePath] = true
+	}
+	relevant := fileMatch || (r.symbol != "" && doc.SymbolName == r.symbol)
+	if relevant && rank > 0 && (r.rank == 0 || rank < r.rank) {
+		r.rank = rank
+	}
+}
+func (r *caseRelevance) recall() float64 {
+	if len(r.files) == 0 {
+		if r.rank > 0 && r.rank <= 5 {
+			return 1
+		}
+		return 0
+	}
+	found := 0
+	for _, hit := range r.files {
+		if hit {
+			found++
+		}
+	}
+	return float64(found) / float64(len(r.files))
 }

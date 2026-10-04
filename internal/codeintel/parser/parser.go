@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/build"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -41,17 +43,86 @@ type walkDirFunc func(string, fs.WalkDirFunc) error
 
 // DiscoverModule locates the root go.mod and any nested go.mod files.
 func DiscoverModule(rootPath string) (*ModuleInfo, error) {
-	return discoverModuleWithWalkDir(rootPath, filepath.WalkDir)
+	return DiscoverModuleWithAllowedFiles(rootPath, nil)
+}
+
+// DiscoverModuleWithAllowedFiles applies the same canonical source boundary to metadata and Go files.
+func DiscoverModuleWithAllowedFiles(rootPath string, allowedFiles []string) (*ModuleInfo, error) {
+	return discoverModule(rootPath, allowedFiles, filepath.WalkDir)
 }
 
 func discoverModuleWithWalkDir(rootPath string, walkDir walkDirFunc) (*ModuleInfo, error) {
+	return discoverModule(rootPath, nil, walkDir)
+}
+
+func allowedPath(rootPath, path string, allowedFiles []string) (string, error) {
+	if allowedFiles != nil {
+		found := false
+		for _, allowed := range allowedFiles {
+			if allowed == path {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", fmt.Errorf("file %q is not in the snapshot allowlist", path)
+		}
+	} else if decision := snapshotpolicy.CanIndex(path, 0); !decision.Allowed {
+		return "", fmt.Errorf("snapshot file access denied: %s (%s)", path, decision.Reason)
+	}
+	if filepath.ToSlash(filepath.Clean(path)) != path {
+		return "", fmt.Errorf("non-canonical snapshot path %q", path)
+	}
+	return snapshotpolicy.SafePath(rootPath, path)
+}
+
+// Load manifest membership once per walk, and intersect any explicit allowlist.
+func snapshotAllowedFiles(rootPath string, allowedFiles []string) ([]string, error) {
+	manifest, err := snapshotpolicy.LoadManifest(rootPath)
+	if errors.Is(err, snapshotpolicy.ErrManifestNotFound) && !snapshotpolicy.RequiresManifest(rootPath) {
+		return allowedFiles, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("snapshot manifest unavailable: %w", err)
+	}
+	if allowedFiles == nil {
+		return manifest.AllowedPaths(), nil
+	}
+	result := make([]string, 0, len(allowedFiles))
+	for _, path := range allowedFiles {
+		if manifest.Contains(path) {
+			result = append(result, path)
+		}
+	}
+	return result, nil
+}
+
+const maxModuleBytes = 1024 * 1024
+
+func discoverModule(rootPath string, allowedFiles []string, walkDir walkDirFunc) (*ModuleInfo, error) {
 	rootPath, err := filepath.Abs(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
+	allowedFiles, err = snapshotAllowedFiles(rootPath, allowedFiles)
+	if err != nil {
+		return nil, err
+	}
 	rootGoMod := filepath.Join(rootPath, "go.mod")
-	data, err := os.ReadFile(rootGoMod)
+	safeMod, err := allowedPath(rootPath, "go.mod", allowedFiles)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(safeMod)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxModuleBytes+1))
+	if len(data) > maxModuleBytes {
+		return nil, fmt.Errorf("go.mod exceeds %d bytes", maxModuleBytes)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("go.mod not found at root (%s): %w", rootGoMod, err)
 	}
@@ -93,6 +164,10 @@ func discoverModuleWithWalkDir(rootPath string, walkDir walkDirFunc) (*ModuleInf
 		}
 		if d.Name() == "go.mod" && path != rootGoMod {
 			rel, _ := filepath.Rel(rootPath, path)
+			rel = filepath.ToSlash(rel)
+			if _, err := allowedPath(rootPath, rel, allowedFiles); err != nil {
+				return nil
+			}
 			info.NestedMods = append(info.NestedMods, rel)
 		}
 		return nil
@@ -114,6 +189,15 @@ func ParseRepositoryWithAllowedFiles(fset *token.FileSet, rootPath string, modul
 }
 
 func parseRepositoryWithWalkDir(fset *token.FileSet, rootPath string, moduleInfo *ModuleInfo, bctx model.BuildContext, allowedFiles []string, walkDir walkDirFunc) ([]*ParsedFile, []string, error) {
+	var err error
+	rootPath, err = filepath.Abs(rootPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	allowedFiles, err = snapshotAllowedFiles(rootPath, allowedFiles)
+	if err != nil {
+		return nil, nil, err
+	}
 	var warnings []string
 	if len(moduleInfo.NestedMods) > 0 {
 		warnings = append(warnings, fmt.Sprintf("found %d nested go.mod files (%s); nested modules excluded from root module semantic analysis",
@@ -134,7 +218,7 @@ func parseRepositoryWithWalkDir(fset *token.FileSet, rootPath string, moduleInfo
 		}
 	}
 
-	err := walkDir(rootPath, func(path string, d fs.DirEntry, walkErr error) error {
+	err = walkDir(rootPath, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -172,7 +256,11 @@ func parseRepositoryWithWalkDir(fset *token.FileSet, rootPath string, moduleInfo
 			return nil
 		}
 
-		content, err := os.ReadFile(path)
+		safeSource, err := snapshotpolicy.SafePath(rootPath, relPath)
+		if err != nil {
+			return err
+		}
+		content, err := os.ReadFile(safeSource)
 		if err != nil {
 			parsedFiles = append(parsedFiles, &ParsedFile{
 				CodeFile: &model.CodeFile{
@@ -203,7 +291,7 @@ func parseRepositoryWithWalkDir(fset *token.FileSet, rootPath string, moduleInfo
 		}
 
 		// Check build constraints
-		included := matchesBuildContext(filepath.Dir(path), d.Name(), bctx)
+		included := matchesBuildContextContent(filepath.Dir(path), d.Name(), bctx, content)
 
 		codeFile := &model.CodeFile{
 			Path:                   relPath,
@@ -284,6 +372,10 @@ func applyExternalTestPackagePaths(files []*ParsedFile) {
 // standard Go build matcher. MatchFile only reads the file; it never executes
 // repository code.
 func matchesBuildContext(dir, name string, bctx model.BuildContext) bool {
+	return matchesBuildContextContent(dir, name, bctx, nil)
+}
+
+func matchesBuildContextContent(dir, name string, bctx model.BuildContext, content []byte) bool {
 	ctx := build.Context{
 		GOOS:        bctx.GOOS,
 		GOARCH:      bctx.GOARCH,
@@ -292,6 +384,9 @@ func matchesBuildContext(dir, name string, bctx model.BuildContext) bool {
 		BuildTags:   normalizedBuildTags(bctx.BuildTags),
 		ReleaseTags: pinnedGoReleaseTags(),
 		ToolTags:    targetToolTags(bctx.GOARCH),
+	}
+	if content != nil {
+		ctx.OpenFile = func(path string) (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(content)), nil }
 	}
 	included, err := ctx.MatchFile(dir, name)
 	return err == nil && included

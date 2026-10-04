@@ -279,6 +279,7 @@ func TestAnalyzerUsesSnapshotManifestFileUniverse(t *testing.T) {
 		}
 	}
 	manifest := snapshotpolicy.NewManifest("snap-manifest", "commit", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", []snapshotpolicy.FileEntry{
+		snapshotpolicy.FileEntryFor("go.mod", []byte(files["go.mod"])),
 		snapshotpolicy.FileEntryFor("src/main.go", []byte(files["src/main.go"])),
 	})
 	if err := snapshotpolicy.WriteManifest(root, manifest); err != nil {

@@ -2,6 +2,7 @@ package evidence
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -53,13 +54,13 @@ type Report struct {
 	ConclusionKind          ConclusionKind `gorm:"size:32;not null;default:''" json:"conclusion_kind"`
 	ReportStatus            ReportStatus   `gorm:"size:32;not null;default:'INVALID'" json:"report_status"`
 	Summary                 string         `gorm:"type:text" json:"summary,omitempty"`
-	FindingsJSON            string         `gorm:"type:text;not null" json:"findings_json"`
-	RecommendedChecksJSON   string         `gorm:"type:text" json:"recommended_checks_json"`
+	FindingsJSON            string         `gorm:"type:mediumtext;not null" json:"findings_json"`
+	RecommendedChecksJSON   string         `gorm:"type:mediumtext" json:"recommended_checks_json"`
 	StructuredPayloadJSON   string         `gorm:"type:mediumtext" json:"structured_payload_json,omitempty"`
 	Confidence              float64        `gorm:"default:0.0" json:"confidence"`
 	RawOutput               string         `gorm:"type:mediumtext" json:"raw_output,omitempty"`
 	ParseError              string         `gorm:"type:text" json:"parse_error,omitempty"`
-	LimitationsJSON         string         `gorm:"type:text" json:"limitations_json,omitempty"`
+	LimitationsJSON         string         `gorm:"type:mediumtext" json:"limitations_json,omitempty"`
 	ModelClaimedConfidence  *float64       `json:"model_claimed_confidence,omitempty"`
 	FindingCount            int            `gorm:"not null;default:0" json:"finding_count"`
 	SupportedFindingCount   int            `gorm:"not null;default:0" json:"supported_finding_count"`
@@ -172,6 +173,48 @@ func ValidateReportStructure(data *DiagnosisReportData) error {
 			}
 		}
 	}
+	serialized, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("serialize report: %w", err)
+	}
+	return ValidateReportBytes("structured_report", string(serialized), MaxReportBytes)
+}
+
+// MaxReportBytes bounds each serialized report/checkpoint payload (4 MiB).
+// MEDIUMTEXT holds 16 MiB minus one byte; keep room for reasonable expansion.
+const MaxReportBytes = 4 * 1024 * 1024
+const ReportTooLargeCode = "REPORT_TOO_LARGE"
+
+var ErrReportTooLarge = errors.New(ReportTooLargeCode)
+
+func ValidateReportBytes(field, value string, limit int) error {
+	if len(value) > limit {
+		return fmt.Errorf("%w: %s exceeds %d serialized bytes", ErrReportTooLarge, field, limit)
+	}
+	return nil
+}
+
+// ValidateReportPersistence closes the contract at every report write boundary.
+// TEXT fields retain their smaller capacity; aggregate JSON fields and raw output
+// share the bounded MEDIUMTEXT contract with attempt checkpoints.
+func ValidateReportPersistence(report *Report) error {
+	if report == nil {
+		return errors.New("report is required")
+	}
+	for field, value := range map[string]string{
+		"findings_json": report.FindingsJSON, "recommended_checks_json": report.RecommendedChecksJSON,
+		"limitations_json": report.LimitationsJSON, "structured_payload_json": report.StructuredPayloadJSON,
+		"raw_output": report.RawOutput,
+	} {
+		if err := ValidateReportBytes(field, value, MaxReportBytes); err != nil {
+			return err
+		}
+	}
+	for field, value := range map[string]string{"summary": report.Summary, "root_cause": report.RootCause, "parse_error": report.ParseError} {
+		if err := ValidateReportBytes(field, value, 65535); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -190,6 +233,9 @@ func NewReportStore(db *gorm.DB) *GormReportStore {
 }
 
 func (s *GormReportStore) Create(ctx context.Context, report *Report) error {
+	if err := ValidateReportPersistence(report); err != nil {
+		return err
+	}
 	if report.ID == "" {
 		report.ID = uuid.New().String()
 	}

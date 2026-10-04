@@ -25,3 +25,14 @@ RepoLens treats repository contents as untrusted input. It does not execute a
 repository's build, tests, generators, or package installation. The local
 single-user deployment is not intended to be exposed directly to the public
 Internet.
+
+The production image includes the same Go toolchain and standard-library sources
+used to compile the worker. It does not copy the builder's module or build cache.
+The offline importer only admits canonical standard-library paths or packages in
+the snapshot's root module; third-party dependencies remain unresolved.
+After building the Compose images, verify the actual worker runtime without
+network access:
+
+```bash
+./scripts/verify_codeintel_runtime.sh
+```

@@ -5,6 +5,7 @@ import { NewDiagnosisPage } from './components/NewDiagnosisPage';
 import { DiagnosisView } from './components/DiagnosisView';
 import { CodeIntelPage } from './components/CodeIntelPage';
 import { api } from './api';
+import { Pagination } from './components/Pagination';
 import { DiagnosisRun } from './types';
 import { FolderGit2, PlusCircle, Settings, Sparkles, Activity, Clock, Code2, Sun, Moon } from 'lucide-react';
 
@@ -15,23 +16,29 @@ export const App: React.FC = () => {
   const [activeDiagnosisId, setActiveDiagnosisId] = useState<string | null>(null);
   const [preselectedRepoId, setPreselectedRepoId] = useState<string>('');
   const [preselectedRevisionId, setPreselectedRevisionId] = useState<string>('');
+  const [historyPage, setHistoryPage] = useState(1);
+  const [diagnosisTotal, setDiagnosisTotal] = useState(0);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [recentDiagnoses, setRecentDiagnoses] = useState<DiagnosisRun[]>([]);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('repolens-theme') as 'dark' | 'light') || 'dark');
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('repolens-theme', theme); }, [theme]);
 
   useEffect(() => {
-    loadRecentDiagnoses();
-  }, [currentView]);
-
-  const loadRecentDiagnoses = async () => {
-    try {
-      const list = await api.listDiagnoses();
-      setRecentDiagnoses(list || []);
-    } catch {
-      // ignore
-    }
-  };
+    let stopped = false;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    setRecentDiagnoses([]);
+    void api.listDiagnoses(historyPage, 20).then((result) => {
+      if (stopped) return;
+      setRecentDiagnoses(result.items);
+      setDiagnosisTotal(result.total);
+    }).catch((err) => {
+      if (!stopped) setHistoryError(err instanceof Error ? err.message : '加载诊断历史失败');
+    }).finally(() => { if (!stopped) setHistoryLoading(false); });
+    return () => { stopped = true; };
+  }, [currentView, historyPage]);
 
   const handleDemoStarted = (diagId: string) => {
     setActiveDiagnosisId(diagId);
@@ -99,7 +106,7 @@ export const App: React.FC = () => {
                 style={{ background: currentView === 'history' ? 'var(--bg-subtle)' : 'transparent', border: 'none' }}
                 onClick={() => setCurrentView('history')}
               >
-                <Clock size={16} /> 历史 ({recentDiagnoses.length})
+                <Clock size={16} /> 历史 ({diagnosisTotal})
               </button>
               <button
                 className="btn"
@@ -176,7 +183,8 @@ export const App: React.FC = () => {
               </button>
             </div>
 
-            {recentDiagnoses.length === 0 ? (
+            {historyError && <p role="alert">{historyError}</p>}
+            {historyLoading ? <p>加载中…</p> : recentDiagnoses.length === 0 ? (
               <div className="card" style={{ textAlign: 'center', padding: '3rem 1rem' }}>
                 <Activity size={36} color="var(--text-muted)" style={{ margin: '0 auto 1rem' }} />
                 <h3 style={{ fontSize: '1.1rem', color: 'var(--text-bright)', marginBottom: '0.5rem' }}>暂无诊断记录</h3>
@@ -211,6 +219,7 @@ export const App: React.FC = () => {
                 ))}
               </div>
             )}
+            <Pagination page={historyPage} pageSize={20} total={diagnosisTotal} loading={historyLoading} onPage={setHistoryPage} />
           </div>
         )}
       </main>

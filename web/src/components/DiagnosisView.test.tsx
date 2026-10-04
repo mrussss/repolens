@@ -158,4 +158,73 @@ describe('DiagnosisView retry polling', () => {
     expect(container.textContent).toContain('generation two output');
     expect(container.textContent).not.toContain('generation one output');
   });
+  it.each(['RUNNING', 'QUEUED'] as const)('loads the current RUNNING attempt trace for a %s run', async (status) => {
+    currentRun = { ...runningRun, status };
+    vi.mocked(api.getDiagnosisAttempts).mockResolvedValue([
+      { id: 'old-attempt', diagnosis_run_id: currentRun.id, execution_generation: 1, attempt_no: 9, status: 'FAILED_RETRYABLE' },
+      { id: 'current-attempt', diagnosis_run_id: currentRun.id, execution_generation: 2, attempt_no: 1, status: 'RUNNING' },
+    ]);
+    vi.mocked(api.getDiagnosisSteps).mockResolvedValue([{ id: 'step-current', seq: 1, step_type: 'LLM_CALL', status: 'COMPLETED' } as any]);
+    await act(async () => { root.render(<DiagnosisView diagnosisId={currentRun.id} onBack={() => undefined} />); });
+    expect(api.getDiagnosisSteps).toHaveBeenCalledWith(currentRun.id, 'current-attempt');
+    expect(container.textContent).toContain('Agent 执行轨迹（1）');
+  });
+
+  it.each(['SUCCEEDED', 'FAILED'] as const)('binds %s traces to FinalAttemptID', async (status) => {
+    currentRun = { ...succeededGenerationTwo, status };
+    vi.mocked(api.getDiagnosisAttempts).mockResolvedValue([
+      { id: 'other-current-attempt', diagnosis_run_id: currentRun.id, execution_generation: 2, attempt_no: 2, status: 'RUNNING' },
+    ]);
+    await act(async () => { root.render(<DiagnosisView diagnosisId={currentRun.id} onBack={() => undefined} />); });
+    expect(api.getDiagnosisSteps).toHaveBeenCalledWith(currentRun.id, 'attempt-gen2');
+  });
+
+  it('does not fabricate an attempt when queued execution has not started', async () => {
+    currentRun = queuedRun;
+    await act(async () => { root.render(<DiagnosisView diagnosisId={currentRun.id} onBack={() => undefined} />); });
+    expect(api.getDiagnosisSteps).not.toHaveBeenCalled();
+  });
+
+  it('switches trace to the new running attempt after retry and clears old steps', async () => {
+    vi.mocked(api.getDiagnosisAttempts).mockImplementation(async () => currentRun.status === 'RUNNING' ? [
+      { id: 'attempt-gen2', diagnosis_run_id: currentRun.id, execution_generation: 2, attempt_no: 1, status: 'RUNNING' },
+      { id: 'attempt-1', diagnosis_run_id: currentRun.id, execution_generation: 1, attempt_no: 1, status: 'FAILED_TERMINAL' },
+    ] : []);
+    vi.mocked(api.getDiagnosisSteps).mockImplementation(async (_id, attemptId) => attemptId === 'attempt-1' ? [{ id: 'old-step' } as any] : []);
+    await act(async () => { root.render(<DiagnosisView diagnosisId={currentRun.id} onBack={() => undefined} />); });
+    expect(api.getDiagnosisSteps).toHaveBeenLastCalledWith(currentRun.id, 'attempt-1');
+    expect(container.textContent).toContain('Agent 执行轨迹（1）');
+    const retry = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('重试诊断'))!;
+    await act(async () => { retry.click(); });
+    currentRun = runningRun;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+    expect(api.getDiagnosisSteps).toHaveBeenLastCalledWith(currentRun.id, 'attempt-gen2');
+    expect(container.textContent).toContain('Agent 执行轨迹（0）');
+  });
+
+  it('shows the latest cancelled attempt trace', async () => {
+    currentRun = { ...runningRun, status: 'CANCELLED' };
+    vi.mocked(api.getDiagnosisAttempts).mockResolvedValue([
+      { id: 'cancelled-attempt', diagnosis_run_id: currentRun.id, execution_generation: 2, attempt_no: 1, status: 'CANCELLED' },
+    ]);
+    await act(async () => { root.render(<DiagnosisView diagnosisId={currentRun.id} onBack={() => undefined} />); });
+    expect(api.getDiagnosisSteps).toHaveBeenCalledWith(currentRun.id, 'cancelled-attempt');
+  });
+
+  it('keeps visibility refreshes from overlapping trace polling requests', async () => {
+    currentRun = runningRun;
+    let resolve!: (value: Awaited<ReturnType<typeof api.getDiagnosisSteps>>) => void;
+    vi.mocked(api.getDiagnosisAttempts).mockResolvedValue([
+      { id: 'current-attempt', diagnosis_run_id: currentRun.id, execution_generation: 2, attempt_no: 1, status: 'RUNNING' },
+    ]);
+    vi.mocked(api.getDiagnosisSteps).mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    await act(async () => { root.render(<DiagnosisView diagnosisId={currentRun.id} onBack={() => undefined} />); });
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+    expect(api.getDiagnosisSteps).toHaveBeenCalledTimes(1);
+    expect(api.getDiagnosis).toHaveBeenCalledTimes(1);
+    await act(async () => { resolve([]); });
+    expect(api.getDiagnosisSteps).toHaveBeenCalledTimes(2);
+    expect(api.getDiagnosisSteps).toHaveBeenLastCalledWith(currentRun.id, 'current-attempt');
+  });
+
 });

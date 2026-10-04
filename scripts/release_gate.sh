@@ -46,6 +46,7 @@ echo "✓ Eval benchmark passed"
 echo "[9/10] Validating Compose and image build..."
 docker compose config >/dev/null
 docker compose build
+./scripts/verify_codeintel_runtime.sh
 
 echo "[10/10] Running product smoke against the Compose stack..."
 cleanup() { docker compose down >/dev/null 2>&1 || true; }

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { api } from '../api';
+import { api, Page } from '../api';
+import { Pagination } from './Pagination';
 import { AnalysisRevision, Repository } from '../types';
 import { GitBranch, Plus, RefreshCw, Database, Play } from 'lucide-react';
 import { mergeRevisionReads, RevisionPoller, shouldContinueRevisionPolling, startRevisionPolling } from '../revisionPolling';
@@ -10,10 +11,14 @@ interface Props {
 
 interface RepositoryPollValue {
   repositories: Repository[];
+  pagination: Page<Repository>;
   revisions: Record<string, AnalysisRevision[]>;
 }
 
 export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) => {
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(20);
   const [repos, setRepos] = useState<Repository[]>([]);
   const [loading, setLoading] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -28,15 +33,22 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
 
   useEffect(() => {
     let initialRequest = true;
+    let stopped = false;
+    setRepos([]);
+    setRevisions({});
+    revisionsRef.current = {};
     const poller = startRevisionPolling<RepositoryPollValue>({
       poll: async () => {
-        let list: Repository[];
+        let pagination: Page<Repository>;
         try {
-          list = await api.listRepositories();
+          pagination = await api.listRepositories(page, 20);
         } catch {
           throw new Error('加载仓库失败，请检查网络后重新加载。');
         }
 
+        // A page change cancels this poller before any obsolete revision reads.
+        if (stopped) return { value: { repositories: [], revisions: {}, pagination } };
+        const list = pagination.items;
         let revisionReadFailed = false;
         const reads = await Promise.all(list.map(async (repository) => {
           try {
@@ -48,7 +60,7 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
         }));
         const nextRevisions = mergeRevisionReads(revisionsRef.current, reads);
         return {
-          value: { repositories: list, revisions: nextRevisions },
+          value: { repositories: list, revisions: nextRevisions, pagination },
           error: revisionReadFailed ? '分析版本刷新失败，已保留上次状态；可稍后重试。' : undefined,
         };
       },
@@ -56,6 +68,8 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
       onValue: (value) => {
         revisionsRef.current = value.revisions;
         setRepos(value.repositories);
+        setTotal(value.pagination.total);
+        setPageSize(value.pagination.page_size);
         setRevisions(value.revisions);
       },
       onError: setError,
@@ -75,11 +89,12 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
     document.addEventListener('visibilitychange', onVisibilityChange);
     poller.refresh();
     return () => {
+      stopped = true;
       poller.stop();
       if (pollerRef.current === poller) pollerRef.current = null;
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, []);
+  }, [page]);
 
   const handleReload = () => {
     setError(null);
@@ -202,6 +217,8 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
           ))}
         </div>
       )}
+
+      <Pagination page={page} pageSize={pageSize} total={total} loading={loading} onPage={setPage} />
 
       {/* Add Repository Modal */}
       {showAddModal && (

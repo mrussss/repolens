@@ -13,3 +13,18 @@
 | **Concurrent worker claim** | Two workers race for one pending job. | Atomic claim requires the current job state and generation; the loser receives `ErrOwnershipLost`/claim conflict. | No duplicate concurrent execution. |
 | **Idempotency Key Conflict** | User resubmits `Idempotency-Key` with different payload. | SHA256 request hash comparison detects hash mismatch, immediately returning HTTP `409 Conflict`. | Prevents payload collision on identical idempotency keys. |
 | **Graceful Shutdown (SIGTERM)** | Worker receives a termination signal. | The worker stops claiming new jobs, cancels the parent context, and waits for in-flight handlers and lease renewers. | Existing ownership is not silently transferred by a second executor. |
+
+## Report serialization capacity
+
+`ValidateReportStructure` caps the complete serialized report at 4 MiB, including
+JSON escaping and canonical citation excerpts. Each persisted report JSON field,
+raw output, parsed report, and parsed report draft also has a 4 MiB boundary.
+`findings_json`, `recommended_checks_json`, and `limitations_json` use MEDIUMTEXT
+through forward migration `018_v2_2_report_capacity.sql`; full report and attempt
+checkpoint columns already use MEDIUMTEXT. Bounded summary/root-cause/parse-error
+TEXT fields retain a 65,535-byte persistence ceiling.
+
+Writers check byte sizes before inserting a report or updating a checkpoint.
+Oversized output fails permanently with `REPORT_TOO_LARGE`, without automatic
+provider retry or a database `Data too long` failure. Final citation validation
+re-serializes the complete report and checks the boundary again.

@@ -46,3 +46,10 @@ BM25 是稳定、可复现的生产基线；Structural Retrieval 按冻结的 he
 - **P50 / P95 Latency & Token Usage**：诊断延迟与成本。
 
 评测必须在同一 immutable Snapshot 和固定 CodeIndexBuild 上比较 BM25 与 Structural Retrieval，避免源码、索引版本或 lineage 漂移影响结论。
+
+策略准入的 `Hit@1`、`Hit@5` 和 MRR 共享一个 relevance 契约：结果的符号精确匹配
+`ExpectedSymbol`，或文件精确匹配任意 `ExpectedFiles`，即为 relevant。
+两类 ground truth 同时存在时，它们表示可接受的相关证据目标，采用 OR 语义。
+最早的真实结果排名决定 Hit@K 和倒数排名；没有命中时均为零。
+文件 Recall 使用去重后的期望文件集合，不重复计数。仅有符号 ground truth 时，
+Recall 保持前五名符号命中的既有语义。BM25 和 Structural 使用同一 helper。

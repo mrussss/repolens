@@ -26,7 +26,7 @@ export const CodeIntelPage: React.FC = () => {
   const loadInitialData = async () => {
     try {
       setLoading(true);
-      const list = await api.listRepositories();
+      const list = await api.listAllRepositories();
       setRepos(list || []);
       if (list && list.length > 0) setSelectedRepoId(list[0].id);
     } catch (err: any) {

@@ -233,6 +233,10 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			log.Error("failed to persist provider checkpoint; refusing automatic provider retry", "error", checkpointErr)
 			failureCode := "CHECKPOINT_SAVE_FAILED"
 			failureMessage := "provider checkpoint could not be persisted; explicit diagnosis retry is required"
+			if errors.Is(checkpointErr, evidence.ErrReportTooLarge) {
+				failureCode = evidence.ReportTooLargeCode
+				failureMessage = checkpointErr.Error()
+			}
 			if providerOutcomeUnknown {
 				failureCode = llm.OutcomeUnknownErrorCode
 				failureMessage = "provider request outcome could not be confirmed; automatic replay is disabled"
@@ -426,7 +430,13 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 		if validatedFindings, marshalErr := json.Marshal(result.Report.Findings); marshalErr == nil {
 			rep.FindingsJSON = string(validatedFindings)
 		}
+		if validatedPayload, marshalErr := json.Marshal(result.Report); marshalErr == nil {
+			rep.StructuredPayloadJSON = string(validatedPayload)
+		}
 		quality, qualityErr := evidence.ClassifyReport(result.Report, result.StructuredReport)
+		if errors.Is(qualityErr, evidence.ErrReportTooLarge) {
+			return h.finalizeDiagnosisFailure(ctx, job, run, attempt, jobs.ErrorClassPermanent, evidence.ReportTooLargeCode, qualityErr.Error(), result)
+		}
 		if qualityErr != nil && result.ParseError == "" {
 			result.ParseError = qualityErr.Error()
 		}
@@ -461,6 +471,9 @@ func (h *DiagnosisJobHandler) Execute(ctx context.Context, job *jobs.AnalysisJob
 			return jobs.ErrOwnershipLost
 		}
 		if finalizeErr != nil {
+			if errors.Is(finalizeErr, evidence.ErrReportTooLarge) {
+				return h.finalizeDiagnosisFailure(ctx, job, run, attempt, jobs.ErrorClassPermanent, evidence.ReportTooLargeCode, finalizeErr.Error(), result)
+			}
 			return jobs.WrapAtomicHandlerFinalization(jobs.StatusSucceeded,
 				jobs.NewRetryableError("ATOMIC_FINALIZE_FAILED", "failed to atomically finalize diagnosis success", finalizeErr))
 		}

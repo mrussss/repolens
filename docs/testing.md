@@ -17,6 +17,12 @@ Web build and tests, eval, Compose configuration and image build, and a
 Compose-backed product smoke. Real MySQL is required in this gate; integration
 tests run in required mode with zero skips.
 
+The production CodeIntel runtime boundary has an additional check after the
+Compose image build: `./scripts/verify_codeintel_runtime.sh`. It executes the
+compiled `TestRuntimeStdlibAndOfflineBoundary` test in the actual worker image
+with networking disabled, proving `fmt.Sprintf` type analysis and third-party
+dependency isolation.
+
 Focused checks and targeted regression tests are useful during development.
 They do not replace the release gate.
 

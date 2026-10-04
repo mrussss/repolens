@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
 import { DiagnosisRun, DiagnosisReport, DiagnosisAttempt, AgentStep } from '../types';
 import { EvidenceViewer } from './EvidenceViewer';
 import { TraceViewer } from './TraceViewer';
+import { currentTraceAttempt } from '../diagnosisTrace';
 import { isInvalidReport } from '../reportStatus';
 import { RefreshCw, StopCircle, FileText, Activity, ShieldAlert, ArrowLeft } from 'lucide-react';
 
@@ -26,6 +27,8 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
   const [run, setRun] = useState<DiagnosisRun | null>(null);
   const [report, setReport] = useState<DiagnosisReport | null>(null);
   const [steps, setSteps] = useState<AgentStep[]>([]);
+  const traceAttemptRef = useRef<string | undefined>();
+  const [traceAttemptId, setTraceAttemptId] = useState<string | undefined>();
   const [attempts, setAttempts] = useState<DiagnosisAttempt[]>([]);
   const [activeTab, setActiveTab] = useState<'evidence' | 'trace'>('evidence');
   const [loading, setLoading] = useState(true);
@@ -37,9 +40,13 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
   useEffect(() => {
     let stopped = false;
     let timer: number | undefined;
+    let inFlight = false;
+    let refreshPending = false;
     let delay = 1000;
     const maxRetryDelay = 15000;
 
+    traceAttemptRef.current = undefined;
+    setTraceAttemptId(undefined);
     setRun(null);
     setReport(null);
     setSteps([]);
@@ -62,8 +69,9 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
         setRun(r);
         active = r.status === 'RUNNING' || r.status === 'QUEUED';
 
+        let loadedAttempts: DiagnosisAttempt[] = [];
         try {
-          const loadedAttempts = await api.getDiagnosisAttempts(diagnosisId);
+          loadedAttempts = await api.getDiagnosisAttempts(diagnosisId);
           if (stopped) return { continuePolling: false, transientFailure: false };
           setAttempts(loadedAttempts);
         } catch (err) {
@@ -86,10 +94,15 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
           }
         }
 
-        const shouldLoadSteps = active || r.status === 'SUCCEEDED' || (r.status === 'FAILED' && !!r.final_attempt_id);
-        if (shouldLoadSteps) {
+        const attemptId = currentTraceAttempt(r, loadedAttempts);
+        if (traceAttemptRef.current !== attemptId) {
+          traceAttemptRef.current = attemptId;
+          setTraceAttemptId(attemptId);
+          setSteps([]);
+        }
+        if (attemptId) {
           try {
-            const st = await api.getDiagnosisSteps(diagnosisId);
+            const st = await api.getDiagnosisSteps(diagnosisId, attemptId);
             if (stopped) return { continuePolling: false, transientFailure: false };
             setSteps(st || []);
           } catch (err) {
@@ -108,12 +121,21 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
 
     const poll = async () => {
       if (stopped) return;
+      if (inFlight) { refreshPending = true; return; }
       if (document.hidden) {
         timer = window.setTimeout(poll, 5000);
         return;
       }
+      inFlight = true;
       const result = await fetchAll();
-      if (stopped || !result.continuePolling) return;
+      inFlight = false;
+      if (stopped) return;
+      if (refreshPending) {
+        refreshPending = false;
+        void poll();
+        return;
+      }
+      if (!result.continuePolling) return;
       delay = result.transientFailure ? Math.min(maxRetryDelay, delay * 2) : Math.min(5000, delay * 2);
       timer = window.setTimeout(poll, delay);
     };
@@ -349,7 +371,7 @@ export const DiagnosisView: React.FC<Props> = ({ diagnosisId, onBack }) => {
       </div>
 
       {activeTab === 'evidence' && <EvidenceViewer findings={report?.findings || []} />}
-      {activeTab === 'trace' && <TraceViewer steps={steps} />}
+      {activeTab === 'trace' && <><p>执行记录：{traceAttemptId || '尚未创建 Attempt'}</p><TraceViewer steps={steps} /></>}
     </div>
   );
 };

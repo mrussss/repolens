@@ -132,7 +132,7 @@ func isStdlibImport(path string) bool {
 	if path == "unsafe" {
 		return true
 	}
-	if path == "" || strings.Contains(path, ".") {
+	if path == "" || filepath.IsAbs(path) || filepath.ToSlash(filepath.Clean(path)) != path || strings.Contains(path, ".") || strings.Contains(path, "\\") {
 		return false
 	}
 	root := runtime.GOROOT()

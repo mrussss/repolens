@@ -58,6 +58,8 @@ async function handleResponse<T>(res: Response): Promise<T> {
   return res.json();
 }
 
+export interface Page<T> { items: T[]; total: number; page: number; page_size: number }
+
 export const api = {
   async getProviderStatus(): Promise<ProviderStatus> {
     const res = await fetch(`${API_BASE}/settings/provider`);
@@ -91,10 +93,21 @@ export const api = {
     return handleResponse(res);
   },
 
-  async listRepositories(): Promise<Repository[]> {
-    const res = await fetch(`${API_BASE}/repositories`);
-    const body = await handleResponse<{ repositories: Repository[] }>(res);
-    return body.repositories || [];
+  async listRepositories(page = 1, pageSize = 20): Promise<Page<Repository>> {
+    const res = await fetch(`${API_BASE}/repositories?page=${page}&page_size=${pageSize}`);
+    const body = await handleResponse<{ repositories: Repository[]; total: number; page: number; page_size: number }>(res);
+    return { items: body.repositories || [], total: body.total, page: body.page, page_size: body.page_size };
+  },
+
+  async listAllRepositories(): Promise<Repository[]> {
+    const items: Repository[] = [];
+    let page = 1;
+    while (true) {
+      const result = await api.listRepositories(page);
+      items.push(...result.items);
+      if (result.items.length === 0 || page * result.page_size >= result.total) return items;
+      page += 1;
+    }
   },
 
   async createRepository(data: { name: string; git_url: string; default_ref?: string }): Promise<Repository> {
@@ -195,10 +208,10 @@ export const api = {
   },
 
   // Diagnoses
-  async listDiagnoses(): Promise<DiagnosisRun[]> {
-    const res = await fetch(`${API_BASE}/diagnoses`);
-    const body = await handleResponse<{ diagnosis_runs: DiagnosisRun[] }>(res);
-    return body.diagnosis_runs || [];
+  async listDiagnoses(page = 1, pageSize = 20): Promise<Page<DiagnosisRun>> {
+    const res = await fetch(`${API_BASE}/diagnoses?page=${page}&page_size=${pageSize}`);
+    const body = await handleResponse<{ diagnosis_runs: DiagnosisRun[]; total: number; page: number; page_size: number }>(res);
+    return { items: body.diagnosis_runs || [], total: body.total, page: body.page, page_size: body.page_size };
   },
 
   async getDiagnosis(id: string): Promise<DiagnosisRun> {
@@ -258,8 +271,9 @@ export const api = {
     return { ...body.report, findings, recommended_checks: recommendedChecks, limitations, confirmed_facts: confirmedFacts } as DiagnosisReport;
   },
 
-  async getDiagnosisSteps(id: string): Promise<AgentStep[]> {
-    const res = await fetch(`${API_BASE}/diagnoses/${id}/steps`);
+  async getDiagnosisSteps(id: string, attemptId?: string): Promise<AgentStep[]> {
+    const query = attemptId ? `?attempt_id=${encodeURIComponent(attemptId)}` : '';
+    const res = await fetch(`${API_BASE}/diagnoses/${id}/steps${query}`);
     const body = await handleResponse<{ steps: AgentStep[] }>(res);
     return body.steps || [];
   },

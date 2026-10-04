@@ -32,7 +32,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisi
 
   const loadRepos = async () => {
     try {
-      const list = await api.listRepositories();
+      const list = await api.listAllRepositories();
       setRepos(list || []);
       if (!selectedRepoId && list?.length > 0) {
         setSelectedRepoId(list[0].id);

@@ -38,7 +38,7 @@ describe('RepositoriesPage AnalysisRevision polling', () => {
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
-    vi.spyOn(api, 'listRepositories').mockResolvedValue([repository]);
+    vi.spyOn(api, 'listRepositories').mockResolvedValue({ items: [repository], total: 1, page: 1, page_size: 20 });
     vi.spyOn(api, 'listAnalysisRevisions').mockResolvedValue([readyRevision]);
     vi.spyOn(api, 'createRepository').mockResolvedValue(repository);
     vi.spyOn(api, 'createAnalysisRevision').mockResolvedValue({ analysis_revision: preparingRevision, created: true });
@@ -114,4 +114,80 @@ describe('RepositoriesPage AnalysisRevision polling', () => {
     expect(container.textContent).toContain('READY');
     expect(container.textContent).not.toContain('分析版本刷新失败');
   });
+  it('opens all 25 repositories with 20 on page one and 5 on page two', async () => {
+    const all = Array.from({ length: 25 }, (_, i) => ({ ...repository, id: `repo-${i}`, name: `repository-${i}` }));
+    vi.mocked(api.listRepositories).mockImplementation(async (page = 1, pageSize = 20) => ({
+      items: all.slice((page - 1) * pageSize, page * pageSize), total: 25, page, page_size: pageSize,
+    }));
+    await mountAndFlush();
+    expect(container.querySelectorAll('h3')).toHaveLength(20);
+    expect(container.textContent).toContain('共 25 条');
+    const next = [...container.querySelectorAll('button')].find((button) => button.textContent === '下一页')!;
+    await act(async () => { next.click(); });
+    expect(api.listRepositories).toHaveBeenLastCalledWith(2, 20);
+    expect(container.querySelectorAll('h3')).toHaveLength(5);
+    expect(container.textContent).toContain('repository-24');
+    expect(container.textContent).not.toContain('repository-0');
+    expect(next.disabled).toBe(true);
+    const previous = [...container.querySelectorAll('button')].find((button) => button.textContent === '上一页')!;
+    await act(async () => { previous.click(); });
+    expect(container.querySelectorAll('h3')).toHaveLength(20);
+  });
+
+  it('discards obsolete page requests and polls revisions only on the current page', async () => {
+    let obsoleteResolve!: (value: Awaited<ReturnType<typeof api.listRepositories>>) => void;
+    let pageOneReads = 0;
+    const second = { ...repository, id: 'repo-21', name: 'second-page' };
+    vi.mocked(api.listRepositories).mockImplementation(async (page = 1) => {
+      if (page === 1 && ++pageOneReads > 1) return new Promise((resolve) => { obsoleteResolve = resolve; });
+      return { items: page === 1 ? [repository] : [second], total: 25, page, page_size: 20 };
+    });
+    let secondReads = 0;
+    vi.mocked(api.listAnalysisRevisions).mockImplementation(async (id) => {
+      if (id === second.id && ++secondReads > 1) return [{ ...readyRevision, repository_id: second.id }];
+      return [{ ...preparingRevision, repository_id: id }];
+    });
+    await mountAndFlush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(obsoleteResolve).toBeTypeOf('function');
+    const next = [...container.querySelectorAll('button')].find((button) => button.textContent === '下一页')!;
+    await act(async () => { next.click(); });
+    expect(container.textContent).toContain('second-page');
+    const oldReads = vi.mocked(api.listAnalysisRevisions).mock.calls.filter(([id]) => id === repository.id).length;
+    await act(async () => {
+      obsoleteResolve({ items: [repository], total: 25, page: 1, page_size: 20 });
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(container.textContent).toContain('second-page');
+    expect(container.textContent).toContain('READY');
+    expect(container.textContent).toContain('第 2 / 2 页');
+    expect(vi.mocked(api.listAnalysisRevisions).mock.calls.filter(([id]) => id === repository.id)).toHaveLength(oldReads);
+    expect(api.listRepositories).toHaveBeenLastCalledWith(2, 20);
+    expect(secondReads).toBe(2);
+  });
+
+  it('does not apply an old page revision response after switching pages', async () => {
+    const second = { ...repository, id: 'repo-21', name: 'second-page' };
+    let resolveOld!: (value: AnalysisRevision[]) => void;
+    let oldReads = 0;
+    vi.mocked(api.listRepositories).mockImplementation(async (page = 1) => ({
+      items: page === 1 ? [repository] : [second], total: 25, page, page_size: 20,
+    }));
+    vi.mocked(api.listAnalysisRevisions).mockImplementation(async (id) => {
+      if (id === second.id) return [{ ...readyRevision, repository_id: id }];
+      if (++oldReads > 1) return new Promise((resolve) => { resolveOld = resolve; });
+      return [preparingRevision];
+    });
+    await mountAndFlush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    await act(async () => { [...container.querySelectorAll('button')].find((button) => button.textContent === '下一页')!.click(); });
+    await act(async () => { resolveOld([preparingRevision]); });
+    expect(container.textContent).toContain('second-page');
+    expect(container.textContent).toContain('READY');
+    expect(container.textContent).not.toContain('PREPARING');
+    expect(container.textContent).toContain('第 2 / 2 页');
+    await act(async () => { await vi.advanceTimersByTimeAsync(30000); });
+    expect(oldReads).toBe(2);
+  });
+
 });

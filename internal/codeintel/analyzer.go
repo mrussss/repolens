@@ -34,7 +34,7 @@ func (a *Analyzer) Analyze(ctx context.Context, rootPath string, bctx BuildConte
 // policy inside the parser.
 func (a *Analyzer) AnalyzeWithAllowedFiles(ctx context.Context, rootPath string, allowedFiles []string, bctx BuildContext) (*AnalysisResult, error) {
 	// 1. Discover module
-	modInfo, err := parser.DiscoverModule(rootPath)
+	modInfo, err := parser.DiscoverModuleWithAllowedFiles(rootPath, allowedFiles)
 	if err != nil {
 		return nil, fmt.Errorf("failed discovering module at %s: %w", rootPath, err)
 	}
@@ -137,9 +137,10 @@ func (a *Analyzer) AnalyzeWithAllowedFiles(ctx context.Context, rootPath string,
 		if err != nil {
 			pkgFailed++
 			typeErrs := offlineImp.GetTypeErrors(pkgPath)
-			if len(typeErrs) > 0 {
-				warnings = append(warnings, fmt.Sprintf("package %s type-check degraded: %s", pkgPath, typeErrs[0]))
+			if len(typeErrs) == 0 {
+				typeErrs = []string{err.Error()}
 			}
+			warnings = append(warnings, fmt.Sprintf("package %s type-check degraded: %s", pkgPath, typeErrs[0]))
 		} else {
 			pkgTypechecked++
 		}

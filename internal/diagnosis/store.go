@@ -368,6 +368,9 @@ func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, 
 				return errors.New("citation lineage does not match diagnosis snapshot/build")
 			}
 		}
+		if err := evidence.ValidateReportPersistence(report); err != nil {
+			return err
+		}
 		if err := tx.Create(report).Error; err != nil {
 			return fmt.Errorf("persist report: %w", err)
 		}
@@ -449,6 +452,9 @@ func (s *GormStore) FinalizeInvalidStructuredReport(ctx context.Context, jobID i
 		}
 		if report.ParseError == "" {
 			report.ParseError = errorMessage
+		}
+		if err := evidence.ValidateReportPersistence(report); err != nil {
+			return err
 		}
 		if err := tx.Create(report).Error; err != nil {
 			return fmt.Errorf("persist invalid report: %w", err)
@@ -888,6 +894,9 @@ func (s *GormStore) UpdateAttemptCheckpointWithDraft(ctx context.Context, attemp
 }
 
 func (s *GormStore) updateAttemptCheckpoint(ctx context.Context, attemptID string, checkpoint AttemptCheckpoint, withDraft bool) error {
+	if err := validateCheckpointBytes(checkpoint); err != nil {
+		return err
+	}
 	updates := checkpointUpdates(checkpoint, withDraft)
 	result := s.db.WithContext(ctx).Model(&DiagnosisAttempt{}).
 		Where("id = ? AND execution_generation = ? AND status = ?", attemptID, checkpoint.ExecutionGeneration, AttemptStatusRunning).
@@ -949,6 +958,9 @@ func (s *GormStore) UpdateAttemptCheckpointWithClaim(ctx context.Context, jobID 
 	}
 	if checkpoint.ExecutionGeneration != generation {
 		return jobs.ErrOwnershipLost
+	}
+	if err := validateCheckpointBytes(checkpoint); err != nil {
+		return err
 	}
 	updates := checkpointUpdates(checkpoint, withDraft)
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -1248,4 +1260,13 @@ func (s *GormStore) RecoverStaleAttempt(ctx context.Context, attemptID, runID st
 
 		return nil
 	})
+}
+
+func validateCheckpointBytes(checkpoint AttemptCheckpoint) error {
+	for field, value := range map[string]string{"raw_output": checkpoint.RawOutput, "parsed_report_json": checkpoint.ParsedReportJSON, "parsed_report_draft_json": checkpoint.ParsedDraftJSON} {
+		if err := evidence.ValidateReportBytes(field, value, evidence.MaxReportBytes); err != nil {
+			return err
+		}
+	}
+	return nil
 }
