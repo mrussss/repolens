@@ -38,7 +38,7 @@ import (
 	"repolens/internal/trace"
 )
 
-const productionStrategy = "symbol_bm25_structural"
+const productionStrategy = codeintelmodel.ProductionRetrievalStrategy
 
 const (
 	e2eNotRequested               = "NOT_REQUESTED"
@@ -632,7 +632,7 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 		Strategy:         productionStrategy,
 		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion,
 		TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
-		ConfigHash:       "config-v2.2",
+		ConfigHash:       codeintelmodel.RetrievalConfigHash(productionStrategy),
 		Status:           codeintelmodel.BuildStatusCreated,
 		CreatedAt:        time.Now().UTC(),
 	}

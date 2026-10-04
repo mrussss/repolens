@@ -160,27 +160,65 @@ func hasDirectSemanticUsage(funcDecl *ast.FuncDecl, typeInfo *types.Info, prodSy
 		if found || n == nil {
 			return !found
 		}
-		if ident, ok := n.(*ast.Ident); ok {
-			if obj, ok := typeInfo.Uses[ident]; ok && obj != nil {
-				if obj.Name() == prodSym.Name {
-					if obj.Pkg() != nil && obj.Pkg().Path() == prodSym.PackagePath {
-						found = true
-						return false
-					}
-				}
-			}
+		if ident, ok := n.(*ast.Ident); ok && semanticObjectMatches(typeInfo.Uses[ident], prodSym) {
+			found = true
+			return false
 		}
 		if sel, ok := n.(*ast.SelectorExpr); ok {
-			if selection, ok := typeInfo.Selections[sel]; ok && selection != nil {
-				if selection.Obj().Name() == prodSym.Name {
-					found = true
-					return false
-				}
+			if selection := typeInfo.Selections[sel]; selection != nil && semanticObjectMatches(selection.Obj(), prodSym) {
+				found = true
+				return false
 			}
 		}
 		return true
 	})
 	return found
+}
+
+// Compare the declaring object, never the expression receiver (which may be
+// promoted or instantiated). Variables and local type declarations are not
+// indexed production symbols, even if they have the same name.
+func semanticObjectMatches(obj types.Object, sym *model.Symbol) bool {
+	if obj == nil || obj.Pkg() == nil || obj.Pkg().Path() != sym.PackagePath || obj.Name() != sym.Name {
+		return false
+	}
+	var kind model.SymbolKind
+	receiver := ""
+	switch value := obj.(type) {
+	case *types.Func:
+		kind = model.SymbolKindFunction
+		sig, ok := value.Type().(*types.Signature)
+		if !ok {
+			return false
+		}
+		if sig.Recv() != nil {
+			kind = model.SymbolKindMethod
+			t := types.Unalias(sig.Recv().Type())
+			if ptr, ok := t.(*types.Pointer); ok {
+				t = types.Unalias(ptr.Elem())
+			}
+			named, ok := t.(*types.Named)
+			if !ok || named.Obj() == nil {
+				return false
+			}
+			receiver = named.Obj().Name()
+		}
+	case *types.TypeName:
+		if value.Parent() != value.Pkg().Scope() {
+			return false
+		}
+		kind = model.SymbolKindType
+		if _, ok := types.Unalias(value.Type()).Underlying().(*types.Interface); ok {
+			kind = model.SymbolKindInterface
+		}
+	default:
+		return false
+	}
+	if kind != sym.Kind || receiver != sym.ReceiverCanonical {
+		return false
+	}
+	raw, hash := model.BuildSymbolKey(sym.ModulePath, obj.Pkg().Path(), receiver, kind, obj.Name())
+	return raw == sym.SymbolKeyRaw && hash == sym.SymbolKeyHash
 }
 
 func hasDirectSyntacticUsage(funcDecl *ast.FuncDecl, prodSym *model.Symbol) bool {

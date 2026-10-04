@@ -153,7 +153,7 @@ func LoadIndex(artifactDir string) (*bm25.Index, error) {
 
 // LoadIndexVerified validates both the manifest identity and the checksum of
 // the index bytes before exposing an artifact to the retriever.
-func LoadIndexVerified(artifactDir string, expectedBuildID int64, expectedHash string) (*bm25.Index, error) {
+func LoadIndexVerified(artifactDir string, expectedBuildID int64, expectedHash string, expectedStrategy ...string) (*bm25.Index, error) {
 	indexPath := filepath.Join(artifactDir, "index.json")
 	manifestPath := filepath.Join(artifactDir, "manifest.json")
 	manifestBytes, err := os.ReadFile(manifestPath)
@@ -166,6 +166,9 @@ func LoadIndexVerified(artifactDir string, expectedBuildID int64, expectedHash s
 	}
 	if expectedBuildID > 0 && manifest.RetrievalBuildID != expectedBuildID {
 		return nil, fmt.Errorf("artifact build id mismatch: manifest=%d expected=%d", manifest.RetrievalBuildID, expectedBuildID)
+	}
+	if len(expectedStrategy) > 0 && manifest.Strategy != expectedStrategy[0] {
+		return nil, fmt.Errorf("retrieval artifact strategy mismatch: manifest=%s expected=%s", manifest.Strategy, expectedStrategy[0])
 	}
 	f, err := os.Open(indexPath)
 	if err != nil {

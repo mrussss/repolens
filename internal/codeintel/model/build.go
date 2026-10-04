@@ -1,6 +1,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"time"
 )
 
@@ -18,9 +20,9 @@ const (
 // semantics change. Keep historical benchmark fixtures pinned separately.
 const (
 	CurrentParserVersion       = "v2.2.2"
-	CurrentAnalyzerVersion     = "v2.2.1"
+	CurrentAnalyzerVersion     = "v2.2.2"
 	CurrentSymbolSchemaVersion = "v2.1.1"
-	CurrentRetrievalVersion    = "v2.2.0"
+	CurrentRetrievalVersion    = "v2.2.1"
 	CurrentTokenizerVersion    = "v2.1.0"
 )
 
@@ -84,4 +86,21 @@ type RetrievalBuild struct {
 
 func (RetrievalBuild) TableName() string {
 	return "retrieval_builds"
+}
+
+// Production remains BM25 until the frozen structural promotion gates pass.
+const (
+	StrategyBM25                = "BM25"
+	StrategyBM25Structural      = "BM25_STRUCTURAL"
+	ProductionRetrievalStrategy = StrategyBM25
+)
+
+// RetrievalConfigHash captures ranking parameters as well as the strategy.
+// The build's version and tokenizer version are separate identity columns.
+func RetrievalConfigHash(strategy string) string {
+	structural := "none"
+	if strategy == StrategyBM25Structural {
+		structural = "symbol-expansion-v1"
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strategy+"|k1=1.2|b=0.75|structural="+structural)))
 }

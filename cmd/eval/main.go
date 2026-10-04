@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	codeintelmodel "repolens/internal/codeintel/model"
 	"repolens/internal/eval"
 	"repolens/internal/indexing"
 	"repolens/internal/llm"
@@ -35,7 +36,8 @@ func (m *MemoryBM25Retriever) Search(ctx context.Context, req retrieval.SearchRe
 			EndLine:         r.Document.EndLine,
 			Snippet:         r.Document.Content,
 			Score:           r.Score,
-			RetrievalSource: "symbol_bm25_structural",
+			RetrievalSource: "symbol_bm25",
+			RetrievalReason: "BM25",
 		})
 	}
 	return out, nil
@@ -140,6 +142,10 @@ func main() {
 
 	eval.PrintComparisonTable([]*eval.EvalRun{runBM25, runE2E})
 	fmt.Printf("\n%s\n", promoRes.Summary)
+	for _, violation := range promoRes.RuleViolations {
+		fmt.Printf("Promotion gate: %s\n", violation)
+	}
+	fmt.Printf("Configured production build strategy: %s (execution follows pinned RetrievalBuild.Strategy).\n", codeintelmodel.ProductionRetrievalStrategy)
 	if !promoRes.PromotedToProduction {
 		fmt.Println("Structural Retrieval remains experimental; BM25 stays the production strategy.")
 	}

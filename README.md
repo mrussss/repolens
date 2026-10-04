@@ -1,6 +1,6 @@
 # RepoLens v2.2
 
-RepoLens 是一个本地单用户 Go 代码诊断工具：它把固定版本的 Go 仓库物化为不可变 Snapshot，用 AST 与离线 best-effort `go/types` 建立版本化 CodeIndex，再用纯 Go BM25 + Structural Retrieval 为受控 Agent 提供证据，最后校验源码 Citation。
+RepoLens 是一个本地单用户 Go 代码诊断工具：它把固定版本的 Go 仓库物化为不可变 Snapshot，用 AST 与离线 best-effort `go/types` 建立版本化 CodeIndex，再用纯 Go BM25 为受控 Agent 提供证据，最后校验源码 Citation。
 
 ## 架构设计
 
@@ -107,7 +107,7 @@ RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开
 - BM25 是 portfolio-scale 的纯 Go 检索，不是分布式代码搜索。
 - Agent 只读、受步数/调用次数/输出大小限制；仓库文本与 CI log 视为不可信输入。
 - Citation validation 证明源码一致性，不证明模型结论的逻辑正确性；secret redaction 是 best-effort。
-- Eval 数据集小且经过整理，Dev 与 frozen held-out 分离；Structural Retrieval 只有通过 promotion rule 才能成为生产策略。
+- Eval 数据集小且经过整理，Dev 与 frozen held-out 分离；当前 Structural Retrieval 未通过 promotion rule，生产构建策略为 `BM25`，实际执行 Pure BM25。Structural 仅允许显式 `BM25_STRUCTURAL` 实验构建。
 - v1.1 的 RabbitMQ、Outbox、Elasticsearch、Vector/RRF、SSE 和旧 Auth 仅存在于历史版本，不属于 v2.2 core。
 - v2.2 不会自动删除仍被数据库引用的历史 Snapshot / RetrievalBuild，也不实现面向用户的 retention policy。Worker 会周期性清理超过 24 小时、且未被任何数据库 `materialized_path` / `artifact_path` 引用的 orphan execution / staging artifact。`make clean-data` 是破坏性的全量本地重置，请谨慎使用。
 

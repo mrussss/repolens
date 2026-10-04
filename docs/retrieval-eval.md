@@ -5,14 +5,14 @@
 RepoLens v2.2 当前生产使用：
 
 ```text
-Pure Go BM25 + Structural Retrieval
+Pure Go BM25 (RetrievalBuild.Strategy = BM25)
 ```
 
 - **Pure Go BM25**：进程内运行，使用代码感知 tokenizer 对文件、符号和路径进行确定性 lexical ranking；不依赖外部搜索集群或 embedding 服务。
-- **Structural Retrieval**：基于固定 CodeIndexBuild 中的 symbols、references、callers 和 related tests 对候选结果进行结构化扩展，并提供可解释的命中原因。
+- **Structural Retrieval（实验）**：冻结 promotion gate 当前未通过；只在显式 `BM25_STRUCTURAL` 构建上执行，默认生产请求不进行结构化扩展或 rerank。
 - **版本与 lineage**：RetrievalBuild 固定 `Snapshot → CodeIndexBuild → RetrievalBuild` 链路，artifact 发布后通过 hash 和 READY 状态校验。
 - **Initial Retrieval**：Agent 启动前由确定性的 QueryBuilder 从标题、少量描述关键词和错误堆栈中的包/文件/函数/符号提取 query，再以固定 Top-K 和总字节预算生成 Evidence Packet。完整 Error Log 不会原样拼进 BM25 query。
-- **Evidence Packet**：候选至少包含仓库相对路径、起止行、源码 excerpt、检索分数和 `BM25 + structural expansion` 原因；重复或高度重叠候选去重后才进入 Agent。
+- **Evidence Packet**：候选至少包含仓库相对路径、起止行、源码 excerpt、检索分数和 `BM25` 原因；重复或高度重叠候选去重后才进入 Agent。
 
 BM25 是稳定、可复现的生产基线；Structural Retrieval 按冻结的 held-out benchmark 规则评估，只有满足 promotion gate 才能改变生产策略。
 
@@ -53,3 +53,22 @@ BM25 是稳定、可复现的生产基线；Structural Retrieval 按冻结的 he
 最早的真实结果排名决定 Hit@K 和倒数排名；没有命中时均为零。
 文件 Recall 使用去重后的期望文件集合，不重复计数。仅有符号 ground truth 时，
 Recall 保持前五名符号命中的既有语义。BM25 和 Structural 使用同一 helper。
+
+## 4. 构建与实际执行契约
+
+`ProductionRetriever` 按 pinned `RetrievalBuild.Strategy` 分流：`BM25` 直接执行
+`idx.Search(query, TopK)`，结果标记 `RetrievalSource=symbol_bm25`、
+`RetrievalReason=BM25`；`BM25_STRUCTURAL` 才调用 Structural Engine。
+未知策略返回稳定的 unsupported strategy 错误。READY、snapshot/build lineage、
+artifact build ID、hash 和 manifest strategy 均在搜索前核验。
+
+当前 AnalyzerVersion 为 `v2.2.2`，RetrievalVersion 为 `v2.2.1`。
+策略、检索版本、tokenizer 版本及配置 SHA256 均参与构建唯一身份；配置 hash 包含
+BM25 k1=1.2、b=0.75 和对应结构参数。Pipeline fingerprint 的生产策略为 `BM25`，
+结构参数为 `none`，避免复用修复前的排序和 semantic related-test 结果。
+Artifact manifest 固定 build ID、strategy 和 index hash；build ID 关联其完整版本身份。
+历史 READY 构建保持原有 pinned identity，标记 BM25 的构建现在实际执行 BM25。
+
+`go run ./cmd/eval` 重新计算冻结准入规则，不硬编码 promotion。
+未通过时保留 BM25；未来准入通过后仍需显式变更生产策略和版本并通过回归验收。
+ADR 001/008 的早期 promotion 记录属于历史结论，本页定义当前生产状态。

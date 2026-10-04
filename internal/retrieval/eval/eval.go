@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"repolens/internal/codeintel/model"
 	"repolens/internal/retrieval/bm25"
 	"repolens/internal/retrieval/structural"
 )
@@ -192,9 +193,9 @@ func CheckPromotionRule(cMetrics, dMetrics StrategyMetrics) PromotionResult {
 	}
 
 	promoted := len(violations) == 0
-	winningStrategy := "SYMBOL_BM25"
+	winningStrategy := model.StrategyBM25
 	if promoted {
-		winningStrategy = "SYMBOL_BM25_STRUCTURAL"
+		winningStrategy = model.StrategyBM25Structural
 	}
 
 	summary := fmt.Sprintf("Promotion Decision: %s (Promoted=%v, Violations=%d)", winningStrategy, promoted, len(violations))

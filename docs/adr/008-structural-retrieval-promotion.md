@@ -1,7 +1,18 @@
 # ADR 008: Structural Retrieval Promotion Rule and Benchmark Evaluation
 
 ## Status
-Accepted and Implemented
+Accepted; historical promotion superseded by the current production state
+
+## Current production state (2026-10-04 follow-up)
+
+The original promotion conclusion below is a historical benchmark record.
+The current frozen evaluation does not pass all promotion gates. Production
+builds use `BM25` and actually execute Pure BM25; structural reranking requires
+an explicit `BM25_STRUCTURAL` build. Strategy, retrieval version and configuration
+are part of build identity and the artifact manifest strategy must match.
+See [current retrieval contract](../retrieval-eval.md). Promotion rules remain
+unchanged; future adoption requires a passing evaluation and an explicit
+production strategy/version change.
 
 ## Context
 Adding structural signals to BM25 must be proven superior on a frozen held-out test suite before being promoted to the production query path.

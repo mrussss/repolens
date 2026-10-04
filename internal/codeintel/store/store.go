@@ -411,7 +411,7 @@ func (s *GormStore) FinalizeLegacyCodeIndexSuccessWithRetrievalHandoff(ctx conte
 		if err := s.saveAnalysisResultTx(tx, buildID, res); err != nil {
 			return err
 		}
-		if _, _, err := s.getOrCreateRetrievalBuildTx(tx, buildID, "BM25", owned.ExecutionGeneration, time.Now().UTC()); err != nil {
+		if _, _, err := s.getOrCreateRetrievalBuildTx(tx, buildID, model.ProductionRetrievalStrategy, owned.ExecutionGeneration, time.Now().UTC()); err != nil {
 			return fmt.Errorf("create legacy RetrievalBuild handoff: %w", err)
 		}
 		return finalizeOwnedJob(tx, jobID, workerID, claimToken)
@@ -445,10 +445,10 @@ func (s *GormStore) FinalizeCodeIndexSuccessWithRevision(ctx context.Context, jo
 			retrievalBuild := &model.RetrievalBuild{
 				AnalysisRevisionID: revisionID,
 				CodeIndexBuildID:   buildID,
-				Strategy:           "BM25",
+				Strategy:           model.ProductionRetrievalStrategy,
 				RetrievalVersion:   model.CurrentRetrievalVersion,
 				TokenizerVersion:   model.CurrentTokenizerVersion,
-				ConfigHash:         "config-v2.2",
+				ConfigHash:         model.RetrievalConfigHash(model.ProductionRetrievalStrategy),
 				Status:             model.BuildStatusCreated,
 				CreatedAt:          now,
 			}
@@ -605,7 +605,7 @@ func (s *GormStore) ListRelatedTests(ctx context.Context, buildID int64, symbolK
 
 // RetrievalBuild implementation
 func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuildID int64, strategy string) (*model.RetrievalBuild, bool, error) {
-	const configHash = "config-v2.2"
+	configHash := model.RetrievalConfigHash(strategy)
 	var existing model.RetrievalBuild
 	err := s.db.WithContext(ctx).Where(
 		"code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?",
@@ -636,7 +636,7 @@ func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuil
 	var winner model.RetrievalBuild
 	lookupErr := s.db.WithContext(ctx).Where(
 		"code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?",
-		codeIndexBuildID, strategy, model.CurrentRetrievalVersion, model.CurrentTokenizerVersion, "config-v2.2",
+		codeIndexBuildID, strategy, model.CurrentRetrievalVersion, model.CurrentTokenizerVersion, configHash,
 	).First(&winner).Error
 	if lookupErr != nil {
 		return nil, false, err
@@ -648,7 +648,7 @@ func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuil
 }
 
 func (s *GormStore) getOrCreateRetrievalBuildTx(tx *gorm.DB, codeIndexBuildID int64, strategy string, generation int, createdAt time.Time) (*model.RetrievalBuild, bool, error) {
-	const configHash = "config-v2.2"
+	configHash := model.RetrievalConfigHash(strategy)
 	var build model.RetrievalBuild
 	err := tx.Where(
 		"code_index_build_id = ? AND strategy = ? AND retrieval_version = ? AND tokenizer_version = ? AND config_hash = ?",
@@ -667,7 +667,7 @@ func (s *GormStore) getOrCreateRetrievalBuildTx(tx *gorm.DB, codeIndexBuildID in
 }
 
 func (s *GormStore) createRetrievalBuildTx(tx *gorm.DB, codeIndexBuildID int64, strategy string, generation int, createdAt time.Time) (*model.RetrievalBuild, bool, error) {
-	const configHash = "config-v2.2"
+	configHash := model.RetrievalConfigHash(strategy)
 	var build model.RetrievalBuild
 	build = model.RetrievalBuild{
 		CodeIndexBuildID: codeIndexBuildID,

@@ -1,7 +1,18 @@
 # ADR 001: Retrieval Engine Architecture & Promotion Decision
 
 ## Status
-Accepted and Promoted to Production
+Accepted; historical promotion superseded by the current production state
+
+## Current production state (2026-10-04 follow-up)
+
+The original promotion conclusion below is a historical benchmark record.
+The current frozen evaluation does not pass all promotion gates. Production
+builds use `BM25` and actually execute Pure BM25; structural reranking requires
+an explicit `BM25_STRUCTURAL` build. Strategy, retrieval version and configuration
+are part of build identity and the artifact manifest strategy must match.
+See [current retrieval contract](../retrieval-eval.md). Promotion rules remain
+unchanged; future adoption requires a passing evaluation and an explicit
+production strategy/version change.
 
 ## Context
 RepoLens v1 relied on an external Elasticsearch 8 service and dense vector indexing with RRF fusion. In a single-tenant local-first developer tool, this incurred significant operational overhead (requiring heavy JVM containers, complex lifecycle management, and external cluster syncing) without providing syntax-aware code navigation.

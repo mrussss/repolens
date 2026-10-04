@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	codeintelmodel "repolens/internal/codeintel/model"
 )
 
 const (
@@ -37,7 +39,7 @@ type Config struct {
 	MaxOutputTokens         int
 	ReasoningEffort         string
 	ProviderSecretPath      string
-	RetrievalStrategy       string // "bm25", "symbol_bm25_structural"
+	RetrievalStrategy       string // Production default; execution uses pinned build metadata.
 }
 
 func Load() *Config {
@@ -71,7 +73,7 @@ func Load() *Config {
 		MaxOutputTokens:         getEnvPositiveInt("REPOLENS_MAX_OUTPUT_TOKENS", DefaultMaxOutputTokens),
 		ReasoningEffort:         strings.TrimSpace(getEnv("REPOLENS_REASONING_EFFORT", DefaultReasoningEffort)),
 		ProviderSecretPath:      getEnv("PROVIDER_SECRET_PATH", defaultProviderSecretPath()),
-		RetrievalStrategy:       getEnv("RETRIEVAL_STRATEGY", "symbol_bm25_structural"),
+		RetrievalStrategy:       codeintelmodel.ProductionRetrievalStrategy,
 	}
 }
 

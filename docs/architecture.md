@@ -13,7 +13,7 @@ graph TD
     Revision[AnalysisRevision\ncommit + pipeline fingerprint]
     Snapshot[Immutable Snapshot\nLocal Filesystem]
     CodeIndex[AST CodeIndex\nSymbols / Relations]
-    Retrieval[Pure Go BM25 +\nStructural Retrieval]
+    Retrieval[Pure Go BM25]
     Agent[Bounded Agent\n5 Read-only Tools]
     Citation[Citation Validator]
 
@@ -127,8 +127,8 @@ Evidence / Citation
 
 ### 2.5 Retrieval（`internal/retrieval`）
 
-- 当前生产路径是进程内的 Pure Go BM25 加 Structural Retrieval。
-- BM25 使用代码感知 tokenizer；Structural Retrieval 基于 CodeIndex 的 symbols、references 和 related tests 做确定性扩展与排序解释。
+- 当前生产路径是进程内的 Pure Go BM25，构建策略 `BM25` 实际执行 BM25。
+- BM25 使用代码感知 tokenizer；Structural Retrieval 当前未通过 promotion gate，只在显式 `BM25_STRUCTURAL` 实验构建中基于 CodeIndex 增强排序。
 - RetrievalBuild artifact 按 Snapshot、CodeIndexBuild、strategy 和版本固定，并通过 hash 与 READY lineage 校验后加载。
 - CodeIndexBuild 持久化文件/包/符号/关系完整度以及 `quality_warnings_json`；symlink、嵌套 module 和 type-check 不完整等情况作为质量数据展示，不静默伪装成完整分析。
 - Agent 启动前执行一次有界、确定性的 QueryBuilder 和初始检索，生成含源码 excerpt、行号、分数和召回原因的 Evidence Packet；完整 Error Log 不会直接作为检索 query。

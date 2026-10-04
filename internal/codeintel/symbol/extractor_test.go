@@ -37,7 +37,10 @@ func TestExtractSymbols_PreservesLongDocsWithoutEmbeddingThemInSignatures(t *tes
 		t.Fatalf("type signature includes its doc or is missing: %+v", box)
 	}
 	method := byName["Value"]
-	if method == nil || len(method.Doc) <= 65535 {
+	if method == nil {
+		t.Fatal("method symbol missing")
+	}
+	if len(method.Doc) <= 65535 {
 		t.Fatalf("method doc bytes=%d; want complete doc above TEXT capacity", len(method.Doc))
 	}
 	if !strings.Contains(method.Doc, "doc-row-0000") || !strings.Contains(method.Doc, "doc-row-0719") {
@@ -47,7 +50,10 @@ func TestExtractSymbols_PreservesLongDocsWithoutEmbeddingThemInSignatures(t *tes
 		t.Fatalf("method signature lost its receiver or includes documentation: %q", method.Signature)
 	}
 	function := byName["Identity"]
-	if function == nil || strings.Contains(function.Signature, "Generic documentation") || !strings.Contains(function.Signature, "Identity[T any](value T) T") {
+	if function == nil {
+		t.Fatal("generic function symbol missing")
+	}
+	if strings.Contains(function.Signature, "Generic documentation") || !strings.Contains(function.Signature, "Identity[T any](value T) T") {
 		t.Fatalf("generic function signature=%q", function.Signature)
 	}
 

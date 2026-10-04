@@ -34,6 +34,7 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisi
     const requestId = ++revisionRequestRef.current;
     let active = true;
     setRevisions([]);
+    setSelectedRevisionId('');
 
     if (!repoId) {
       setSelectedRevisionId('');

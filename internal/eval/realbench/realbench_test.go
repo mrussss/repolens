@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	codeintelmodel "repolens/internal/codeintel/model"
 	"strings"
 	"testing"
 
@@ -50,6 +51,10 @@ func TestSyntheticRunnerKeepsGroundTruthOutOfPrediction(t *testing.T) {
 	if result.Metrics.CompletedCases != 1 || result.Metrics.InfraErrors != 0 || result.Metrics.ProductFailures != 0 {
 		t.Fatalf("unexpected metrics: %+v", result.Metrics)
 	}
+	if result.Metadata.RetrievalStrategy != codeintelmodel.ProductionRetrievalStrategy {
+		t.Fatalf("RealBench metadata does not reflect production: %s", result.Metadata.RetrievalStrategy)
+	}
+
 	if result.Metadata.E2EStatus != e2eNotRequested || result.Cases[0].E2EStatus != e2eNotRequested {
 		t.Fatalf("unexpected not-requested E2E state: metadata=%s case=%s", result.Metadata.E2EStatus, result.Cases[0].E2EStatus)
 	}

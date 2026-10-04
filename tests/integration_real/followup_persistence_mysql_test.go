@@ -71,6 +71,13 @@ func TestRealMySQL_DiagnosisDescriptionRedactionCapacity(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("create with 65,536-byte description: created=%t err=%v", created, err)
 	}
+	var stored diagnosis.DiagnosisRun
+	if err := db.First(&stored, "id = ?", run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.IssueDescription != input.IssueDescription {
+		t.Fatal("MySQL description round trip changed accepted input")
+	}
 	if len(run.IssueDescription) != 65_536 {
 		t.Fatalf("stored description bytes=%d; want 65,536", len(run.IssueDescription))
 	}
@@ -116,6 +123,33 @@ func TestRealMySQL_DiagnosisDescriptionRedactionCapacity(t *testing.T) {
 	if _, _, err := service.Create(ctx, input); err != diagnosis.ErrInputTooLarge {
 		t.Fatalf("raw description above product limit error=%v; want ErrInputTooLarge", err)
 	}
+	input.IssueDescription = "normal description"
+	input.ErrorLog = strings.Repeat("x", diagnosis.MaxErrorLogBytes)
+	input.IdempotencyKey = "log-boundary"
+	logRun, _, err := service.Create(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored = diagnosis.DiagnosisRun{}
+	if err := db.First(&stored, "id = ?", logRun.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.ErrorLog != input.ErrorLog {
+		t.Fatal("accepted error log did not survive MySQL persistence")
+	}
+	input.IdempotencyKey = "log-expansion"
+	input.ErrorLog = strings.Repeat("Authorization: a x\n", 12000)
+	if len(input.ErrorLog) > diagnosis.MaxErrorLogBytes || len(diagnosis.RedactSecrets(input.ErrorLog)) <= diagnosis.MaxErrorLogBytes {
+		t.Fatal("log expansion fixture does not cross persisted boundary")
+	}
+	if _, _, err := service.Create(ctx, input); err != diagnosis.ErrInputTooLarge {
+		t.Fatalf("expanded log error=%v", err)
+	}
+	input.ErrorLog = strings.Repeat("x", diagnosis.MaxErrorLogBytes+1)
+	if _, _, err := service.Create(ctx, input); err != diagnosis.ErrInputTooLarge {
+		t.Fatalf("raw log error=%v", err)
+	}
+
 }
 
 func TestRealMySQL_LargeDocumentationCodeIndexReachesReady(t *testing.T) {
@@ -133,8 +167,10 @@ func TestRealMySQL_LargeDocumentationCodeIndexReachesReady(t *testing.T) {
 	}
 	var source strings.Builder
 	source.WriteString("package longdoc\n\n")
+	var expectedDoc strings.Builder
 	for i := 0; i < 720; i++ {
 		fmt.Fprintf(&source, "// doc-row-%04d %s\n", i, strings.Repeat("x", 96))
+		fmt.Fprintf(&expectedDoc, "doc-row-%04d %s\n", i, strings.Repeat("x", 96))
 	}
 	source.WriteString("func LongDocumented() string { return \"ready\" }\n")
 	if err := os.WriteFile(filepath.Join(sourceDir, "longdoc.go"), []byte(source.String()), 0o600); err != nil {
@@ -177,7 +213,7 @@ func TestRealMySQL_LargeDocumentationCodeIndexReachesReady(t *testing.T) {
 	if documented == nil || len(documented.Doc) <= 65_535 {
 		t.Fatalf("persisted long doc symbol=%+v; expected more than 65,535 bytes", documented)
 	}
-	if !strings.Contains(documented.Doc, "doc-row-0000") || !strings.Contains(documented.Doc, "doc-row-0719") {
+	if documented.Doc != expectedDoc.String() {
 		t.Fatal("MySQL did not preserve the complete 720-line documentation")
 	}
 	if strings.Contains(documented.Signature, "doc-row-") || documented.Signature != "func LongDocumented() string" {

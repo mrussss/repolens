@@ -149,6 +149,35 @@ describe('NewDiagnosisPage submission and revision ownership', () => {
     expect(container.querySelectorAll('select')[1].value).toBe('other-revision');
   });
 
+  it('clears loaded options immediately and never reapplies the initial revision after manual switching', async () => {
+    vi.spyOn(api, 'listAllRepositories').mockResolvedValue([
+      { id: 'repo-a', name: 'A', git_url: 'https://example.com/a' } as any,
+      { id: 'repo-b', name: 'B', git_url: 'https://example.com/b' } as any,
+    ]);
+    let resolveNext!: (value: AnalysisRevision[]) => void;
+    const revisions = vi.spyOn(api, 'listAnalysisRevisions')
+      .mockResolvedValueOnce([readyRevision('a-first', 'repo-a'), readyRevision('a-initial', 'repo-a')])
+      .mockImplementation(() => new Promise((resolve) => { resolveNext = resolve; }));
+    await act(async () => {
+      root.render(<NewDiagnosisPage initialRepoId="repo-a" initialRevisionId="a-initial" onDiagnosisCreated={() => undefined} />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const [repoSelect, revisionSelect] = [...container.querySelectorAll('select')];
+    expect(revisionSelect.value).toBe('a-initial');
+    expect(revisionSelect.options.length).toBe(3);
+    await act(async () => setInputValue(repoSelect, 'repo-b'));
+    expect(revisionSelect.value).toBe('');
+    expect([...revisionSelect.options].map((option) => option.value)).toEqual(['']);
+    await act(async () => { resolveNext([readyRevision('b-ready', 'repo-b')]); await Promise.resolve(); });
+    expect(revisionSelect.value).toBe('b-ready');
+    await act(async () => setInputValue(repoSelect, 'repo-a'));
+    expect(revisions).toHaveBeenLastCalledWith('repo-a');
+    expect(revisionSelect.value).toBe('');
+    await act(async () => { resolveNext([readyRevision('a-first', 'repo-a'), readyRevision('a-initial', 'repo-a')]); await Promise.resolve(); });
+    expect(revisionSelect.value).toBe('a-first');
+  });
+
   it('leaves revision selection empty when the current repository has no READY revision', async () => {
     vi.spyOn(api, 'listAllRepositories').mockResolvedValue([{ id: 'repo-a', name: 'A', git_url: 'https://example.com/a' } as any]);
     vi.spyOn(api, 'listAnalysisRevisions').mockResolvedValue([{ ...readyRevision('preparing', 'repo-a'), status: 'PREPARING' }]);

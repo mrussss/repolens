@@ -35,10 +35,10 @@ func ComputePipelineFingerprint() string {
 		SymbolSchemaVersion:  codeintelmodel.CurrentSymbolSchemaVersion,
 		RetrievalVersion:     codeintelmodel.CurrentRetrievalVersion,
 		TokenizerVersion:     codeintelmodel.CurrentTokenizerVersion,
-		RetrievalStrategy:    "symbol_bm25_structural",
+		RetrievalStrategy:    codeintelmodel.ProductionRetrievalStrategy,
 		BM25K1:               "1.2",
 		BM25B:                "0.75",
-		StructuralParameters: "symbol-expansion-v1",
+		StructuralParameters: "none",
 		FileFilterVersion:    "filter-v2.2",
 	}
 	raw, _ := json.Marshal(input)

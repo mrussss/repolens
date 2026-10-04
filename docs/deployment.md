@@ -36,3 +36,9 @@ network access:
 ```bash
 ./scripts/verify_codeintel_runtime.sh
 ```
+
+Production retrieval runs in-process Pure Go BM25. New production builds use
+`RetrievalBuild.Strategy=BM25`; the retriever executes that pinned strategy.
+Structural retrieval has not passed the current frozen promotion gate and is
+available only for explicit `BM25_STRUCTURAL` experimental builds. No external
+search cluster or embedding service is required. See [retrieval evaluation](retrieval-eval.md).

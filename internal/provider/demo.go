@@ -135,7 +135,7 @@ func (h *Handler) triggerRealDemo(c *gin.Context) {
 	}
 	build, _ = h.codeIntelStore.GetByID(ctx, build.ID)
 
-	retrievalBuild, _, err := h.codeIntelStore.GetOrCreateRetrievalBuild(ctx, build.ID, "symbol_bm25_structural")
+	retrievalBuild, _, err := h.codeIntelStore.GetOrCreateRetrievalBuild(ctx, build.ID, codeintelmodel.ProductionRetrievalStrategy)
 	if err != nil {
 		writeProviderInternalError(c, "DEMO_INITIALIZATION_FAILED", "failed to initialize demo", err)
 		return

@@ -2,6 +2,7 @@ package retrieval
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -14,12 +15,20 @@ import (
 	"repolens/internal/retrieval/structural"
 )
 
-// ProductionRetriever implements Retriever using the pure Go BM25 and Structural Code Intelligence engine.
+// ErrUnsupportedStrategy identifies an unsupported pinned build strategy.
+var ErrUnsupportedStrategy = errors.New("unsupported retrieval strategy")
+
+type indexCacheKey struct {
+	BuildID              int64
+	Path, Hash, Strategy string
+}
+
+// ProductionRetriever executes the strategy pinned by the retrieval build.
 type ProductionRetriever struct {
 	mu             sync.RWMutex
 	ciStore        codeintelstore.Store
 	baseStorageDir string
-	indexCache     map[int64]*bm25.Index
+	indexCache     map[indexCacheKey]*bm25.Index
 }
 
 // NewProductionRetriever constructs the production retrieval adapter.
@@ -27,7 +36,7 @@ func NewProductionRetriever(ciStore codeintelstore.Store, baseStorageDir string)
 	return &ProductionRetriever{
 		ciStore:        ciStore,
 		baseStorageDir: baseStorageDir,
-		indexCache:     make(map[int64]*bm25.Index),
+		indexCache:     make(map[indexCacheKey]*bm25.Index),
 	}
 }
 
@@ -59,9 +68,14 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 		return nil, fmt.Errorf("pinned code index build belongs to snapshot %s, not %s", cib.SnapshotID, req.SnapshotID)
 	}
 
+	if rb.Strategy != codeintelmodel.StrategyBM25 && rb.Strategy != codeintelmodel.StrategyBM25Structural {
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedStrategy, rb.Strategy)
+	}
+	cacheKey := indexCacheKey{rb.ID, rb.ArtifactPath, rb.ArtifactHash, rb.Strategy}
+
 	// 2. Load BM25 Index (with in-memory caching)
 	r.mu.RLock()
-	idx, exists := r.indexCache[rb.ID]
+	idx, exists := r.indexCache[cacheKey]
 	r.mu.RUnlock()
 
 	if !exists {
@@ -69,20 +83,28 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 		if artifactPath == "" {
 			artifactPath = filepath.Join(r.baseStorageDir, fmt.Sprintf("%d", rb.ID))
 		}
-		loaded, loadErr := artifact.LoadIndexVerified(artifactPath, rb.ID, rb.ArtifactHash)
+		loaded, loadErr := artifact.LoadIndexVerified(artifactPath, rb.ID, rb.ArtifactHash, rb.Strategy)
 		if loadErr != nil {
 			return nil, fmt.Errorf("failed loading retrieval artifact from %s: %w", artifactPath, loadErr)
 		}
 		r.mu.Lock()
-		r.indexCache[rb.ID] = loaded
+		r.indexCache[cacheKey] = loaded
 		idx = loaded
 		r.mu.Unlock()
 	}
 
-	// 3. Execute Structural Retrieval
+	// Execute exactly the pinned strategy with the requested result budget.
 	topK := req.TopK
 	if topK <= 0 {
 		topK = 20
+	}
+
+	if rb.Strategy == codeintelmodel.StrategyBM25 {
+		var results []SearchResult
+		for _, hit := range idx.Search(req.Query, topK) {
+			results = append(results, mapSearchResult(hit.Document, hit.Score, "symbol_bm25", "BM25", req.Query))
+		}
+		return results, nil
 	}
 
 	engine := structural.NewEngine(idx, r.ciStore, cib.ID)
@@ -95,25 +117,22 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 		if reason == "" {
 			reason = "BM25"
 		}
-		symbolKeys := []string(nil)
-		if sr.Document.SymbolKeyHash != "" {
-			symbolKeys = []string{sr.Document.SymbolKeyHash}
-		}
-		searchResults = append(searchResults, SearchResult{
-			ChunkID:         fmt.Sprintf("%s:%d-%d", sr.Document.FilePath, sr.Document.StartLine, sr.Document.EndLine),
-			Path:            sr.Document.FilePath,
-			Language:        "go",
-			Symbol:          sr.Document.SymbolName,
-			StartLine:       sr.Document.StartLine,
-			EndLine:         sr.Document.EndLine,
-			Snippet:         sr.Document.Content,
-			Score:           sr.FinalScore,
-			RetrievalSource: "symbol_bm25_structural",
-			MatchedTerms:    matchedTerms(req.Query, sr.Document.Content+" "+sr.Document.SymbolName+" "+sr.Document.FilePath),
-			SymbolKeys:      symbolKeys,
-			RetrievalReason: reason,
-		})
+		searchResults = append(searchResults, mapSearchResult(sr.Document, sr.FinalScore, "symbol_bm25_structural", reason, req.Query))
 	}
 
 	return searchResults, nil
+}
+
+func mapSearchResult(doc bm25.Document, score float64, source, reason, query string) SearchResult {
+	var keys []string
+	if doc.SymbolKeyHash != "" {
+		keys = []string{doc.SymbolKeyHash}
+	}
+	return SearchResult{
+		ChunkID: fmt.Sprintf("%s:%d-%d", doc.FilePath, doc.StartLine, doc.EndLine),
+		Path:    doc.FilePath, Language: "go", Symbol: doc.SymbolName,
+		StartLine: doc.StartLine, EndLine: doc.EndLine, Snippet: doc.Content,
+		Score: score, RetrievalSource: source, RetrievalReason: reason, SymbolKeys: keys,
+		MatchedTerms: matchedTerms(query, doc.Content+" "+doc.SymbolName+" "+doc.FilePath),
+	}
 }

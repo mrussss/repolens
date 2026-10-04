@@ -154,6 +154,12 @@ func TestFinalizerPreservesStageTransactionsAndClaimFencing(t *testing.T) {
 		t.Fatalf("created retrieval build = %+v err=%v", retrievalBuild, err)
 	}
 
+	if retrievalBuild.Strategy != codeintelmodel.StrategyBM25 ||
+		retrievalBuild.ConfigHash != codeintelmodel.RetrievalConfigHash(codeintelmodel.StrategyBM25) ||
+		retrievalBuild.RetrievalVersion != codeintelmodel.CurrentRetrievalVersion {
+		t.Fatalf("production finalizer created an inconsistent retrieval identity: %+v", retrievalBuild)
+	}
+
 	retrievalJob := claimFinalizerJob(t, ctx, jobStore, jobs.JobTypeBuildRetrieval)
 	if retrievalJob.ExecutionGeneration != 2 {
 		t.Fatalf("retrieval job generation = %d, want 2", retrievalJob.ExecutionGeneration)

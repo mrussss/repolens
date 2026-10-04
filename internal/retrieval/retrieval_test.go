@@ -295,6 +295,14 @@ func TestRetrievalJobHandlerIndexesSymbolSourceBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create retrieval build: %v", err)
 	}
+	// This fixture specifically exercises structural boosting. Select it
+	// explicitly on the build rather than relying on implicit production reranking.
+	if err := db.Model(rb).Updates(map[string]any{
+		"strategy":    codeintelmodel.StrategyBM25Structural,
+		"config_hash": codeintelmodel.RetrievalConfigHash(codeintelmodel.StrategyBM25Structural),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	handler := retrieval.NewRetrievalJobHandler(ciStore, storageDir).WithSnapshotSource(snapStore, storeFS)
 	if err := handler.Execute(ctx, &jobs.AnalysisJob{ResourceID: fmt.Sprintf("%d", rb.ID)}); !errors.Is(err, jobs.ErrOwnershipLost) {
 		t.Fatalf("unclaimed retrieval job error = %v, want ownership lost", err)
@@ -513,7 +521,7 @@ func TestProductionRetriever_SearchAndStructuralExpansion(t *testing.T) {
 	if results[0].Symbol != "ValidateToken" {
 		t.Errorf("expected symbol ValidateToken, got %s", results[0].Symbol)
 	}
-	if results[0].RetrievalSource != "symbol_bm25_structural" {
-		t.Errorf("expected source symbol_bm25_structural, got %s", results[0].RetrievalSource)
+	if results[0].RetrievalSource != "symbol_bm25" {
+		t.Errorf("expected source symbol_bm25, got %s", results[0].RetrievalSource)
 	}
 }

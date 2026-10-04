@@ -428,31 +428,42 @@ func TestMilestone6_PureGoBM25AndStructuralProductionRetriever(t *testing.T) {
 	idx.Build()
 
 	pub := artifact.NewPublisher(tempBase)
-	rb, _, _ := ciStore.GetOrCreateRetrievalBuild(ctx, cib.ID, "BM25")
-	finalPath, hash, _ := pub.Publish(rb.ID, 1, "tok", "BM25", idx)
-	_ = ciStore.MarkRetrievalBuilding(ctx, rb.ID)
-	_ = ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, hash, 1)
-
-	// Search via ProductionRetriever
 	prodRetriever := retrieval.NewProductionRetriever(ciStore, tempBase)
-	results, err := prodRetriever.Search(ctx, retrieval.SearchRequest{
-		SnapshotID: snapID, CodeIndexBuildID: cib.ID, RetrievalBuildID: rb.ID,
-		Query: "GenerateToken", TopK: 5,
-	})
-	if err != nil {
-		t.Fatalf("retrieval failed: %v", err)
+	for _, tc := range []struct{ strategy, source, reason string }{
+		{codeintelmodel.ProductionRetrievalStrategy, "symbol_bm25", "BM25"},
+		{codeintelmodel.StrategyBM25Structural, "symbol_bm25_structural", "EXACT_SYMBOL_MATCH"},
+	} {
+		t.Run(tc.strategy, func(t *testing.T) {
+			rb, _, err := ciStore.GetOrCreateRetrievalBuild(ctx, cib.ID, tc.strategy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			finalPath, hash, err := pub.Publish(rb.ID, 1, "tok", tc.strategy, idx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ciStore.MarkRetrievalBuilding(ctx, rb.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := ciStore.CompleteRetrievalBuild(ctx, rb.ID, finalPath, hash, 1); err != nil {
+				t.Fatal(err)
+			}
+			results, err := prodRetriever.Search(ctx, retrieval.SearchRequest{
+				SnapshotID: snapID, CodeIndexBuildID: cib.ID, RetrievalBuildID: rb.ID,
+				Query: "GenerateToken", TopK: 5,
+			})
+			if err != nil {
+				t.Fatalf("retrieval failed: %v", err)
+			}
+			if len(results) == 0 {
+				t.Fatal("expected non-empty search results")
+			}
+			if results[0].Path != "internal/auth/jwt.go" || results[0].RetrievalSource != tc.source || results[0].RetrievalReason != tc.reason {
+				t.Fatalf("wrong strategy result: %+v", results[0])
+			}
+		})
 	}
 
-	if len(results) == 0 {
-		t.Fatalf("expected non-empty search results from pure Go BM25 retriever")
-	}
-
-	if results[0].Path != "internal/auth/jwt.go" {
-		t.Errorf("expected top result internal/auth/jwt.go, got %s", results[0].Path)
-	}
-	if results[0].RetrievalSource != "symbol_bm25_structural" {
-		t.Errorf("expected source symbol_bm25_structural, got %s", results[0].RetrievalSource)
-	}
 }
 
 // 5. Test Application Retry on 429 Rate Limit
