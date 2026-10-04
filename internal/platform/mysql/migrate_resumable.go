@@ -369,6 +369,9 @@ func applyAlterDefault(ctx context.Context, conn *sql.Conn, version, table, clau
 
 func migrationLegacyColumnDefinition(version, table, name string) (migrationColumnDefinition, bool) {
 	legacy := map[string]string{
+		"019_v2_2_persisted_text_capacity.sql|diagnosis_runs|issue_description":            "TEXT NULL",
+		"019_v2_2_persisted_text_capacity.sql|symbols|signature":                           "TEXT NULL",
+		"019_v2_2_persisted_text_capacity.sql|symbols|doc":                                 "TEXT NULL",
 		"018_v2_2_report_capacity.sql|reports|findings_json":                               "TEXT NOT NULL",
 		"018_v2_2_report_capacity.sql|reports|recommended_checks_json":                     "TEXT NULL",
 		"018_v2_2_report_capacity.sql|reports|limitations_json":                            "TEXT NULL",

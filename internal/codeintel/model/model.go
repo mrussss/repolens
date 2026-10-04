@@ -126,8 +126,8 @@ type Symbol struct {
 	QualifiedName     string     `json:"qualified_name" gorm:"size:255;not null"`
 	ReceiverRaw       string     `json:"receiver_raw,omitempty" gorm:"size:128"`
 	ReceiverCanonical string     `json:"receiver_canonical,omitempty" gorm:"size:128"`
-	Signature         string     `json:"signature" gorm:"type:text"`
-	Doc               string     `json:"doc,omitempty" gorm:"type:text"`
+	Signature         string     `json:"signature" gorm:"type:mediumtext"`
+	Doc               string     `json:"doc,omitempty" gorm:"type:mediumtext"`
 	StartLine         int        `json:"start_line" gorm:"not null"`
 	StartCol          int        `json:"start_col" gorm:"not null"`
 	EndLine           int        `json:"end_line" gorm:"not null"`

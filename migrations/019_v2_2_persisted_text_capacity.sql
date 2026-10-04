@@ -1,0 +1,8 @@
+ALTER TABLE diagnosis_runs
+    MODIFY COLUMN issue_description MEDIUMTEXT NULL;
+
+ALTER TABLE symbols
+    MODIFY COLUMN signature MEDIUMTEXT NULL;
+
+ALTER TABLE symbols
+    MODIFY COLUMN doc MEDIUMTEXT NULL;

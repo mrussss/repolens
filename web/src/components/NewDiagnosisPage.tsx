@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
 import { AnalysisRevision, Repository } from '../types';
 import { Play } from 'lucide-react';
@@ -13,8 +13,11 @@ interface Props {
 export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisionId, onDiagnosisCreated }) => {
   const [repos, setRepos] = useState<Repository[]>([]);
   const [selectedRepoId, setSelectedRepoId] = useState(initialRepoId || '');
-  const [selectedRevisionId, setSelectedRevisionId] = useState(initialRevisionId || '');
+  const [selectedRevisionId, setSelectedRevisionId] = useState('');
   const [revisions, setRevisions] = useState<AnalysisRevision[]>([]);
+  const selectedRepoRef = useRef(selectedRepoId);
+  const revisionRequestRef = useRef(0);
+  const initialRevisionPendingRef = useRef(Boolean(initialRepoId && initialRevisionId));
   const [issueTitle, setIssueTitle] = useState('');
   const [issueDescription, setIssueDescription] = useState('');
   const [errorLog, setErrorLog] = useState('');
@@ -26,9 +29,45 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisi
   }, []);
 
   useEffect(() => {
-    if (!selectedRepoId) return;
-    loadRevisions(selectedRepoId);
-  }, [selectedRepoId]);
+    const repoId = selectedRepoId;
+    selectedRepoRef.current = repoId;
+    const requestId = ++revisionRequestRef.current;
+    let active = true;
+    setRevisions([]);
+
+    if (!repoId) {
+      setSelectedRevisionId('');
+      return () => {
+        active = false;
+      };
+    }
+
+    const mayUseInitialRevision = initialRevisionPendingRef.current && repoId === initialRepoId;
+    if (initialRevisionPendingRef.current && !mayUseInitialRevision) {
+      initialRevisionPendingRef.current = false;
+    }
+
+    api.listAnalysisRevisions(repoId).then((values) => {
+      if (!active || requestId !== revisionRequestRef.current || selectedRepoRef.current !== repoId) return;
+      const currentRepoRevisions = values.filter((revision) => revision.repository_id === repoId);
+      const initialRevision = mayUseInitialRevision
+        ? currentRepoRevisions.find((revision) => revision.id === initialRevisionId && revision.status === 'READY')
+        : undefined;
+      setRevisions(currentRepoRevisions);
+      setSelectedRevisionId(initialRevision?.id || currentRepoRevisions.find((revision) => revision.status === 'READY')?.id || '');
+      if (mayUseInitialRevision) initialRevisionPendingRef.current = false;
+    }).catch((err: any) => {
+      if (!active || requestId !== revisionRequestRef.current || selectedRepoRef.current !== repoId) return;
+      setRevisions([]);
+      setSelectedRevisionId('');
+      setError(err.message || '加载分析版本失败');
+    });
+
+    return () => {
+      active = false;
+      if (revisionRequestRef.current === requestId) revisionRequestRef.current++;
+    };
+  }, [selectedRepoId, initialRepoId, initialRevisionId]);
 
   const loadRepos = async () => {
     try {
@@ -39,18 +78,6 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisi
       }
     } catch (err: any) {
       setError(err.message || '加载仓库失败');
-    }
-  };
-
-  const loadRevisions = async (repoId: string) => {
-    try {
-      const values = await api.listAnalysisRevisions(repoId);
-      setRevisions(values);
-      if (!initialRevisionId && !selectedRevisionId) {
-        setSelectedRevisionId(values.find((revision) => revision.status === 'READY')?.id || '');
-      }
-    } catch (err: any) {
-      setError(err.message || '加载分析版本失败');
     }
   };
 
@@ -72,8 +99,8 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisi
     setLoading(true);
     setError(null);
     try {
-      const payloadFingerprint = JSON.stringify({ selectedRevisionId, issueTitle, issueDescription, errorLog });
-      const idempotencyKey = getStableDiagnosisIdempotencyKey(payloadFingerprint, sessionStorage, crypto.randomUUID);
+      const payloadFingerprint = JSON.stringify({ selectedRepoId, selectedRevisionId, issueTitle, issueDescription, errorLog });
+      const idempotencyKey = getStableDiagnosisIdempotencyKey(payloadFingerprint, sessionStorage, () => window.crypto.randomUUID());
       const res = await api.createDiagnosis({
         repository_id: selectedRepoId,
         analysis_revision_id: selectedRevisionId,
@@ -116,8 +143,13 @@ export const NewDiagnosisPage: React.FC<Props> = ({ initialRepoId, initialRevisi
               value={selectedRepoId}
               onChange={(e) => {
                 const repoId = e.target.value;
+                selectedRepoRef.current = repoId;
+                revisionRequestRef.current++;
+                initialRevisionPendingRef.current = false;
                 setSelectedRepoId(repoId);
                 setSelectedRevisionId('');
+                setRevisions([]);
+                setError(null);
               }}
               required
             >

@@ -19,11 +19,16 @@ import (
 var ErrInputTooLarge = errors.New("diagnosis input exceeds configured limit")
 var ErrRevisionNotReady = analysispipeline.ErrRevisionNotReady
 
+const (
+	MaxIssueDescriptionBytes = 64 * 1024
+	MaxErrorLogBytes         = 256 * 1024
+)
+
 func ValidateInput(input CreateDiagnosisInput) error {
 	if len(input.IssueTitle) == 0 || len(input.IssueTitle) > 255 {
 		return fmt.Errorf("issue_title must be between 1 and 255 bytes")
 	}
-	if len(input.IssueDescription) > 64*1024 || len(input.ErrorLog) > 256*1024 {
+	if len(input.IssueDescription) > MaxIssueDescriptionBytes || len(input.ErrorLog) > MaxErrorLogBytes {
 		return ErrInputTooLarge
 	}
 	if len(input.IdempotencyKey) > 128 {
@@ -121,6 +126,12 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 	if err := ValidateInput(input); err != nil {
 		return nil, false, err
 	}
+	cleanTitle := RedactSecrets(input.IssueTitle)
+	cleanDesc := RedactSecrets(input.IssueDescription)
+	cleanLog := RedactSecrets(input.ErrorLog)
+	if len(cleanTitle) > 255 || len(cleanDesc) > MaxIssueDescriptionBytes || len(cleanLog) > MaxErrorLogBytes {
+		return nil, false, ErrInputTooLarge
+	}
 	var selectedLineage analysispipeline.ResolvedLineage
 	if input.AnalysisRevisionID != "" {
 		repositoryID, revErr := s.lineage.RepositoryForRevision(ctx, input.AnalysisRevisionID)
@@ -190,9 +201,6 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		selectedLineage = lineage
 	}
 
-	cleanDesc := RedactSecrets(input.IssueDescription)
-	cleanLog := RedactSecrets(input.ErrorLog)
-
 	if metadata.MaxAgentRounds == 0 {
 		metadata.MaxAgentRounds = 8
 	}
@@ -245,7 +253,7 @@ func (s *Service) create(ctx context.Context, input CreateDiagnosisInput) (*Diag
 		SnapshotID:                  selectedLineage.SnapshotID,
 		CodeIndexBuildID:            selectedLineage.CodeIndexBuildID,
 		RetrievalBuildID:            selectedLineage.RetrievalBuildID,
-		IssueTitle:                  RedactSecrets(input.IssueTitle),
+		IssueTitle:                  cleanTitle,
 		IssueDescription:            cleanDesc,
 		ErrorLog:                    cleanLog,
 		Status:                      StatusQueued,

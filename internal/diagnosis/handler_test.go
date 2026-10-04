@@ -192,6 +192,55 @@ func TestDiagnosisCreateRejectsUnconfiguredProviderWithoutCreatingJob(t *testing
 	}
 }
 
+func TestDiagnosisCreateReturns413ForRawAndRedactedByteLimits(t *testing.T) {
+	db := newDiagnosisHandlerTestDB(t)
+	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))
+	router := diagnosisHandlerRouter(svc)
+
+	tests := []struct {
+		name        string
+		description string
+	}{
+		{name: "raw description exceeds byte limit", description: strings.Repeat("x", diagnosis.MaxIssueDescriptionBytes+1)},
+		{name: "redaction expansion exceeds persisted byte limit", description: strings.Repeat("Authorization: a x\n", 3000)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]interface{}{
+				"analysis_revision_id": "revision", "issue_title": "issue", "issue_description": test.description,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/diagnoses", bytes.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status=%d body=%s; want HTTP 413", response.Code, response.Body.String())
+			}
+			var payload map[string]interface{}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["code"] != "PAYLOAD_TOO_LARGE" {
+				t.Fatalf("response code=%v; want PAYLOAD_TOO_LARGE", payload["code"])
+			}
+		})
+	}
+
+	var runs, jobCount int64
+	if err := db.Model(&diagnosis.DiagnosisRun{}).Count(&runs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Count(&jobCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if runs != 0 || jobCount != 0 {
+		t.Fatalf("rejected descriptions wrote runs=%d jobs=%d", runs, jobCount)
+	}
+}
+
 func TestDiagnosisCreateRejectsIncompleteBuildSelection(t *testing.T) {
 	db := newDiagnosisHandlerTestDB(t)
 	svc := newDiagnosisTestService(db, diagnosis.NewStore(db), repo.NewStore(db), snapshot.NewStore(db))

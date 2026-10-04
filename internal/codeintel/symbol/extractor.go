@@ -70,10 +70,14 @@ func extractFuncDecl(fset *token.FileSet, decl *ast.FuncDecl, filePath, modulePa
 
 	// Signature
 	sigBuf := new(bytes.Buffer)
-	// Temporarily clear body for clean signature formatting
+	// Omit attached documentation and the body: a signature is only the
+	// declaration, and large comments must not inflate its persisted value.
+	origDoc := decl.Doc
 	origBody := decl.Body
+	decl.Doc = nil
 	decl.Body = nil
 	_ = format.Node(sigBuf, fset, decl)
+	decl.Doc = origDoc
 	decl.Body = origBody
 	sig := strings.TrimSpace(sigBuf.String())
 
@@ -161,7 +165,10 @@ func extractTypeSpec(fset *token.FileSet, decl *ast.GenDecl, typeSpec *ast.TypeS
 
 	// Format signature / type definition
 	typeBuf := new(bytes.Buffer)
+	origDoc := typeSpec.Doc
+	typeSpec.Doc = nil
 	_ = format.Node(typeBuf, fset, typeSpec)
+	typeSpec.Doc = origDoc
 	sig := strings.TrimSpace(typeBuf.String())
 
 	rawKey, hashKey := model.BuildSymbolKey(modulePath, packagePath, "", kind, name)

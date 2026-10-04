@@ -19,7 +19,7 @@ const (
 const (
 	CurrentParserVersion       = "v2.2.2"
 	CurrentAnalyzerVersion     = "v2.2.1"
-	CurrentSymbolSchemaVersion = "v2.1.0"
+	CurrentSymbolSchemaVersion = "v2.1.1"
 	CurrentRetrievalVersion    = "v2.2.0"
 	CurrentTokenizerVersion    = "v2.1.0"
 )

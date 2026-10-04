@@ -23,7 +23,7 @@ type DiagnosisRun struct {
 	CodeIndexBuildID            int64     `gorm:"not null;index" json:"code_index_build_id"`
 	RetrievalBuildID            int64     `gorm:"not null;index" json:"retrieval_build_id"`
 	IssueTitle                  string    `gorm:"size:255;not null" json:"issue_title"`
-	IssueDescription            string    `gorm:"type:text" json:"issue_description"`
+	IssueDescription            string    `gorm:"type:mediumtext" json:"issue_description"`
 	ErrorLog                    string    `gorm:"type:mediumtext" json:"error_log"`
 	Status                      RunStatus `gorm:"size:32;not null;default:'QUEUED';index" json:"status"`
 	CancelRequested             bool      `gorm:"default:false;not null" json:"cancel_requested"`
