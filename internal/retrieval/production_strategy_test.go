@@ -7,12 +7,66 @@ import (
 	"testing"
 
 	model "repolens/internal/codeintel/model"
+	"repolens/internal/jobs"
 	"repolens/internal/retrieval"
 	"repolens/internal/retrieval/artifact"
 	"repolens/internal/retrieval/bm25"
 	retrievaleval "repolens/internal/retrieval/eval"
 	"repolens/internal/retrieval/structural"
 )
+
+func TestGetOrCreateRetrievalBuildRejectsUnsupportedStrategyBeforeWriting(t *testing.T) {
+	db, _, store, _ := setupRetrievalDB(t)
+	ctx := context.Background()
+	codeBuild, _, err := store.GetOrCreateBuild(ctx, "strategy-validation-snapshot", "example.com/m", model.DefaultBuildContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(codeBuild).Update("status", model.BuildStatusReady).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	for _, strategy := range []string{model.StrategyBM25, model.StrategyBM25Structural} {
+		rb, created, err := store.GetOrCreateRetrievalBuild(ctx, codeBuild.ID, strategy)
+		if err != nil {
+			t.Fatalf("create %s build: %v", strategy, err)
+		}
+		if !created || rb.Strategy != strategy {
+			t.Fatalf("create %s build: build=%+v created=%v", strategy, rb, created)
+		}
+	}
+
+	var buildsBefore, jobsBefore int64
+	if err := db.Model(&model.RetrievalBuild{}).Where("code_index_build_id = ?", codeBuild.ID).Count(&buildsBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ?", jobs.JobTypeBuildRetrieval).Count(&jobsBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	if buildsBefore != 2 || jobsBefore != 2 {
+		t.Fatalf("valid strategies created builds=%d jobs=%d; want 2 each", buildsBefore, jobsBefore)
+	}
+
+	if _, _, err := store.GetOrCreateRetrievalBuild(ctx, codeBuild.ID, "FOO"); err == nil || !strings.Contains(err.Error(), "unsupported retrieval strategy") {
+		t.Fatalf("unsupported strategy error = %v", err)
+	}
+
+	var buildsAfter, jobsAfter, orphanJobs int64
+	if err := db.Model(&model.RetrievalBuild{}).Where("code_index_build_id = ?", codeBuild.ID).Count(&buildsAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ?", jobs.JobTypeBuildRetrieval).Count(&jobsAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&jobs.AnalysisJob{}).
+		Where("job_type = ? AND resource_id NOT IN (SELECT CAST(id AS TEXT) FROM retrieval_builds)", jobs.JobTypeBuildRetrieval).
+		Count(&orphanJobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if buildsAfter != buildsBefore || jobsAfter != jobsBefore || orphanJobs != 0 {
+		t.Fatalf("unsupported strategy changed storage: builds=%d (was %d), jobs=%d (was %d), orphan jobs=%d", buildsAfter, buildsBefore, jobsAfter, jobsBefore, orphanJobs)
+	}
+}
 
 func TestProductionRetrieverExecutesPinnedStrategy(t *testing.T) {
 	db, _, store, _ := setupRetrievalDB(t)

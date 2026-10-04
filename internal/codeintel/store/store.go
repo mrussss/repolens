@@ -605,6 +605,10 @@ func (s *GormStore) ListRelatedTests(ctx context.Context, buildID int64, symbolK
 
 // RetrievalBuild implementation
 func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuildID int64, strategy string) (*model.RetrievalBuild, bool, error) {
+	if strategy != model.StrategyBM25 && strategy != model.StrategyBM25Structural {
+		return nil, false, fmt.Errorf("unsupported retrieval strategy %q", strategy)
+	}
+
 	configHash := model.RetrievalConfigHash(strategy)
 	var existing model.RetrievalBuild
 	err := s.db.WithContext(ctx).Where(
