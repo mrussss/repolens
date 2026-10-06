@@ -45,3 +45,42 @@ go run ./cmd/realbench run --dataset v2 --all
 不传 `--dataset` 仍运行 v1，保持既有命令兼容。v2 离线 baseline 和真实 Provider E2E 证据分别见 [`../history/benchmarks/realbench/v2-baseline.md`](../history/benchmarks/realbench/v2-baseline.md) 与 [`../history/benchmarks/realbench/v2-agent-e2e.md`](../history/benchmarks/realbench/v2-agent-e2e.md)。
 
 `realbench-v1` 是第一版 pilot external benchmark，由 3 个真实 Go 项目历史 Bug 组成，用于验证完整外部评测链路，不代表大规模真实世界泛化结论；v2 同样是小规模外部历史 Bug 证据，不是 production accuracy 声明。
+
+## Production-consistent paired retrieval
+
+```bash
+go run ./cmd/realbench validate --dataset v2
+go run ./cmd/realbench compare-retrieval --dataset v2 --all
+go run ./cmd/realbench compare-retrieval --dataset v2 --case REAL-004
+```
+
+支持已有 `--data`、`--cache`、`--artifacts`；无需 Provider，不运行 LLM 或 Agent。
+既有 `validate`、`run` 命令与其 Top10/full-input query 契约保留。
+索引文档现在统一复用生产 Symbol builder，包含 pinned Snapshot 的源码正文。
+
+每 case 使用 exact buggy commit、独立 Snapshot、一次 CodeIndex 分析；两个
+RetrievalBuild 共享 CodeIndexBuild、版本和文档，分别固定 BM25 与 BM25_STRUCTURAL
+及各自 ConfigHash、manifest strategy。相同 index bytes 的 ArtifactHash 相同。
+两边均执行 ProductionRetriever.Search，覆盖 build pinning、artifact 校验、strategy dispatch
+及真实 CodeIntel store / related-test 查询。Query 复用生产 BuildQuery，TopK 固定 8。
+
+指标只使用 PrimaryFiles：Recall@8 对路径 normalize 后去重，按 case 平均；
+RR 使用首个命中的 Symbol 结果排名，MRR 按 case 平均。SupportingFiles 仅展示。
+better/equal/worse 先比较 Recall@8，再比较 RR。ground truth 在预测结果落盘后读取。
+
+每次 run 写入：
+
+- `retrieval_compare.json`：逐 case identity、构建、query、原始 Top8、耗时、ground truth、指标及差值。
+- `retrieval_compare_metrics.json`：完成/失败数、聚合指标及 paired case 列表。
+- `retrieval_compare_report.md`：汇总与可读 Top8 对照。
+- `cases/REAL-NNN/retrieval_compare_prediction.json`：评分前的无标签预测。
+
+聚合只使用完整 pairs，明确报告分母；失败 case 保留 status / error_class / error，
+全失败不生成虚假的零分聚合。失败分类为 EXTERNAL_INFRA 或 REPOLENS_PRODUCT；
+有未完成 case 时 CLI 返回非零 exit status，结果仍写入 artifacts。
+
+Latency 为一次 ProductionRetriever.Search 的 wall clock 毫秒，保留浮点精度，
+包含冷 artifact 加载，不含分析/建索引；按 case 交替先搜索策略。p50/p95 使用排序后
+线性插值。它反映本次机器和缓存条件，只用于观察，无 promotion gate。
+本轮不调整 Structural 算法，也不改变 BM25 production default。
+旧 `cmd/eval` 只作为 legacy/synthetic regression，不能替代该生产语义对照。

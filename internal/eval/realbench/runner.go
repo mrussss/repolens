@@ -34,7 +34,6 @@ import (
 	"repolens/internal/provider"
 	"repolens/internal/retrieval"
 	"repolens/internal/retrieval/artifact"
-	"repolens/internal/retrieval/bm25"
 	"repolens/internal/trace"
 )
 
@@ -568,6 +567,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (*RunResult, error) {
 
 type productionWorkspace struct {
 	Retriever         *retrieval.ProductionRetriever
+	CodeIndexBuild    *codeintelmodel.CodeIndexBuild
+	RetrievalBuilds   map[string]*codeintelmodel.RetrievalBuild
 	CodeIndexBuildID  int64
 	RetrievalBuildID  int64
 	SnapshotStore     snapshotstore.SnapshotStore
@@ -586,7 +587,7 @@ func (w *productionWorkspace) Close() {
 	}
 }
 
-func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, cacheDir, artifactDir string, fetcher SnapshotFetcher) (*productionWorkspace, error) {
+func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, cacheDir, artifactDir string, fetcher SnapshotFetcher, strategies ...string) (*productionWorkspace, error) {
 	snapshotStore := snapshotstore.NewLocalSnapshotStore(cacheDir)
 	sourceDir := snapshotStore.GetSourcePath(input.CaseID, snapshotID)
 	if err := fetcher.Fetch(ctx, input, sourceDir); err != nil {
@@ -598,6 +599,14 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 	if err != nil {
 		return nil, productFailure("open benchmark state database", err)
 	}
+	prepared := false
+	defer func() {
+		if !prepared {
+			if sqlDB, err := db.DB(); err == nil {
+				_ = sqlDB.Close()
+			}
+		}
+	}()
 	if err := mysql.AutoMigrate(db); err != nil {
 		return nil, productFailure("migrate benchmark state database", err)
 	}
@@ -608,7 +617,7 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 		return nil, productFailure("CodeIndex analysis", err)
 	}
 	build := &codeintelmodel.CodeIndexBuild{
-		SnapshotID:          input.CaseID,
+		SnapshotID:          snapshotID,
 		ParserVersion:       codeintelmodel.CurrentParserVersion,
 		AnalyzerVersion:     codeintelmodel.CurrentAnalyzerVersion,
 		SymbolSchemaVersion: codeintelmodel.CurrentSymbolSchemaVersion,
@@ -627,47 +636,59 @@ func prepareProductionWorkspace(ctx context.Context, input Input, snapshotID, ca
 		return nil, productFailure("save CodeIndex", err)
 	}
 
-	retrievalBuild := &codeintelmodel.RetrievalBuild{
-		CodeIndexBuildID: build.ID,
-		Strategy:         productionStrategy,
-		RetrievalVersion: codeintelmodel.CurrentRetrievalVersion,
-		TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
-		ConfigHash:       codeintelmodel.RetrievalConfigHash(productionStrategy),
-		Status:           codeintelmodel.BuildStatusCreated,
-		CreatedAt:        time.Now().UTC(),
-	}
-	if err := db.Create(retrievalBuild).Error; err != nil {
-		return nil, productFailure("create RetrievalBuild", err)
-	}
-	if err := ciStore.MarkRetrievalBuilding(ctx, retrievalBuild.ID); err != nil {
-		return nil, productFailure("mark RetrievalBuild building", err)
-	}
-	idx := bm25.NewIndex(1.2, 0.75)
-	for _, symbol := range analysis.Symbols {
-		content := fmt.Sprintf("%s %s %s %s %s", symbol.Name, symbol.QualifiedName, symbol.ReceiverCanonical, symbol.Signature, symbol.Doc)
-		idx.AddDocument(bm25.Document{
-			FilePath:      symbol.FilePath,
-			StartLine:     symbol.StartLine,
-			EndLine:       symbol.EndLine,
-			Content:       content,
-			SymbolKeyHash: symbol.SymbolKeyHash,
-			SymbolName:    symbol.Name,
-			Kind:          string(symbol.Kind),
-		})
-	}
-	idx.Build()
-	indexRoot := filepath.Join(artifactDir, "indexes")
-	artifactPath, artifactHash, err := artifact.NewPublisher(indexRoot).Publish(retrievalBuild.ID, 1, "realbench", productionStrategy, idx)
+	symbols, err := ciStore.ListAllSymbols(ctx, build.ID)
 	if err != nil {
-		return nil, productFailure("publish Retrieval artifact", err)
+		return nil, productFailure("list indexed symbols", err)
 	}
-	if err := ciStore.CompleteRetrievalBuild(ctx, retrievalBuild.ID, artifactPath, artifactHash, idx.TotalDocs); err != nil {
-		return nil, productFailure("finalize RetrievalBuild", err)
+	idx, err := retrieval.BuildSymbolIndex(ctx, symbols, &retrieval.SymbolIndexSource{
+		Store: snapshotStore, RepositoryID: input.CaseID, SnapshotID: snapshotID,
+	})
+	if err != nil {
+		return nil, productFailure("build Symbol retrieval index", err)
 	}
+	if len(strategies) == 0 {
+		strategies = []string{productionStrategy}
+	}
+	indexRoot := filepath.Join(artifactDir, "indexes")
+	builds := make(map[string]*codeintelmodel.RetrievalBuild, len(strategies))
+	for _, strategy := range strategies {
+		retrievalBuild := &codeintelmodel.RetrievalBuild{
+			CodeIndexBuildID: build.ID, Strategy: strategy,
+			RetrievalVersion: codeintelmodel.CurrentRetrievalVersion,
+			TokenizerVersion: codeintelmodel.CurrentTokenizerVersion,
+			ConfigHash:       codeintelmodel.RetrievalConfigHash(strategy),
+			Status:           codeintelmodel.BuildStatusCreated, CreatedAt: time.Now().UTC(),
+		}
+		if err := db.Create(retrievalBuild).Error; err != nil {
+			return nil, productFailure("create RetrievalBuild", err)
+		}
+		if err := ciStore.MarkRetrievalBuilding(ctx, retrievalBuild.ID); err != nil {
+			return nil, productFailure("mark RetrievalBuild building", err)
+		}
+		artifactPath, artifactHash, err := artifact.NewPublisher(indexRoot).Publish(retrievalBuild.ID, 1, "realbench", strategy, idx)
+		if err != nil {
+			return nil, productFailure("publish Retrieval artifact", err)
+		}
+		if err := ciStore.CompleteRetrievalBuild(ctx, retrievalBuild.ID, artifactPath, artifactHash, idx.TotalDocs); err != nil {
+			return nil, productFailure("finalize RetrievalBuild", err)
+		}
+		builds[strategy], err = ciStore.GetRetrievalBuildByID(ctx, retrievalBuild.ID)
+		if err != nil {
+			return nil, productFailure("read ready RetrievalBuild", err)
+		}
+	}
+	build, err = ciStore.GetByID(ctx, build.ID)
+	if err != nil {
+		return nil, productFailure("read ready CodeIndexBuild", err)
+	}
+
+	prepared = true
 	return &productionWorkspace{
 		Retriever:         retrieval.NewProductionRetriever(ciStore, indexRoot),
 		CodeIndexBuildID:  build.ID,
-		RetrievalBuildID:  retrievalBuild.ID,
+		RetrievalBuildID:  builds[strategies[0]].ID,
+		CodeIndexBuild:    build,
+		RetrievalBuilds:   builds,
 		SnapshotStore:     snapshotStore,
 		CodeIndexStore:    ciStore,
 		Quality:           analysis.Quality,

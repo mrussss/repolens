@@ -2,6 +2,24 @@ package main
 
 import "testing"
 
+func TestComparisonCaseSelection(t *testing.T) {
+	for _, tc := range []struct {
+		id    string
+		all   bool
+		valid bool
+	}{
+		{"", true, true}, {" REAL-004 ", false, true}, {"", false, false}, {"REAL-004", true, false}, {" ", false, false},
+	} {
+		ids, err := comparisonCaseIDs(tc.id, tc.all)
+		if (err == nil) != tc.valid {
+			t.Fatalf("selection(%q,%t): %v", tc.id, tc.all, err)
+		}
+		if tc.valid && !tc.all && (len(ids) != 1 || ids[0] != "REAL-004") {
+			t.Fatalf("wrong case IDs: %v", ids)
+		}
+	}
+}
+
 func TestResolveDatasetRoot(t *testing.T) {
 	tests := []struct {
 		version string

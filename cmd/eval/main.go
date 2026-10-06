@@ -116,7 +116,7 @@ func main() {
 		runE2E.RetrievalStrategy = "AGENT_5_TOOLS"
 	}
 
-	// 3. Four-Track Promotion Rule Benchmark Evaluation (ADR 008)
+	// 3. Legacy synthetic regression gate (not production promotion evidence).
 	var testCases []retrievaleval.TestCase
 	for _, c := range heldoutCases {
 		testCases = append(testCases, retrievaleval.TestCase{
@@ -141,9 +141,10 @@ func main() {
 	promoRes := retrievaleval.CheckPromotionRule(cMetrics, dMetrics)
 
 	eval.PrintComparisonTable([]*eval.EvalRun{runBM25, runE2E})
-	fmt.Printf("\n%s\n", promoRes.Summary)
+	fmt.Println("Legacy synthetic evaluation; not authoritative for production BM25_STRUCTURAL promotion. Use realbench compare-retrieval for production-consistent retrieval results.")
+	fmt.Printf("\nLegacy synthetic %s\n", promoRes.Summary)
 	for _, violation := range promoRes.RuleViolations {
-		fmt.Printf("Promotion gate: %s\n", violation)
+		fmt.Printf("Legacy synthetic gate: %s\n", violation)
 	}
 	fmt.Printf("Configured production build strategy: %s (execution follows pinned RetrievalBuild.Strategy).\n", codeintelmodel.ProductionRetrievalStrategy)
 	if !promoRes.PromotedToProduction {

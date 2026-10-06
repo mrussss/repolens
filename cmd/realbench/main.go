@@ -24,6 +24,8 @@ func main() {
 		runValidate(os.Args[2:])
 	case "run":
 		runBenchmark(os.Args[2:])
+	case "compare-retrieval":
+		runRetrievalComparison(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -96,6 +98,63 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: realbench validate [--dataset v1|v2] [--data ...]")
 	fmt.Fprintln(os.Stderr, "       realbench run --dataset v1|v2 --case REAL-NNN [--data ...] [--e2e]")
 	fmt.Fprintln(os.Stderr, "       realbench run --dataset v1|v2 --all [--data ...] [--e2e]")
+	fmt.Fprintln(os.Stderr, "       realbench compare-retrieval --dataset v2 (--all | --case REAL-NNN) [--data ...] [--cache ...] [--artifacts ...]")
+}
+
+func runRetrievalComparison(args []string) {
+	flags := flag.NewFlagSet("compare-retrieval", flag.ExitOnError)
+	datasetVersion := flags.String("dataset", "v2", "RealBench dataset version: v1 or v2")
+	dataRoot := flags.String("data", "", "RealBench dataset root (overrides --dataset)")
+	cacheRoot := flags.String("cache", ".cache/realbench", "checkout cache root")
+	artifactRoot := flags.String("artifacts", "artifacts/realbench", "benchmark artifact root")
+	caseID := flags.String("case", "", "run one case, for example REAL-004")
+	all := flags.Bool("all", false, "run every case in the manifest")
+	_ = flags.Parse(args)
+	caseIDs, err := comparisonCaseIDs(*caseID, *all)
+	if err != nil {
+		fatal(err)
+	}
+	root, err := resolveDatasetRoot(*datasetVersion, *dataRoot)
+	if err != nil {
+		fatal(err)
+	}
+	dataset, err := realbench.LoadInputs(root)
+	if err != nil {
+		fatal(err)
+	}
+	result, err := realbench.NewRunner(dataset).CompareRetrieval(context.Background(), realbench.RunOptions{
+		CaseIDs: caseIDs, CacheDir: *cacheRoot, ArtifactRoot: *artifactRoot,
+	})
+	if err != nil {
+		fatal(err)
+	}
+	m := result.Metrics
+	fmt.Printf("run: %s\ntotal=%d completed=%d infra_errors=%d product_failures=%d better=%d equal=%d worse=%d\n",
+		result.RunDir, m.TotalCases, m.CompletedCases, m.InfraErrors, m.ProductFailures, len(m.BetterCases), len(m.EqualCases), len(m.WorseCases))
+	for i, s := range []*realbench.ComparisonAggregate{m.BM25, m.Structural} {
+		if s == nil {
+			continue
+		}
+		name := "BM25"
+		if i == 1 {
+			name = "BM25_STRUCTURAL"
+		}
+		fmt.Printf("%s recall@8=%.6f mrr=%.6f p50_ms=%.6f p95_ms=%.6f\n", name, s.MeanRecallAt8, s.MRR, s.LatencyP50MS, s.LatencyP95MS)
+	}
+	if m.CompletedCases != m.TotalCases {
+		fatal(fmt.Errorf("incomplete comparison; inspect %s", filepath.Join(result.RunDir, "retrieval_compare_report.md")))
+	}
+}
+
+func comparisonCaseIDs(caseID string, all bool) ([]string, error) {
+	caseID = strings.TrimSpace(caseID)
+	if (caseID == "") == !all {
+		return nil, fmt.Errorf("choose exactly one of --case REAL-NNN or --all")
+	}
+	if caseID == "" {
+		return nil, nil
+	}
+	return []string{caseID}, nil
 }
 
 func resolveDatasetRoot(version, explicitRoot string) (string, error) {

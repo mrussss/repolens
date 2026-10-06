@@ -9,12 +9,12 @@ Pure Go BM25 (RetrievalBuild.Strategy = BM25)
 ```
 
 - **Pure Go BM25**：进程内运行，使用代码感知 tokenizer 对文件、符号和路径进行确定性 lexical ranking；不依赖外部搜索集群或 embedding 服务。
-- **Structural Retrieval（实验）**：冻结 promotion gate 当前未通过；只在显式 `BM25_STRUCTURAL` 构建上执行，默认生产请求不进行结构化扩展或 rerank。
+- **Structural Retrieval（实验）**：旧 synthetic gate 当前未通过（不代表完整生产 Structural 的质量结论）；只在显式 `BM25_STRUCTURAL` 构建上执行，默认生产请求不进行结构化扩展或 rerank。
 - **版本与 lineage**：RetrievalBuild 固定 `Snapshot → CodeIndexBuild → RetrievalBuild` 链路，artifact 发布后通过 hash 和 READY 状态校验。
 - **Initial Retrieval**：Agent 启动前由确定性的 QueryBuilder 从标题、少量描述关键词和错误堆栈中的包/文件/函数/符号提取 query，再以固定 Top-K 和总字节预算生成 Evidence Packet。完整 Error Log 不会原样拼进 BM25 query。
 - **Evidence Packet**：候选至少包含仓库相对路径、起止行、源码 excerpt、检索分数和 `BM25` 原因；重复或高度重叠候选去重后才进入 Agent。
 
-BM25 是稳定、可复现的生产基线；Structural Retrieval 按冻结的 held-out benchmark 规则评估，只有满足 promotion gate 才能改变生产策略。
+BM25 是稳定、可复现的生产基线；生产语义对照使用 RealBench paired retrieval；本轮仅观察指标，不执行 promotion。正式晋升仍需要后续独立验收。
 
 ## 2. 历史方案与实验方向
 
@@ -47,7 +47,7 @@ BM25 是稳定、可复现的生产基线；Structural Retrieval 按冻结的 he
 
 评测必须在同一 immutable Snapshot 和固定 CodeIndexBuild 上比较 BM25 与 Structural Retrieval，避免源码、索引版本或 lineage 漂移影响结论。
 
-策略准入的 `Hit@1`、`Hit@5` 和 MRR 共享一个 relevance 契约：结果的符号精确匹配
+旧 synthetic regression 的 `Hit@1`、`Hit@5` 和 MRR 共享一个 relevance 契约：结果的符号精确匹配
 `ExpectedSymbol`，或文件精确匹配任意 `ExpectedFiles`，即为 relevant。
 两类 ground truth 同时存在时，它们表示可接受的相关证据目标，采用 OR 语义。
 最早的真实结果排名决定 Hit@K 和倒数排名；没有命中时均为零。
@@ -69,6 +69,9 @@ BM25 k1=1.2、b=0.75 和对应结构参数。Pipeline fingerprint 的生产策�
 Artifact manifest 固定 build ID、strategy 和 index hash；build ID 关联其完整版本身份。
 历史 READY 构建保持原有 pinned identity，标记 BM25 的构建现在实际执行 BM25。
 
-`go run ./cmd/eval` 重新计算冻结准入规则，不硬编码 promotion。
-未通过时保留 BM25；未来准入通过后仍需显式变更生产策略和版本并通过回归验收。
+`go run ./cmd/eval` 保留旧 synthetic regression 与 `CheckPromotionRule`，不硬编码结果；
+该 gate 不是 BM25_STRUCTURAL production promotion 的最终权威评测。
+`go run ./cmd/realbench compare-retrieval --dataset v2 --all` 通过 ProductionRetriever
+对照单 Snapshot 的两种 pinned strategy，使用 BuildQuery、TopK=8、PrimaryFiles、Recall@8/MRR。
+详见 [RealBench 使用说明](realbench/README.md)。本轮不建立新 promotion gate，生产默认仍为 BM25。
 ADR 001/008 的早期 promotion 记录属于历史结论，本页定义当前生产状态。
