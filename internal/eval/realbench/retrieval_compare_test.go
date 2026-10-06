@@ -31,7 +31,10 @@ func TestPairedRetrievalUsesProductionBuildsAndArtifacts(t *testing.T) {
 	runner := NewRunner(dataset)
 	runner.Fetcher = fetcher
 	// Provider configuration must have no bearing on this path.
-	t.Setenv("REPOLENS_LLM_BASE_URL", "http://127.0.0.1:1")
+	t.Setenv("REPOLENS_REALBENCH_PROVIDER", "openai")
+	t.Setenv("REPOLENS_REALBENCH_API_KEY", "test-no-network")
+	t.Setenv("REPOLENS_REALBENCH_MODEL", "test-model")
+	t.Setenv("REPOLENS_REALBENCH_BASE_URL", "http://127.0.0.1:1")
 	result, err := runner.CompareRetrieval(context.Background(), RunOptions{CacheDir: t.TempDir(), ArtifactRoot: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
