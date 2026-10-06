@@ -40,6 +40,7 @@ type Store interface {
 	GetSymbolByHash(ctx context.Context, buildID int64, symbolKeyHash string) (*model.Symbol, error)
 	ListRelationsForSymbol(ctx context.Context, buildID int64, symbolID int64) ([]*model.SymbolRelation, error)
 	ListRelatedTests(ctx context.Context, buildID int64, symbolKeyHash string) ([]*model.SymbolRelation, error)
+	ListStructuralExpansionCandidates(ctx context.Context, buildID int64, seedHash string) (model.StructuralExpansionCandidates, error)
 
 	// RetrievalBuild methods
 	GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuildID int64, strategy string) (*model.RetrievalBuild, bool, error)
@@ -605,7 +606,7 @@ func (s *GormStore) ListRelatedTests(ctx context.Context, buildID int64, symbolK
 
 // RetrievalBuild implementation
 func (s *GormStore) GetOrCreateRetrievalBuild(ctx context.Context, codeIndexBuildID int64, strategy string) (*model.RetrievalBuild, bool, error) {
-	if strategy != model.StrategyBM25 && strategy != model.StrategyBM25Structural {
+	if strategy != model.StrategyBM25 && strategy != model.StrategyBM25Structural && strategy != model.StrategyBM25StructuralV2 {
 		return nil, false, fmt.Errorf("unsupported retrieval strategy %q", strategy)
 	}
 

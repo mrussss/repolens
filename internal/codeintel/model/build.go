@@ -92,12 +92,19 @@ func (RetrievalBuild) TableName() string {
 const (
 	StrategyBM25                = "BM25"
 	StrategyBM25Structural      = "BM25_STRUCTURAL"
+	StrategyBM25StructuralV2    = "BM25_STRUCTURAL_V2"
 	ProductionRetrievalStrategy = StrategyBM25
 )
 
 // RetrievalConfigHash captures ranking parameters as well as the strategy.
 // The build's version and tokenizer version are separate identity columns.
 func RetrievalConfigHash(strategy string) string {
+	if strategy == StrategyBM25StructuralV2 {
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf(
+			"%s|k1=1.2|b=0.75|structural=semantic-onehop-v2|base=2*topK|seeds=%d|per_seed=%d|max_expanded=%d|depth=%d|min_confidence=%.2f|rows_per_direction=%d|call=forward-semantic|test=reverse-direct-semantic|order=effective-rank,base-first,call-first,seed-rank,symbol-hash|targets=hash-asc,confidence-desc,reason-asc|base-neighbors=skip",
+			strategy, StructuralV2SeedBudget, StructuralV2PerSeedBudget, StructuralV2ExpansionBudget,
+			StructuralV2Depth, StructuralV2MinConfidence, StructuralV2RelationLimit))))
+	}
 	structural := "none"
 	if strategy == StrategyBM25Structural {
 		structural = "symbol-expansion-v1"

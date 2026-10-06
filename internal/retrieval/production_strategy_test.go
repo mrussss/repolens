@@ -26,7 +26,7 @@ func TestGetOrCreateRetrievalBuildRejectsUnsupportedStrategyBeforeWriting(t *tes
 		t.Fatal(err)
 	}
 
-	for _, strategy := range []string{model.StrategyBM25, model.StrategyBM25Structural} {
+	for _, strategy := range []string{model.StrategyBM25, model.StrategyBM25Structural, model.StrategyBM25StructuralV2} {
 		rb, created, err := store.GetOrCreateRetrievalBuild(ctx, codeBuild.ID, strategy)
 		if err != nil {
 			t.Fatalf("create %s build: %v", strategy, err)
@@ -43,8 +43,8 @@ func TestGetOrCreateRetrievalBuildRejectsUnsupportedStrategyBeforeWriting(t *tes
 	if err := db.Model(&jobs.AnalysisJob{}).Where("job_type = ?", jobs.JobTypeBuildRetrieval).Count(&jobsBefore).Error; err != nil {
 		t.Fatal(err)
 	}
-	if buildsBefore != 2 || jobsBefore != 2 {
-		t.Fatalf("valid strategies created builds=%d jobs=%d; want 2 each", buildsBefore, jobsBefore)
+	if buildsBefore != 3 || jobsBefore != 3 {
+		t.Fatalf("valid strategies created builds=%d jobs=%d; want 3 each", buildsBefore, jobsBefore)
 	}
 
 	if _, _, err := store.GetOrCreateRetrievalBuild(ctx, codeBuild.ID, "FOO"); err == nil || !strings.Contains(err.Error(), "unsupported retrieval strategy") {
@@ -97,7 +97,7 @@ func TestProductionRetrieverExecutesPinnedStrategy(t *testing.T) {
 	retriever := retrieval.NewProductionRetriever(store, root)
 	var previousID int64
 	var previousHash string
-	for _, tc := range []struct{ strategy, path, source string }{{model.ProductionRetrievalStrategy, "a.go", "symbol_bm25"}, {model.StrategyBM25Structural, "b.go", "symbol_bm25_structural"}} {
+	for _, tc := range []struct{ strategy, path, source string }{{model.ProductionRetrievalStrategy, "a.go", "symbol_bm25"}, {model.StrategyBM25Structural, "b.go", "symbol_bm25_structural"}, {model.StrategyBM25StructuralV2, "a.go", "symbol_bm25_structural_v2"}} {
 		t.Run(tc.strategy, func(t *testing.T) {
 			rb, _, err := store.GetOrCreateRetrievalBuild(ctx, cib.ID, tc.strategy)
 			if err != nil {

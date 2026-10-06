@@ -42,34 +42,41 @@ func NewProductionRetriever(ciStore codeintelstore.Store, baseStorageDir string)
 
 // Search queries the authoritative pinned retrieval index for the requested snapshot.
 func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]SearchResult, error) {
+	results, _, err := r.SearchWithTrace(ctx, req)
+	return results, err
+}
+
+// SearchWithTrace executes the same pinned production path, exposing V2's
+// request-local diagnostic work and candidates without a separate eval engine.
+func (r *ProductionRetriever) SearchWithTrace(ctx context.Context, req SearchRequest) ([]SearchResult, *structural.ExpansionSearchTrace, error) {
 	if req.SnapshotID == "" {
-		return nil, fmt.Errorf("snapshot_id is required for retrieval")
+		return nil, nil, fmt.Errorf("snapshot_id is required for retrieval")
 	}
 
 	// Production requests must carry the identities captured by Diagnosis.
 	var cib *codeintelmodel.CodeIndexBuild
 	var rb *codeintelmodel.RetrievalBuild
 	if req.CodeIndexBuildID <= 0 || req.RetrievalBuildID <= 0 {
-		return nil, fmt.Errorf("both code_index_build_id and retrieval_build_id are required")
+		return nil, nil, fmt.Errorf("both code_index_build_id and retrieval_build_id are required")
 	}
 	var err error
 	cib, err = r.ciStore.GetByID(ctx, req.CodeIndexBuildID)
 	if err != nil {
-		return nil, fmt.Errorf("pinned code index build not found: %w", err)
+		return nil, nil, fmt.Errorf("pinned code index build not found: %w", err)
 	}
 	rb, err = r.ciStore.GetRetrievalBuildByID(ctx, req.RetrievalBuildID)
 	if err != nil {
-		return nil, fmt.Errorf("pinned retrieval build not found: %w", err)
+		return nil, nil, fmt.Errorf("pinned retrieval build not found: %w", err)
 	}
 	if cib.Status != codeintelmodel.BuildStatusReady || rb.Status != codeintelmodel.BuildStatusReady || rb.CodeIndexBuildID != cib.ID {
-		return nil, fmt.Errorf("pinned retrieval lineage is not READY or does not match")
+		return nil, nil, fmt.Errorf("pinned retrieval lineage is not READY or does not match")
 	}
 	if cib.SnapshotID != req.SnapshotID {
-		return nil, fmt.Errorf("pinned code index build belongs to snapshot %s, not %s", cib.SnapshotID, req.SnapshotID)
+		return nil, nil, fmt.Errorf("pinned code index build belongs to snapshot %s, not %s", cib.SnapshotID, req.SnapshotID)
 	}
 
-	if rb.Strategy != codeintelmodel.StrategyBM25 && rb.Strategy != codeintelmodel.StrategyBM25Structural {
-		return nil, fmt.Errorf("%w: %s", ErrUnsupportedStrategy, rb.Strategy)
+	if rb.Strategy != codeintelmodel.StrategyBM25 && rb.Strategy != codeintelmodel.StrategyBM25Structural && rb.Strategy != codeintelmodel.StrategyBM25StructuralV2 {
+		return nil, nil, fmt.Errorf("%w: %s", ErrUnsupportedStrategy, rb.Strategy)
 	}
 	cacheKey := indexCacheKey{rb.ID, rb.ArtifactPath, rb.ArtifactHash, rb.Strategy}
 
@@ -85,7 +92,7 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 		}
 		loaded, loadErr := artifact.LoadIndexVerified(artifactPath, rb.ID, rb.ArtifactHash, rb.Strategy)
 		if loadErr != nil {
-			return nil, fmt.Errorf("failed loading retrieval artifact from %s: %w", artifactPath, loadErr)
+			return nil, nil, fmt.Errorf("failed loading retrieval artifact from %s: %w", artifactPath, loadErr)
 		}
 		r.mu.Lock()
 		r.indexCache[cacheKey] = loaded
@@ -104,7 +111,28 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 		for _, hit := range idx.Search(req.Query, topK) {
 			results = append(results, mapSearchResult(hit.Document, hit.Score, "symbol_bm25", "BM25", req.Query))
 		}
-		return results, nil
+		return results, nil, nil
+	}
+
+	if rb.Strategy == codeintelmodel.StrategyBM25StructuralV2 {
+		hits, trace, err := structural.NewExpansionEngine(idx, r.ciStore, cib.ID).Search(ctx, req.Query, topK)
+		if err != nil {
+			return nil, trace, err
+		}
+		var results []SearchResult
+		for _, hit := range hits {
+			reason := "BM25"
+			if hit.Trace.Expanded {
+				reason = hit.Trace.BestSeed.Reason
+			}
+			// Score remains lexical evidence, not the V2 rank-placement key.
+			// An added document has no lexical score; typed trace explains rank.
+			mapped := mapSearchResult(hit.Document, hit.BaseScore, "symbol_bm25_structural_v2", reason, req.Query)
+			detail := hit.Trace
+			mapped.StructuralV2 = &detail
+			results = append(results, mapped)
+		}
+		return results, trace, nil
 	}
 
 	engine := structural.NewEngine(idx, r.ciStore, cib.ID)
@@ -120,7 +148,7 @@ func (r *ProductionRetriever) Search(ctx context.Context, req SearchRequest) ([]
 		searchResults = append(searchResults, mapSearchResult(sr.Document, sr.FinalScore, "symbol_bm25_structural", reason, req.Query))
 	}
 
-	return searchResults, nil
+	return searchResults, nil, nil
 }
 
 func mapSearchResult(doc bm25.Document, score float64, source, reason, query string) SearchResult {

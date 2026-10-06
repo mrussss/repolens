@@ -114,10 +114,11 @@ func e2eStatusFor(requested, providerConfigured bool) string {
 }
 
 type RunOptions struct {
-	CaseIDs      []string
-	CacheDir     string
-	ArtifactRoot string
-	RunE2E       bool
+	CandidateStrategy string // compare-retrieval only; empty preserves V1.
+	CaseIDs           []string
+	CacheDir          string
+	ArtifactRoot      string
+	RunE2E            bool
 }
 
 type RunMetadata struct {

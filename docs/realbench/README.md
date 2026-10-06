@@ -82,5 +82,38 @@ better/equal/worse 先比较 Recall@8，再比较 RR。ground truth 在预测结
 Latency 为一次 ProductionRetriever.Search 的 wall clock 毫秒，保留浮点精度，
 包含冷 artifact 加载，不含分析/建索引；按 case 交替先搜索策略。p50/p95 使用排序后
 线性插值。它反映本次机器和缓存条件，只用于观察，无 promotion gate。
-本轮不调整 Structural 算法，也不改变 BM25 production default。
+不传 candidate 时仍运行历史 V1，BM25 production default 保持不变。
 旧 `cmd/eval` 只作为 legacy/synthetic regression，不能替代该生产语义对照。
+
+## Minimal Structural Expansion V2（dev experiment）
+
+```bash
+go run ./cmd/realbench validate --dataset v2
+go run ./cmd/realbench compare-retrieval --dataset v2 --case REAL-007 --candidate BM25_STRUCTURAL_V2
+go run ./cmd/realbench compare-retrieval --dataset v2 --case REAL-011 --candidate BM25_STRUCTURAL_V2
+go run ./cmd/realbench compare-retrieval --dataset v2 --all --candidate BM25_STRUCTURAL_V2
+```
+
+`--candidate` 仅允许 `BM25_STRUCTURAL`（默认，历史 V1 flat rerank）或 `BM25_STRUCTURAL_V2`
+（实验 bounded one-hop semantic expansion）。不复制 runner：同 Snapshot/CodeIndex、同 builder/index bytes、
+BuildQuery、TopK=8、PrimaryFiles metric 和 ProductionRetriever；production default 仍 BM25。
+
+V2 只从原 Top8 seeds 沿 forward semantic direct call / reverse direct semantic test 扩展，
+confidence>=0.95、每 seed 新增<=1、总新增<=4、depth=1。没有 V1 flat boost、generic reference、
+reverse call 或多跳。完整参数、查询上限和排序规则见 [检索说明](../retrieval-eval.md#5-bounded-semantic-expansion-v2实验)。
+
+JSON/report/CLI 明示实际 `candidate_strategy`；case 的 `candidate_retrieval_build` 和 `candidate`
+固定对应构建及结果。既有 `bm25_structural` 字段仅在 V1 保留，V2 不使用这个历史标签。
+`candidate.expansion` 含 seed/symbol/relation query 数、返回关系行数、新增数量、完整 merge pool 和 typed provenance。
+逐 result `structural_v2` 记录 effective/final rank、best seed、去重 reasons；新增候选无需 lexical score。
+Report 显示完整 expansion trace（包括 Top8 外新增候选）。latency 仍包含冷 artifact 加载。
+
+GroundTruth 评分读取发生在对应 case 的 prediction 落盘之后。因为冻结 manifest digest 也覆盖 labels，
+其内容核验在所有 predictions 完成后执行；hash mismatch 仍使命令失败，不产生合法 aggregate。
+输入、ground truth 和 manifest contract 均未改动。
+
+这些 10 cases 的 gold 已被分析过：**DEV / DIAGNOSTIC EVIDENCE ONLY**，禁止作 promotion held-out。
+全量完整 v2 dev run 才输出 `V2_DEV_GO` 或 `STOP_STRUCTURAL`：新增 PrimaryFile 进入 Top8、
+mean Recall@8>0.85 且高于配对 baseline、所有 case recall 无回归、零 product failure、所有 budget 满足才 GO。
+单 case 或 infrastructure 不完整的 run 不给完整 dev verdict；MRR/latency 记录但不作为本轮 promotion gate。
+GO 只意味着值得准备 3~5 个 untouched Go bugs；STOP 意味停止 Structural 投资，production 保持 BM25。

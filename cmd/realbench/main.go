@@ -98,7 +98,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: realbench validate [--dataset v1|v2] [--data ...]")
 	fmt.Fprintln(os.Stderr, "       realbench run --dataset v1|v2 --case REAL-NNN [--data ...] [--e2e]")
 	fmt.Fprintln(os.Stderr, "       realbench run --dataset v1|v2 --all [--data ...] [--e2e]")
-	fmt.Fprintln(os.Stderr, "       realbench compare-retrieval --dataset v2 (--all | --case REAL-NNN) [--data ...] [--cache ...] [--artifacts ...]")
+	fmt.Fprintln(os.Stderr, "       realbench compare-retrieval --dataset v2 (--all | --case REAL-NNN) [--data ...] [--cache ...] [--artifacts ...] [--candidate BM25_STRUCTURAL|BM25_STRUCTURAL_V2]")
 }
 
 func runRetrievalComparison(args []string) {
@@ -109,6 +109,7 @@ func runRetrievalComparison(args []string) {
 	artifactRoot := flags.String("artifacts", "artifacts/realbench", "benchmark artifact root")
 	caseID := flags.String("case", "", "run one case, for example REAL-004")
 	all := flags.Bool("all", false, "run every case in the manifest")
+	candidate := flags.String("candidate", "BM25_STRUCTURAL", "comparison candidate: BM25_STRUCTURAL or BM25_STRUCTURAL_V2")
 	_ = flags.Parse(args)
 	caseIDs, err := comparisonCaseIDs(*caseID, *all)
 	if err != nil {
@@ -123,21 +124,25 @@ func runRetrievalComparison(args []string) {
 		fatal(err)
 	}
 	result, err := realbench.NewRunner(dataset).CompareRetrieval(context.Background(), realbench.RunOptions{
-		CaseIDs: caseIDs, CacheDir: *cacheRoot, ArtifactRoot: *artifactRoot,
+		CaseIDs: caseIDs, CacheDir: *cacheRoot, ArtifactRoot: *artifactRoot, CandidateStrategy: *candidate,
 	})
 	if err != nil {
 		fatal(err)
 	}
+	fmt.Printf("candidate=%s\nDEV / DIAGNOSTIC EVIDENCE ONLY\n", result.CandidateStrategy)
+	if result.DevDecision != "" {
+		fmt.Printf("dev_decision=%s (no promotion)\n", result.DevDecision)
+	}
 	m := result.Metrics
 	fmt.Printf("run: %s\ntotal=%d completed=%d infra_errors=%d product_failures=%d better=%d equal=%d worse=%d\n",
 		result.RunDir, m.TotalCases, m.CompletedCases, m.InfraErrors, m.ProductFailures, len(m.BetterCases), len(m.EqualCases), len(m.WorseCases))
-	for i, s := range []*realbench.ComparisonAggregate{m.BM25, m.Structural} {
+	for i, s := range []*realbench.ComparisonAggregate{m.BM25, m.Candidate} {
 		if s == nil {
 			continue
 		}
 		name := "BM25"
 		if i == 1 {
-			name = "BM25_STRUCTURAL"
+			name = result.CandidateStrategy
 		}
 		fmt.Printf("%s recall@8=%.6f mrr=%.6f p50_ms=%.6f p95_ms=%.6f\n", name, s.MeanRecallAt8, s.MRR, s.LatencyP50MS, s.LatencyP95MS)
 	}

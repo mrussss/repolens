@@ -2,6 +2,8 @@ package retrieval
 
 import (
 	"context"
+
+	"repolens/internal/retrieval/structural"
 )
 
 type SearchRequest struct {
@@ -14,19 +16,20 @@ type SearchRequest struct {
 }
 
 type SearchResult struct {
-	ChunkID         string   `json:"chunk_id"`
-	EvidenceID      string   `json:"evidence_id,omitempty"`
-	Path            string   `json:"path"`
-	Language        string   `json:"language"`
-	Symbol          string   `json:"symbol,omitempty"`
-	StartLine       int      `json:"start_line"`
-	EndLine         int      `json:"end_line"`
-	Snippet         string   `json:"snippet"`
-	Score           float64  `json:"score"`
-	RetrievalSource string   `json:"retrieval_source"` // "lexical", "bm25", "vector", "hybrid_rrf"
-	MatchedTerms    []string `json:"matched_terms,omitempty"`
-	SymbolKeys      []string `json:"symbol_keys,omitempty"`
-	RetrievalReason string   `json:"retrieval_reason,omitempty"`
+	ChunkID         string                           `json:"chunk_id"`
+	EvidenceID      string                           `json:"evidence_id,omitempty"`
+	Path            string                           `json:"path"`
+	Language        string                           `json:"language"`
+	Symbol          string                           `json:"symbol,omitempty"`
+	StartLine       int                              `json:"start_line"`
+	EndLine         int                              `json:"end_line"`
+	Snippet         string                           `json:"snippet"`
+	Score           float64                          `json:"score"`
+	RetrievalSource string                           `json:"retrieval_source"` // "lexical", "bm25", "vector", "hybrid_rrf"
+	MatchedTerms    []string                         `json:"matched_terms,omitempty"`
+	SymbolKeys      []string                         `json:"symbol_keys,omitempty"`
+	RetrievalReason string                           `json:"retrieval_reason,omitempty"`
+	StructuralV2    *structural.ExpansionResultTrace `json:"structural_v2,omitempty"`
 }
 
 type Retriever interface {
