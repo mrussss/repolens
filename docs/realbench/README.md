@@ -117,3 +117,14 @@ GroundTruth 评分读取发生在对应 case 的 prediction 落盘之后。因�
 mean Recall@8>0.85 且高于配对 baseline、所有 case recall 无回归、零 product failure、所有 budget 满足才 GO。
 单 case 或 infrastructure 不完整的 run 不给完整 dev verdict；MRR/latency 记录但不作为本轮 promotion gate。
 GO 只意味着值得准备 3~5 个 untouched Go bugs；STOP 意味停止 Structural 投资，production 保持 BM25。
+
+### V2 本轮结果：STOP_STRUCTURAL
+
+`artifacts/realbench/20261006T123312Z-a8c80ec5/`：10/10 完成，0 infra/product failures，better/equal/worse=0/9/1。
+两边 Recall@8=0.850000，无新 PrimaryFile 召回；BM25 MRR=0.611667，V2=0.603333。
+REAL-005 只有 RR 退步（Recall 保持），REAL-007/011 的缺失实现未进入 Top8。
+V2 p50/p95=280.350481/2141.075054 ms；BM25=52.831868/531.676623 ms。该单次机器测量不作为性能泛化结论。
+所有预算均满足，但实验没有达到预先设定的 dev GO 条件。
+
+因此停止 Structural 投资，production 固定保持 BM25；V1/V2 保留为实验历史，不实现 V3、不继续 unseen validation 或 promotion。
+完整实现、per-case trace 和验收记录保存在本地 `docs/development/minimal-structural-expansion-v2-implementation-report.md`。

@@ -9,7 +9,7 @@ Pure Go BM25 (RetrievalBuild.Strategy = BM25)
 ```
 
 - **Pure Go BM25**：进程内运行，使用代码感知 tokenizer 对文件、符号和路径进行确定性 lexical ranking；不依赖外部搜索集群或 embedding 服务。
-- **Structural Retrieval（实验）**：旧 synthetic gate 当前未通过（不代表完整生产 Structural 的质量结论）；只在显式 `BM25_STRUCTURAL` 构建上执行，默认生产请求不进行结构化扩展或 rerank。
+- **Structural Retrieval（实验）**：旧 synthetic gate 当前未通过（不代表完整生产 Structural 的质量结论）；V1 只在显式 `BM25_STRUCTURAL` 构建上执行，V2 只在显式 `BM25_STRUCTURAL_V2` 构建上执行；两者均保留为实验历史，默认生产请求不进行结构化扩展或 rerank。
 - **版本与 lineage**：RetrievalBuild 固定 `Snapshot → CodeIndexBuild → RetrievalBuild` 链路，artifact 发布后通过 hash 和 READY 状态校验。
 - **Initial Retrieval**：Agent 启动前由确定性的 QueryBuilder 从标题、少量描述关键词和错误堆栈中的包/文件/函数/符号提取 query，再以固定 Top-K 和总字节预算生成 Evidence Packet。完整 Error Log 不会原样拼进 BM25 query。
 - **Evidence Packet**：候选至少包含仓库相对路径、起止行、源码 excerpt、检索分数和 `BM25` 原因；重复或高度重叠候选去重后才进入 Agent。
@@ -110,3 +110,13 @@ go run ./cmd/realbench compare-retrieval --dataset v2 --all --candidate BM25_STR
 mean Recall@8>0.85 且高于配对 BM25、无逐 case recall regression、零 product failure、严格预算。
 `V2_DEV_GO` 仅允许准备 3~5 个 untouched Go bugs；`STOP_STRUCTURAL` 表示停止投资，production 保持 BM25。
 本轮不执行 unseen validation 或 promotion。
+
+### V2 dev experiment 的最终决定：STOP_STRUCTURAL
+
+完整 10-case dev run（`20261006T123312Z-a8c80ec5`，实现 commit `6a1c3ca`）完成 10/10，零 infra/product failure。
+BM25 与 V2 Mean Recall@8 均为 0.850000，没有新增 PrimaryFile 进入 Top8；MRR 从 0.611667 降到 0.603333。
+REAL-005 首个 gold rank 从 3 退到 4；REAL-007/011 的缺失 gold 均未救回。预算均满足，仍没有质量收益。
+
+依本轮预先规定的 stop criteria，决定 **STOP_STRUCTURAL**：停止 Structural 投资，不开发 V3，
+不继续扩展 relation/fan-out/depth、调权重或做性能优化。Production 固定保持 BM25，V1/V2 留作可复现的实验历史。
+这是 DEV / DIAGNOSTIC EVIDENCE ONLY 的负结果；不是所有结构检索方法无效的泛化结论。
