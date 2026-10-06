@@ -63,6 +63,7 @@ describe('v2.2 API and UI contracts', () => {
       compatibility: {
         probe_max_output_tokens: 256,
         production_max_output_tokens: 4096,
+        production_timeout_seconds: 60,
         reasoning_effort: 'low',
         response_format: 'json_object',
         tools: true,
@@ -83,6 +84,7 @@ describe('v2.2 API and UI contracts', () => {
       compatibility: {
         probe_max_output_tokens: 256,
         production_max_output_tokens: 4096,
+        production_timeout_seconds: 60,
         reasoning_effort: 'low',
         response_format: 'json_object',
         tools: true,

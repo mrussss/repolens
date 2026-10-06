@@ -217,6 +217,7 @@ func TestTestConnection(t *testing.T) {
 func TestCompatibilityProbeUsesProductionGenerationShape(t *testing.T) {
 	t.Setenv("REPOLENS_REASONING_EFFORT", "low")
 	t.Setenv("REPOLENS_MAX_OUTPUT_TOKENS", "4096")
+	t.Setenv("REPOLENS_PROVIDER_TIMEOUT_SECONDS", "60")
 	var request map[string]interface{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -264,6 +265,9 @@ func TestCompatibilityProbeUsesProductionGenerationShape(t *testing.T) {
 	}
 	if result.ProbeStatus != provider.CompatibilityProbeConfirmed {
 		t.Fatalf("probe status = %q, want %q", result.ProbeStatus, provider.CompatibilityProbeConfirmed)
+	}
+	if result.ProductionTimeoutSeconds != 60 || result.ProductionMaxOutputTokens != 4096 || len(result.Warnings) != 0 {
+		t.Fatalf("default profile response changed: %+v", result)
 	}
 }
 

@@ -96,6 +96,15 @@ Diagnosis 的业务状态只有 `QUEUED`、`RUNNING`、`SUCCEEDED`、`FAILED`、
 
 历史 v2.2 RC 检查记录见 [`docs/history/freezes/v2.2-rc-release-checklist.md`](docs/history/freezes/v2.2-rc-release-checklist.md)。Provider 设置页的 Test Connection 会执行 production Agent 请求形状的兼容性探测（小型 `max_tokens`、`reasoning_effort`、`response_format=json_object` 和 tools），不会把 API Key 或 Provider 原始响应写入日志、trace 或 artifact。
 
+RepoLens 的 generation 默认值为 `low / 4096 tokens / 60s`，这是项目默认配置，并非所有 Provider 的最佳配置。
+Test Connection 的 256-token probe 验证请求形状兼容性；CONFIRMED 仅表示观测到目标工具调用，
+不保证完整多轮 Diagnosis 在当前或自定义 reasoning/token/timeout 下能够完成。
+非空且非 `low` 的 reasoning 配置会返回 `HIGHER_REASONING_BUDGET_RISK`；任意 generation 设置偏离默认会返回
+`CUSTOM_GENERATION_PROFILE`，并附带 `production_timeout_seconds`。设置页显示这些 warning，连接成功仍保持成功。
+更高 reasoning 可能消耗更多 completion/reasoning tokens 并增加延迟，仍可能截断或超时；
+截断会明确报告 `MODEL_OUTPUT_TRUNCATED`，不会当作正常 JSON。
+这些提示不会自动降低 reasoning、扩大 token/timeout、修改 Diagnosis 快照或触发重试。
+
 RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开仓库，Hit@5 `7/10`、Hit@10 `9/10`、MRR `0.724`。这是小规模 external benchmark，不是 production accuracy；完整方法、per-case rank 和 AnalysisQuality 见 [`docs/history/benchmarks/realbench/v2-baseline.md`](docs/history/benchmarks/realbench/v2-baseline.md)。真实 Provider Agent E2E 只记录选定 case 的证据和失败边界，见 [`docs/history/benchmarks/realbench/v2-agent-e2e.md`](docs/history/benchmarks/realbench/v2-agent-e2e.md)。
 
 ## 范围与限制

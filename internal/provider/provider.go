@@ -79,13 +79,15 @@ const (
 // exercised by the provider probe. It deliberately excludes credentials and
 // response content.
 type CompatibilityProbeResult struct {
-	ProbeMaxOutputTokens      int    `json:"probe_max_output_tokens"`
-	ProductionMaxOutputTokens int    `json:"production_max_output_tokens"`
-	ReasoningEffort           string `json:"reasoning_effort"`
-	ResponseFormat            string `json:"response_format"`
-	Tools                     bool   `json:"tools"`
-	ProbeStatus               string `json:"probe_status"`
-	ToolCallObserved          bool   `json:"tool_call_observed"`
+	ProbeMaxOutputTokens      int                    `json:"probe_max_output_tokens"`
+	ProductionMaxOutputTokens int                    `json:"production_max_output_tokens"`
+	ReasoningEffort           string                 `json:"reasoning_effort"`
+	ResponseFormat            string                 `json:"response_format"`
+	Tools                     bool                   `json:"tools"`
+	ProbeStatus               string                 `json:"probe_status"`
+	ToolCallObserved          bool                   `json:"tool_call_observed"`
+	ProductionTimeoutSeconds  int                    `json:"production_timeout_seconds"`
+	Warnings                  []CompatibilityWarning `json:"warnings,omitempty"`
 }
 
 const (
@@ -429,6 +431,9 @@ func (m *Manager) TestConnectionWithAuthMode(ctx context.Context, baseURL, model
 // response_format, and tools. A returned probe tool call confirms tool
 // behavior; CONFIRMED means only that the first target tool call was observed,
 // not that a complete multi-turn tool loop was exercised.
+// The 256-token probe does not establish that the production token budget or
+// timeout suffices for a complete diagnosis. Warnings describe that risk only;
+// they do not change requests, probe success, or retry behavior.
 func (m *Manager) TestConnectionCompatibilityWithAuthMode(ctx context.Context, baseURL, model, apiKey, authMode string) (time.Duration, CompatibilityProbeResult, error) {
 	normBase, err := NormalizeBaseURL(baseURL)
 	if err != nil {
@@ -442,6 +447,8 @@ func (m *Manager) TestConnectionCompatibilityWithAuthMode(ctx context.Context, b
 		ResponseFormat:            "json_object",
 		Tools:                     true,
 		ProbeStatus:               CompatibilityProbeUncertain,
+		ProductionTimeoutSeconds:  cfg.ProviderTimeoutSeconds,
+		Warnings:                  AssessGenerationCompatibility(cfg.ReasoningEffort, cfg.MaxOutputTokens, cfg.ProviderTimeoutSeconds),
 	}
 
 	start := time.Now()

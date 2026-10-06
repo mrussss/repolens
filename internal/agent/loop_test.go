@@ -10,6 +10,7 @@ import (
 
 	"repolens/internal/diagnosis"
 	"repolens/internal/llm"
+	providersettings "repolens/internal/provider"
 	"repolens/internal/trace"
 )
 
@@ -118,6 +119,34 @@ func TestAgentLoopRejectsLengthTruncationBeforeParsing(t *testing.T) {
 	}
 	if result.FinishReason != "length" || result.ParseError != ErrCodeModelOutputTruncated {
 		t.Fatalf("truncation evidence = finish_reason=%q parse_error=%q", result.FinishReason, result.ParseError)
+	}
+}
+
+type reasoningTruncationProvider struct{ requests []llm.GenerateRequest }
+
+func (p *reasoningTruncationProvider) Generate(_ context.Context, req llm.GenerateRequest) (llm.GenerateResponse, error) {
+	p.requests = append(p.requests, req)
+	return llm.GenerateResponse{Message: llm.Message{Role: llm.RoleAssistant}, FinishReason: "length", CompletionTokens: 4096, ReasoningTokens: 4000}, nil
+}
+
+func TestGenerationWarningDoesNotRetryOrDowngradeReasoningTruncation(t *testing.T) {
+	warnings := providersettings.AssessGenerationCompatibility("high", 4096, 60)
+	if len(warnings) != 2 {
+		t.Fatal("expected advisory warnings")
+	}
+	p := &reasoningTruncationProvider{}
+	cfg := DefaultGuardConfig()
+	loop := NewAgentLoop(p, NewToolRegistry(), nil, cfg).WithGenerationOptions(GenerationOptions{ReasoningEffort: "high"})
+	run := &diagnosis.DiagnosisRun{ID: "warning-truncation", RepositoryID: "repo", SnapshotID: "snapshot", IssueTitle: "issue", ReasoningEffort: "high", MaxOutputTokens: 4096, ProviderTimeoutSeconds: 60}
+	spec := testExecutionSpec(run)
+	before, _ := json.Marshal(spec)
+	result, err := loop.Run(context.Background(), spec, &diagnosis.DiagnosisAttempt{ID: "warning-attempt"})
+	after, _ := json.Marshal(spec)
+	if !errors.Is(err, ErrModelOutputTruncated) || result == nil || result.ParseError != ErrCodeModelOutputTruncated || result.ReasoningTokens != 4000 || result.ProviderCalls != 1 {
+		t.Fatalf("truncation boundary changed: %+v %v", result, err)
+	}
+	if len(p.requests) != 1 || p.requests[0].ReasoningEffort != "high" || p.requests[0].MaxTokens != 4096 || string(before) != string(after) {
+		t.Fatalf("warning changed request, snapshot, or retry: %+v", p.requests)
 	}
 }
 

@@ -12,6 +12,8 @@ export interface ProviderCompatibility {
   tools: boolean;
   probe_status: ProviderProbeStatus;
   tool_call_observed: boolean;
+  production_timeout_seconds: number;
+  warnings?: { code: string; message: string }[];
 }
 
 export interface TestProviderConnectionResult {
@@ -42,17 +44,23 @@ async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let errDetail = `HTTP ${res.status} ${res.statusText}`;
     let errCode: string | undefined;
+    let compatibility: ProviderCompatibility | undefined;
+    let latencyMS: number | undefined;
     try {
       const body = await res.json();
       errCode = body.code;
+      compatibility = body.compatibility;
+      latencyMS = body.latency_ms;
       if (body.error) errDetail = body.error;
       else if (body.message) errDetail = body.message;
     } catch {
       // ignore
     }
-    const error = new Error(errDetail) as Error & { code?: string; status?: number };
+    const error = new Error(errDetail) as Error & { code?: string; status?: number; compatibility?: ProviderCompatibility; latency_ms?: number };
     error.code = errCode;
     error.status = res.status;
+    error.compatibility = compatibility;
+    error.latency_ms = latencyMS;
     throw error;
   }
   return res.json();

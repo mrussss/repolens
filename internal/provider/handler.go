@@ -222,10 +222,11 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		// text or request details. The stable code is sufficient for operations.
 		logger.L(c.Request.Context()).Error("provider connection test failed", "code", code)
 		c.JSON(status, gin.H{
-			"success":    false,
-			"code":       code,
-			"error":      message,
-			"latency_ms": latency.Milliseconds(),
+			"success":       false,
+			"code":          code,
+			"error":         message,
+			"latency_ms":    latency.Milliseconds(),
+			"compatibility": compatibility,
 		})
 		return
 	}
