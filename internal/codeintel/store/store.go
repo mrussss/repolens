@@ -239,6 +239,9 @@ func (s *GormStore) saveAnalysisResultTx(tx *gorm.DB, buildID int64, res *model.
 	// 2. Batch insert Symbols
 	symbolMap := make(map[string]int64)
 	for _, sym := range res.Symbols {
+		if _, exists := symbolMap[sym.SymbolKeyHash]; exists {
+			return fmt.Errorf("symbol identity collision: hash=%s declaration=%s:%d:%d", sym.SymbolKeyHash, sym.FilePath, sym.StartLine, sym.StartCol)
+		}
 		sym.CodeIndexBuildID = buildID
 		if fID, ok := fileMap[sym.FilePath]; ok {
 			sym.FileID = fID

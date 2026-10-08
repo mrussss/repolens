@@ -21,19 +21,25 @@ const priorFollowupPipelineInput = `{"pipeline_version":"v2.2.0","parser_version
 
 const followupFixPipelineInput = `{"pipeline_version":"v2.2.0","parser_version":"v2.2.2","analyzer_version":"v2.2.2","symbol_schema_version":"v2.1.1","retrieval_version":"v2.2.1","tokenizer_version":"v2.1.0","retrieval_strategy":"BM25","bm25_k1":"1.2","bm25_b":"0.75","structural_parameters":"none","file_filter_version":"filter-v2.2"}`
 
-func TestPipelineFingerprintMatchesFollowupFixProductionInputs(t *testing.T) {
+const correctnessPipelineInput = `{"pipeline_version":"v2.2.0","parser_version":"v2.2.2","analyzer_version":"v2.2.3","symbol_schema_version":"v2.1.2","retrieval_version":"v2.2.1","tokenizer_version":"v2.1.0","retrieval_strategy":"BM25","bm25_k1":"1.2","bm25_b":"0.75","structural_parameters":"none","file_filter_version":"filter-v2.2"}`
+
+func TestPipelineFingerprintMatchesCorrectnessProductionInputs(t *testing.T) {
 	if revision.PipelineVersion != "v2.2.0" ||
 		codeintelmodel.CurrentParserVersion != "v2.2.2" ||
-		codeintelmodel.CurrentAnalyzerVersion != "v2.2.2" ||
-		codeintelmodel.CurrentSymbolSchemaVersion != "v2.1.1" ||
+		codeintelmodel.CurrentAnalyzerVersion != "v2.2.3" ||
+		codeintelmodel.CurrentSymbolSchemaVersion != "v2.1.2" ||
 		codeintelmodel.CurrentRetrievalVersion != "v2.2.1" ||
 		codeintelmodel.CurrentTokenizerVersion != "v2.1.0" {
-		t.Fatal("production pipeline version inputs differ from the follow-up fix contract")
+		t.Fatal("production pipeline version inputs differ from the correctness contract")
 	}
-	baseline := sha256.Sum256([]byte(followupFixPipelineInput))
+	baseline := sha256.Sum256([]byte(correctnessPipelineInput))
 	want := hex.EncodeToString(baseline[:])
 	if got := revision.ComputePipelineFingerprint(); got != want {
-		t.Fatalf("pipeline fingerprint differs from the follow-up fix contract: got %s, baseline %s", got, want)
+		t.Fatalf("pipeline fingerprint differs from the correctness contract: got %s, baseline %s", got, want)
+	}
+	previous := sha256.Sum256([]byte(followupFixPipelineInput))
+	if revision.ComputePipelineFingerprint() == hex.EncodeToString(previous[:]) {
+		t.Fatal("reused identity before physical coordinate and init fixes")
 	}
 	prior := sha256.Sum256([]byte(priorFollowupPipelineInput))
 	if revision.ComputePipelineFingerprint() == hex.EncodeToString(prior[:]) {

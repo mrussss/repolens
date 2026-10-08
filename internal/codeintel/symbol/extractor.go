@@ -56,8 +56,8 @@ func ExtractSymbols(fset *token.FileSet, astFile *ast.File, filePath, modulePath
 
 func extractFuncDecl(fset *token.FileSet, decl *ast.FuncDecl, filePath, modulePath, packagePath, pkgName string, content []byte) *model.Symbol {
 	name := decl.Name.Name
-	startPos := fset.Position(decl.Pos())
-	endPos := fset.Position(decl.End())
+	startPos := fset.PositionFor(decl.Pos(), false)
+	endPos := fset.PositionFor(decl.End(), false)
 
 	spanBytes := getSourceSpan(content, startPos, endPos)
 	contentHash := sha256.Sum256(spanBytes)
@@ -84,6 +84,9 @@ func extractFuncDecl(fset *token.FileSet, decl *ast.FuncDecl, filePath, modulePa
 	if decl.Recv == nil || len(decl.Recv.List) == 0 {
 		// Normal Function
 		rawKey, hashKey := model.BuildSymbolKey(modulePath, packagePath, "", model.SymbolKindFunction, name)
+		if name == "init" {
+			rawKey, hashKey = model.BuildDisambiguatedSymbolKey(modulePath, packagePath, "", model.SymbolKindFunction, name, filePath, startPos.Line, startPos.Column)
+		}
 		qualName := pkgName + "." + name
 
 		return &model.Symbol{
@@ -144,8 +147,8 @@ func extractFuncDecl(fset *token.FileSet, decl *ast.FuncDecl, filePath, modulePa
 
 func extractTypeSpec(fset *token.FileSet, decl *ast.GenDecl, typeSpec *ast.TypeSpec, filePath, modulePath, packagePath, pkgName string, content []byte) *model.Symbol {
 	name := typeSpec.Name.Name
-	startPos := fset.Position(typeSpec.Pos())
-	endPos := fset.Position(typeSpec.End())
+	startPos := fset.PositionFor(typeSpec.Pos(), false)
+	endPos := fset.PositionFor(typeSpec.End(), false)
 
 	spanBytes := getSourceSpan(content, startPos, endPos)
 	contentHash := sha256.Sum256(spanBytes)

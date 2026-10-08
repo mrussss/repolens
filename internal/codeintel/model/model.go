@@ -150,6 +150,15 @@ func BuildSymbolKey(modulePath, packagePath, receiverCanonical string, kind Symb
 	return raw, hash
 }
 
+// BuildDisambiguatedSymbolKey adds a physical declaration coordinate only for
+// legal duplicate declarations such as init. Ordinary symbol keys stay stable.
+func BuildDisambiguatedSymbolKey(modulePath, packagePath, receiverCanonical string, kind SymbolKind, name, filePath string, line, column int) (raw string, hash string) {
+	raw, _ = BuildSymbolKey(modulePath, packagePath, receiverCanonical, kind, name)
+	raw += fmt.Sprintf("|%s:%d:%d", filePath, line, column)
+	h := sha256.Sum256([]byte(raw))
+	return raw, hex.EncodeToString(h[:])
+}
+
 // CanonicalizeReceiver extracts the base type name from a receiver expression.
 // e.g. "*Service" -> "Service", "(s *Service)" -> "Service", "Service" -> "Service".
 func CanonicalizeReceiver(recv string) string {

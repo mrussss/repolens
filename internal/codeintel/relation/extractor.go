@@ -73,7 +73,7 @@ func ExtractRelations(ectx *ExtractionContext, astFile *ast.File, filePath, pack
 }
 
 func extractCallRelation(ectx *ExtractionContext, call *ast.CallExpr, funcDecl *ast.FuncDecl, callerHash, filePath, packagePath string, typeInfo *types.Info) *model.SymbolRelation {
-	pos := ectx.Fset.Position(call.Pos())
+	pos := ectx.Fset.PositionFor(call.Pos(), false)
 
 	// 1. Check if semantic resolution via go/types is available
 	if typeInfo != nil {
@@ -84,7 +84,7 @@ func extractCallRelation(ectx *ExtractionContext, call *ast.CallExpr, funcDecl *
 					// Use the declaration receiver, not selection.Recv(). The latter
 					// describes the expression receiver and may be a promoted or
 					// instantiated type rather than the declaring type.
-					receiverName, hasReceiver := declaredReceiverName(selection)
+					receiverName, hasReceiver := declaredReceiverName(targetFunc)
 					targetPkgPath := ""
 					if targetFunc.Pkg() != nil {
 						targetPkgPath = targetFunc.Pkg().Path()
@@ -329,12 +329,8 @@ func indirectCallRelation(ectx *ExtractionContext, callerHash, targetName, fileP
 	}
 }
 
-func declaredReceiverName(selection *types.Selection) (string, bool) {
-	if selection == nil {
-		return "", false
-	}
-	fn, ok := selection.Obj().(*types.Func)
-	if !ok {
+func declaredReceiverName(fn *types.Func) (string, bool) {
+	if fn == nil {
 		return "", false
 	}
 
@@ -355,7 +351,7 @@ func declaredReceiverName(selection *types.Selection) (string, bool) {
 }
 
 func extractSelectorReference(ectx *ExtractionContext, sel *ast.SelectorExpr, callerHash, filePath, packagePath string, typeInfo *types.Info) *model.SymbolRelation {
-	pos := ectx.Fset.Position(sel.Pos())
+	pos := ectx.Fset.PositionFor(sel.Pos(), false)
 	targetName := sel.Sel.Name
 
 	if typeInfo != nil {
@@ -368,7 +364,15 @@ func extractSelectorReference(ectx *ExtractionContext, sel *ast.SelectorExpr, ca
 			if usesObj.Pkg() != nil {
 				targetPkgPath = usesObj.Pkg().Path()
 			}
-			rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, "", kind, targetName)
+			receiver := ""
+			if kind == model.SymbolKindMethod {
+				var valid bool
+				receiver, valid = declaredReceiverName(usesObj.(*types.Func))
+				if !valid {
+					return nil
+				}
+			}
+			rawKey, _ := model.BuildSymbolKey(ectx.ModulePath, targetPkgPath, receiver, kind, targetName)
 			if targetSym, exists := ectx.SymbolsByKey[rawKey]; exists {
 				return &model.SymbolRelation{
 					FromSymbolKeyHash:   callerHash,
@@ -395,6 +399,9 @@ func extractSelectorReference(ectx *ExtractionContext, sel *ast.SelectorExpr, ca
 func referencedSymbolKind(object types.Object) (model.SymbolKind, bool) {
 	switch value := object.(type) {
 	case *types.Func:
+		if sig, ok := value.Type().(*types.Signature); ok && sig.Recv() != nil {
+			return model.SymbolKindMethod, true
+		}
 		return model.SymbolKindFunction, true
 	case *types.TypeName:
 		if _, ok := types.Unalias(value.Type()).Underlying().(*types.Interface); ok {
@@ -407,9 +414,9 @@ func referencedSymbolKind(object types.Object) (model.SymbolKind, bool) {
 }
 
 func findEnclosingSymbol(fset *token.FileSet, funcDecl *ast.FuncDecl, fileSymbols []*model.Symbol) *model.Symbol {
-	startPos := fset.Position(funcDecl.Pos())
+	startPos := fset.PositionFor(funcDecl.Pos(), false)
 	for _, sym := range fileSymbols {
-		if sym.StartLine == startPos.Line && sym.Name == funcDecl.Name.Name {
+		if sym.StartLine == startPos.Line && sym.StartCol == startPos.Column && sym.Name == funcDecl.Name.Name {
 			return sym
 		}
 	}
