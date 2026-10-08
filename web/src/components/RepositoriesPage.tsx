@@ -26,7 +26,7 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
   const [gitURL, setGitURL] = useState('');
   const [defaultRef, setDefaultRef] = useState('main');
   const [error, setError] = useState<string | null>(null);
-  const [preparingRepoId, setPreparingRepoId] = useState<string | null>(null);
+  const [preparing, setPreparing] = useState<{ repoId: string; action: 'retry' | 'latest' } | null>(null);
   const [revisions, setRevisions] = useState<Record<string, AnalysisRevision[]>>({});
   const revisionsRef = useRef<Record<string, AnalysisRevision[]>>({});
   const pollerRef = useRef<RevisionPoller | null>(null);
@@ -116,12 +116,12 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
     }
   };
 
-  const handlePrepareOrRetry = async (repoId: string, ref: string) => {
+  const handlePrepare = async (repoId: string, ref: string, action: 'retry' | 'latest') => {
     const latest = revisions[repoId]?.[0];
-    setPreparingRepoId(repoId);
+    setPreparing({ repoId, action });
     setError(null);
     try {
-      if (latest?.status === 'FAILED') {
+      if (action === 'retry' && latest?.status === 'FAILED') {
         await api.retryAnalysisRevision(latest.id);
       } else {
         await api.createAnalysisRevision(repoId, ref);
@@ -130,7 +130,7 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
     } catch (err: any) {
       setError(err.message || '准备分析失败');
     } finally {
-      setPreparingRepoId(null);
+      setPreparing((current) => current?.repoId === repoId && current.action === action ? null : current);
     }
   };
 
@@ -196,13 +196,19 @@ export const RepositoriesPage: React.FC<Props> = ({ onSelectRepoForDiagnosis }) 
                 </div>
 
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  {revisions[r.id]?.[0]?.status === 'FAILED' && (
+                    <button className="btn" onClick={() => handlePrepare(r.id, r.default_ref, 'retry')} disabled={preparing?.repoId === r.id}>
+                      <RefreshCw size={14} className={preparing?.repoId === r.id && preparing.action === 'retry' ? 'spin' : ''} />
+                      重试此版本
+                    </button>
+                  )}
                   <button
                     className="btn"
-                    onClick={() => handlePrepareOrRetry(r.id, r.default_ref)}
-                    disabled={preparingRepoId === r.id}
+                    onClick={() => handlePrepare(r.id, r.default_ref, 'latest')}
+                    disabled={preparing?.repoId === r.id}
                   >
-                    {preparingRepoId === r.id ? <RefreshCw size={14} className="spin" /> : <RefreshCw size={14} />}
-                    {revisions[r.id]?.[0]?.status === 'FAILED' ? '重试准备' : '准备分析'}
+                    <RefreshCw size={14} className={preparing?.repoId === r.id && preparing.action === 'latest' ? 'spin' : ''} />
+                    {revisions[r.id]?.[0]?.status === 'FAILED' ? '准备最新版本' : '准备分析'}
                   </button>
                   <button
                     className="btn btn-primary"

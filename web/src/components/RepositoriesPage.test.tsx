@@ -190,4 +190,25 @@ describe('RepositoriesPage AnalysisRevision polling', () => {
     expect(oldReads).toBe(2);
   });
 
+  it.each(['retry', 'latest'] as const)('separates FAILED revision intent: %s', async (action) => {
+    const failed = { ...preparingRevision, id: 'failed-exact-commit', status: 'FAILED' as const };
+    vi.mocked(api.listAnalysisRevisions).mockResolvedValue([failed]);
+    await mountAndFlush();
+    const buttons = [...container.querySelectorAll('button')];
+    const retry = buttons.find((button) => button.textContent?.includes('重试此版本'))!;
+    const latest = buttons.find((button) => button.textContent?.includes('准备最新版本'))!;
+    expect(retry).toBeTruthy();
+    expect(latest).toBeTruthy();
+    await act(async () => { (action === 'retry' ? retry : latest).click(); });
+    if (action === 'retry') {
+      expect(api.retryAnalysisRevision).toHaveBeenCalledTimes(1);
+      expect(api.retryAnalysisRevision).toHaveBeenCalledWith(failed.id);
+      expect(api.createAnalysisRevision).not.toHaveBeenCalled();
+    } else {
+      expect(api.createAnalysisRevision).toHaveBeenCalledTimes(1);
+      expect(api.createAnalysisRevision).toHaveBeenCalledWith(repository.id, repository.default_ref);
+      expect(api.retryAnalysisRevision).not.toHaveBeenCalled();
+    }
+  });
+
 });
