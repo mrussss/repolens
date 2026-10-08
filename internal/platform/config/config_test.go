@@ -101,11 +101,16 @@ func TestProductionAgentDefaults(t *testing.T) {
 }
 
 func TestProductionAgentConfigCanBeOverridden(t *testing.T) {
-	t.Setenv("REPOLENS_MAX_OUTPUT_TOKENS", "8192")
-	t.Setenv("REPOLENS_REASONING_EFFORT", "medium")
-	cfg := Load()
-	if cfg.MaxOutputTokens != 8192 || cfg.ReasoningEffort != "medium" {
-		t.Fatalf("production agent config = %+v", cfg)
+	for _, effort := range []string{"medium", "high"} {
+		t.Run(effort, func(t *testing.T) {
+			t.Setenv("REPOLENS_MAX_OUTPUT_TOKENS", "8192")
+			t.Setenv("REPOLENS_REASONING_EFFORT", effort)
+			t.Setenv("REPOLENS_PROVIDER_TIMEOUT_SECONDS", "180")
+			cfg := Load()
+			if cfg.MaxOutputTokens != 8192 || cfg.ReasoningEffort != effort || cfg.ProviderTimeoutSeconds != 180 {
+				t.Fatalf("generation = %s/%d/%d, want %s/8192/180", cfg.ReasoningEffort, cfg.MaxOutputTokens, cfg.ProviderTimeoutSeconds, effort)
+			}
+		})
 	}
 }
 

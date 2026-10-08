@@ -33,6 +33,9 @@ services:
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - SNAPSHOT_BASE_PATH=/data/repositories
       - PROVIDER_SECRET_PATH=/data/secrets/provider.json
+      - REPOLENS_REASONING_EFFORT=${REPOLENS_REASONING_EFFORT:-low}
+      - REPOLENS_MAX_OUTPUT_TOKENS=${REPOLENS_MAX_OUTPUT_TOKENS:-4096}
+      - REPOLENS_PROVIDER_TIMEOUT_SECONDS=${REPOLENS_PROVIDER_TIMEOUT_SECONDS:-60}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -55,6 +58,9 @@ services:
       - DB_DSN=repolens:repolens_password@tcp(mysql:3306)/repolens?charset=utf8mb4&parseTime=True&loc=Local
       - SNAPSHOT_BASE_PATH=/data/repositories
       - PROVIDER_SECRET_PATH=/data/secrets/provider.json
+      - REPOLENS_REASONING_EFFORT=${REPOLENS_REASONING_EFFORT:-low}
+      - REPOLENS_MAX_OUTPUT_TOKENS=${REPOLENS_MAX_OUTPUT_TOKENS:-4096}
+      - REPOLENS_PROVIDER_TIMEOUT_SECONDS=${REPOLENS_PROVIDER_TIMEOUT_SECONDS:-60}
     volumes:
       - snapshot_data:/data/repositories
       - provider_secrets:/data/secrets

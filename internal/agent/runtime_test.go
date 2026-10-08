@@ -71,7 +71,7 @@ func (p *runtimeGenerationProvider) Generate(_ context.Context, request llm.Gene
 }
 
 func TestRuntimeUsesFrozenRunReasoningEffortAndSupportsEmptyValue(t *testing.T) {
-	for _, want := range []string{"low", ""} {
+	for _, want := range []string{"low", "high", ""} {
 		t.Run("reasoning="+want, func(t *testing.T) {
 			provider := &runtimeGenerationProvider{}
 			executor := NewAgentRuntimeExecutor(provider, nil, nil, nil, DefaultGuardConfig())
@@ -87,9 +87,15 @@ func TestRuntimeUsesFrozenRunReasoningEffortAndSupportsEmptyValue(t *testing.T) 
 }
 
 func TestRuntimeResumeKeepsRunReasoningEffort(t *testing.T) {
+	t.Setenv("REPOLENS_REASONING_EFFORT", "high")
+	t.Setenv("REPOLENS_MAX_OUTPUT_TOKENS", "8192")
+	t.Setenv("REPOLENS_PROVIDER_TIMEOUT_SECONDS", "180")
 	provider := &runtimeGenerationProvider{}
-	executor := NewAgentRuntimeExecutor(provider, nil, nil, nil, DefaultGuardConfig())
-	run := &diagnosis.DiagnosisRun{ID: "run-runtime-resume", IssueTitle: "issue", ReasoningEffort: "low"}
+	workerGuard := DefaultGuardConfig()
+	workerGuard.MaxOutputTokens = 8192
+	executor := NewAgentRuntimeExecutor(provider, nil, nil, nil, workerGuard).
+		WithGenerationOptions(GenerationOptions{ReasoningEffort: "high", ResponseFormat: &llm.ResponseFormat{Type: "json_object"}})
+	run := &diagnosis.DiagnosisRun{ID: "run-runtime-resume", IssueTitle: "issue", ReasoningEffort: "low", MaxOutputTokens: 4096, ProviderTimeoutSeconds: 60}
 	for _, attemptID := range []string{"attempt-runtime-1", "attempt-runtime-2"} {
 		if _, err := executor.Execute(context.Background(), testExecutionSpec(run), &diagnosis.DiagnosisAttempt{ID: attemptID}); err != nil {
 			t.Fatal(err)
@@ -99,8 +105,8 @@ func TestRuntimeResumeKeepsRunReasoningEffort(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 2", len(provider.requests))
 	}
 	for i, request := range provider.requests {
-		if request.ReasoningEffort != "low" {
-			t.Fatalf("request %d reasoning_effort = %q, want low", i, request.ReasoningEffort)
+		if request.ReasoningEffort != "low" || request.MaxTokens != 4096 {
+			t.Fatalf("request %d generation = %s/%d, want low/4096", i, request.ReasoningEffort, request.MaxTokens)
 		}
 	}
 }
