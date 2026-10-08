@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
 import { Repository, Snapshot, CodeIndexBuild, CodeSymbol, QualityReport, SymbolRelation, RetrievalBuild } from '../types';
 import { Search, CheckCircle2, RefreshCw, BarChart2, Layers } from 'lucide-react';
@@ -19,38 +19,78 @@ export const CodeIntelPage: React.FC = () => {
   const [symbolLoading, setSymbolLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadInitialData();
-  }, []);
+  // Every context change invalidates all requests, including polling loops.
+  const context = useRef({ repoId: '', snapshotId: '', buildId: 0 });
+  const searchGeneration = useRef(0);
+  const symbolGeneration = useRef(0);
+  type ViewContext = typeof context.current;
+  const isCurrent = (view: ViewContext) => context.current === view;
 
-  const loadInitialData = async () => {
-    try {
-      setLoading(true);
-      const list = await api.listAllRepositories();
-      setRepos(list || []);
-      if (list && list.length > 0) setSelectedRepoId(list[0].id);
-    } catch (err: any) {
-      setError(err.message || '加载仓库失败');
-    } finally {
-      setLoading(false);
-    }
+  const resetSymbol = () => {
+    symbolGeneration.current += 1;
+    setSelectedSymbol(null);
+    setReferences([]);
+    setRelatedTests([]);
+    setSymbolLoading(false);
   };
+
+  const resetContext = (repoId: string, snapshotId: string) => {
+    const view = { repoId, snapshotId, buildId: 0 };
+    context.current = view;
+    searchGeneration.current += 1;
+    setBuildId(0);
+    setRetrievalBuild(null);
+    setQuality(null);
+    setSymbols([]);
+    setSearchQuery('');
+    resetSymbol();
+    setLoading(false);
+    setError(null);
+    return view;
+  };
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    api.listAllRepositories().then((list) => {
+      if (!active) return;
+      setRepos(list || []);
+      const repoId = list?.[0]?.id || '';
+      setSelectedRepoId(repoId);
+      context.current = { repoId, snapshotId: '', buildId: 0 };
+    }).catch((err) => {
+      if (active) setError(err.message || '加载仓库失败');
+    }).finally(() => {
+      if (active) setLoading(false);
+    });
+    return () => {
+      active = false;
+      context.current = { repoId: '', snapshotId: '', buildId: 0 };
+      searchGeneration.current += 1;
+      symbolGeneration.current += 1;
+    };
+  }, []);
 
   const readySnapshots = (repo: Repository): Snapshot[] =>
     (repo.snapshots || []).filter((snapshot) => snapshot.status === 'READY');
 
-  const waitForCodeIndex = async (id: number): Promise<CodeIndexBuild> => {
+  const staleRequest = new Error('stale CodeIntel request');
+  const waitForCodeIndex = async (id: number, view: ViewContext): Promise<CodeIndexBuild> => {
     for (let attempt = 0; attempt < 60; attempt += 1) {
+      if (!isCurrent(view)) throw staleRequest;
       const build = await api.getCodeIndexBuild(id);
+      if (!isCurrent(view)) throw staleRequest;
       if (build.status === 'READY' || build.status === 'FAILED') return build;
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     throw new Error('代码索引仍在运行，请稍后刷新。');
   };
 
-  const waitForRetrieval = async (id: number): Promise<RetrievalBuild> => {
+  const waitForRetrieval = async (id: number, view: ViewContext): Promise<RetrievalBuild> => {
     for (let attempt = 0; attempt < 60; attempt += 1) {
+      if (!isCurrent(view)) throw staleRequest;
       const build = await api.getRetrievalBuild(id);
+      if (!isCurrent(view)) throw staleRequest;
       if (build.status === 'READY' || build.status === 'FAILED') return build;
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
@@ -58,77 +98,86 @@ export const CodeIntelPage: React.FC = () => {
   };
 
   const prepareBuild = async (snapshot: Snapshot) => {
+    const view = resetContext(selectedRepoId, snapshot.id);
+    setLoading(true);
     try {
-      setLoading(true);
-      setSelectedSnapshotId(snapshot.id);
-      setQuality(null);
-      setSymbols([]);
-      setSelectedSymbol(null);
       const response = await api.triggerCodeIndexBuild(snapshot.id);
+      if (!isCurrent(view)) return;
       const build = response.code_index_build.status === 'READY'
         ? response.code_index_build
-        : await waitForCodeIndex(response.code_index_build.id);
+        : await waitForCodeIndex(response.code_index_build.id, view);
+      if (!isCurrent(view)) return;
       if (build.status !== 'READY') throw new Error(`代码索引状态为 ${build.status}`);
+      view.buildId = build.id;
       setBuildId(build.id);
 
       const retrievalResponse = await api.triggerRetrievalBuild(build.id);
+      if (!isCurrent(view)) return;
       const retrieval = retrievalResponse.retrieval_build.status === 'READY'
         ? retrievalResponse.retrieval_build
-        : await waitForRetrieval(retrievalResponse.retrieval_build.id);
+        : await waitForRetrieval(retrievalResponse.retrieval_build.id, view);
+      if (!isCurrent(view)) return;
       if (retrieval.status !== 'READY') throw new Error(`检索索引状态为 ${retrieval.status}`);
       setRetrievalBuild(retrieval);
-      await loadBuildDetails(build.id);
+      await loadBuildDetails(build.id, view);
     } catch (err: any) {
-      setError(err.message || '准备代码智能索引失败');
+      if (isCurrent(view)) setError(err.message || '准备代码智能索引失败');
     } finally {
-      setLoading(false);
+      if (isCurrent(view)) setLoading(false);
     }
   };
 
-  const loadBuildDetails = async (id: number) => {
-    try {
-      setLoading(true);
-      setBuildId(id);
-      const q = await api.getBuildQuality(id);
-      setQuality(q);
-
-      const symRes = await api.listSymbols(id, searchQuery);
-      setSymbols(symRes.symbols || []);
-      if (symRes.symbols && symRes.symbols.length > 0) await handleSelectSymbol(symRes.symbols[0], id);
-    } catch (err: any) {
-      setError(err.message || '加载代码索引详情失败');
-    } finally {
-      setLoading(false);
-    }
+  const loadBuildDetails = async (id: number, view: ViewContext) => {
+    const [q, symRes] = await Promise.all([api.getBuildQuality(id), api.listSymbols(id, '')]);
+    if (!isCurrent(view) || view.buildId !== id) return;
+    setQuality(q);
+    setSymbols(symRes.symbols || []);
+    if (symRes.symbols?.length) void handleSelectSymbol(symRes.symbols[0], id, view);
   };
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
+    const view = context.current;
+    if (!view.buildId || loading) return;
+    const generation = ++searchGeneration.current;
+    const current = () => isCurrent(view) && generation === searchGeneration.current;
+    resetSymbol();
+    setSymbols([]);
+    setLoading(true);
+    setError(null);
     try {
-      setLoading(true);
-      const symRes = await api.listSymbols(buildId, searchQuery);
+      const symRes = await api.listSymbols(view.buildId, searchQuery);
+      if (!current()) return;
       setSymbols(symRes.symbols || []);
-      if (symRes.symbols && symRes.symbols.length > 0) await handleSelectSymbol(symRes.symbols[0], buildId);
+      if (symRes.symbols?.length) void handleSelectSymbol(symRes.symbols[0], view.buildId, view);
     } catch (err: any) {
-      setError(err.message || '搜索符号失败');
+      if (current()) setError(err.message || '搜索符号失败');
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   };
 
-  const handleSelectSymbol = async (sym: CodeSymbol, bId: number) => {
+  const handleSelectSymbol = async (sym: CodeSymbol, bId: number, view = context.current) => {
+    if (!isCurrent(view) || view.buildId !== bId) return;
+    const generation = ++symbolGeneration.current;
+    const current = () => isCurrent(view) && view.buildId === bId && generation === symbolGeneration.current;
     setSelectedSymbol(sym);
+    setReferences([]);
+    setRelatedTests([]);
     setSymbolLoading(true);
+    setError(null);
     try {
-      const refRes = await api.getSymbolReferences(sym.id, bId);
+      const [refRes, testRes] = await Promise.all([
+        api.getSymbolReferences(sym.id, bId),
+        api.getSymbolRelatedTests(sym.id, bId, sym.symbol_key_hash),
+      ]);
+      if (!current()) return;
       setReferences(refRes.relations || []);
-
-      const testRes = await api.getSymbolRelatedTests(sym.id, bId, sym.symbol_key_hash);
       setRelatedTests(testRes.related_tests || []);
     } catch (err: any) {
-      setError(err.message || '加载符号关系失败');
+      if (current()) setError(err.message || '加载符号关系失败');
     } finally {
-      setSymbolLoading(false);
+      if (current()) setSymbolLoading(false);
     }
   };
 
@@ -149,8 +198,7 @@ export const CodeIntelPage: React.FC = () => {
             onChange={(e) => {
               setSelectedRepoId(e.target.value);
               setSelectedSnapshotId('');
-              setBuildId(0);
-              setRetrievalBuild(null);
+              resetContext(e.target.value, '');
             }}
           >
             {repos.map((r) => (
@@ -163,6 +211,7 @@ export const CodeIntelPage: React.FC = () => {
             value={selectedSnapshotId}
             onChange={(e) => {
               setSelectedSnapshotId(e.target.value);
+              resetContext(selectedRepoId, e.target.value);
             }}
             disabled={!selectedRepoId}
           >
@@ -232,7 +281,7 @@ export const CodeIntelPage: React.FC = () => {
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="搜索符号，例如 ProcessOrder、Service…"
             />
-            <button type="submit" className="btn btn-primary">
+            <button type="submit" className="btn btn-primary" disabled={!buildId || loading}>
               <Search size={14} />
             </button>
           </form>
