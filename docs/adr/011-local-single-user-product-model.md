@@ -1,12 +1,15 @@
-# ADR 011: Local Single-User Product Model and Zero-Leakage Secrets
+# ADR 011：本地单用户产品模型与密钥隔离
 
-## Status
-Accepted and Implemented
+## 状态
 
-## Context
-RepoLens is designed as a local developer tool. Multi-tenant SaaS concepts like JWT logins, RBAC roles, and cloud user registration introduce unnecessary barriers to instant developer adoption.
+已采纳并实现。
 
-## Decision
-1. Eliminate multi-tenant authentication, login walls, and session management.
-2. Store API keys locally in secret files with `0600` permissions; never persist keys in frontend storage.
-3. Expose single-user local APIs with immediate 1-click Demo Mode out-of-the-box.
+## 背景
+
+RepoLens 面向开发者本地使用。多租户 SaaS 的登录、RBAC 和会话管理会增加启动门槛，并不符合当前产品范围。
+
+## 决策
+
+1. 不实现多租户身份认证、登录流程和会话管理；本项目不适合直接暴露到公网。
+2. Provider API Key 写入本地共享密钥文件，文件权限为 `0600`，不存入前端持久化存储。
+3. Try Demo 提供预置报告和 Trace，不调用 Provider；真实诊断需要用户配置 Provider。

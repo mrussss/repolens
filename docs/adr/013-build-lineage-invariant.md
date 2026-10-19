@@ -1,14 +1,13 @@
-# ADR 013: Build Lineage Invariant and Cross-Build Integrity
+# ADR 013：Build lineage 完整性约束
 
-## Status
-Accepted and Implemented
+## 状态
 
-## Context
-A diagnosis request or agent query must not mix snapshots, code intelligence tables, and retrieval builds across disparate repository commits or parent lineages.
+已采纳并实现。
 
-## Decision
-1. Enforce strict lineage invariant checks on all diagnosis creations and queries:
-   - `snapshot.repository_id == diagnosis.repository_id`
-   - `code_index_build.snapshot_id == diagnosis.snapshot_id`
-   - `retrieval_build.code_index_build_id == code_index_build.id`
-2. Reject any mismatched combination with HTTP 409 `BUILD_LINEAGE_MISMATCH`.
+## 背景
+
+Diagnosis 及 Agent 查询不能混用不同 Repository、commit 或父构建的 Snapshot、CodeIndex 和 Retrieval 数据。
+
+## 决策
+
+创建 Diagnosis 和执行查询时校验 lineage：Snapshot 属于目标 Repository，CodeIndexBuild 属于该 Snapshot，RetrievalBuild 属于该 CodeIndexBuild。任一关系不匹配时拒绝请求并返回 `BUILD_LINEAGE_MISMATCH`。

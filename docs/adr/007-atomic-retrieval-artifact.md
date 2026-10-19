@@ -1,14 +1,16 @@
-# ADR 007: Atomic Retrieval Artifact Publishing and Storage Protocol
+# ADR 007：原子发布 Retrieval artifact
 
-## Status
-Accepted and Implemented
+## 状态
 
-## Context
-Writing search index files directly into active production directories can lead to partial reads or corrupted indexes if crashes or cancellations occur during construction.
+已采纳并实现。
 
-## Decision
-1. Stage all index files in `.tmp/<retrieval_build_id>-<claim_token>/`.
-2. Generate index binary, metadata, and `manifest.json`.
-3. Compute SHA256 checksums across all written files.
-4. Perform atomic directory rename via `os.Rename` to `storage/indexes/<retrieval_build_id>/`.
-5. Update `RetrievalBuild` to `READY` within a database transaction.
+## 背景
+
+若索引直接写入正在使用的目录，进程崩溃或任务取消可能留下部分文件，导致读取到不完整 artifact。
+
+## 决策
+
+1. 在 `.tmp/<retrieval_build_id>-<claim_token>/` 下写入临时文件。
+2. 生成索引、元数据和 `manifest.json`，并对写入内容计算 SHA256。
+3. 校验后通过目录原子 rename 发布到最终路径。
+4. 仅在 claim 仍有效时，将 RetrievalBuild 在数据库事务中标记为 READY。

@@ -1,17 +1,20 @@
-# ADR 001: Drop RabbitMQ & Outbox Relay for Database-Backed Analysis Jobs
+# ADR 001：使用数据库任务队列替代 RabbitMQ 与 Outbox Relay
 
-## Status
-Accepted and Implemented
+## 状态
 
-## Context
-RepoLens v1 used an asynchronous architecture with RabbitMQ and an Outbox relay daemon. For a single-tenant local-first repository intelligence and RCA engine, maintaining RabbitMQ containers, outbox table polling loops, exchange/queue bindings, and dead-letter topics created significant operational complexity without adding value.
+已采纳并实现。
 
-## Decision
-1. Replace RabbitMQ and Outbox Relay with a native Database-backed Job runtime (`internal/jobs/`).
-2. Implement concurrent job claiming via `SELECT ... FOR UPDATE SKIP LOCKED` (MySQL 8) and transaction-fenced locks (SQLite3).
-3. Enforce deterministic fencing tokens (`execution_generation`), dynamic background lease renewal (`LeaseRenewer`), and stale job reaping (`Reaper`).
-4. Support 4 frozen job types: `MATERIALIZE_SNAPSHOT`, `BUILD_CODE_INDEX`, `BUILD_RETRIEVAL`, and `RUN_DIAGNOSIS`.
+## 背景
 
-## Consequences
-- Zero external message broker dependency; reduced container count and instant startup.
-- Full transactional consistency between business domain entities (Diagnoses/Snapshots/Builds) and their queued execution jobs.
+RepoLens v1 使用 RabbitMQ 和 Outbox relay。项目定位是本地单用户仓库诊断工具，维护消息代理、Outbox 轮询、交换机和死信队列会增加部署与运维负担。
+
+## 决策
+
+1. 使用 `internal/jobs/` 中基于数据库的 Job runtime。
+2. MySQL 8 使用 `SELECT ... FOR UPDATE SKIP LOCKED` 并发领取；SQLite 测试使用事务锁定。
+3. 通过 execution generation、claim token、lease renewer 和 Reaper 管理执行权、续租与过期任务恢复。
+4. 当前任务类型为 `MATERIALIZE_SNAPSHOT`、`BUILD_CODE_INDEX`、`BUILD_RETRIEVAL` 和 `RUN_DIAGNOSIS`。
+
+## 结果
+
+无需外部消息代理，部署组件更少。业务对象和排队任务在同一数据库事务中创建；执行状态仍需遵守 claim fencing 与 lease recovery 约束。

@@ -31,7 +31,7 @@ export REPOLENS_REALBENCH_AUTH_MODE=bearer  # 或 none
 go run ./cmd/realbench run --all --e2e
 ```
 
-真实 Agent E2E 的 pilot 记录见 [`../history/benchmarks/realbench/v1-agent-e2e.md`](../history/benchmarks/realbench/v1-agent-e2e.md)。其中的 API Key 只通过运行环境传入，不写入命令示例、Git 或 benchmark artifact；Retrieval 正式 baseline 仍见 [`../history/benchmarks/realbench/v1-baseline.md`](../history/benchmarks/realbench/v1-baseline.md)。
+v1 数据集和命令仍为兼容保留。当前检索基线与真实 Provider Agent E2E 证据见下方链接的 v2 记录；密钥只通过运行环境传入，不写入命令示例或 benchmark artifact。
 
 ## RealBench v2
 
@@ -126,5 +126,4 @@ REAL-005 只有 RR 退步（Recall 保持），REAL-007/011 的缺失实现未�
 V2 p50/p95=280.350481/2141.075054 ms；BM25=52.831868/531.676623 ms。该单次机器测量不作为性能泛化结论。
 所有预算均满足，但实验没有达到预先设定的 dev GO 条件。
 
-因此停止 Structural 投资，production 固定保持 BM25；V1/V2 保留为实验历史，不实现 V3、不继续 unseen validation 或 promotion。
-完整实现、per-case trace 和验收记录保存在本地 `docs/development/minimal-structural-expansion-v2-implementation-report.md`。
+因此停止 Structural 投资，production 固定保持 BM25；V1/V2 保留为实验历史，不实现 V3、不继续 unseen validation 或 promotion。逐 case 失败分析见[Structural 检索失败记录](../history/benchmarks/structural-retrieval-failure-analysis-v2.md)。

@@ -1,14 +1,16 @@
-# ADR 014: Deterministic Provider Configuration Pinning and Endpoint Fingerprints
+# ADR 014：冻结 Provider 执行配置
 
-## Status
-Accepted and Implemented
+## 状态
 
-## Context
-When configuring third-party OpenAI-compatible LLM endpoints, subtle variations in base URLs (trailing slashes, `/v1` paths) or credentials can cause configuration drift and silent failures.
+已采纳并实现。
 
-## Decision
-1. Normalize Base URLs strictly: trim trailing slashes, ensure `/v1` endpoint consistency, and prohibit non-HTTPS endpoints in production.
-2. Compute deterministic SHA256 fingerprints:
-   - `endpoint_fingerprint`: SHA256 of normalized Base URL + Model name.
-   - `config_fingerprint`: SHA256 of normalized Base URL + Model + API Key.
-3. Expose safe endpoint fingerprints in public health status without leaking API keys.
+## 背景
+
+OpenAI-compatible endpoint 的 URL 规范化、模型身份和凭据配置变化可能导致同一 Diagnosis 执行漂移或失败。
+
+## 决策
+
+1. 规范化 Base URL，并在生产配置中要求 HTTPS。
+2. Diagnosis 创建时冻结 Provider endpoint/model 身份及相关执行选项；Worker 执行时核对兼容性，避免无提示地切换 endpoint 或 model。
+3. API Key 不写入 Diagnosis 快照或公开健康信息；相同 endpoint/model 下允许轮换本地密钥。
+4. 对外暴露的 endpoint 指纹不包含 API Key。

@@ -38,7 +38,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-打开 <http://127.0.0.1:8080>。Setup 页面可以保存 OpenAI-compatible Provider；API Key 只写入 API/Worker 共享的 0600 本地 secret 文件，不会返回浏览器、trace 或日志。没有 API Key 时可使用 Try Demo 的确定性 FakeProvider。
+打开 <http://127.0.0.1:8080>。Setup 页面可以保存 OpenAI-compatible Provider；API Key 写入 API/Worker 共享的本地 secret 文件，权限为 `0600`，不会返回浏览器。Try Demo 会创建预置的示例报告和 Trace，不调用 Provider，也不代表真实模型诊断效果。要体验真实诊断，请先配置 Provider，再提交 Diagnosis。
 
 Compose 最终只运行 `mysql`、`api`、`worker`，默认仅绑定 loopback。仓库内容是不可信数据；系统不会执行用户仓库的 build、test、generate 或 package install。
 
@@ -82,7 +82,7 @@ Diagnosis 的业务状态只有 `QUEUED`、`RUNNING`、`SUCCEEDED`、`FAILED`、
 - [架构说明](docs/architecture.md)：当前子系统职责与数据链路。
 - [状态机](docs/state-machines.md)：Pipeline、Job、Diagnosis 和 Attempt 状态转换。
 - [失败语义](docs/failure-semantics.md) 与 [Provider 执行语义](docs/provider-execution-semantics.md)：重试、lease recovery 和未知 Provider 结果。
-- [测试与验证](docs/testing.md) 和 [本地部署](docs/deployment.md)：CI、Release Gate 和 Compose 使用方法。
+- [测试与验证](docs/testing.md) 和 [本地部署](docs/deployment.md)：Fast CI、Heavy Release Gate 和 Compose 使用方法。
 - [Agent Runtime](docs/agent-runtime.md) 与 [Retrieval 评测](docs/retrieval-eval.md)：专项开发说明。
 - 历史记录归档在 [`docs/history/README.md`](docs/history/README.md)；当前 ADR 保留在 [`docs/adr/`](docs/adr/)。
 
@@ -94,7 +94,7 @@ Diagnosis 的业务状态只有 `QUEUED`、`RUNNING`、`SUCCEEDED`、`FAILED`、
 ./scripts/release_gate.sh
 ```
 
-历史 v2.2 RC 检查记录见 [`docs/history/freezes/v2.2-rc-release-checklist.md`](docs/history/freezes/v2.2-rc-release-checklist.md)。Provider 设置页的 Test Connection 会执行 production Agent 请求形状的兼容性探测（小型 `max_tokens`、`reasoning_effort`、`response_format=json_object` 和 tools），不会把 API Key 或 Provider 原始响应写入日志、trace 或 artifact。
+Provider 设置页的 Test Connection 会执行 production Agent 请求形状的兼容性探测（小型 `max_tokens`、`reasoning_effort`、`response_format=json_object` 和 tools）；它验证请求形状，不保证完整 Diagnosis 可完成。密钥的本地存储和脱敏边界见部署说明。
 
 RepoLens 的 generation 默认值为 `low / 4096 tokens / 60s`，这是项目默认配置，并非所有 Provider 的最佳配置。
 Test Connection 的 256-token probe 验证请求形状兼容性；CONFIRMED 仅表示观测到目标工具调用，
@@ -105,7 +105,7 @@ Test Connection 的 256-token probe 验证请求形状兼容性；CONFIRMED 仅�
 截断会明确报告 `MODEL_OUTPUT_TRUNCATED`，不会当作正常 JSON。
 这些提示不会自动降低 reasoning、扩大 token/timeout、修改 Diagnosis 快照或触发重试。
 
-RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开仓库，Hit@5 `7/10`、Hit@10 `9/10`、MRR `0.724`。这是小规模 external benchmark，不是 production accuracy；完整方法、per-case rank 和 AnalysisQuality 见 [`docs/history/benchmarks/realbench/v2-baseline.md`](docs/history/benchmarks/realbench/v2-baseline.md)。真实 Provider Agent E2E 只记录选定 case 的证据和失败边界，见 [`docs/history/benchmarks/realbench/v2-agent-e2e.md`](docs/history/benchmarks/realbench/v2-agent-e2e.md)。
+RealBench v2 检索基线覆盖 8 个公开仓库中的 10 个历史 Go Bug：Hit@5 `7/10`、Hit@10 `9/10`、MRR `0.724`。这是小规模外部历史 Bug 评测，不是生产诊断准确率。方法、逐 case 结果和 AnalysisQuality 见[基线记录](docs/history/benchmarks/realbench/v2-baseline.md)；真实 Provider Agent E2E 的范围和失败边界见[专项记录](docs/history/benchmarks/realbench/v2-agent-e2e.md)。
 
 ## 范围与限制
 
@@ -115,7 +115,7 @@ RealBench v2 frozen retrieval evidence：10 个真实历史 Go Bug、8 个公开
 - Related Test 是证据排序，不是完整 test impact analysis。
 - BM25 是 portfolio-scale 的纯 Go 检索，不是分布式代码搜索。
 - Agent 只读、受步数/调用次数/输出大小限制；仓库文本与 CI log 视为不可信输入。
-- Citation validation 证明源码一致性，不证明模型结论的逻辑正确性；secret redaction 是 best-effort。
+- Citation validation 检查引用与固定源码的一致性，不证明模型结论正确；密钥脱敏是 best-effort。
 - Eval 数据集小且经过整理，Dev 与 frozen held-out 分离；当前 Structural Retrieval 未通过 promotion rule，生产构建策略为 `BM25`，实际执行 Pure BM25。Structural 仅允许显式 `BM25_STRUCTURAL` 实验构建。
 - v1.1 的 RabbitMQ、Outbox、Elasticsearch、Vector/RRF、SSE 和旧 Auth 仅存在于历史版本，不属于 v2.2 core。
 - v2.2 不会自动删除仍被数据库引用的历史 Snapshot / RetrievalBuild，也不实现面向用户的 retention policy。Worker 会周期性清理超过 24 小时、且未被任何数据库 `materialized_path` / `artifact_path` 引用的 orphan execution / staging artifact。`make clean-data` 是破坏性的全量本地重置，请谨慎使用。

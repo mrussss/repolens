@@ -1,12 +1,15 @@
-# ADR 012: Separation of Business State and Job Execution with Manual Requeue
+# ADR 012：业务状态与 Job 执行状态分离
 
-## Status
-Accepted and Implemented
+## 状态
 
-## Context
-Diagnosis runs have business states (`QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`) while underlying execution jobs cycle through transient retries (`RETRY_WAIT`). Mixing transient execution attempts with domain business states causes confusing UI flickering.
+已采纳并实现。
 
-## Decision
-1. Separate `DiagnosisRun` status from `AnalysisJob` status.
-2. Allow `GET /api/v1/diagnoses/:id` to expose `execution_status` and `attempt_count` alongside business `status`.
-3. Support manual requeue for jobs terminating with `RETRYABLE_EXHAUSTED` (HTTP 202), while preventing requeue of `PERMANENT` failures (HTTP 409).
+## 背景
+
+Diagnosis 的业务状态为 `QUEUED`、`RUNNING`、`SUCCEEDED`、`FAILED` 或 `CANCELLED`；底层 Job 还会经历 `RETRY_WAIT`。混合两者会让业务状态随瞬时重试反复变化。
+
+## 决策
+
+1. 分开保存 DiagnosisRun 与 AnalysisJob 状态；API 同时返回业务状态和执行信息。
+2. 自动执行重试由 Job 管理，等待期间 Diagnosis 保持 RUNNING。
+3. 对符合条件的重试耗尽任务提供显式重新提交；永久失败不允许通过该入口重排。

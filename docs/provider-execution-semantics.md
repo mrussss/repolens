@@ -1,35 +1,21 @@
-# Provider execution semantics
+# Provider 执行语义
 
-## Provider execution guarantee
+自动重试取决于请求是否派发，以及 Provider 的执行结果是否明确。每次 Diagnosis 使用冻结的 `DiagnosisExecutionSpec` 中的 Provider 身份和重试预算。
 
-Provider retry behavior depends on whether dispatch and its outcome are known.
-The frozen `DiagnosisExecutionSpec` supplies the Provider retry budget and
-identity for the run.
+## 请求派发前
 
-### Before dispatch
+能够确认请求尚未发出的错误（例如建立连接时被拒绝）可按 Job 重试策略自动重试。
 
-Failures known to occur before dispatch, such as a connection refusal during
-dial, may be retried automatically by the job policy.
+## 收到明确响应
 
-### Definite provider response
+明确收到 HTTP 429 或 5xx 时，Provider 可在本次执行冻结的重试预算内重试。预算耗尽后，Job 重试策略可能安排新的执行尝试。
 
-An explicit HTTP 429 or 5xx response is a known retryable provider response.
-The Provider may retry it within the run's frozen provider retry budget; if
-that budget is exhausted, the job retry policy may schedule another attempt.
+## 派发后结果未知
 
-### Outcome unknown after dispatch
+请求可能已经发出，但没有收到完整响应时，系统将其记录为永久 Job 错误 `PROVIDER_OUTCOME_UNKNOWN`，不会自动重放请求，因为 Provider 可能已经完成并计费。用户仍可显式重试 Diagnosis；显式重试可能再次产生 Provider 调用。
 
-When a request may have been dispatched but no complete response is observed,
-RepoLens records `PROVIDER_OUTCOME_UNKNOWN` as a permanent job failure. It does
-not automatically replay the request, since the Provider may already have
-performed billable work. The user can explicitly retry the Diagnosis.
+Job 的 claim fencing 仍然有效：已失去执行权的 Worker 不能提交终态。若终态写入响应含糊，Worker 会根据数据库中的持久状态核对结果，同时保留未知结果不自动重放的规则。
 
-Job claim fencing still applies: a worker that has lost its claim cannot
-finalize the outcome. The worker reconciles ambiguous finalization against the
-durable job state while preserving the no-replay policy.
+## 保证边界
 
-### Limits
-
-An operator's explicit retry can issue a new Provider request. The execution
-contract therefore prevents automatic replay of an unknown outcome; it does
-not promise at-most-once effects across explicit retries.
+系统禁止对未知结果进行自动重放，但不承诺跨用户显式重试的 at-most-once 外部副作用。

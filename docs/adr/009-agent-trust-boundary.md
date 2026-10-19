@@ -1,12 +1,15 @@
-# ADR 009: Agent Trust Boundary and Read-Only Tool Authorizations
+# ADR 009：Agent 信任边界与只读工具
 
-## Status
-Accepted and Implemented
+## 状态
 
-## Context
-Code repositories, error logs, and issue descriptions contain untrusted user data that could attempt prompt injections, shell execution, or credential exfiltration.
+已采纳并实现。
 
-## Decision
-1. Establish rigid policy hierarchy: `Server Policy > Tool Authorization > User Goal > Untrusted Repository Data`.
-2. Restrict agent execution strictly to 5 read-only tools: `search_code`, `get_symbol`, `find_references`, `find_related_tests`, and `read_file`.
-3. Apply secret redaction and size limits to user inputs and tool responses before sending prompts to LLM providers.
+## 背景
+
+源码、注释、Issue 描述和 CI 日志都可能含有不可信指令，尝试影响模型行为、执行命令或泄露凭据。
+
+## 决策
+
+1. 服务端策略和工具授权优先于用户目标；仓库数据只作为待分析内容，不作为可信指令。
+2. Agent 仅能访问 Registry 中受控的只读工具，不提供 shell、仓库命令执行或任意网络访问。
+3. 输入和工具响应有大小预算；快照路径按共享安全策略校验，密钥脱敏为 best-effort。

@@ -45,4 +45,4 @@ Conclusion for the current evidence: this is an Agent policy/model-budget intera
 
 ## Timeout and retry policy
 
-Provider/network/429/5xx/timeout errors are classified as `EXTERNAL_INFRA`; Agent runtime, citation, and RepoLens logic errors are `REPOLENS_PRODUCT`. External errors may retry at most three attempts, with every attempt retained in `e2e_attempts.json`; product failures are not retried. The frozen v1 `REAL-003` timeout remains documented as external infrastructure evidence in [`v1-agent-e2e.md`](v1-agent-e2e.md), not as a Retrieval accuracy failure.
+Provider/network/429/5xx/timeout errors are classified as `EXTERNAL_INFRA`; Agent runtime, citation, and RepoLens logic errors are `REPOLENS_PRODUCT`. External errors may retry at most three attempts, with every attempt retained in `e2e_attempts.json`; product failures are not retried. The frozen v1 `REAL-003` timeout remains an external-infrastructure result, not a Retrieval accuracy failure; its detailed v1 report is retained in the local historical archive.

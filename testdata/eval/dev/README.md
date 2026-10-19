@@ -1,4 +1,3 @@
-# Dev evaluation set
+# 开发评测集
 
-Cases 001-016 are development cases. Retrieval and prompt changes may be
-inspected against this set while iterating.
+Case 001–016 属于开发集，可用于迭代检索或 prompt 时观察变化。开发集结果不能替代冻结集的晋升评测。

@@ -1,17 +1,9 @@
-# Documentation History
+# 历史资料
 
-These files preserve project decisions, implementation phases, audits,
-benchmark evidence, and release checkpoints. They describe the state and
-evidence of their recorded point in time; current behavior is documented in
-the core guides linked from the root README.
+当前版本保留少量仍用于解释检索取舍的证据：
 
-| Directory | Contents |
-|---|---|
-| [`audits/`](audits/) | Citation audit and RC post-review checkpoint |
-| [`benchmarks/`](benchmarks/) | Frozen RealBench candidates, run reports, and release evidence |
-| [`design/`](design/) | Superseded retrieval strategy and prior state-machine design |
-| [`freezes/`](freezes/) | Architecture gate and v2.2 RC/freeze candidate records |
-| [`phases/`](phases/) | Architecture reconciliation and hardening phase reports |
+- [RealBench v2 检索基线](benchmarks/realbench/v2-baseline.md)
+- [真实 Provider Agent E2E 记录](benchmarks/realbench/v2-agent-e2e.md)
+- [Structural 检索失败分析](benchmarks/structural-retrieval-failure-analysis-v2.md)
 
-Accepted architecture decisions that still inform the current system remain
-in [`../adr/`](../adr/).
+更早的重复审计、阶段进度、冻结检查点和旧版基准报告已从当前展示目录移出。原始文件已在仓库外归档并校验可恢复；它们也仍可从删除前的 Git 历史取回。当前行为以根目录 README 和 docs/ 当前指南为准。

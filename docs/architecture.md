@@ -87,14 +87,14 @@ Evidence / Citation
 
 | 子系统 | 独占职责 |
 | :--- | :--- |
-| **AnalysisPipeline** | Product stage lifecycle：Revision preparation/retry、Snapshot/CodeIndex/Retrieval stage advancement、READY lineage resolution 与 stage finalization ownership |
-| **Worker** | Job execution lifecycle：claim、lease renewal、execution start、handler dispatch 与 graceful recovery coordination |
-| **Jobs** | Durable execution state、retry scheduling、lease recovery、generation and claim-token fencing、cancellation 与 job terminal resolution |
-| **DiagnosisExecutionSpec** | Freeze lineage、Provider identity/options、Agent version/configuration and budgets used by one Diagnosis execution; define Provider and Agent compatibility |
-| **Diagnosis** | Authorization、request idempotency、select validated lineage、persist DiagnosisRun、schedule Diagnosis job、materialize DiagnosisExecutionSpec |
-| **Agent Runtime** | Consume DiagnosisExecutionSpec、build Provider、assemble read-only tools（`BuildToolRegistry`）、run bounded Agent loop、produce ReportDraft、invoke deterministic report finalization |
-| **Evidence** | Issue attempt-scoped evidence、validate citation identity、publish deterministic report evidence |
-| **Trace** | Persist ordered AgentStep、query by Attempt、query after sequence |
+| **AnalysisPipeline** | 管理 Revision 准备与重试、Snapshot/CodeIndex/Retrieval 阶段推进、READY lineage 解析和阶段最终化。 |
+| **Worker** | 管理 Job 领取、lease 续期、执行开始、handler 分发和退出恢复。 |
+| **Jobs** | 持久化执行状态，负责重试排期、lease recovery、generation/claim-token fencing、取消及 Job 终态。 |
+| **DiagnosisExecutionSpec** | 冻结一次 Diagnosis 使用的 lineage、Provider 身份与选项、Agent 版本、配置和预算，并定义执行时的兼容性检查。 |
+| **Diagnosis** | 负责请求授权与幂等、选择已校验 lineage、保存 DiagnosisRun、排入 Diagnosis Job 并生成执行快照。 |
+| **Agent Runtime** | 读取冻结的执行快照、创建 Provider、组装只读工具（`BuildToolRegistry`）、运行有界循环、生成 ReportDraft 并调用确定性最终化。 |
+| **Evidence** | 签发绑定 Attempt 的证据，校验 Citation 身份，并持久化最终报告证据。 |
+| **Trace** | 按顺序保存 AgentStep，并按 Attempt 和序号查询。 |
 
 ## 2. 核心子系统
 

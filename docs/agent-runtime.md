@@ -1,51 +1,27 @@
-# RepoLens Agent Runtime 与安全防护体系
+# Agent Runtime 与安全边界
 
-## 1. 受控的 Tool Calling Loop
-
-系统采用自研受控 Agent 循环，不盲目引入重型 LangChain / Eino 框架：
+Agent Runtime 使用自有的受控工具调用循环。模型输出的工具名、参数和结果都要经过服务端检查；仓库代码、注释和错误日志均视为不可信数据。
 
 ```text
-[User Diagnosis Context]
-   ↓
-[LLM Provider]
-   ↓
-Tool Call Request?
-   ├─ No  → Parse Structured JSON Report
-   └─ Yes
-        ↓
-     Validate Tool Name (Registry)
-        ↓
-     Validate Arguments & Schema
-        ↓
-     Security Guards Check
-        ↓
-     Execute Tool (Bounded Timeout & Max Bytes)
-        ↓
-     Append Result to Context & Record AgentStep
-        ↓
-     Next Step (Guard: MaxSteps, RepeatCalls)
+DiagnosisExecutionSpec
+  → Provider 请求
+  → 检查工具名和参数
+  → 检查预算及读取策略
+  → 执行只读工具并记录 AgentStep
+  → 继续调用或进入仅生成最终报告的收尾阶段
+  → 校验结构与 Citation
 ```
 
----
+## 可用工具
 
-## 2. 核心只读工具与安全防护边界
+Registry 只注册五个只读工具：`search_code`、`get_symbol`、`find_references`、`find_related_tests` 和 `read_file`。Agent 不能调用 shell、执行仓库命令或自行访问网络。
 
-1. `search_code`: 限制 Scope、TopK 及输入长度。
-2. `read_file`:
-   - **Path Traversal Guard**: 校验相对路径及 `..` 越界；
-   - **Symlink Escape Guard**: 调用 `EvalSymlinks` 确认软链接目标未逃逸 Snapshot 根目录；
-   - **Sensitive Filename Guard**: 严禁读取 `.env`, `.git/config`, `id_rsa`, `*.pem`, `*.key` 等敏感凭据；
-   - **Binary Guard**: 拦截 `.bin`, `.exe`, `.so` 等二进制文件；
-   - **Output Size Guard**: 限制单次返回最大字节数（默认 64KB），防止 Context 撑爆。
-3. `read_docs`: 仅限读取 `README` 及 `docs/**` 文档。
-4. `read_ci_log`: 支持行号切片及关键字过滤。
+`read_file` 只允许读取固定 Snapshot 中符合共享 Snapshot policy 的相对路径：拒绝路径越界、符号链接、非普通文件、排除目录和敏感文件类型。读取受单次字节预算限制；超出的结果按完整行界限截取。工具创建的 Evidence 会记录实际行号和内容摘要，供后续 Citation 校验。
 
----
+## 调用预算与收尾
 
-## 3. Citation 机器校验逻辑
+默认 Guard 限制每轮步数、工具调用次数、`search_code` 次数、重复调用次数、单个工具结果字节数和模型输出 token。耗尽探索预算后，Runtime 会取消剩余工具调用，保留一个不带工具定义的收尾请求，让模型基于已有证据输出结构化报告。若最终输出截断或无法解析，会记录失败结果，不将不完整文本当作有效 JSON 报告。
 
-大模型在输出中给出的 Citations 不得直接采信：
-1. 校验 `file_path` 在指定 Snapshot 下是否存在；
-2. 校验 `start_line` 与 `end_line` 范围合法性；
-3. 从不可变 Snapshot 中提取实际源码行，计算 SHA256 Content Hash 并校验与 Excerpt 匹配度；
-4. 校验通过标记为 `VALID`，否则标记为 `INVALID` 并记录具体错误原因。
+## Citation 校验
+
+模型只能引用当前 Attempt 工具返回的 `evidence_id`。最终化时，服务端会检查该 Evidence 是否属于当前 Diagnosis/Attempt 和固定 lineage，并按已签发的源码路径、行号、内容哈希及 excerpt 校验报告。检查通过表示引用与所读 Snapshot 内容一致；它不证明模型推断的根因正确。

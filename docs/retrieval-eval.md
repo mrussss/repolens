@@ -75,7 +75,7 @@ Artifact manifest 固定 build ID、strategy 和 index hash；build ID 关联其
 `go run ./cmd/realbench compare-retrieval --dataset v2 --all` 通过 ProductionRetriever
 对照单 Snapshot 的两种 pinned strategy，使用 BuildQuery、TopK=8、PrimaryFiles、Recall@8/MRR。
 详见 [RealBench 使用说明](realbench/README.md)。本轮不建立新 promotion gate，生产默认仍为 BM25。
-ADR 001/008 的早期 promotion 记录属于历史结论，本页定义当前生产状态。
+早期 Structural promotion 记录属于历史结论，本页和 ADR 001 定义当前生产状态。
 
 ## 5. Bounded semantic expansion V2（实验）
 

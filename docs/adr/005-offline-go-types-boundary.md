@@ -1,12 +1,15 @@
-# ADR 005: Offline Go Types Importer Boundary and Synthetic Fallback
+# ADR 005：离线 Go 类型分析边界
 
-## Status
-Accepted and Implemented
+## 状态
 
-## Context
-Standard `go/types` type checking requires downloading external module dependencies from the internet (`go.mod`/GOPROXY). In an offline, secure local developer environment, missing external packages cause type checkers to halt.
+已采纳并实现。
 
-## Decision
-1. Implement `OfflineImporter` (`internal/codeintel/importer/`):
-   - Fully parses and type checks internal repository packages from in-memory ASTs.
-   - For external unresolvable packages, generates synthetic empty `types.Package` placeholders to allow type-checking to continue without network access.
+## 背景
+
+完整的 `go/types` 分析通常需要下载外部 module。RepoLens 不执行仓库命令，也不为静态分析访问网络；缺失依赖时类型检查可能无法解析完整关系。
+
+## 决策
+
+1. `internal/codeintel/importer/` 从内存中的 AST 分析仓库内部 package。
+2. 对无法离线解析的外部 package 使用合成的空 `types.Package` 占位，使分析可以继续。
+3. 将解析和类型检查质量作为 AnalysisQuality 展示；离线结果属于 best-effort，不伪装成完整类型分析。

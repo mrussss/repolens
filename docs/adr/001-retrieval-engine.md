@@ -1,52 +1,20 @@
-# ADR 001: Retrieval Engine Architecture & Promotion Decision
+# ADR 001：检索引擎与生产策略
 
-## Status
-Accepted; historical promotion superseded by the current production state
+## 状态
 
-## Current production state (2026-10-04 follow-up)
+已采纳。当前生产构建策略为 BM25；Structural 检索仍是显式选择的实验路径。
 
-The original promotion conclusion below is a historical benchmark record.
-The current frozen evaluation does not pass all promotion gates. Production
-builds use `BM25` and actually execute Pure BM25; structural reranking requires
-an explicit `BM25_STRUCTURAL` build. Strategy, retrieval version and configuration
-are part of build identity and the artifact manifest strategy must match.
-See [current retrieval contract](../retrieval-eval.md). Promotion rules remain
-unchanged; future adoption requires a passing evaluation and an explicit
-production strategy/version change.
+## 背景
 
-## Context
-RepoLens v1 relied on an external Elasticsearch 8 service and dense vector indexing with RRF fusion. In a single-tenant local-first developer tool, this incurred significant operational overhead (requiring heavy JVM containers, complex lifecycle management, and external cluster syncing) without providing syntax-aware code navigation.
+RepoLens v1 依赖 Elasticsearch、稠密向量和 RRF 融合。对于本地单用户工具，这些外部服务增加了启动和维护成本。v2 引入 Go AST Code Intelligence 与进程内 BM25。
 
-In RepoLens v2.1, we designed and benchmarked four candidate retrieval tracks:
-- **Track A (Baseline)**: V1 regex text window search (Eval only).
-- **Track B**: Symbol Lexical Search.
-- **Track C**: Self-written pure Go BM25 index with AST tokenization.
-- **Track D**: Symbol BM25 + Structural Code Intelligence expansion (exact symbol match, callers, references, related tests).
+## 决策
 
-## Decision
-1. **Adopt Pure Go BM25 Engine with Code-Aware Tokenizer (`internal/retrieval/bm25`)**:
-   - Zero external infrastructure dependency (runs in-process with minimal memory footprint).
-   - Code-aware subword tokenization (splits camelCase, snake_case, punctuation while preserving exact identifiers).
-   - Sub-millisecond P95 retrieval latency.
+1. 使用纯 Go BM25 和代码感知 tokenizer 作为默认生产检索路径，不要求外部搜索集群或 embedding 服务。
+2. RetrievalBuild 固定策略、版本和 lineage；artifact manifest、hash 与 READY build 必须一致。
+3. Structural 检索保留为显式的实验构建策略。当前评测未达到 promotion 条件，默认生产请求不执行结构扩展或 rerank。
+4. 旧 Elasticsearch 和早期 regex/window 检索不属于当前运行时依赖。
 
-2. **Structural Code Intelligence Boosting (`internal/retrieval/structural`)**:
-   - Integrates authoritative symbol tables and relations from `code_index_builds`.
-   - Explains search rankings with deterministic structural reasons (`EXACT_SYMBOL_MATCH`, `RELATED_TEST_DISCOVERY`, `TEST_CONTEXT_MATCH`).
+## 当前约束
 
-3. **Atomic Artifact Publishing (`internal/retrieval/artifact`)**:
-   - Index builds are staged in `.tmp/<build_id>-<token>/` and verified with SHA256 checksums before atomic rename to `<build_id>/`.
-   - Guaranteed immutable snapshot pinning: diagnoses only search pinned `READY` retrieval builds.
-
-4. **Deprecate and Remove Legacy Elasticsearch**:
-   - Elasticsearch container, Docker service, and legacy search adapters are permanently removed.
-   - V1 regex/window baseline is isolated to `internal/retrieval/baseline/` solely for benchmark reproducibility.
-
-## Evaluation & Promotion Results
-Evaluated on the paired held-out benchmark suite:
-- **Symbol Hit@1**: 100.0% (Tracks C & D)
-- **Symbol Hit@5**: 100.0% (Tracks C & D)
-- **Mean MRR**: 1.000 (D >= C - 0.01 satisfied)
-- **P95 Latency**: < 1.0ms across test cases (D <= 1.5 * C satisfied)
-- **Degradation Cases**: 0 cases degraded.
-
-**Winning Strategy**: `SYMBOL_BM25_STRUCTURAL` (Promoted).
+生产默认是 `RetrievalBuild.Strategy=BM25)，并实际执行 Pure BM25。实验结果及复现命令见[检索与评测说明](../retrieval-eval.md)和[RealBench 使用指南](../realbench/README.md)。小规模历史 Bug 指标不构成生产诊断准确率声明。
