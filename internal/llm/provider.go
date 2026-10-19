@@ -92,8 +92,8 @@ func ProviderDispatchGuardFromContext(ctx context.Context) ProviderDispatchGuard
 	return guard
 }
 
-// GuardProvider wraps every concrete provider invocation. It descends through
-// RetryingProvider so each HTTP retry crosses the durable dispatch boundary.
+// GuardProvider 包装每一次具体 Provider 调用。它会递归进入 RetryingProvider，
+// 确保每次 HTTP 重试都先经过持久化派发标记和执行权检查。
 func GuardProvider(provider Provider, guard ProviderDispatchGuard) Provider {
 	if provider == nil || guard == nil {
 		return provider
@@ -128,9 +128,8 @@ func (p *guardedProvider) Generate(ctx context.Context, req GenerateRequest) (Ge
 		if resolved {
 			return GenerateResponse{}, callErr
 		}
-		// An earlier successful provider response in this attempt is still only
-		// in memory. A later definite error cannot make that earlier work safe to
-		// replay, so retain fail-closed semantics.
+		// 本 Attempt 若已有成功响应但尚未 checkpoint，后续明确错误也不能
+		// 证明此前的外部工作可安全重放，因此继续按未知结果 fail closed。
 		return GenerateResponse{}, &OutcomeUnknownError{Cause: callErr}
 	}
 	return GenerateResponse{}, &OutcomeUnknownError{Cause: callErr}

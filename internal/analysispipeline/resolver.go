@@ -101,6 +101,8 @@ func (r *Resolver) ResolveLegacyReady(ctx context.Context, repositoryID, snapsho
 	}, nil
 }
 
+// ResolveReadyLineage 只返回完整 READY revision 的固定资源链。
+// 每一层都要校验归属和父子 ID，不能用“状态均为 READY”代替 lineage 一致性检查。
 func (r *Resolver) ResolveReadyLineage(ctx context.Context, revisionID string) (ResolvedLineage, error) {
 	if r == nil || r.revisions == nil || r.snapshots == nil || r.codeintel == nil {
 		return ResolvedLineage{}, errors.New("READY lineage resolver is not configured")

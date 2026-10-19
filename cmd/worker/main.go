@@ -89,7 +89,7 @@ func run() error {
 		cfg.ProviderRetryAttempts,
 	)
 
-	// Pure Go Production Retrieval (BM25 + Structural Code Intelligence)
+	// 生产默认固定使用 Pure Go BM25；Structural 只能由显式实验构建策略选择。
 	indexStorageDir := filepath.Join(cfg.SnapshotBasePath, "indexes")
 	activeRetriever := retrieval.NewProductionRetriever(codeIntelStore, indexStorageDir)
 

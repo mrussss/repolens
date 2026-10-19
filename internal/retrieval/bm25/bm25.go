@@ -124,7 +124,7 @@ func (idx *Index) Search(query string, topK int) []SearchResult {
 		}
 
 		df := float64(idx.DocFreq[qTerm])
-		// Standard Robertson-Spärck Jones IDF with smoothing
+		// Robertson–Spärck Jones 平滑 IDF，降低普遍词对区分度的影响。
 		idf := math.Log(1.0 + (float64(idx.TotalDocs)-df+0.5)/(df+0.5))
 		if idf < 0 {
 			idf = 0.0001
@@ -134,12 +134,12 @@ func (idx *Index) Search(query string, topK int) []SearchResult {
 			docLen := float64(idx.Documents[p.DocID].DocLength)
 			tf := float64(p.TermFreq)
 
-			// BM25 term weighting formula
+			// BM25 词频与文档长度归一化；随后再累计各 query term 的分数。
 			numerator := tf * (idx.K1 + 1.0)
 			denominator := tf + idx.K1*(1.0-idx.B+idx.B*(docLen/idx.AvgDocLength))
 			score := idf * (numerator / denominator)
 
-			// Boost if the query term matches symbol name exactly
+			// 精确匹配符号名时做小幅加权；它只影响排序，不替代证据校验。
 			if idx.Documents[p.DocID].SymbolName == qTerm {
 				score *= 1.5
 			}

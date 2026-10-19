@@ -132,6 +132,7 @@ func NewAgentLoop(
 	}
 }
 
+// Run 按冻结的 DiagnosisExecutionSpec 执行有界工具循环，并把步骤绑定到当前 Attempt。
 func (l *AgentLoop) Run(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt) (*LoopResult, error) {
 	guard := NewAgentGuard(l.guardCfg)
 	toolsDef := l.registry.Definitions()
@@ -381,6 +382,8 @@ func modelOutputTruncatedError(resp llm.GenerateResponse, maxOutputTokens int) e
 	return fmt.Errorf("%w: finish_reason=%q completion_tokens=%d reasoning_tokens=%d max_output_tokens=%d", ErrModelOutputTruncated, resp.FinishReason, resp.CompletionTokens, resp.ReasoningTokens, maxOutputTokens)
 }
 
+// finalizeOnly 在探索预算耗尽后禁用所有工具定义，只留下一个受 token 上限约束的报告收尾调用。
+// 这样不会因缺少工具预算而直接丢弃已有证据；截断或无效 JSON 仍按失败处理。
 func (l *AgentLoop) finalizeOnly(ctx context.Context, spec diagnosis.DiagnosisExecutionSpec, attempt *diagnosis.DiagnosisAttempt, messages []llm.Message, reason string, promptTokens, completionTokens, cachedTokens, reasoningTokens, toolCalls, searchCalls int, toolNames []string, rounds, seq int) (*LoopResult, error) {
 	seq++
 	finalMessages := append([]llm.Message{}, messages...)

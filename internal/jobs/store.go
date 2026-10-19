@@ -136,7 +136,9 @@ func (s *Store) GetJobByResource(ctx context.Context, jobType JobType, resourceI
 	return scanJob(row)
 }
 
-// ClaimJobs finds eligible pending or retry-wait jobs using SELECT ... FOR UPDATE SKIP LOCKED and marks them RUNNING.
+// ClaimJobs 在事务中领取到期 Job，并写入新的 worker、claim token 和 lease。
+// Claim 只建立执行权，execution_started 仍为 false，不在此处消耗 attempt；
+// Worker 必须在分发业务 handler 前调用 MarkExecutionStarted。
 func (s *Store) ClaimJobs(ctx context.Context, workerID string, batchSize int, leaseDuration time.Duration) ([]*AnalysisJob, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -235,9 +237,9 @@ func (s *Store) ClaimJobs(ctx context.Context, workerID string, batchSize int, l
 	return claimedJobs, nil
 }
 
-// MarkExecutionStarted durably charges an attempt immediately before the
-// Worker invokes the business handler. It is idempotent for the same live
-// claim so a caller can safely resolve an ambiguous database response.
+// MarkExecutionStarted 在调用业务 handler 前持久化开始状态并计入一次 attempt。
+// 同一有效 claim 的重复调用是幂等的，用于解析数据库响应含糊的情况；
+// claim、generation 或 lease 已变化时则拒绝旧 Worker。
 func (s *Store) MarkExecutionStarted(ctx context.Context, jobID int64, workerID, claimToken string, executionGeneration int) (int, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {

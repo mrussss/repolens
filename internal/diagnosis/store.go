@@ -118,8 +118,8 @@ func (s *GormStore) StartAttempt(ctx context.Context, runID string, attempt *Dia
 	})
 }
 
-// StartAttemptWithClaim creates the Attempt and transitions its DiagnosisRun
-// only while the live AnalysisJob lease still belongs to the caller.
+// StartAttemptWithClaim 仅在 AnalysisJob 的有效 lease 仍归当前 Worker 时创建 Attempt。
+// Attempt 编号必须对应持久化的 attempt_count，Run 状态转换和 Attempt 创建在同一事务中完成。
 func (s *GormStore) StartAttemptWithClaim(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID string, attempt *DiagnosisAttempt) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		job, err := lockLiveDiagnosisJobTx(ctx, tx, jobID, workerID, claimToken, generation, runID)
@@ -211,8 +211,8 @@ func lockLiveDiagnosisExecutionTx(ctx context.Context, tx *gorm.DB, jobID int64,
 	return job, run, attempt, nil
 }
 
-// BeginProviderDispatch durably marks a possibly side-effecting provider
-// request before the caller is allowed to invoke the provider.
+// BeginProviderDispatch 在可能产生外部副作用的 Provider 调用前持久化未决标记。
+// 调用方提交标记后还会再次核对执行权，只有仍持有有效 lease 的 Worker 才能派发请求。
 func (s *GormStore) BeginProviderDispatch(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		_, _, attempt, err := lockLiveDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, generation, runID, attemptID, attemptNo)
@@ -227,8 +227,8 @@ func (s *GormStore) BeginProviderDispatch(ctx context.Context, jobID int64, work
 	})
 }
 
-// CheckProviderDispatchAuthority is a second live ownership check after the
-// durable marker commit and immediately before the external provider call.
+// CheckProviderDispatchAuthority 在未决标记提交后、Provider 调用前再次检查执行权。
+// 这一步避免已失去 claim 的 Worker 在数据库提交与外部调用之间继续派发。
 func (s *GormStore) CheckProviderDispatchAuthority(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		_, _, attempt, err := lockLiveDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, generation, runID, attemptID, attemptNo)
@@ -266,8 +266,8 @@ func (s *GormStore) ProviderDispatchSucceeded(ctx context.Context, jobID int64, 
 	})
 }
 
-// ProviderDispatchFailedDefinitely resolves the marker only if this attempt
-// has never received a successful provider response that is still uncheckpointed.
+// ProviderDispatchFailedDefinitely 只有在本 Attempt 没有未 checkpoint 的成功响应时才清除未决标记。
+// 否则后续的明确错误不能证明先前的 Provider 工作可安全重放。
 func (s *GormStore) ProviderDispatchFailedDefinitely(ctx context.Context, jobID int64, workerID, claimToken string, generation int, runID, attemptID string, attemptNo int) (bool, error) {
 	resolved := false
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -349,8 +349,8 @@ func lockDiagnosisExecutionTx(ctx context.Context, tx *gorm.DB, jobID int64, wor
 	return &job, &run, &attempt, nil
 }
 
-// FinalizeSuccess atomically persists report/citations, closes the generation's
-// active attempt and diagnosis, and fences the AnalysisJob by claim ownership.
+// FinalizeSuccess 在同一事务中保存报告与引用、结束当前 Attempt/Diagnosis，
+// 并按 claim 所有权完成 AnalysisJob，避免部分报告或迟到 Worker 写入终态。
 func (s *GormStore) FinalizeSuccess(ctx context.Context, jobID int64, workerID, claimToken, runID, attemptID string, report *evidence.Report, citations []evidence.Citation, promptTokens, completionTokens, toolCalls int) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		job, run, attempt, err := lockDiagnosisExecutionTx(ctx, tx, jobID, workerID, claimToken, 0, runID, attemptID, false)
