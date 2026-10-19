@@ -31,7 +31,9 @@ GOFLAGS=-mod=readonly go test -race ./tests/integration/...
 echo "✓ Component integration tests passed"
 
 echo "[6/10] Running real MySQL integration tests with race detector..."
-REPOLENS_REQUIRE_REAL_INTEGRATION=1 GOFLAGS=-mod=readonly go test -race ./tests/integration_real/...
+# The full package starts isolated MySQL databases sequentially and exceeds
+# Go's default 10-minute test deadline on the supported local validation path.
+REPOLENS_REQUIRE_REAL_INTEGRATION=1 GOFLAGS=-mod=readonly go test -race -timeout=30m ./tests/integration_real/...
 echo "✓ Real MySQL integration tests passed (required mode, 0 skips)"
 
 echo "[7/10] Running the required real-MySQL Golden Path with race detector..."
@@ -59,7 +61,7 @@ for attempt in $(seq 1 30); do
 done
 demo_response=$(curl --noproxy '*' --max-time 30 --fail --silent -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8080/api/v1/demo/trigger)
 echo "$demo_response" | grep -q 'diagnosis_id'
-echo "✓ Product health and real Demo smoke passed"
+echo "✓ Product health and Demo smoke passed"
 
 echo "================================================================="
 echo "ALL GATES PASSED: RepoLens is verified and ready for release!"
