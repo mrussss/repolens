@@ -12,7 +12,7 @@ import (
 	"repolens/internal/codeintel/model"
 )
 
-// ExtractSymbols extracts all functions, methods, types, and interfaces from a parsed AST file.
+// ExtractSymbols extracts package-level functions, methods, types, and interfaces.
 func ExtractSymbols(fset *token.FileSet, astFile *ast.File, filePath, modulePath, packagePath string, content []byte) []*model.Symbol {
 	if astFile == nil {
 		return nil
@@ -21,19 +21,15 @@ func ExtractSymbols(fset *token.FileSet, astFile *ast.File, filePath, modulePath
 	var symbols []*model.Symbol
 	pkgName := astFile.Name.Name
 
-	ast.Inspect(astFile, func(n ast.Node) bool {
-		if n == nil {
-			return true
-		}
-
-		switch decl := n.(type) {
+	// Symbol identity has package scope. Visiting only file declarations keeps
+	// local types in function bodies and variable initializer closures out of it.
+	for _, declaration := range astFile.Decls {
+		switch decl := declaration.(type) {
 		case *ast.FuncDecl:
 			sym := extractFuncDecl(fset, decl, filePath, modulePath, packagePath, pkgName, content)
 			if sym != nil {
 				symbols = append(symbols, sym)
 			}
-			return false // Do not inspect inside func body for top-level symbols
-
 		case *ast.GenDecl:
 			if decl.Tok == token.TYPE {
 				for _, spec := range decl.Specs {
@@ -44,12 +40,9 @@ func ExtractSymbols(fset *token.FileSet, astFile *ast.File, filePath, modulePath
 						}
 					}
 				}
-				return false
 			}
 		}
-
-		return true
-	})
+	}
 
 	return symbols
 }

@@ -20,7 +20,7 @@ const (
 // semantics change. Keep historical benchmark fixtures pinned separately.
 const (
 	CurrentParserVersion       = "v2.2.2"
-	CurrentAnalyzerVersion     = "v2.2.3"
+	CurrentAnalyzerVersion     = "v2.2.4"
 	CurrentSymbolSchemaVersion = "v2.1.2"
 	CurrentRetrievalVersion    = "v2.2.1"
 	CurrentTokenizerVersion    = "v2.1.0"
